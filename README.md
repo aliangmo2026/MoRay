@@ -4,7 +4,7 @@
 > 一份产物、两种用法：双击即用的纯前端单文件，或 FastAPI + SQLite 的本地全栈应用；同时兼容 **Ollama 本地模型**与任意 **OpenAI 兼容云端**（DeepSeek 等）。
 
 <p align="left">
-  <b>🌐 在线体验（BYOK，自带 Key）：</b><i>部署后替换为你的 Pages 地址</i>
+  <b>🌐 在线体验（BYOK，自带 Key）：</b><a href="https://moray1.pages.dev">moray1.pages.dev</a>
   &nbsp;｜&nbsp; <b>💻 本地使用：</b>双击 <code>moray-workbench.html</code>
   &nbsp;｜&nbsp; <b>📦 许可证：</b>MIT
 </p>
