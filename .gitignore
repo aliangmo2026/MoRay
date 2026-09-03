@@ -1,0 +1,65 @@
+# ============================================================
+# MoRay .gitignore —— 公开开源仓库忽略清单
+# 原则：只提交可复现的源码与静态资源；
+#       密钥 / 用户数据 / 历史备份 / 构建产物 / 内部过程稿一律不进仓库
+# ============================================================
+
+# ---- 密钥 / 环境变量（绝不上传；仅保留 .env.example 模板）----
+.env
+**/.env
+!**/.env.example
+
+# ---- 本地数据库 / 用户数据（含真实聊天记录，绝不公开）----
+server/data/
+*.sqlite3
+*.sqlite
+*.db
+
+# ---- Python 虚拟环境与缓存 ----
+server/.venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 历史备份（体积巨大，本地保留，不进仓库）----
+backup/
+backups/
+
+# ---- 构建/发布产物（可由 assemble.py / build_release.py 重新生成）----
+release/
+dist/
+build/
+
+# ---- 内部过程稿：与 AI 协作的任务书、夜间报告、审计记录（不对外）----
+work/
+tools/
+NIGHT_TASK.md
+NIGHT_PROGRESS.md
+NIGHT_REPORT.md
+FIX_*.md
+CODEX_TASK.md
+controls_audit.md
+audit_report.md
+FEATURES_STATUS.md
+runtime_check.md
+verify_v32.txt
+
+# ---- 临时脚本 / 空壳文件 / 临时截图 ----
+u1.py
+u2.py
+tmp_clean.py
+clean2.py
+patch_tools1.py
+uvicorn
+_q*.png
+*.tmp
+*.log
+
+# ---- 系统 / 编辑器杂项 ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/

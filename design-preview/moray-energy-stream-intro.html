@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoRay · Energy Stream Intro</title>
+<style>
+  :root {
+    --bg: #05070d;
+    --cobalt: #5b8cff;
+    --violet: #9d7bff;
+    --cyan: #3ad6e8;
+    --text: #e8ecf5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  #canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #replay {
+    position: fixed; right: 20px; top: 20px; z-index: 10;
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid rgba(91, 140, 255, 0.5);
+    background: rgba(5, 7, 13, 0.8);
+    color: var(--cyan); font-size: 18px; cursor: pointer;
+    opacity: 0.7; transition: all 0.2s ease;
+  }
+  #replay:hover { opacity: 1; box-shadow: 0 0 12px rgba(58, 214, 232, 0.4); }
+  #veil {
+    position: fixed; inset: 0; z-index: 5; background: var(--bg);
+    opacity: 1; pointer-events: none;
+    transition: opacity 0.35s cubic-bezier(.22,1,.36,1);
+  }
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <button id="replay" aria-label="重播">↻</button>
+  <div id="veil"></div>
+<script>
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const veil = document.getElementById('veil');
+  const replay = document.getElementById('replay');
+  let W, H, raf = 0, running = 0;
+
+  function resize() {
+    W = canvas.width = innerWidth;
+    H = canvas.height = innerHeight;
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  function animate() {
+    running++;
+    cancelAnimationFrame(raf);
+    veil.style.opacity = '1';
+
+    const startTime = performance.now();
+    const totalDuration = 2600; // 总时长 2.6 秒（缓慢从容）
+    const cx = W / 2;
+    const cy = H / 2;
+
+    // 生成能量粒子：从四周向中心汇聚
+    const particles = [];
+    const numParticles = 140;
+    for (let i = 0; i < numParticles; i++) {
+      // 粒子从屏幕边缘生成
+      let side = Math.floor(Math.random() * 4);
+      let x, y;
+      if (side === 0) { // 上边
+        x = Math.random() * W; y = -10;
+      } else if (side === 1) { // 右边
+        x = W + 10; y = Math.random() * H;
+      } else if (side === 2) { // 下边
+        x = Math.random() * W; y = H + 10;
+      } else { // 左边
+        x = -10; y = Math.random() * H;
+      }
+      const dist = Math.hypot(x - cx, y - cy);
+      const angle = Math.atan2(cy - y, cx - x);
+      // 随机颜色
+      const r = Math.random();
+      let color;
+      if (r < 0.4) color = [91, 140, 255];
+      else if (r < 0.7) color = [58, 214, 232];
+      else color = [157, 123, 255];
+      particles.push({
+        x, y,
+        vx: Math.cos(angle) * (dist / 450 + 1 + Math.random() * 2),
+        vy: Math.sin(angle) * (dist / 450 + 1 + Math.random() * 2),
+        size: 1 + Math.random() * 2.5,
+        alpha: 0.3 + Math.random() * 0.5,
+        color,
+        arrived: false
+      });
+    }
+
+    let exploded = false;
+    let explodeTime = 0;
+    let explodeProgress = 0;
+    let explodedParticles = [];
+
+    function explode() {
+      exploded = true;
+      explodeTime = performance.now();
+      for (let i = 0; i < 100; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 0.6 + Math.random() * 1.6;
+        const r = Math.random();
+        let color;
+        if (r < 0.4) color = [91, 140, 255];
+        else if (r < 0.75) color = [143, 246, 255];
+        else color = [157, 123, 255];
+        explodedParticles.push({
+          x: cx + (Math.random() - 0.5) * 8,
+          y: cy + (Math.random() - 0.5) * 8,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          size: 1.2 + Math.random() * 2.5,
+          alpha: 0.6 + Math.random() * 0.3,
+          color,
+          phase: Math.random() * Math.PI * 2
+        });
+      }
+    }
+
+    function draw(now) {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / totalDuration);
+
+      // 极淡清屏，让拖尾持久保留
+      ctx.fillStyle = 'rgba(5, 7, 13, 0.04)';
+      ctx.fillRect(0, 0, W, H);
+
+      // 汇聚阶段
+      if (!exploded) {
+        let allArrived = true;
+        particles.forEach(p => {
+          if (!p.arrived) {
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vx *= 1.01;
+            p.vy *= 1.01;
+            const dist = Math.hypot(p.x - cx, p.y - cy);
+            if (dist < 14) {
+              p.arrived = true;
+            } else {
+              allArrived = false;
+            }
+          }
+          // 拖尾
+          const prevX = p.x - p.vx * 2;
+          const prevY = p.y - p.vy * 2;
+          ctx.strokeStyle = `rgba(${p.color[0]}, ${p.color[1]}, ${p.color[2]}, ${p.alpha * 0.35})`;
+          ctx.lineWidth = p.size * 0.5;
+          ctx.beginPath();
+          ctx.moveTo(prevX, prevY);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+          // 粒子
+          ctx.fillStyle = `rgba(${p.color[0]}, ${p.color[1]}, ${p.color[2]}, ${p.alpha})`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          ctx.fill();
+        });
+
+        // 中心光晕
+        const gp = Math.min(1, elapsed / 1000);
+        const cr = 6 + gp * 14;
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, cr * 4);
+        g.addColorStop(0, `rgba(143, 246, 255, ${0.12 + gp * 0.28})`);
+        g.addColorStop(0.5, `rgba(91, 140, 255, ${0.08 + gp * 0.14})`);
+        g.addColorStop(1, 'rgba(58, 214, 232, 0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(cx, cy, cr * 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        if (allArrived && elapsed > 1000) {
+          explode();
+        }
+      }
+
+      // 呼吸扩散阶段
+      if (exploded) {
+        const ee = now - explodeTime;
+        explodeProgress = Math.min(1, ee / 1200);
+
+        const breath = 1 + 0.035 * Math.sin(ee * 0.0025);
+        const baseR = explodeProgress * Math.max(W, H) * 0.35;
+        const glowR = baseR * breath;
+        const intensity = (1 - explodeProgress * 0.5) * breath;
+
+        const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+        glow.addColorStop(0, `rgba(143, 246, 255, ${0.1 * intensity})`);
+        glow.addColorStop(0.35, `rgba(91, 140, 255, ${0.07 * intensity})`);
+        glow.addColorStop(0.7, `rgba(157, 123, 255, ${0.04 * intensity})`);
+        glow.addColorStop(1, 'rgba(58, 214, 232, 0)');
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(cx, cy, glowR, 0, Math.PI * 2);
+        ctx.fill();
+
+        explodedParticles.forEach(p => {
+          const f = 1 + 0.05 * Math.sin(ee * 0.0025 + p.phase);
+          p.x += p.vx * 0.12 * f;
+          p.y += p.vy * 0.12 * f;
+          p.alpha *= 0.998;
+          p.vx *= 0.998;
+          p.vy *= 0.998;
+          if (p.alpha > 0.01) {
+            ctx.fillStyle = `rgba(${p.color[0]}, ${p.color[1]}, ${p.color[2]}, ${p.alpha})`;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.size * 0.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        });
+
+        veil.style.opacity = String(Math.max(0, 1 - explodeProgress * 0.85));
+      }
+
+      if (progress < 1 || exploded && explodeProgress < 1) {
+        raf = requestAnimationFrame(draw);
+      } else {
+        raf = 0;
+      }
+    }
+
+    raf = requestAnimationFrame(draw);
+  }
+
+  replay.onclick = animate;
+  animate();
+})();
+</script>
+</body>
+</html>

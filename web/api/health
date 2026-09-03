@@ -1,0 +1,10 @@
+{
+  "ok": false,
+  "service": "moray-static",
+  "version": "static",
+  "build": "web",
+  "db": "offline",
+  "cloud_configured": false,
+  "counts": { "conversations": 0, "messages": 0 },
+  "message": "静态托管无本地后端：完整版请使用 启动MoRay.bat（后端 127.0.0.1:8000）"
+}

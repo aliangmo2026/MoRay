@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MoRay · Stellar Intro</title>
+<style>
+  :root{--void:#05070d;--panel:#101520;--line:#202b3c;--text:#eaf5ff;--muted:#718097;--cyan:#8ff6ff;--blue:#6d9dff;--warm:#ffd38f;--ease:cubic-bezier(.2,.8,.2,1)}
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:var(--void);color:var(--text);font-family:Inter,"SF Pro Text",system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+  #scene{position:fixed;inset:0;background:radial-gradient(900px 620px at 50% 48%,rgba(26,66,91,.18),transparent 65%),#05070d}
+  #space{position:fixed;inset:0;z-index:2;pointer-events:none}
+  #veil{position:fixed;inset:0;z-index:1;background:#05070d;pointer-events:none;opacity:1}
+  .mark{position:fixed;left:26px;top:24px;z-index:8;display:flex;align-items:center;gap:10px;opacity:.82;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#b8d9e5}
+  .mark i{width:10px;height:10px;border:1px solid var(--cyan);transform:rotate(45deg);display:block;box-shadow:0 0 12px rgba(143,246,255,.45)}
+  #replay{position:fixed;right:22px;top:20px;z-index:8;width:32px;height:32px;border:1px solid #243247;border-radius:50%;background:rgba(9,13,21,.6);color:#9eb9c7;font-size:17px;line-height:1;cursor:pointer;opacity:.7;transition:.2s ease}
+  #replay:hover{opacity:1;border-color:#6ba7b7;color:#d8fbff}
+  .ui{position:fixed;inset:0;z-index:3;display:grid;grid-template-columns:54px 230px 1fr;opacity:0;transform:scale(1.012);filter:blur(8px);transition:opacity .72s var(--ease),transform 1.1s var(--ease),filter .85s var(--ease)}
+  .ui.ready{opacity:1;transform:none;filter:none}
+  .rail{background:rgba(10,15,24,.8);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding-top:76px;gap:13px}
+  .rail b{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:var(--cyan);border:1px solid rgba(143,246,255,.28);background:rgba(71,124,160,.14);font-size:12px}
+  .rail span{width:8px;height:8px;border-radius:50%;background:#324254;box-shadow:0 0 0 5px transparent;transition:.2s ease}.rail span.on{background:var(--cyan);box-shadow:0 0 0 5px rgba(143,246,255,.1)}
+  .sidebar{background:rgba(14,20,31,.72);border-right:1px solid var(--line);padding:76px 14px 20px}
+  .sidehead{display:flex;justify-content:space-between;align-items:center;color:#aebdcd;font-size:12px;margin:0 4px 21px}.sidehead em{font-style:normal;color:#597083;font-size:11px}
+  .section{font-size:10px;letter-spacing:.12em;color:#56677b;margin:18px 5px 7px;text-transform:uppercase}.conv{padding:10px 10px;border-radius:8px;margin:3px 0;color:#8494a8;font-size:12px}.conv.active{background:rgba(92,147,182,.14);color:#e1edf6;border:1px solid rgba(104,174,204,.18)}.conv small{display:block;color:#586b80;font-size:10px;margin-top:4px}
+  .main{min-width:0;display:flex;flex-direction:column;background:rgba(8,12,19,.46)}
+  .topline{height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 27px;border-bottom:1px solid rgba(32,43,60,.75);font-size:13px;font-weight:600}.topline b{font-weight:500;color:#7f92a5}.mode{font-size:11px;color:#7693a7;border:1px solid #27374b;border-radius:6px;padding:5px 9px}
+  .chat{flex:1;padding:46px 9%;display:flex;flex-direction:column;gap:18px}.bubble{max-width:560px;padding:13px 16px;border:1px solid #1f2b3b;border-radius:13px;background:rgba(13,19,29,.78);color:#bfcedc;font-size:13px;line-height:1.65}.bubble.user{align-self:flex-end;background:rgba(41,85,113,.36);border-color:rgba(106,180,211,.25);color:#d9edf5}.who{font-size:11px;color:#71879b;margin-bottom:7px}.who i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);margin-right:6px;box-shadow:0 0 9px rgba(143,246,255,.6)}
+  .code{margin-top:9px;padding:11px 12px;border-radius:8px;background:#080c13;color:#89a9bd;font:11px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace}.code strong{color:#b8e7f0;font-weight:500}.code i{font-style:normal;color:#667b90}
+  .dock{height:58px;margin:0 9% 22px;border:1px solid #26384b;border-radius:15px;display:flex;align-items:center;gap:11px;padding:0 14px;background:rgba(9,14,22,.88);color:#62788b;font-size:12px}.dock .dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 10px rgba(143,246,255,.65)}.dock .grow{flex:1}.send{width:31px;height:31px;border-radius:50%;display:grid;place-items:center;background:#5e94ac;color:#071019;font-weight:700}
+</style>
+</head>
+<body>
+  <div id="scene"></div><canvas id="space"></canvas><div id="veil"></div>
+  <div class="mark"><i></i><span>MoRay / stellar intro</span></div>
+  <button id="replay" aria-label="重播">↻</button>
+  <section class="ui" id="ui" aria-label="MoRay 工作台">
+    <nav class="rail"><b>MR</b><span class="on"></span><span></span><span></span><span></span></nav>
+    <aside class="sidebar"><div class="sidehead"><span>会话</span><em>⌘ K</em></div><div class="section">今天</div><div class="conv active">恒星爆发模拟<small>核心能量已锁定</small></div><div class="conv">轨道光束设计<small>三条路径待确认</small></div><div class="section">昨天</div><div class="conv">本地模型路由<small>qwen2.5-coder</small></div><div class="conv">界面动效清单<small>收束与过渡</small></div></aside>
+    <main class="main"><header class="topline"><span>恒星爆发模拟 <b>· local runtime</b></span><span class="mode">对比</span></header><div class="chat"><div class="bubble user">把核心熔聚做成一次恒星级爆发，但保持 MoRay 的轻盈感</div><div class="bubble"><div class="who"><i></i>qwen2.5-coder</div>先塌缩，再点燃。让光线成为主角，界面只在爆发之后出现。<div class="code"><strong>stellar()</strong> {<br>&nbsp;&nbsp;collapse(<i>particles</i>);<br>&nbsp;&nbsp;ignite(<i>white-hot core</i>);<br>&nbsp;&nbsp;release(<i>rays, corona</i>);<br>}</div></div></div><div class="dock"><span class="dot"></span><span>qwen2.5-coder</span><span class="grow">输入消息，Enter 发送</span><span>⌘</span><span class="send">↑</span></div></main>
+  </section>
+<script>
+(function(){
+  const cv=document.getElementById('space'),ctx=cv.getContext('2d'),veil=document.getElementById('veil'),ui=document.getElementById('ui'),replay=document.getElementById('replay');
+  let raf=0,run=0,W=0,H=0,stars=[],dust=[],rays=[];
+  const TAU=Math.PI*2;
+  function size(){W=cv.width=innerWidth;H=cv.height=innerHeight;stars=[];for(let i=0;i<120;i++)stars.push({x:Math.random()*W,y:Math.random()*H,r:.3+Math.random()*1.1,a:.12+Math.random()*.5});}
+  addEventListener('resize',size);size();
+  function reset(){run++;cancelAnimationFrame(raf);ui.classList.remove('ready');veil.style.opacity='1';ctx.clearRect(0,0,W,H);dust=[];rays=[];stars.forEach(s=>s.a=.12+Math.random()*.5);const id=run,t0=performance.now();
+    for(let i=0;i<160;i++){const a=Math.random()*TAU,R=Math.max(W,H)*(.18+Math.random()*.38);dust.push({a,R,phase:Math.random()*TAU,dir:Math.random()<.5?-1:1,z:.35+Math.random()*.65,c:Math.random()<.08?'255,211,144':'143,246,255',px:null,py:null});}
+    function frame(t){if(id!==run)return;const el=t-t0,p=Math.min(1,el/1920);ctx.fillStyle='rgba(5,7,13,.24)';ctx.fillRect(0,0,W,H);
+      stars.forEach(s=>{const tw=.5+.5*Math.sin(t*.0015+s.x);ctx.fillStyle=`rgba(187,218,232,${s.a*tw})`;ctx.fillRect(s.x,s.y,s.r,s.r);});
+      const cx=W*.5,cy=H*.49,pre=Math.min(1,Math.max(0,(el-120)/720)),collapse=1-Math.pow(1-pre,3),coreR=10+collapse*18;
+      dust.forEach(o=>{const e=Math.min(1,Math.max(0,(el/1000-.05)/.78)),r=o.R*(1-e*.94)+8*(1-e),a=o.a+o.dir*(.18+e*2.25)+Math.sin(e*TAU+o.phase)*.12,x=cx+Math.cos(a)*r*(.95+.08*Math.sin(o.phase)),y=cy+Math.sin(a)*r*(.72+.06*Math.cos(o.phase));if(o.px!==null&&e>.3){ctx.strokeStyle=`rgba(${o.c},${.075*o.z})`;ctx.lineWidth=.45+o.z*.7;ctx.beginPath();ctx.moveTo(o.px,o.py);ctx.lineTo(x,y);ctx.stroke();}if(e>0){ctx.fillStyle=`rgba(${o.c},${(.13+.62*o.z)*(1-e*.1)})`;ctx.beginPath();ctx.arc(x,y,.55+o.z*1.2,0,TAU);ctx.fill();}o.px=x;o.py=y;});
+      if(el>520&&el<980){const a=-.9+el*.001,beam=70+collapse*160,bx=cx+Math.cos(a)*beam,by=cy+Math.sin(a)*beam;const g=ctx.createLinearGradient(cx,cy,bx,by);g.addColorStop(0,'rgba(245,255,239,.46)');g.addColorStop(.16,'rgba(143,246,255,.2)');g.addColorStop(1,'rgba(143,246,255,0)');ctx.strokeStyle=g;ctx.lineWidth=1.1;ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(bx,by);ctx.stroke();}
+      const fired=el>820;if(fired&&!rays.length){for(let i=0;i<34;i++)rays.push({a:i/34*TAU+(Math.random()-.5)*.11,len:Math.max(W,H)*(.14+Math.random()*.28),bend:(Math.random()-.5)*42,warm:i%11===0});}
+      if(fired){const sp=Math.min(1,(el-820)/650),fade=1-sp,bloomR=16+sp*Math.max(W,H)*.2;const bg=ctx.createRadialGradient(cx,cy,0,cx,cy,bloomR);bg.addColorStop(0,`rgba(255,250,215,${fade*.42})`);bg.addColorStop(.18,`rgba(143,246,255,${fade*.2})`);bg.addColorStop(1,'rgba(143,246,255,0)');ctx.fillStyle=bg;ctx.beginPath();ctx.arc(cx,cy,bloomR,0,TAU);ctx.fill();const cr=17+sp*Math.max(W,H)*.14;ctx.strokeStyle=`rgba(255,240,195,${fade*.26})`;ctx.lineWidth=.8;ctx.beginPath();for(let i=0;i<=64;i++){const a=i/64*TAU,j=1+.1*Math.sin(i*1.8+t*.004)+.04*Math.sin(i*4.1-t*.002),r=cr*j,x=cx+Math.cos(a)*r,y=cy+Math.sin(a)*r*.78;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}ctx.closePath();ctx.stroke();rays.forEach(q=>{const r0=14+sp*20,r1=r0+sp*q.len,ax=Math.cos(q.a),ay=Math.sin(q.a),px=-ay*q.bend*sp,py=ax*q.bend*sp;ctx.strokeStyle=`rgba(${q.warm?'255,211,144':'214,251,255'},${fade*.46})`;ctx.lineWidth=.95*(1-sp)+.22;ctx.beginPath();ctx.moveTo(cx+ax*r0,cy+ay*r0);ctx.quadraticCurveTo(cx+ax*(r0+r1)*.54+px,cy+ay*(r0+r1)*.54+py,cx+ax*r1,cy+ay*r1*.8);ctx.stroke();});
+        const rr=sp*Math.max(W,H)*.26;ctx.strokeStyle=`rgba(176,244,255,${fade*.18})`;ctx.lineWidth=1;ctx.setLineDash([18,14]);ctx.beginPath();ctx.ellipse(cx,cy,rr,rr*.72,0,0,TAU);ctx.stroke();ctx.setLineDash([]);}
+      const core=Math.min(1,Math.max(0,(el-690)/250)),coreFade=Math.max(0,1-Math.max(0,(el-1080)/260));if(core&&coreFade){const r=9+core*15,g=ctx.createRadialGradient(cx,cy,0,cx,cy,r*3.2);g.addColorStop(0,`rgba(255,255,243,${(.7+.3*core)*coreFade})`);g.addColorStop(.16,`rgba(255,230,165,${.36*core*coreFade})`);g.addColorStop(1,'rgba(143,246,255,0)');ctx.fillStyle=g;ctx.beginPath();ctx.arc(cx,cy,r*3.2,0,TAU);ctx.fill();ctx.fillStyle=`rgba(255,255,246,${(.5+.5*core)*coreFade})`;ctx.beginPath();ctx.arc(cx,cy,r*.58,0,TAU);ctx.fill();}
+      if(el>1120)veil.style.opacity=String(Math.max(0,1-(el-1120)/420));if(el>1320)ui.classList.add('ready');if(el<2400)raf=requestAnimationFrame(frame);else{ctx.clearRect(0,0,W,H);raf=0;}}
+    raf=requestAnimationFrame(frame);
+  }
+  replay.onclick=reset;reset();
+})();
+</script>
+</body>
+</html>

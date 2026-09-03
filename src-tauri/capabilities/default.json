@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "MoRay 默认能力：窗口/托盘/通知/文件/剪贴板/全局快捷键",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-start-dragging",
+    "shell:allow-spawn",
+    "shell:allow-execute",
+    {
+      "identifier": "shell:allow-stdin-write",
+      "allow": [{ "name": "cmd", "cmd": "cmd", "args": true }]
+    },
+    "notification:default",
+    "dialog:default",
+    "fs:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "updater:default",
+    "process:allow-restart",
+    "process:allow-exit"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "MoRay — 本地AI开发者工作台",
+  "short_name": "MoRay",
+  "description": "本地优先的 AI 开发者工作台：对话、多模型对比、提示词库、RAG 知识库与自动化工作流",
+  "start_url": "./moray-workbench.html",
+  "display": "standalone",
+  "background_color": "#0A0C14",
+  "theme_color": "#0A0C14",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230A0C14'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%233AD6E8'%3E%E2%97%88%3C/text%3E%3C/svg%3E", "sizes": "192x192", "type": "image/svg+xml" }
+  ]
+}

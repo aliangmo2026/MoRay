@@ -1,0 +1,6 @@
+# MoRay 本地薄后端（里程碑 M1 + M2）
+# M2：httpx（云端 LLM 转发）+ python-dotenv（读取 server/.env 配置云端 key）
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0

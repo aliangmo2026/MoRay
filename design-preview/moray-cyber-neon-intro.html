@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoRay · Cyber Neon Intro</title>
+<style>
+  :root {
+    --bg: #05060a;
+    --cyan: #00fff9;
+    --pink: #ff00c8;
+    --purple: #9d4edd;
+    --yellow: #faff00;
+    --grid-line: rgba(0, 255, 249, 0.18);
+    --grid-glow: rgba(255, 0, 200, 0.6);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  #canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #replay {
+    position: fixed; right: 20px; top: 20px; z-index: 10;
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid rgba(0, 255, 249, 0.5);
+    background: rgba(5, 6, 10, 0.8);
+    color: var(--cyan); font-size: 18px; cursor: pointer;
+    opacity: 0.7; transition: all 0.2s ease;
+  }
+  #replay:hover { opacity: 1; box-shadow: 0 0 12px rgba(0, 255, 249, 0.5); }
+  #veil {
+    position: fixed; inset: 0; z-index: 5; background: var(--bg);
+    opacity: 1; pointer-events: none;
+    transition: opacity 0.4s ease-out;
+  }
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <button id="replay" aria-label="重播">↻</button>
+  <div id="veil"></div>
+<script>
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const veil = document.getElementById('veil');
+  const replay = document.getElementById('replay');
+  let W, H, raf = 0, running = 0;
+
+  function resize() {
+    W = canvas.width = innerWidth;
+    H = canvas.height = innerHeight;
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // 赛博霓虹网格开场动画
+  function animate() {
+    running++;
+    cancelAnimationFrame(raf);
+    veil.style.opacity = '1';
+
+    const startTime = performance.now();
+    const totalDuration = 1600; // 总时长 1.6 秒（快节奏）
+
+    // 网格参数
+    const cellSize = Math.min(W, H) / 22;
+    const cols = Math.ceil(W / cellSize);
+    const rows = Math.ceil(H / cellSize);
+
+    function glitch(offset, intensity) {
+      ctx.save();
+      ctx.translate((Math.random() - 0.5) * offset * intensity, (Math.random() - 0.5) * offset * intensity);
+      ctx.clip();
+    }
+
+    function draw(now) {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / totalDuration);
+
+      // 清屏
+      ctx.fillStyle = 'rgba(5, 6, 10, 0.3)';
+      ctx.fillRect(0, 0, W, H);
+
+      // 阶段 1：网格扫描 (0 - 0.5)
+      const scanProgress = Math.min(1, progress / 0.5);
+      const centerX = W / 2;
+      const centerY = H / 2;
+      const maxRadius = Math.max(W, H) * 0.8;
+      const currentRadius = scanProgress * maxRadius;
+
+      // 绘制网格
+      ctx.lineWidth = 1;
+      for (let c = 0; c <= cols; c++) {
+        const x = c * cellSize;
+        const dx = Math.abs(x - centerX);
+        if (dx < currentRadius + cellSize) {
+          const dist = dx / maxRadius;
+          const alpha = (currentRadius > dx) ? (0.18 - dist * 0.12) : 0;
+          if (alpha > 0.02) {
+            const gradient = ctx.createLinearGradient(x, 0, x + 2, H);
+            gradient.addColorStop(0, `rgba(0, 255, 249, ${alpha})`);
+            gradient.addColorStop(1, `rgba(255, 0, 200, ${alpha * 0.8})`);
+            ctx.strokeStyle = gradient;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, H);
+            ctx.stroke();
+          }
+        }
+      }
+      for (let r = 0; r <= rows; r++) {
+        const y = r * cellSize;
+        const dy = Math.abs(y - centerY);
+        if (dy < currentRadius + cellSize) {
+          const dist = dy / maxRadius;
+          const alpha = (currentRadius > dy) ? (0.18 - dist * 0.12) : 0;
+          if (alpha > 0.02) {
+            const gradient = ctx.createLinearGradient(0, y, W, y + 2);
+            gradient.addColorStop(0, `rgba(255, 0, 200, ${alpha})`);
+            gradient.addColorStop(1, `rgba(0, 255, 249, ${alpha * 0.8})`);
+            ctx.strokeStyle = gradient;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(W, y);
+            ctx.stroke();
+          }
+        }
+      }
+
+      // 霓虹点发光
+      if (scanProgress > 0.2) {
+        const glowRadius = scanProgress * maxRadius * 0.35;
+        const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, glowRadius);
+        gradient.addColorStop(0, 'rgba(157, 78, 221, 0.25)');
+        gradient.addColorStop(0.5, 'rgba(255, 0, 200, 0.12)');
+        gradient.addColorStop(1, 'rgba(0, 255, 249, 0)');
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, glowRadius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 阶段 2：故障抖动 + 中心爆炸 (0.5 - 0.85)
+      const glitchProgress = progress < 0.5 ? 0 : Math.min(1, (progress - 0.5) / 0.35);
+      if (glitchProgress > 0) {
+        const intensity = glitchProgress * 3;
+        // RGB 分离故障效果
+        const offsetX = Math.sin(elapsed * 0.08) * intensity * 4;
+        const offsetY = Math.cos(elapsed * 0.12) * intensity * 2;
+
+        // 保存当前状态用于 RGB 分离
+        const image = ctx.getImageData(0, 0, W, H);
+
+        // 红色通道偏移
+        for (let i = 0; i < image.data.length; i += 4) {
+          if (i % (4 * 4) === 0) {
+            const nx = Math.floor((i / 4) % W) + Math.round(offsetX);
+            const ny = Math.floor((i / 4) / W);
+            if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+              image.data[i] = image.data[(ny * W + nx) * 4];
+            }
+          }
+        }
+        // 蓝色通道反向偏移
+        for (let i = 2; i < image.data.length; i += 4) {
+          const nx = Math.floor((i / 4) % W) - Math.round(offsetX * 0.6);
+          const ny = Math.floor((i / 4) / W) + Math.round(offsetY);
+          if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+            image.data[i] = image.data[(ny * W + nx) * 4 + 2];
+          }
+        }
+        ctx.putImageData(image, 0, 0);
+
+        // 随机水平扫描线
+        if (Math.random() < 0.3 * glitchProgress) {
+          const y = Math.random() * H;
+          const h = 2 + Math.random() * 4;
+          const gradient = ctx.createLinearGradient(0, y, W, y);
+          gradient.addColorStop(0, 'transparent');
+          gradient.addColorStop(0.5, `rgba(0, 255, 249, ${0.3 * glitchProgress})`);
+          gradient.addColorStop(1, 'transparent');
+          ctx.fillStyle = gradient;
+          ctx.fillRect(0, y - h/2, W, h);
+        }
+      }
+
+      // 阶段 3：脉冲爆炸收缩 (0.85 - 1.0)
+      const explodeProgress = progress < 0.85 ? 0 : Math.min(1, (progress - 0.85) / 0.15);
+      if (explodeProgress > 0) {
+        const p = explodeProgress;
+        const outerR = maxRadius * (1 - p * 0.95);
+        const innerR = maxRadius * 0.1 * p;
+
+        // 霓虹外环
+        const gradient = ctx.createRadialGradient(centerX, centerY, outerR - 6, centerX, centerY, outerR);
+        gradient.addColorStop(0, 'rgba(0, 255, 249, 0)');
+        gradient.addColorStop(0.5, 'rgba(255, 0, 200, 0.8)');
+        gradient.addColorStop(1, 'rgba(0, 255, 249, 0)');
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, outerR, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 中心霓虹收缩
+        if (p > 0.3) {
+          const ig = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, innerR * 3);
+          ig.addColorStop(0, 'rgba(250, 255, 0, 0.6)');
+          ig.addColorStop(0.4, 'rgba(255, 0, 200, 0.3)');
+          ig.addColorStop(1, 'rgba(0, 255, 249, 0)');
+          ctx.fillStyle = ig;
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, innerR * 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // 十字霓虹光束
+        const beamAlpha = 0.5 * (1 - p);
+        ctx.globalCompositeOperation = 'screen';
+        const beamGradH = ctx.createLinearGradient(0, centerY, W, centerY);
+        beamGradH.addColorStop(0, 'transparent');
+        beamGradH.addColorStop(0.5, `rgba(255, 255, 0, ${beamAlpha})`);
+        beamGradH.addColorStop(1, 'transparent');
+        ctx.fillStyle = beamGradH;
+        ctx.fillRect(0, centerY - 2, W, 4);
+        const beamGradV = ctx.createLinearGradient(centerX, 0, centerX, H);
+        beamGradV.addColorStop(0, 'transparent');
+        beamGradV.addColorStop(0.5, `rgba(0, 255, 249, ${beamAlpha})`);
+        beamGradV.addColorStop(1, 'transparent');
+        ctx.fillStyle = beamGradV;
+        ctx.fillRect(centerX - 2, 0, 4, H);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+
+      // 最后淡出面纱
+      if (progress > 0.75) {
+        const fade = (progress - 0.75) / 0.25;
+        veil.style.opacity = String(1 - fade);
+      }
+
+      if (progress < 1) {
+        raf = requestAnimationFrame(draw);
+      } else {
+        // 结束，清理
+        ctx.clearRect(0, 0, W, H);
+        raf = 0;
+      }
+    }
+
+    raf = requestAnimationFrame(draw);
+  }
+
+  replay.onclick = animate;
+  animate();
+})();
+</script>
+</body>
+</html>
