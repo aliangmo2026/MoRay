@@ -540,6 +540,12 @@ const SettingsApp = {
                 <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="clearSamplesBtn"><i data-lucide="eraser" class="w-3.5 h-3.5"></i>清空示例数据</button>
                 <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="cleanOrphansBtn" title="清理无归属的孤儿消息（串台残留）"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i>清理孤儿消息</button>
               </div>
+              <!-- [批次修复 #4] 存储边界显式说明 -->
+              <div class="rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2 text-[10px] text-text-tertiary leading-relaxed mt-2">
+                <b class="text-text-secondary">存储边界</b>：图片附件<b class="text-warning">仅保存在本机浏览器 IndexedDB</b>，
+                清除浏览器数据或更换设备将丢失；文本消息可通过本地后端（SQLite）同步。
+                附件不随文本同步、不外传。
+              </div>
             </div>
           </div>
 
@@ -1089,7 +1095,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.18.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.18.6'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -1176,6 +1182,10 @@ async function bootApp() {
       if (typeof appendAgentSettings === 'function') appendAgentSettings();
       if (typeof syncNativeAgentBtn === 'function') syncNativeAgentBtn();
       if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
+      // [批次修复 #2] 上次会话开启过本机工具 → 应用 Agent 推荐默认模型（当前模型自检通过则跳过）
+      if (MoraySettings.get('nativeToolsEnabled') === true && typeof agentApplyRecommendedModel === 'function') {
+        setTimeout(() => agentApplyRecommendedModel(), 400);
+      }
       // [工具调用] 对比模式提示（CompareApp.build 已重建面板，此时注入不被清掉）
       if (typeof installCompareToolsTip === 'function') installCompareToolsTip();
       // [任务1] 统一全局搜索面板（接管 ⌘K）

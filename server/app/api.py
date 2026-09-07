@@ -90,6 +90,9 @@ def conv_delete(conv_id: str):
 
 @router.get("/api/conversations/{conv_id}/messages")
 def msg_list(conv_id: str):
+    """宽松语义：会话不存在也返回 200 + 空数组（历史行为；删除/清理竞态下不报错）"""
+    if not crud.get_conversation(conv_id):
+        return _ok([])
     return _ok(crud.list_messages(conv_id))
 
 

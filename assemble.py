@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """组装第二阶段应用层：拼接 parts -> 单个 <script> 块 -> 注入 HTML </body> 前
 同时生成 PWA 配套文件（sw.js / manifest.webmanifest）"""
-import io, os
+import io, os, re
 
 PARTS = ['parts/10_db.js', 'parts/20_ai.js', 'parts/30_chat.js',
          'parts/40_compare_prompts.js', 'parts/50_snippets.js',
@@ -119,13 +119,46 @@ def stage(name, content):
 
 try:
     stage(SRC, html)
-    stage('sw.js', io.open(SW_TEMPLATE, encoding='utf-8').read())
+    # [批次修复 #5] SW 缓存名绑定 MORAY_BUILD：升级后浏览器自动换缓存，不依赖用户硬刷新
+    sw_src = io.open(SW_TEMPLATE, encoding='utf-8').read()
+    m_build = re.search(r"window\.MORAY_BUILD = '([^']+)'", app_js)
+    build_ver = m_build.group(1) if m_build else 'dev'
+    sw_src = re.sub(r"const CACHE_NAME = '[^']*'", "const CACHE_NAME = 'moray-" + build_ver + "'", sw_src, count=1)
+    stage('sw.js', sw_src)
     stage('manifest.webmanifest', MANIFEST)
 
     # 4) 运行时依赖校验（通过后才允许替换正式文件）
     missing = [rel for rel in RUNTIME_DEPS if not os.path.exists(rel)]
     if missing:
         print('构建失败：缺少运行时依赖：' + ', '.join(missing))
+        sys.exit(1)
+
+    # [批次修复 #14] 内部版本三处一致性校验（110 MORAY_BUILD / 70 APP_VERSION / config BUILD）
+    m110 = re.search(r"window\.MORAY_BUILD = '([^']+)'", app_js)
+    p70 = io.open('parts/70_models_settings_boot.js', encoding='utf-8-sig').read()
+    m70 = re.search(r"const APP_VERSION = 'v([^']+)'", p70)
+    pcfg = io.open('server/app/config.py', encoding='utf-8').read()
+    mcfg = re.search(r'BUILD = "([^"]+)"', pcfg)
+    v110 = m110.group(1) if m110 else ''
+    v70 = m70.group(1) if m70 else ''
+    vcfg = mcfg.group(1) if mcfg else ''
+    if not (v110 and v110 == v70 == vcfg):
+        print('构建失败：内部版本号三处不一致 —— parts/110_polish.js MORAY_BUILD=' + v110 +
+              '，parts/70_models_settings_boot.js APP_VERSION=v' + v70 +
+              '，server/app/config.py BUILD=' + vcfg + '（请统一后重试）')
+        sys.exit(1)
+
+    # [批次修复 #14b] 对外产品版本校验：产物内全部 MORAY_VERSION 定义一致且等于 config PRODUCT_VERSION
+    v_mv = set(re.findall(r"window\.MORAY_VERSION = '([^']+)'", app_js))
+    mprod = re.search(r'PRODUCT_VERSION = "([^"]+)"', pcfg)
+    v_prod = mprod.group(1) if mprod else ''
+    if len(v_mv) > 1:
+        print('构建失败：产物中存在多个 MORAY_VERSION 定义：' + ', '.join(sorted(v_mv)) + '（请统一）')
+        sys.exit(1)
+    v_mv_one = next(iter(v_mv)) if v_mv else ''
+    if not (v_mv_one and v_prod and v_mv_one == v_prod):
+        print('构建失败：对外产品版本不一致 —— parts/110_polish.js MORAY_VERSION=' + v_mv_one +
+              '，server/app/config.py PRODUCT_VERSION=' + v_prod + '（请统一后重试）')
         sys.exit(1)
 
     # 5) 原子替换
@@ -239,8 +272,28 @@ if _args.web:
         '}\n'
     ))
     # 成品 html：线上入口 index.html + 本地名副本（SW 离线回退两处都能命中）
-    _emit(SRC, 'index.html')
-    _emit(SRC, 'moray-workbench.html')
+    # [批次修复 #5] 在线演示版横幅：--web 导出的成品注入不可关闭顶部横幅（静态站无本机 Agent）
+    def _read_with_demo_banner():
+        html = open(SRC, encoding='utf-8').read()
+        style = (
+            '<style>#demoModeBanner{position:sticky;top:0;z-index:9998;'
+            'background:linear-gradient(90deg,#b98a2f,#8a6420);color:#fdf3d8;'
+            'font-size:11px;text-align:center;padding:3px 10px;line-height:1.7;'
+            'font-weight:500;letter-spacing:.2px;'
+            'box-sizing:border-box;width:100%;max-width:100vw;'
+            'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+            '}</style>'
+        )
+        banner = (
+            '<div id="demoModeBanner">当前为在线演示版（纯前端 BYOK）——本机 Agent 能力需本地运行完整版'
+            '（双击「启动MoRay.bat」或运行 server\\ 下 uvicorn 后访问 http://127.0.0.1:8000/）</div>'
+        )
+        html = html.replace('</head>', style + '</head>', 1)
+        import re as _re
+        html = _re.sub(r'<body[^>]*>', lambda m: m.group(0) + banner, html, count=1)
+        return html
+    _emit(SRC, 'index.html', _read_with_demo_banner())
+    _emit(SRC, 'moray-workbench.html', _read_with_demo_banner())
     # deploy/（Worker 代理 + 部署说明）随包携带
     if os.path.isdir('deploy'):
         for root, _dirs, files in os.walk('deploy'):

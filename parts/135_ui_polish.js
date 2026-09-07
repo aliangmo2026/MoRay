@@ -156,6 +156,14 @@ window.showNotification = function (title, message, type = 'info', duration) {
   const st = document.createElement('style');
   st.id = 'uiPolishStyle';
   st.textContent = `
+/* ---------- [批次修复 #4] 附件“仅存本机”角标 ---------- */
+.local-only-badge {
+  font-size: 9px; line-height: 1.2; padding: 1px 5px; border-radius: 8px;
+  color: var(--color-text-secondary, #9ca3af);
+  border: 1px solid rgba(120,140,180,.3); background: rgba(120,140,180,.08);
+  cursor: help; white-space: nowrap;
+}
+
 /* ---------- A. 通知：壁纸下可读 scrim / 状态色 / 进度条 / 右上安全边距 ---------- */
 .notification-container { top: 16px; right: 16px; max-width: min(400px, calc(100vw - 32px)); }
 .notification--polished {
@@ -243,6 +251,9 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 .native-agent-btn:not(.native-on) { opacity: .62; }
 .native-agent-btn:not(.native-on):hover { opacity: 1; }
+/* [批次修复 #1] 后端离线：本机 Agent 开关与入口置灰 */
+.native-agent-btn.native-offline { opacity: .38; cursor: not-allowed; filter: grayscale(.4); }
+.native-agent-btn.native-offline:hover { opacity: .45; }
 
 /* ---------- F. Agent 组件精修 ---------- */
 /* 欢迎页快捷卡片精修：图标底统一、hover 抬升、间距统一；Agent 引导卡高亮 */
@@ -302,6 +313,10 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
   .plan-card .animate-pulse, [class*="animate-"] { animation: none !important; }
   .msg-enter, .msg-fade, .tool-step, .notification, .plan-card { transition: none !important; animation: none !important; }
   * { scroll-behavior: auto !important; }
+}
+/* ---------- [批次修复 #20] 窄屏/触控：fixed 背景退化时防布局溢出（随内容滚动） ---------- */
+@media (max-width: 900px) {
+  body, #app, .aurora-bg { background-attachment: scroll !important; }
 }
 `;
   document.head.appendChild(st);

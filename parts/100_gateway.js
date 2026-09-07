@@ -344,9 +344,25 @@ function ensureStringModel(value, fallback) {
 
 /* ===================== [v3.15.13] 模型失败熔断 + 已驻留模型亲和 ===================== */
 
-/** 失败模型短期熔断（内存态）：模型真实请求失败才记录；AbortError/正常完成/缓存命中不计。 */
+/** 失败模型短期熔断（内存态 + [批次修复 #9] localStorage 持久化：键名带版本前缀防脏数据，
+ * 刷新后保留对失败模型的临时禁用直到冷却期结束）。 */
 const GatewayBreaker = {
   _fails: {},
+  _persistKey() {
+    return 'moray_breaker_' + ((typeof window !== 'undefined' && window.MORAY_BUILD) || 'dev');
+  },
+  _load() {
+    try {
+      const raw = localStorage.getItem(this._persistKey());
+      if (raw) {
+        const j = JSON.parse(raw);
+        if (j && typeof j === 'object') this._fails = j;
+      }
+    } catch (e) { /* 忽略 */ }
+  },
+  _save() {
+    try { localStorage.setItem(this._persistKey(), JSON.stringify(this._fails)); } catch (e) { /* 忽略 */ }
+  },
   cooldownMs() {
     let s = parseInt(MoraySettings.get('circuitBreakerCooldownSec') || 90, 10);
     if (!isFinite(s) || s <= 0) s = 90;
@@ -357,7 +373,7 @@ const GatewayBreaker = {
     const f = this._fails[model];
     if (!f) return 0;
     const left = this.cooldownMs() - (Date.now() - f.at);
-    if (left <= 0) { delete this._fails[model]; return 0; }
+    if (left <= 0) { delete this._fails[model]; this._save(); return 0; }
     return Math.ceil(left / 1000);
   },
   record(model, reason) {
@@ -368,9 +384,10 @@ const GatewayBreaker = {
       reason: String(reason || '').slice(0, 400),
       consec: (prev.consec || 0) + 1
     };
+    this._save();
   },
-  clear(model) { delete this._fails[model]; },
-  clearAll() { this._fails = {}; },
+  clear(model) { delete this._fails[model]; this._save(); },
+  clearAll() { this._fails = {}; this._save(); },
   snapshot() {
     return Object.keys(this._fails).map(model => ({
       model,
@@ -380,6 +397,7 @@ const GatewayBreaker = {
     })).filter(x => x.left > 0);
   }
 };
+GatewayBreaker._load(); // [批次修复 #9] 启动时恢复持久化熔断（冷却期内的失败模型保留临时禁用）
 
 /** Ollama 当前驻留模型名（GET /api/ps，5 秒短缓存；失败静默返回空，不报错不阻塞路由） */
 let __psCache = { at: 0, list: null };
@@ -1328,7 +1346,14 @@ async function updateGatewayStatusBar() {
   try {
     const today = await UsageTracker.summarize('today');
     const cache = await GatewayCache.stats();
-    if (el) el.textContent = '今日 ' + ((today.prompt + today.completion) / 1000).toFixed(1) + 'k tok · ' + (typeof CostEngine !== 'undefined' ? CostEngine.formatMoney(today.cost) : ('¥' + today.cost.toFixed(2))) + (cache.hits ? ' · 省' + cache.tokensSaved + ' tok' : '');
+    if (el) {
+      // [批次修复 #16] 纯前端（无后端）模式下 token 为前端估算，标注“估算”
+      const mb = window.MorayBackend;
+      const offline = !(mb && mb.connected);
+      el.textContent = '今日 ' + ((today.prompt + today.completion) / 1000).toFixed(1) + 'k tok' + (offline ? '（估算）' : '') +
+        ' · ' + (typeof CostEngine !== 'undefined' ? CostEngine.formatMoney(today.cost) : ('¥' + today.cost.toFixed(2))) +
+        (cache.hits ? ' · 省' + cache.tokensSaved + ' tok' : '');
+    }
   } catch (e) { /* 忽略 */ }
 }
 

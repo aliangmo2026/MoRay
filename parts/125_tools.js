@@ -149,13 +149,20 @@ const ToolRegistry = {
     // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
     // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
     const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
-    let body = '';
+    const body = '';
     if (evt.status === 'error') {
       body = '<div class="text-[10px] text-danger mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
     } else if (evt.status === 'denied') {
       body = '<div class="text-[10px] text-warning mt-1.5">' + escapeHtml(full || '用户拒绝了该操作') + '</div>';
     } else if (full) {
       body = '<div class="text-[10px] text-text-tertiary mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all" data-tool-full>' + escapeHtml(full) + '</div>';
+    }
+    // [批次修复 #7] 重放标记：该步被“重试该步”重放过（仅重新执行工具，不自动改写已生成回复）
+    if (evt.replayed) {
+      const changedNote = evt.replayed.changed ? '结果与上次不同（已更新）' : '结果与上次一致';
+      body = '<div class="flex items-center gap-1.5 mt-1.5 text-[10px] text-warning"><i data-lucide="rotate-cw" class="w-3 h-3"></i>' +
+        '已重放该步（仅重新执行工具，不自动改写已生成回复）· ' + escapeHtml(changedNote) +
+        ' · 可点回复右上「重新生成」让模型基于最新结果作答</div>' + body;
     }
     const retry = evt.status === 'error' && evt.name
       ? '<button data-tool-retry="' + evt.index + '" class="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-warning hover:bg-surface-panel flex items-center gap-1 text-[10px]" title="重新执行本步骤（走完整安全层与审批）"><i data-lucide="rotate-cw" class="w-3 h-3"></i>重试该步</button>'
@@ -380,12 +387,16 @@ const ToolRegistry = {
       step.status = res.ok ? 'success' : 'error';
       step.ms = res.ms;
       const text = res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : res.error;
+      const prevFull = step.resultFull || '';
+      const newFull = (res.ok ? text : ('错误：' + res.error)).slice(0, 10000);
+      // [批次修复 #7] 重放标记：显式告知“仅重放工具、不自动改写回复”，并标注结果是否变化
+      step.replayed = { at: Date.now(), changed: !!prevFull && prevFull !== newFull };
       step.resultPreview = text;
-      step.resultFull = (res.ok ? text : ('错误：' + res.error)).slice(0, 10000);
+      step.resultFull = newFull;
       const card = btn.closest('.tool-step');
       if (card && card.isConnected) card.outerHTML = this.stepHtml(Object.assign({}, step, { index: idx }));
       refreshIcons();
-      if (res.ok) showNotification('重试成功', '可点击该回复的「重新生成」让模型基于最新结果作答', 'success', 3200);
+      if (res.ok) showNotification('重试成功', '已重放该步（仅重新执行工具）——点「重新生成」可让模型基于最新结果作答', 'success', 3800);
       else showNotification('重试失败', String(res.error || '').slice(0, 140), 'error', 3000);
       if (msg && typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
     } catch (e) {
@@ -1010,6 +1021,26 @@ function agentFingerprint(name, args) {
   return name + '::' + agentStableStringify(args || {});
 }
 
+/** [批次修复 #8] 审批用指纹：写类工具（write_file/edit_file）额外并入“目标文件当前内容哈希”——
+ * 文件内容已变化时，即使工具+参数相同也必须重新弹审批；read 类只读工具不受影响。
+ * @param {Object} def - 工具定义
+ * @param {Object} args - 参数
+ * @returns {Promise<string>} 指纹 */
+async function agentFingerprintForApproval(def, args) {
+  let fp = agentFingerprint(def.name, args || {});
+  if (def.name === 'write_file' || def.name === 'edit_file') {
+    const path = String((args && args.path) || '');
+    try {
+      const data = await wsFetchTool('read_file', { path, maxBytes: 65536 });
+      const content = (data && data.content != null) ? String(data.content) : '';
+      fp += '::h' + (typeof fnvHash64 === 'function' ? fnvHash64(content) : String(content.length));
+    } catch (e) {
+      fp += '::missing';
+    }
+  }
+  return fp;
+}
+
 /** 已信任操作数（设置页展示/清除用）
  * @returns {number} 数量 */
 function agentTrustedCount() {
@@ -1116,10 +1147,13 @@ function agentApproval(def, args, ctx) {
     catch (e) { done(false, false); return; }
     const okBtn = box.querySelector('[data-agent-approve-ok]');
     const noBtn = box.querySelector('[data-agent-approve-no]');
-    if (okBtn) okBtn.addEventListener('click', () => {
+    if (okBtn) okBtn.addEventListener('click', async () => {
       const trust = box.querySelector('[data-agent-trust]');
       const trusted = !!(trust && trust.checked);
-      if (trusted) __agentTrustedOps.set(agentFingerprint(def.name, args || {}), true);
+      if (trusted) {
+        // [批次修复 #8] 写类工具信任指纹含目标内容哈希（async 取当前文件内容）
+        __agentTrustedOps.set(await agentFingerprintForApproval(def, args || {}), true);
+      }
       done(true, trusted);
     });
     if (noBtn) noBtn.addEventListener('click', () => done(false, false));
@@ -1165,7 +1199,8 @@ function agentReportDenied(name, args) {
  * @param {Object} [ctx] - 上下文（signal 取消 + onStatus('pending') 通知步骤卡）
  * @returns {Promise<Object>} 后端 data */
 async function agentNativeRun(def, args, ctx) {
-  const fp = agentFingerprint(def.name, args || {});
+  // [批次修复 #8] 审批判断用“含内容哈希”的指纹（写类工具；read 类仅工具+参数）
+  const fp = await agentFingerprintForApproval(def, args || {});
   // run_command 永不入信任表：指纹命中也照样弹审批
   const trusted = def.name !== 'run_command' && __agentTrustedOps.has(fp);
   const needApprove = (def.sideEffect === true || MoraySettings.get('agentApprovalMode') === 'all') && !trusted;
@@ -1698,6 +1733,16 @@ function installWsTreeHandlers() {
   if (window.__wsTreeBound) return;
   window.__wsTreeBound = true;
   document.addEventListener('click', async (e) => {
+    // [批次修复 #1] 本机 Agent 入口离线守卫：点击时给出明确原因提示（不执行动作）
+    const agentBtn = e.target.closest('[data-ws-tree-btn], [data-agent-selfcheck-btn], [data-ws-sample-btn]');
+    if (agentBtn) {
+      const reason = (typeof agentOfflineReason === 'function') ? agentOfflineReason() : '';
+      if (reason) {
+        e.preventDefault();
+        showNotification('本机 Agent 暂不可用', reason, 'warning', 5200);
+        return;
+      }
+    }
     const entry = e.target.closest('[data-ws-tree-btn]');
     if (entry) { e.preventDefault(); toggleWsSidebar(); return; }
     // [阶段1 M1] Agent 自检入口
@@ -1808,6 +1853,38 @@ async function loadSampleWorkspace() {
   showNotification('示例工作区已就绪',
     '新建 ' + created + ' 个文件' + (skipped ? '，跳过已存在 ' + skipped + ' 个' : '') + '。试试：“列出计划，找到所有 txt 并汇总要点到 summary.md”',
     'success', 6000);
+}
+
+/** [批次修复 #2] 工具调用最稳模型推荐（真机实测：qwen2.5:7b 非流式/流式均 3/3）
+ * @returns {string} 本机可用的推荐模型名（无则空串） */
+function agentRecommendedModel() {
+  if (typeof AI === 'undefined' || !Array.isArray(AI.models)) return '';
+  const wish = ['qwen2.5:7b', 'qwen3.5:9b', 'qwen3.5:4b'];
+  for (const w of wish) {
+    const hit = (AI.models || []).find(m => m.name === w || String(m.name || '').indexOf(w) === 0);
+    if (hit) return hit.name;
+  }
+  return '';
+}
+
+/** [批次修复 #2] Agent 模式默认模型：当前模型自检通过则维持原默认；
+ * 否则（未自检/未通过）切到推荐模型——不强制锁定，用户仍可手动切换。
+ * @returns {void} */
+function agentApplyRecommendedModel() {
+  try {
+    const sc = MoraySettings.get('agentSelfCheck');
+    const cur = (typeof activeModelName === 'function') ? activeModelName() : MoraySettings.get('defaultModel');
+    if (sc && sc.ok === true && sc.model === cur) return; // 自检通过 → 维持原默认
+    const rec = agentRecommendedModel();
+    if (!rec || cur === rec) return;
+    MoraySettings.set('defaultModel', rec).then(() => {
+      try {
+        if (typeof syncInputModelLabel === 'function') syncInputModelLabel();
+        if (typeof updateStatusBar === 'function') updateStatusBar();
+        showNotification('Agent 默认模型已切换', rec + '（真机实测工具调用最稳 3/3）；仍可在输入台手动切换', 'info', 4500);
+      } catch (e) { /* 忽略 */ }
+    }).catch(() => {});
+  } catch (e) { /* 忽略 */ }
 }
 
 /** [阶段1 M1] Agent 自检：用当前所选模型发一个必然触发工具调用的最小请求，

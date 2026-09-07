@@ -147,6 +147,10 @@ Ollama 本地模型无需任何配置（自动探测 11434）。
 
 `python assemble.py --web` 生成的 `web/` 是纯静态站，可直接拖拽部署到 **Cloudflare Pages / Vercel / Netlify / GitHub Pages**，无需构建配置；浏览器直连遇 CORS 时，可按 [`deploy/README.md`](deploy/README.md) 五步部署一个免费的 Cloudflare Worker 透传代理（不存储、不记录 Key）。
 
+> **线上演示版边界（如实声明）**：`--web` 导出的成品顶部带有不可关闭的“在线演示版”横幅——该版本为纯前端 BYOK，**不含本机 Agent 能力**（受控工作区工具需要本地后端安全层执行）。
+>
+> **更新方式**：每次更新把最新 `web/` **整个文件夹**重新拖入 Cloudflare Pages（覆盖式重传）；PWA 缓存名绑定内部构建号（随构建自动递增），升级后浏览器自动取新包，一般无需用户硬刷新；若仍显示旧版，Ctrl+Shift+R 硬刷新一次即可。
+
 ## 六、目录结构
 
 ```

@@ -366,22 +366,39 @@ function installNativeAgentToggle() {
   refreshIcons();
 }
 
-/** 同步按钮态（开启高亮 + ON 标 + 提示文案）
+/** [批次修复 #1] 本机 Agent 离线原因与后端可用性判断
+ * @returns {string} 离线原因（在线返回空串） */
+function agentOfflineReason() {
+  const mb = window.MorayBackend;
+  if (mb && mb.connected === true) return '';
+  return '本机 Agent 需要本地后端，请双击「启动MoRay.bat」（或运行 server\\ 下 uvicorn）后刷新';
+}
+
+/** 同步按钮态（开启高亮 + ON 标 + 提示文案；[批次修复 #1] 后端离线时置灰并给出明确原因）
  * @returns {void} */
 function syncNativeAgentBtn() {
   const btn = document.getElementById('nativeAgentBtn');
   if (!btn) return;
   const on = MoraySettings.get('nativeToolsEnabled') === true;
+  const offline = agentOfflineReason();
   btn.classList.toggle('native-on', on);
-  btn.title = on
-    ? '本机工具已开启：模型可列目录/读文件/写文件/执行只读命令（写与命令需人工审批；点击关闭）'
-    : '本机工具/Agent（默认关）：开启后模型可操作工作区文件与只读命令（需本地后端，写/命令会先征求你同意）';
+  btn.classList.toggle('native-offline', !!offline);
+  btn.title = offline
+    ? '本机工具不可用 · ' + offline
+    : on
+      ? '本机工具已开启：模型可列目录/读文件/写文件/执行只读命令（写与命令需人工审批；点击关闭）'
+      : '本机工具/Agent（默认关）：开启后模型可操作工作区文件与只读命令（需本地后端，写/命令会先征求你同意）';
 }
 
-/** 点击切换本机工具开关
+/** 点击切换本机工具开关（[批次修复 #1] 后端离线时拒绝开启并提示原因）
  * @returns {Promise<void>} */
 async function toggleNativeAgent() {
   const next = !(MoraySettings.get('nativeToolsEnabled') === true);
+  // [批次修复 #1] 仅“开启”方向受后端可用性约束（离线时仍可关闭已开启的开关）
+  if (next && agentOfflineReason()) {
+    showNotification('本机 Agent 暂不可用', agentOfflineReason(), 'warning', 5200);
+    return;
+  }
   await MoraySettings.set('nativeToolsEnabled', next);
   syncNativeAgentBtn();
   refreshNativeAgentBanner();
@@ -389,6 +406,26 @@ async function toggleNativeAgent() {
     const cfg = await agentBackendConfig(true);
     if (cfg) showNotification('本机工具已开启', '工作区：' + cfg.workspace, 'success', 2600);
     else showNotification('本机工具已开启，但本地后端离线', '本机动作需启动后端（默认 http://127.0.0.1:8000）后可用', 'warning', 4200);
+    // [批次修复 #2] Agent 模式默认模型：自检未通过/未自检时切换到工具调用最稳模型
+    if (typeof agentApplyRecommendedModel === 'function') agentApplyRecommendedModel();
+    // [批次修复 #17] 首次开启说明（仅一次、仅说明，不改变默认关闭策略）
+    try {
+      if (!localStorage.getItem('moray_native_first_note')) {
+        localStorage.setItem('moray_native_first_note', '1');
+        showModal(
+          '<div class="space-y-2 text-xs text-text-secondary leading-relaxed">' +
+          '<div class="flex items-center gap-1.5 text-text-primary font-medium"><i data-lucide="shield-check" class="w-4 h-4 text-brand-violet"></i>本机 Agent 默认关闭是为了安全</div>' +
+          '<p>开启后，模型可在受控工作区内调用工具；每次工具执行受以下保护：</p>' +
+          '<ul class="list-disc pl-4 space-y-1">' +
+          '<li>工作区隔离与路径越界防护（只许相对路径，符号链接/危险后缀/非白名单命令均被拒绝）</li>' +
+          '<li>写文件 / 编辑 / 只读命令执行前的人工审批（含 unified diff 预览）</li>' +
+          '<li>全部工具调用写入审计日志（可在设置→本机 Agent 查看）</li>' +
+          '</ul>' +
+          '<p class="text-[10px] text-text-tertiary">你可随时关闭本机工具回到纯聊天模式。</p></div>',
+          { title: '本机 Agent 安全说明', icon: 'shield-alert', footer: false }
+        );
+      }
+    } catch (e) { /* 忽略 */ }
   } else {
     showNotification('本机工具已关闭', '已回到纯聊天模式（请求不再携带本机工具）', 'info', 1800);
   }
@@ -421,7 +458,12 @@ async function refreshNativeAgentBanner() {
       '<button data-ws-sample-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="载入示例工作区（notes/a.txt、notes/b.txt、todo.md，不覆盖已有文件）"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
       '<button data-ws-tree-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="查看工作区文件树（只读）"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
       '</span>'
-    : '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-warning)"></span>本机工具已开启，但本地后端离线 —— 本机动作不可用，需启动后端（默认 http://127.0.0.1:8000）';
+    : '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-warning)"></span>本机工具已开启，但本地后端离线 —— ' + escapeHtml(agentOfflineReason()) +
+      '<span class="ml-auto flex items-center gap-1.5 shrink-0">' +
+      '<button data-agent-selfcheck-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
+      '<button data-ws-sample-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
+      '<button data-ws-tree-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
+      '</span>';
   // [阶段1.6 M3] 当前模型自检未通过 → 输入台上方一行温和提示（不打断输入）
   const selfCheck = MoraySettings.get('agentSelfCheck');
   const curModel = (typeof activeModelName === 'function') ? activeModelName() : '';
@@ -738,7 +780,8 @@ function buildMessageEl(msg, animate) {
           <div class="md-body user-msg-content"></div>
           ${(msg.attachments && msg.attachments.length) ? `<div class="flex gap-1.5 flex-wrap mt-2">${msg.attachments.map(a => `<img src="${a.dataUrl}" alt="${escapeHtml(a.name || '图片')}" class="w-20 h-20 object-cover rounded-lg border border-line-ghost">`).join('')}</div>` : ''}
         </div>
-        <div class="msg-timestamp text-[10px] text-text-tertiary text-right mt-1 flex items-center justify-end gap-1">
+        <div class="msg-timestamp text-[10px] text-text-tertiary right-0 mt-1 flex items-center justify-end gap-1">
+          ${(msg.attachments && msg.attachments.length) ? '<span class="local-only-badge" title="图片附件仅保存在本机浏览器 IndexedDB，清除浏览器数据或更换设备将丢失">仅存本机</span>' : ''}
           <i data-lucide="clock" class="w-3 h-3"></i><span>${time}</span>
         </div>
       </div>`;
@@ -1110,6 +1153,16 @@ async function buildRequestMessages(conv, extraContext) {
     if (agentPrompt) sys = (sys ? sys + '\n\n' : '') + agentPrompt;
   }
   if (sys) msgs.push({ role: 'system', content: sys });
+  // [批次修复 #6] 短问候短路：新会话首条 ≤8 字符的纯问候（无引用/附件）→ 系统提示追加精简约束
+  const _userMsgs = (AppState.messages || []).filter(m => m.conversationId === conv.id && m.role === 'user');
+  const _lastUserText = _userMsgs.length ? String((_userMsgs[_userMsgs.length - 1] || {}).content || '').trim() : '';
+  const _isShortGreet = _userMsgs.length === 1 && _lastUserText.length <= 8 && !extraContext &&
+    !(AppState.attachments || []).length &&
+    /^(你?好|您好|在吗|嗨|hi|hello|hey|哈喽|早上好|下午好|晚上好|谢谢|嗯|哦|ok|好的|再见|bye)[!！。.~～\s]*$/i.test(_lastUserText);
+  if (_isShortGreet) {
+    sys = (sys ? sys + '\n\n' : '') + '约束：当前是新会话的简短问候。请只做简短回应（一两句即可），不要展开介绍功能、不要罗列能力、不要输出无关内容。';
+    msgs[0] = { role: 'system', content: sys };
+  }
   const limit = MoraySettings.get('historyRetention') || 100;
   // [P0 治本] 严格只认当前会话：conversationId 必须全等 conv.id，无 id 的旧/脏消息一律不放行
   const rawAll = AppState.messages || [];
@@ -1263,6 +1316,15 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   fillAssistantBody(inner, { reasoning: '', citations: citations || [] }, true);
   // [阶段三] 打字指示器（首个增量到达后移除）
   const typingEl = showTypingIndicator(inner);
+  // [批次修复 #3] 冷加载等待反馈：2s 无首 token → 明确占位（首 token/收尾移除指示器后自然失效）
+  const coldStartTimer = setTimeout(() => {
+    try {
+      const label = typingEl && typingEl.isConnected ? typingEl.querySelector('.typing-label') : null;
+      if (label && AppState.generating && !assistantMsg.content && !assistantMsg.reasoning) {
+        label.textContent = '模型加载中（冷启动约 5~15s，首次使用后更快）…';
+      }
+    } catch (e) { /* 忽略 */ }
+  }, 2000);
   refreshIcons();
   if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
 

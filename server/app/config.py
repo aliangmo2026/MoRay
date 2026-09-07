@@ -21,7 +21,9 @@ SQLITE_PATH = Path(_env_db).expanduser() if _env_db else (DATA_DIR / "moray.sqli
 
 SERVICE_NAME = "moray-backend"
 VERSION = "1.0.0"      # 产品版本（对外，与前端 MORAY_VERSION 一致）
-BUILD = "3.18.0"      # 内部构建号（对应 CHANGELOG 迭代序号，随发布更新）
+BUILD = "3.18.6"      # 内部构建号（对应 CHANGELOG 迭代序号，随发布更新）
+# 对外产品版本权威字段（assemble 构建期校验 MORAY_VERSION 用；与内部 BUILD 数值不同属正常）
+PRODUCT_VERSION = "1.0.0"
 
 # ---- [阶段0 本机 Agent] 受控工作区根 ----
 # 优先级：MORAY_WORKSPACE 环境变量 > kv 表 agent_workspace（设置页可改，运行时解析）

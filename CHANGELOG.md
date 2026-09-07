@@ -1,7 +1,122 @@
 # MoRay 变更日志
 
-## v1.0.0（2026-09-07）正式版封版定稿（仅版本/文档/清理，功能逻辑零改动）
+## 3.18.6（2026-09-07）修复批次 6（残留收尾）：messages 宽松语义 / 对外版本自动校验 / 演示横幅极窄屏防折行
 
+- **#1 GET /messages 恢复宽松**（api.py）：会话不存在时不再 404，一律返回 200 + 空数组；
+  存在会话照常返回消息列表；DELETE/PUT/POST 等其余接口行为不变。验证（TestClient）：
+  存在会话 → 200 含 1 条；删除后 GET → 200 {data:[]}；从未存在 id → 200 {data:[]}；
+  DELETE 幽灵会话仍 404。
+- **#2 MORAY_VERSION 对外版本自动校验**（config.py / assemble.py）：config 新增
+  `PRODUCT_VERSION = "1.0.0"` 权威字段（与内部 BUILD=3.18.x 数值不同属正常，不互相比对）；
+  assemble 幂等流程在内部构建号校验旁新增对外版本校验：产物内所有 MORAY_VERSION 定义
+  必须彼此一致且等于 config.PRODUCT_VERSION，否则打印各来源差异并以非零码退出。
+  负向验证：110 的 MORAY_VERSION 改 9.9.9 → 构建失败 exit 1，
+  “构建失败：对外产品版本不一致 —— parts/110_polish.js MORAY_VERSION=9.9.9，
+  server/app/config.py PRODUCT_VERSION=1.0.0（请统一后重试）”；改回 1.0.0 恢复通过，
+  重复构建根 hash 稳定（幂等）。
+- **#3 演示横幅极窄屏防折行**（assemble.py 注入模板）：横幅样式加入
+  box-sizing:border-box;width:100%;max-width:100vw;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis —— 单行不折行、超长省略号截断、容器不溢出视口。
+  （实测 min-width:fit-content 在 360px 下会把容器撑到内容宽 837 导致横向溢出，故以
+  width:100%+max-width:100vw 替代。）验证（Tabbit 无头）：360px 宽横幅 360×25 单行
+  nowrap+ellipsis 不溢出（截图 work/shots/banner_360.png）；1440px 1440×25 与之前一致；
+  根/release 仍不含横幅（hash 分组不变）。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  hash：根=release=`40e005372cb0022f…`（幂等稳定），web 两份=`8ae00239ae60a8ee…`（横幅分组）。
+
+## 3.18.5（2026-09-07）修复批次 5（收尾）：熔断持久化 / 404 语义 / hidden 复核 / 版本校验 / 估算标注 / 首次说明 / 移动端
+
+- **#9 熔断持久化**（100_gateway.js GatewayBreaker）：失败记录同步 localStorage
+  （键名 `moray_breaker_<MORAY_BUILD>` 带版本前缀防脏数据），启动时恢复——刷新后保留对
+  失败模型的临时禁用直到冷却期结束；record/cooling/clear 惰性写回。
+- **#10 GET /messages 404**（api.py）：会话不存在返回 404 not_found（不再宽容 200 空数组）；
+  前端无 GET messages 调用（拉取走已 404 的 GET /api/conversations/{id}），无需前端分支改动。
+  验证：不存在会话 → 404 {code:not_found}；存在会话 → 200。
+- **#11 健康探测 hidden 复核**：70_models_settings_boot.js startHealthMonitor 首行
+  `if (document.hidden) return;` 已存在（v3.15 落地）——复核确认，未重复改动。
+- **#14 版本一致性构建校验**（assemble.py）：构建替换前校验
+  parts/110_polish.js MORAY_BUILD == parts/70 APP_VERSION == config BUILD，不一致即
+  “构建失败：内部版本号三处不一致 —— …（请统一后重试）”并退出。负向验证：改 70 为 v9.99.99
+  → 构建失败并指出差异；恢复后通过。
+- **#16 纯前端成本估算标注**（100_gateway.js updateGatewayStatusBar）：后端未连接时
+  状态栏“今日 Xk tok”后追加“（估算）”标注。
+- **#17 本机工具首次开启说明**（30_chat.js）：首次开启时弹一次安全说明（工作区隔离/人工审批
+  unified diff/全程审计 + 可随时关闭），仅说明不改变默认关闭策略（localStorage 一次性标志）。
+- **#20 移动端 fixed 背景防御**（135_ui_polish.js）：≤900px 时 body/#app/.aurora-bg
+  background-attachment 强制 scroll，防 fixed 背景在窄屏/触控环境渲染溢出。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  hash：根=release=`ffa6ded4f4978301…`，web 两份=`19f4e7e262e629e8…`（横幅分组）；
+  sw CACHE_NAME=moray-3.18.5。
+
+## 3.18.4（2026-09-07）修复批次 4：[#6] 短消息回复风格短路 + [#8] 写类工具信任指纹加内容哈希
+
+- **#6 短问候短路**（30_chat.js buildRequestMessages）：新会话首条 ≤8 字符的纯问候
+  （你好/在吗/hi/hello/谢谢/嗯 等白名单 + 结尾标点）且无引用与附件时，系统提示追加约束
+  “对简短问候只做简短回应（一两句），不展开介绍功能、不罗列能力”。真机验证（qwen2.5:7b）：
+  新会话发“你好”→ 回复 13 字符“你好！有什么可以帮到你吗？”，无长篇罗列。
+- **#8 指纹加入内容时序**（125_tools.js）：新增 `agentFingerprintForApproval` ——
+  write_file/edit_file 的审批用指纹额外并入“目标文件当前内容哈希”（fnvHash64，读失败记
+  missing）；文件内容已变化时即使工具+参数相同也重新弹审批；read 类只读工具不受影响。
+  勾选“本会话信任”时写入的也是含内容哈希的指纹（okBtn 改 async）。函数级断言：
+  同参数写内容 A→指纹 fp1；文件改为 B 后同参数指纹 fp2≠fp1；写回 A 后 fp3==fp1
+  （内容未变时免确认语义仍生效）；read_file 指纹不含内容哈希。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  hash：根=release=`7e03365a…`，web 两份=`bc781757…`（演示横幅分组）。sw CACHE_NAME=moray-3.18.4。
+
+## 3.18.3（2026-09-07）修复批次 3：[#5] 线上演示版自动标注与 PWA 缓存版本化 + [#7] 重试语义显式化
+
+- **#5 演示版横幅与缓存**：
+  - `assemble.py --web` 导出的成品（web/index.html 与 web/moray-workbench.html）自动注入
+    不可关闭的 sticky 顶部横幅“当前为在线演示版（纯前端 BYOK）——本机 Agent 能力需本地运行
+    完整版…”，位于 body 首元素；根产物与发布包不含横幅（hash 按组校验：根/release 一组、
+    web 两份一组，差异为有意设计）。
+  - sw.js 缓存名绑定内部构建号：assemble 构建时把模板 CACHE_NAME 替换为 `moray-<MORAY_BUILD>`，
+    升级后浏览器自动换缓存、不再依赖用户硬刷新；修复 assemble.py 缺 `import re` 导致
+    stage 替换未生效的问题。
+  - README「在线部署」节补充：线上为演示版无 Agent、更新需整文件夹覆盖重传、PWA 自动取新包。
+- **#7 重试语义显式化**（125_tools.js）：步骤卡新增“重放标记”——`retryStep` 重放后记录
+  `replayed{at, changed}`（结果与上次对比），stepHtml 渲染警示行“已重放该步（仅重新执行工具，
+  不自动改写已生成回复）· 结果与上次不同/一致 · 可点「重新生成」让模型基于最新结果作答”；
+  重放结果更新进步骤卡与持久化 toolCalls（重建后标记仍在），toast 同步明确该语义。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  产物断言：web 两份含 #demoModeBanner 且位于 body 首、根/release 不含；sw CACHE_NAME=
+  moray-3.18.3。hash：根=release=`d28dd9e3…`，web 两份=`3aa86780…`（横幅分组）。
+
+## 3.18.2（2026-09-07）修复批次 2：[#3] 冷启动等待反馈 + [#4] 附件持久化边界显式化
+
+- **#3 冷加载等待反馈**（30_chat.js）：打字指示器（typing-indicator）在发送 2 秒后仍无
+  首 token 时，标签文案切换为“模型加载中（冷启动约 5~15s，首次使用后更快）…”——
+  首 token 到达或收尾移除指示器后自然消失，不再表现为“白等卡死”。
+  保留 keep_alive 30m 透传（既有）不动。
+- **#4 附件仅存本机显式化**（30_chat.js / 70_models_settings_boot.js / 135_ui_polish.js）：
+  带图片的消息时间行新增“仅存本机”小角标（hover 说明：清除浏览器数据或更换设备将丢失）；
+  设置→数据管理新增“存储边界”说明块（图片附件仅存本机浏览器 IndexedDB，文本消息可经
+  本地后端 SQLite 同步，附件不随文本同步不外传）。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL、
+  四份产物 SHA256 一致 = `cc9dcb36b9316fa1130d43832d6bfc39598618e27278f11562c1acddddf56162`（3.18.2）。
+
+## 3.18.1（2026-09-07）修复批次 1：[#1] 演示环境依赖强提示 + [#2] Agent 默认模型修正
+
+- **#1 后端未启动强提示**（30_chat.js / 125_tools.js / 135_ui_polish.js）：新增
+  `agentOfflineReason()` 统一原因（“本机 Agent 需要本地后端，请双击「启动MoRay.bat」（或运行
+  server\ 下 uvicorn）后刷新”）；`MorayBackend.connected===false` 时输入台「本机工具」开关与
+  顶部提示条的 自检/示例/文件树 入口全部**置灰**（native-offline 灰化样式），hover 显示原因，
+  点击统一弹明确原因 toast 且不执行/不切换（开关离线时仍可关闭，仅“开启”方向被拦）。
+  验证（Tabbit 无头 8899 离线页）：connected=false → 开关带 native-offline、title 为原因文案、
+  点击弹“本机 Agent 暂不可用”且 nativeToolsEnabled 未变。
+- **#2 Agent 模式默认模型**（125_tools.js / 70 boot）：新增 `agentRecommendedModel()`
+  （真机实测优先级 qwen2.5:7b → qwen3.5:9b → qwen3.5:4b）与 `agentApplyRecommendedModel()`
+  ——本机工具开启时若当前模型**自检未通过或未自检**，默认模型自动切到推荐（提示可手动改回）；
+  自检通过则维持原默认；开关关闭（纯聊天）不干预；页面加载时若上次开启过本机工具同样应用。
+  验证（Tabbit 8000 在线页 + 真 Ollama）：defaultModel qwen3.5:4b → 点开开关 →
+  defaultModel 自动变为 qwen2.5:7b（recommended 一致）。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL、
+  四份产物 SHA256 一致 = `0f06eb793333e483d0715575c4041bfc36ff64ce3553e56dcd2071e3454f3b37`
+  （3.18.1）。
+
+
+
+## v1.0.0（2026-09-07）正式版封版定稿（仅版本/文档/清理，功能逻辑零改动）
 ### 定版
 - 对外产品版本 **0.3.0 → 1.0.0**（前端 MORAY_VERSION、后端 config VERSION 同步）；
   内部构建号统一 **3.18.0**（MORAY_BUILD / APP_VERSION / config BUILD）；
