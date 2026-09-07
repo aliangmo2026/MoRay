@@ -144,7 +144,7 @@ function renderSessionList() {
 function shortModelName(model) {
   if (!model) return '默认';
   const p = model.split(':');
-  return p[0] || '默认';
+  return (typeof p[0] === 'string' && p[0]) ? p[0] : '默认';
 }
 
 /** [路由修复] 精确模型名（保留 :4b/:9b 参数量后缀，气泡头部展示实际命中模型用）
@@ -152,6 +152,24 @@ function shortModelName(model) {
  * @returns {string} */
 function preciseModelName(model) {
   return model || '默认';
+}
+
+/** [显示去重] 唯一可区分的模型显示名：
+ * 当前模型列表中“冒号前家族名”唯一时显示家族名（如 qwen3.5）；
+ * 同家族存在多个模型时保留完整名（如 qwen2.5:1.5b / qwen2.5:7b），
+ * 用于对比勾选区/栏标题/模型下拉等需要“同屏不重名”的场景。
+ * @param {string} model - 完整模型名
+ * @returns {string} */
+function uniqueModelName(model) {
+  const full = String(model || '');
+  if (!full) return '默认';
+  let names = [];
+  try { names = (AI && Array.isArray(AI.models) ? AI.models : []).map(m => m && m.name).filter(Boolean); } catch (e) { names = []; }
+  if (!names.length) return shortModelName(full);
+  const family = (n) => { const s = String(n).split(':'); return (typeof s[0] === 'string' && s[0]) ? s[0] : n; };
+  const base = family(full);
+  const sameFamCount = names.reduce((c, n) => c + (family(n) === base ? 1 : 0), 0);
+  return sameFamCount > 1 ? full : base;
 }
 
 /* ---------- [显示统一] 实际生效模型单一状态（气泡 / 输入台 / 状态栏共用） ---------- */
@@ -252,6 +270,21 @@ const THINK_MODES = [
   { key: 'off',  tag: 'OFF',  title: '深度思考：关闭（所有请求不思考）',         cls: 'think-off' }
 ];
 
+/** [深度思考] 与普通对话完全一致的 think 决策（对比页/工作流复用，不另写一套）：
+ * on→true；off→false；auto 档对 qwen3.5 系列默认 think=false（复杂任务也不自动开），
+ * 其余思考型模型仅复杂任务才 true；非思考模型由 20_ai 的 isThinkingModel 过滤不下发。
+ * @param {string} model - 完整模型名
+ * @param {Array} [messages] - 已组装的请求消息（auto 档分类用）
+ * @returns {boolean} */
+function decideThinkFor(model, messages) {
+  const mode = MoraySettings.get('thinkMode') || 'auto';
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  // [速度/思考优化] qwen3.5 系列默认 think=false：仅用户把深度思考切到 ON 才下发 think=true
+  if (/^qwen3\.5/i.test(String(model || ''))) return false;
+  return !!(typeof TaskRouter !== 'undefined' && TaskRouter.classify(messages || []) === 'complex');
+}
+
 /** [深度思考] 按钮 UI 同步：按当前 thinkMode 设置 图标高亮/小标/禁用态
  * @returns {void} */
 function refreshThinkModeBtn() {
@@ -305,6 +338,98 @@ function installThinkModeBtn() {
   }
   refreshIcons();
   refreshThinkModeBtn();
+}
+
+/** [阶段0 本机 Agent] 输入工具栏"本机工具/Agent"开关按钮（对齐深度思考按钮模式）：
+ * 控制 nativeToolsEnabled（native 工具进入 listForRequest 的总门）。
+ * 点击异步探测本地后端：在线 → 成功开启并提示工作区；离线 → 仍可开启（工具执行时给出
+ * 明确降级错误，不卡死），banner 展示离线态。 */
+function installNativeAgentToggle() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar || document.getElementById('nativeAgentBtn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'nativeAgentBtn';
+  btn.className = 'input-toolbar-btn native-agent-btn';
+  btn.setAttribute('aria-label', '本机工具');
+  btn.innerHTML = '<i data-lucide="bot" class="w-4 h-4"></i><span class="native-agent-tag">ON</span>';
+  on(btn, 'click', toggleNativeAgent);
+  const divider = toolbar.querySelector('.input-toolbar-divider');
+  if (divider) toolbar.insertBefore(btn, divider);
+  else toolbar.appendChild(btn);
+  if (!document.getElementById('nativeAgentBtnStyle')) {
+    const st = document.createElement('style');
+    st.id = 'nativeAgentBtnStyle';
+    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
+    document.head.appendChild(st);
+  }
+  syncNativeAgentBtn();
+  refreshIcons();
+}
+
+/** 同步按钮态（开启高亮 + ON 标 + 提示文案）
+ * @returns {void} */
+function syncNativeAgentBtn() {
+  const btn = document.getElementById('nativeAgentBtn');
+  if (!btn) return;
+  const on = MoraySettings.get('nativeToolsEnabled') === true;
+  btn.classList.toggle('native-on', on);
+  btn.title = on
+    ? '本机工具已开启：模型可列目录/读文件/写文件/执行只读命令（写与命令需人工审批；点击关闭）'
+    : '本机工具/Agent（默认关）：开启后模型可操作工作区文件与只读命令（需本地后端，写/命令会先征求你同意）';
+}
+
+/** 点击切换本机工具开关
+ * @returns {Promise<void>} */
+async function toggleNativeAgent() {
+  const next = !(MoraySettings.get('nativeToolsEnabled') === true);
+  await MoraySettings.set('nativeToolsEnabled', next);
+  syncNativeAgentBtn();
+  refreshNativeAgentBanner();
+  if (next) {
+    const cfg = await agentBackendConfig(true);
+    if (cfg) showNotification('本机工具已开启', '工作区：' + cfg.workspace, 'success', 2600);
+    else showNotification('本机工具已开启，但本地后端离线', '本机动作需启动后端（默认 http://127.0.0.1:8000）后可用', 'warning', 4200);
+  } else {
+    showNotification('本机工具已关闭', '已回到纯聊天模式（请求不再携带本机工具）', 'info', 1800);
+  }
+}
+
+/** 会话区顶部轻提示条："本机工具已开启 · 工作区 X"（含自检/文件树入口，常驻显示）
+ * @returns {Promise<void>} */
+async function refreshNativeAgentBanner() {
+  const content = document.getElementById('chatNormalContent');
+  if (!content) return;
+  let banner = document.getElementById('nativeAgentBanner');
+  const on = MoraySettings.get('nativeToolsEnabled') === true;
+  if (!on) {
+    if (banner) banner.remove();
+    return;
+  }
+  const cfg = await agentBackendConfig();
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'nativeAgentBanner';
+    banner.className = 'native-agent-banner text-[10px] text-text-tertiary flex items-center gap-2 px-3 py-1.5 mx-3 mt-2 rounded-lg border border-line-ghost/50 bg-surface-panel/50';
+    const anchor = content.querySelector('#chatMessagesNormal');
+    content.insertBefore(banner, anchor || content.firstChild);
+  }
+  const ok = !!cfg;
+  banner.innerHTML = ok
+    ? '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-success)"></span>本机工具已开启 · 工作区 <span class="font-mono text-text-secondary">' + escapeHtml(cfg.workspace || '') + '</span><span class="text-text-tertiary">（写文件与只读命令需你授权）</span>' +
+      '<span class="ml-auto flex items-center gap-1.5 shrink-0">' +
+      '<button data-agent-selfcheck-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="检测当前模型能否触发工具调用"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
+      '<button data-ws-sample-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="载入示例工作区（notes/a.txt、notes/b.txt、todo.md，不覆盖已有文件）"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
+      '<button data-ws-tree-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="查看工作区文件树（只读）"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
+      '</span>'
+    : '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-warning)"></span>本机工具已开启，但本地后端离线 —— 本机动作不可用，需启动后端（默认 http://127.0.0.1:8000）';
+  // [阶段1.6 M3] 当前模型自检未通过 → 输入台上方一行温和提示（不打断输入）
+  const selfCheck = MoraySettings.get('agentSelfCheck');
+  const curModel = (typeof activeModelName === 'function') ? activeModelName() : '';
+  if (ok && selfCheck && selfCheck.ok === false && curModel && selfCheck.model === curModel) {
+    banner.innerHTML += '<div class="w-full text-[10px] text-warning mt-1 flex items-center gap-1.5">' +
+      '<i data-lucide="alert-triangle" class="w-3 h-3"></i>该模型（' + escapeHtml(curModel) + '）工具调用偶发失败（自检未通过），Agent 任务建议 qwen2.5:7b，或点「自检」复测</div>';
+  }
+  refreshIcons();
 }
 
 /** 打开会话：加载消息并渲染
@@ -628,7 +753,8 @@ function buildMessageEl(msg, animate) {
           <span class="text-[10px] text-text-tertiary">${escapeHtml(preciseModelName(msg.model))} · ${time}</span>
           ${typeof renderCostPills === 'function' ? renderCostPills(msg) : ''}
         </div>
-        ${typeof renderToolSteps === 'function' ? renderToolSteps(msg.toolCalls) : ''}
+        ${(typeof renderToolSteps === 'function') ? renderToolSteps(msg.toolCalls) : ''}
+        ${(typeof PlanTracker !== 'undefined' && msg.plan) ? PlanTracker.renderStatic(msg.plan) : ''}
         <div class="rounded-xl px-4 py-3 bg-surface-card border border-line-ghost/60 msg-bubble__ai-box">
           <div class="ai-msg-inner"></div>
           ${msgActionsHtml(msg)}
@@ -695,6 +821,8 @@ function renderMessages() {
   if (!AppState.messages.length) {
     box.classList.add('hidden');
     showWelcomeView();
+    // [阶段0] 欢迎页存在时不显示本机工具 banner（避免干扰欢迎布局）
+    if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
     return;
   }
   box.classList.remove('hidden');
@@ -718,6 +846,8 @@ function renderMessages() {
   box.classList.remove('msg-fade');
   void box.offsetWidth;
   box.classList.add('msg-fade');
+  // [阶段0] 有消息时刷新本机工具顶部轻提示（10s 缓存，不阻塞渲染）
+  if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
 }
 
 /** 显示欢迎视图（无会话/空会话时）
@@ -750,6 +880,11 @@ function showWelcomeView() {
         <div class="welcome-suggestion-icon" style="background:rgba(242,178,76,0.12);color:#F2B24C;"><i data-lucide="bug" class="w-4 h-4"></i></div>
         <div class="welcome-suggestion-text"><strong>调试错误</strong>排查问题原因</div>
       </div>
+      ${(typeof MoraySettings !== 'undefined' && MoraySettings.get('nativeToolsEnabled') === true && window.MorayBackend && window.MorayBackend.connected) ? `
+      <div class="welcome-suggestion welcome-suggestion--agent" onclick="tryLocalAgentSuggestion()" title="载入示例工作区并演示本机 Agent">
+        <div class="welcome-suggestion-icon" style="background:rgba(74,222,128,0.12);color:#4ADE80;"><i data-lucide="bot" class="w-4 h-4"></i></div>
+        <div class="welcome-suggestion-text"><strong>试试本地 Agent</strong>演示查找→读取→汇总工作区文件</div>
+      </div>` : ''}
     </div>`;
   content.insertBefore(welcome, content.firstChild);
   refreshIcons();
@@ -760,6 +895,41 @@ function showWelcomeView() {
 function removeWelcomeView() {
   const w = document.getElementById('welcomeScreen');
   if (w) w.remove();
+}
+
+/** [阶段1.6 M3] “试试本地 Agent”引导卡动作：
+ * 1) 载入示例工作区（不覆盖已有文件）；2) 确保本机工具开关开启并高亮 2 秒；
+ * 3) 自动填好一句演示任务并聚焦输入台。
+ * @returns {Promise<void>} */
+async function tryLocalAgentSuggestion() {
+  try {
+    // 1) 本机工具开关：未开启则自动开启
+    if (MoraySettings.get('nativeToolsEnabled') !== true) {
+      await MoraySettings.set('nativeToolsEnabled', true);
+      syncNativeAgentBtn();
+      refreshNativeAgentBanner();
+    }
+    // 2) 开关高亮 2 秒（克制 beacon）
+    const btn = document.getElementById('nativeAgentBtn');
+    if (btn) {
+      btn.classList.add('native-on-pulse');
+      setTimeout(() => btn.classList.remove('native-on-pulse'), 2000);
+    }
+    // 3) 示例工作区（后端在线时；失败不阻塞演示任务填写）
+    try {
+      if (typeof loadSampleWorkspace === 'function') await loadSampleWorkspace();
+    } catch (e) { /* 离线等：用户仍可看输入台里的演示任务 */ }
+    // 4) 自动填好演示任务
+    const ta = document.getElementById('chatInputNormal');
+    if (ta) {
+      ta.value = '先列出计划，然后找到工作区里所有 txt 文件，读取 notes/a.txt 与 notes/b.txt，把两个素材的要点汇总写入 summary.md';
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.focus();
+    }
+    showNotification('演示就绪', '示例文件已就位，任务已填入输入框——点发送即可观看完整 Agent 流程', 'info', 5000);
+  } catch (e) {
+    showNotification('引导失败', String((e && e.message) || e).slice(0, 140), 'error', 3000);
+  }
 }
 
 /** 滚动消息区到底部
@@ -899,6 +1069,8 @@ async function sendUserMessage() {
   if (typeof updateInputStats === 'function') updateInputStats('');
   if (typeof ChatRefs !== 'undefined') ChatRefs.clear();
   if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+  // [阶段0] 首条消息落地（欢迎页已移除）→ 显示本机工具顶部轻提示
+  if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
 
   // [V2 功能9] 视觉能力提示：附件图片 + 疑似不支持视觉的模型
   if ((AppState.attachments || []).length && typeof isVisionModel === 'function' && !isVisionModel(conv.model || MoraySettings.get('defaultModel'))) {
@@ -929,7 +1101,14 @@ async function buildRequestMessages(conv, extraContext) {
   const rawSys = (conv.systemPrompt || MoraySettings.get('systemPrompt') || '').trim();
   const sysSrc = rawSys || buildSystemPrompt();
   // [V2 功能3] 系统提示词清洗：去冗余空白与重复，节省 token
-  const sys = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(sysSrc).text : sysSrc;
+  let sys = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(sysSrc).text : sysSrc;
+  // [阶段1 M5] 本机 Agent 系统提示：开关开启且请求携带本机工具时追加（用户自定义覆盖内置）
+  if (MoraySettings.get('nativeToolsEnabled') && typeof ToolRegistry !== 'undefined' &&
+      ToolRegistry.listForRequest().some(t => t.function.name === 'list_directory' || t.function.name === 'submit_plan')) {
+    const override = (MoraySettings.get('agentSysPromptOverride') || '').trim();
+    const agentPrompt = override || (typeof PlanTracker !== 'undefined' && PlanTracker.SYSTEM_PROMPT) || '';
+    if (agentPrompt) sys = (sys ? sys + '\n\n' : '') + agentPrompt;
+  }
   if (sys) msgs.push({ role: 'system', content: sys });
   const limit = MoraySettings.get('historyRetention') || 100;
   // [P0 治本] 严格只认当前会话：conversationId 必须全等 conv.id，无 id 的旧/脏消息一律不放行
@@ -1107,10 +1286,32 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   const requestMessages = await buildRequestMessages(conv, extraContext);
   // [小补丁] auto 档在 requestMessages 就绪后补齐 classify 决策并回写占位消息（on/off 已提前定）
   if (thinkMode === 'auto') {
-    think = (typeof TaskRouter !== 'undefined' && TaskRouter.classify(requestMessages) === 'complex');
+    // [深度思考] 统一决策入口（qwen3.5 auto 默认 false 逻辑已并入 decideThinkFor）
+    think = decideThinkFor(model, requestMessages);
     assistantMsg.think = think === true;
   }
   const genStart = performance.now();
+  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥60ms 才整段重绘 Markdown）
+  let rafPending = false, lastStreamPaint = 0;
+  const scheduleStreamPaint = () => {
+    if (rafPending || !AppState.generating) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      if (!AppState.generating) return; // 完成/停止后不再补画流式光标
+      const now = performance.now();
+      if (now - lastStreamPaint < 60) {
+        setTimeout(scheduleStreamPaint, Math.max(1, 60 - (now - lastStreamPaint)));
+        return;
+      }
+      lastStreamPaint = now;
+      const ce = inner.querySelector('.ai-content');
+      if (ce && ce.isConnected) {
+        ce.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
+        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+      }
+    });
+  };
   // [V2] 经由 API 智能网关：缓存 → 智能路由 → 超时 → 重试 → 降级
   const useGateway = MoraySettings.get('gatewayEnabled') !== false && typeof Gateway !== 'undefined';
   const chatFn = useGateway ? Gateway : AI;
@@ -1133,6 +1334,18 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       if (hdr) {
         const thinkingNow = assistantMsg.think === true && isThinkingModel(assistantMsg.model);
         hdr.innerHTML = escapeHtml(preciseModelName(assistantMsg.model)) + ' · <span class="gen-status-text">' + (thinkingNow ? '思考中' : '正在生成') + '</span>';
+        // [TTFT 反馈] 实际模型确定后区分“已驻留”与“正在唤醒（冷加载）”
+        (async () => {
+          try {
+            if (typeof isLocalModelName !== 'function' || !isLocalModelName(assistantMsg.model)) return;
+            if (typeof ollamaLoadedModels !== 'function') return;
+            const loaded = await ollamaLoadedModels();
+            const st = hdr.querySelector('.gen-status-text');
+            if (st && !assistantMsg.content && AppState.generating) {
+              st.textContent = loaded.includes(assistantMsg.model) ? '响应中…' : '正在唤醒模型，约 5-10 秒…';
+            }
+          } catch (e) { /* 反馈失败不影响请求 */ }
+        })();
       }
       // 思考面板按实际模型重新评估：非思考型/think=false 立即移除占位"深度思考中"
       const tp = inner.querySelector('.thinking-panel');
@@ -1147,8 +1360,12 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     // 全局 defaultModel 仅作兜底候选，不锁路由
     _userPicked: conv.userPickedModel === true,
     // [工具调用] 步骤事件 → 实时步骤卡（首个事件自动插入最终回复之前）
-    onToolStep: (evt) => { if (typeof ToolRegistry !== 'undefined') ToolRegistry.renderLiveStep(el, evt); },
-    onChunk: throttle(({ content, reasoning }) => {
+    onToolStep: (evt) => {
+      if (typeof ToolRegistry !== 'undefined') ToolRegistry.renderLiveStep(el, evt);
+      // [阶段1 M3] 计划编排：submit_plan 登记 / 真实工具事件推进计划步骤状态
+      if (typeof PlanTracker !== 'undefined') PlanTracker.observe(evt, el);
+    },
+    onChunk: ({ content, reasoning }) => {
       if (content) assistantMsg.content += content;
       if (reasoning) assistantMsg.reasoning += reasoning;
       // [夜间优化3.1] 生成速度实时显示
@@ -1159,14 +1376,10 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           ? `生成中 · ${Math.round((assistantMsg.content.length / 4) / Math.max(0.5, secs))} tok/s`
           : (assistantMsg.think === true && isThinkingModel(assistantMsg.model) ? '深度思考中' : '正在生成'));
       }
-      // 流式节流渲染：仅正文区更新，避免整段重建开销
+      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥60ms 才真正整段重绘 Markdown），
+      // 避免每个 token 全量 reparse；代码高亮统一留到结束后的完整渲染，不在流式中逐 token 高亮。
       if (typingEl.isConnected) typingEl.remove();
-      const contentEl = inner.querySelector('.ai-content');
-      if (contentEl) {
-        contentEl.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
-        // 流式期间不做完整代码块增强（等结束后统一处理），但保持滚动
-        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
-      }
+      scheduleStreamPaint();
       if (reasoning) {
         const tp = inner.querySelector('.thinking-panel');
         if (tp && !assistantMsg.reasoningRendered) {
@@ -1178,7 +1391,7 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           if (tc) tc.textContent = assistantMsg.reasoning;
         }
       }
-    }, 80)
+    }
   });
   AppState.generating = true;
   AppState.genController = controller;
@@ -1189,6 +1402,20 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     assistantMsg.reasoning = result.reasoning || assistantMsg.reasoning;
     assistantMsg.stats = result.stats;
     assistantMsg.tokens = result.stats.tokens || 0;
+    // [阶段1 M3] 全部步骤结束：模型总结已输出 → 计划剩余待办步骤标记完成
+    if (typeof PlanTracker !== 'undefined' && PlanTracker.current) {
+      PlanTracker.current.steps.forEach(s => { if (s.status === 'todo' || s.status === 'running') s.status = 'done'; });
+      PlanTracker.render(el);
+      // [阶段1.6] 同步最终状态到消息持久化
+      try {
+        const msgId = el && el.dataset ? el.dataset.msgId : null;
+        const msg = msgId ? (AppState.messages || []).find(m => m.id === msgId) : null;
+        if (msg && msg.plan) {
+          msg.plan.steps.forEach((ps, i) => { if (PlanTracker.current.steps[i]) ps.status = PlanTracker.current.steps[i].status; });
+          if (typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
+        }
+      } catch (e) { /* 忽略 */ }
+    }
     // [V2] 记录缓存命中与路由信息
     if (result._cache) assistantMsg.cacheInfo = { from: result._cache.from, similarity: result._cache.similarity, tokens: result._cache.tokens || 0 };
     if (result._routed) {
@@ -1760,3 +1987,9 @@ bindNewChatMain();
 // [深度思考] 输入工具栏三态按钮安装（script 位于 </body> 前，静态骨架已就绪）
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installThinkModeBtn);
 else installThinkModeBtn();
+
+// [阶段0 本机 Agent] 输入工具栏"本机工具"开关（同工具栏、同装载时机；幂等）
+if (typeof installNativeAgentToggle === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installNativeAgentToggle);
+  else installNativeAgentToggle();
+}

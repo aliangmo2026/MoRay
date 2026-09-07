@@ -18,8 +18,8 @@ const CompareApp = {
   build() {
     const root = document.getElementById('chat-compare');
     if (!root) return;
-    this.selected = MoraySettings.get('compareModels') && MoraySettings.get('compareModels').length
-      ? MoraySettings.get('compareModels') : (AI.models.slice(0, 2).map(m => m.name));
+    // [多模型对比修复] 读取持久化勾选时立即清洗（剔除占位串/失效模型），脏数据不再进入界面
+    this.selected = this.cleanSelected(MoraySettings.get('compareModels'));
     root.innerHTML = `
       <div class="h-9 px-5 flex items-center justify-between border-b border-line-ghost/30 flex-shrink-0">
         <div class="flex items-center gap-3 text-[10px] text-text-tertiary" id="compareStatusText">勾选模型后输入提示词开始竞速</div>
@@ -102,23 +102,66 @@ const CompareApp = {
     }
   },
 
+  /** [多模型对比修复] 当前真实模型名列表（AI.models 的权威名）
+   * @returns {string[]} */
+  validModels() {
+    return (AI && Array.isArray(AI.models) ? AI.models : [])
+      .map(m => m && m.name)
+      .filter(n => typeof n === 'string' && n.trim());
+  },
+
+  /** [多模型对比修复] 统一清洗勾选模型：
+   * 剔除空名与历史占位串；模型列表非空时只保留真实存在的模型（失效/已删除模型不残留）。
+   * @param {*} sel - 待清洗勾选（兼容非法/非数组持久化值）
+   * @returns {string[]} */
+  cleanSelected(sel) {
+    const arr = Array.isArray(sel) ? sel : [];
+    const valid = this.validModels();
+    return arr.filter(n => typeof n === 'string' && n && n !== '（未检测到模型）' && (!valid.length || valid.includes(n)));
+  },
+
+  /** [多模型对比修复] 规范化选中集并回写存储：
+   * 清洗后为空且有真实模型 → 默认选前 2 个；无模型 → 空数组；同时清除持久化脏数据。
+   * @returns {string[]} */
+  normalizeSelected() {
+    let next = this.cleanSelected(this.selected);
+    if (!next.length) {
+      const valid = this.validModels();
+      if (valid.length) next = valid.slice(0, 2);
+    }
+    this.selected = next;
+    try { MoraySettings.set('compareModels', next); } catch (e) { /* 持久化失败不影响界面 */ }
+    return next;
+  },
+
   /** 渲染模型勾选区与列
    * @returns {void} */
   renderModelChecks() {
     const wrap = document.getElementById('compareModelChecks');
     if (!wrap) return;
-    const models = AI.models.length ? AI.models.map(m => m.name) : ['（未检测到模型）'];
-    if (!this.selected.length) this.selected = models.slice(0, 2);
+    const models = this.validModels();
+    const cols = document.getElementById('compareColumns');
+    if (!models.length) {
+      // [多模型对比修复] 模型未就绪：只显示禁用纯文字提示；
+      // 不生成可勾选 checkbox、不 addColumn、不写 MoraySettings（占位串永不再进入界面与存储）
+      this.selected = this.cleanSelected(this.selected);
+      wrap.innerHTML = '<span class="text-xs text-text-tertiary select-none" style="opacity:.75">未检测到可用模型，请先连接 Ollama / 云端 API</span>';
+      if (cols) cols.innerHTML = '';
+      this.__lastModelsKey = '';
+      return;
+    }
+    const clean = this.normalizeSelected();
+    const allowed = new Set(clean);
     wrap.innerHTML = models.map(name => `
       <label class="flex items-center gap-1.5 cursor-pointer">
-        <input type="checkbox" data-compare-model="${escapeHtml(name)}" ${this.selected.includes(name) ? 'checked' : ''} class="accent-brand-cobalt w-3.5 h-3.5">
+        <input type="checkbox" data-compare-model="${escapeHtml(name)}" ${allowed.has(name) ? 'checked' : ''} class="accent-brand-cobalt w-3.5 h-3.5">
         <span class="beacon-dot" style="width:6px;height:6px"></span>
-        <span>${escapeHtml(shortModelName(name))}</span>
+        <span title="${escapeHtml(name)}">${escapeHtml(uniqueModelName(name))}</span>
       </label>`).join('');
     wrap.querySelectorAll('[data-compare-model]').forEach(cb => {
       cb.addEventListener('change', () => {
         const name = cb.dataset.compareModel;
-        if (cb.checked) { this.selected.push(name); this.addColumn(name); }
+        if (cb.checked) { if (!this.selected.includes(name)) this.selected.push(name); this.addColumn(name); }
         else {
           this.selected = this.selected.filter(n => n !== name);
           const col = document.querySelector(`#compareColumns [data-col-model="${CSS.escape(name)}"]`);
@@ -127,11 +170,11 @@ const CompareApp = {
         MoraySettings.set('compareModels', this.selected);
       });
     });
-    const cols = document.getElementById('compareColumns');
     if (cols) {
       cols.innerHTML = '';
       this.selected.forEach(name => this.addColumn(name));
     }
+    this.__lastModelsKey = models.join('\u0001');
   },
 
   /** 添加一列（模型通道）
@@ -146,7 +189,7 @@ const CompareApp = {
     sec.innerHTML = `
       <div class="h-10 px-4 flex items-center gap-2 border-b border-line-ghost/50 flex-shrink-0">
         <span class="beacon-dot"></span>
-        <span class="text-sm font-medium text-text-primary truncate" title="${escapeHtml(model)}">${escapeHtml(shortModelName(model))}</span>
+        <span class="text-sm font-medium text-text-primary truncate" title="${escapeHtml(model)}">${escapeHtml(uniqueModelName(model))}</span>
       </div>
       <div class="flex-1 overflow-y-auto p-4 space-y-3 col-messages">
         <div class="text-center text-[11px] text-text-tertiary py-8">等待输入…</div>
@@ -174,39 +217,68 @@ const CompareApp = {
   async run(prompt) {
     if (!prompt || !prompt.trim()) return;
     if (this.running) { showNotification('进行中', '上一轮对比尚未结束', 'warning'); return; }
-    if (!this.selected.length) { showNotification('未选择模型', '请至少勾选一个模型', 'warning'); return; }
     if (AI.backend === 'none') await AI.detectBackend();
     if (AI.backend === 'none') { showNotification('未连接后端', '请先在设置页配置 AI 服务', 'error', 4000); return; }
+    // [多模型对比修复] 发送前最终校验：占位串/失效模型一律不得进入请求体（杜绝 400 invalid model name）
+    const validNow = this.validModels();
+    if (!validNow.length) {
+      showNotification('未检测到可用模型', '未检测到可用模型，请先连接 Ollama/API 或勾选模型', 'warning');
+      return;
+    }
+    const useModels = this.selected.filter(m => validNow.includes(m));
+    if (!useModels.length) {
+      showNotification('未选择模型', '请至少勾选一个模型', 'warning');
+      return;
+    }
+    if (useModels.length !== this.selected.length) {
+      this.selected = useModels;
+      try { MoraySettings.set('compareModels', useModels); } catch (e) { /* 忽略 */ }
+    }
 
     this.running = true;
+    this.__stoppedByUser = false; // [阶段0.5] 停止标志：run 收尾不得覆盖 stop() 设置的状态文案
     const input = document.getElementById('compareInput');
     input.value = '';
     document.getElementById('compareStopBtn').style.display = '';
-    document.getElementById('compareStatusText').textContent = '竞速中 · ' + this.selected.length + ' 个模型并发';
+    document.getElementById('compareStatusText').textContent = '竞速中 · ' + useModels.length + ' 个模型并发';
 
     this.controllers = [];
     const results = [];
-    const tasks = this.selected.map(async (model) => {
+    // [体验优化] 对比页与普通对话统一走默认系统提示（优先级：用户自定义 rawSys > buildSystemPrompt；对比不带历史的设计不变）
+    const rawSys = (typeof MoraySettings !== 'undefined' ? (MoraySettings.get('systemPrompt') || '') : '').trim();
+    const sys = (typeof buildSystemPrompt === 'function') ? (rawSys || buildSystemPrompt()) : (rawSys || '');
+    const msgs = sys ? [{ role: 'system', content: sys }, { role: 'user', content: prompt }] : [{ role: 'user', content: prompt }];
+    // 先为所有列铺好本轮消息骨架：串行执行时用户也能看到全部待命列（不提前计时）
+    const colHolders = new Map();
+    useModels.forEach(model => {
       const sec = document.querySelector(`#compareColumns [data-col-model="${CSS.escape(model)}"]`);
       if (!sec) return;
       const msgBox = sec.querySelector('.col-messages');
       msgBox.innerHTML = `
         <div class="flex justify-end"><div class="max-w-[80%] rounded-xl px-3 py-2 bg-brand-cobalt/14 border border-brand-cobalt/20"><p class="text-xs text-text-primary">${escapeHtml(prompt)}</p></div></div>
         <div class="flex justify-start"><div class="max-w-[90%] rounded-xl px-3 py-2 bg-surface-card border border-line-ghost/60"><div class="md-body col-ai-content"></div></div></div>`;
-      const contentEl = msgBox.querySelector('.col-ai-content');
-
+      colHolders.set(model, { sec, contentEl: msgBox.querySelector('.col-ai-content') });
+    });
+    // [阶段0.5 C1] 待命列登记：串行停止时把"尚未轮到"的列明确标为已停止，不留空白占位
+    this.__pendingCols = new Set(colHolders.keys());
+    // 单模型一轮对比也正常（见 run() 顶部校验）；runOne 只负责本列自身请求，计时不含排队
+    const runOne = async (model) => {
+      if (this.__pendingCols) this.__pendingCols.delete(model);
+      const holder = colHolders.get(model);
+      if (!holder) return;
+      const { sec, contentEl } = holder;
       const controller = new AbortController();
       this.controllers.push(controller);
-      const started = performance.now();
+      const started = performance.now(); // 串行场景：轮到本模型真正发起请求才开始计时
       let firstMs = 0, text = '';
-      // [体验优化] 对比页与普通对话统一走默认系统提示（优先级：用户自定义 rawSys > buildSystemPrompt；对比不带历史的设计不变）
-      const rawSys = (typeof MoraySettings !== 'undefined' ? (MoraySettings.get('systemPrompt') || '') : '').trim();
-      const sys = (typeof buildSystemPrompt === 'function') ? (rawSys || buildSystemPrompt()) : (rawSys || '');
-      const msgs = sys ? [{ role: 'system', content: sys }, { role: 'user', content: prompt }] : [{ role: 'user', content: prompt }];
       try {
+        // [深度思考/常驻] 与普通对话完全一致的 think 决策（auto 档 qwen3.5 默认 false）；
+        // keep_alive:30m 由 AI.chatStream 的 Ollama 分支统一附带，这里只透传 think
+        const think = (typeof decideThinkFor === 'function') ? decideThinkFor(model, msgs) : false;
         const { promise } = AI.chatStream({
           model,
           messages: msgs,
+          think,
           onChunk: throttle(({ content }) => {
             if (!content) return;
             if (!firstMs) firstMs = performance.now() - started;
@@ -242,8 +314,20 @@ const CompareApp = {
           results.push({ model, error: String(e.message || e) });
         }
       }
-    });
-    await Promise.all(tasks);
+    };
+    // [单卡显存] 勾选全部为本地 Ollama 模型时改为串行：MAX_LOADED_MODELS=1 下避免反复换入换出；
+    // 任一模型属云端后端则维持并发。串行队列等待不计入已完成列计时（started 在各自轮次才起表）。
+    const allLocal = AI.backend === 'ollama' && useModels.every(m => (AI.models || []).some(x => x && x.name === m));
+    if (allLocal && useModels.length > 1) {
+      document.getElementById('compareStatusText').textContent = '本地模型将依次对比以避免显存抢占 · ' + useModels.length + ' 个';
+      for (const m of useModels) {
+        if (!this.running) break; // 用户点击停止后不再发起后续模型
+        await runOne(m);
+      }
+    } else {
+      document.getElementById('compareStatusText').textContent = '竞速中 · ' + useModels.length + ' 个模型并发';
+      await Promise.all(useModels.map(runOne));
+    }
     this.running = false;
     this.lastResults = results;
     this.lastPrompt = prompt;
@@ -252,10 +336,11 @@ const CompareApp = {
     const exportBtn = document.getElementById('compareExportBtn');
     if (exportBtn) exportBtn.style.display = results.some(r => !r.error) ? '' : 'none';
     document.getElementById('compareStopBtn').style.display = 'none';
-    document.getElementById('compareStatusText').textContent = '本轮完成 · 可继续输入';
+    // [阶段0.5 C1] 用户停止时保持"已停止"文案，不覆盖为"本轮完成"
+    if (!this.__stoppedByUser) document.getElementById('compareStatusText').textContent = '本轮完成 · 可继续输入';
     if (results.length >= 2 && results.every(r => !r.error)) {
       const best = results.slice().sort((a, b) => (b.quality + Math.min(100, b.stats.tokPerSec || 0) / 2) - (a.quality + Math.min(100, a.stats.tokPerSec || 0) / 2))[0];
-      showNotification('竞速结果', shortModelName(best.model) + ' 综合表现最佳（质量 ' + best.quality + '）', 'success', 3500);
+      showNotification('竞速结果', uniqueModelName(best.model) + ' 综合表现最佳（质量 ' + best.quality + '）', 'success', 3500);
     }
   },
 
@@ -264,12 +349,58 @@ const CompareApp = {
   stop() {
     this.controllers.forEach(c => { try { c.abort(); } catch (e) { /* 忽略 */ } });
     this.running = false;
+    this.__stoppedByUser = true;
     const btn = document.getElementById('compareStopBtn');
     if (btn) btn.style.display = 'none';
     const st = document.getElementById('compareStatusText');
     if (st) st.textContent = '已停止';
+    // [阶段0.5 C1] 串行队列中尚未轮到的列：明确显示"已停止（未开始）"，不留空白占位
+    const pending = this.__pendingCols || new Set();
+    this.__pendingCols = null;
+    pending.forEach(model => {
+      try {
+        const sec = document.querySelector('#compareColumns [data-col-model="' + CSS.escape(model) + '"]');
+        if (!sec) return;
+        const contentEl = sec.querySelector('.col-ai-content');
+        if (contentEl && !contentEl.firstChild) {
+          contentEl.innerHTML = '<span class="text-xs text-text-tertiary">已停止（未开始）</span>';
+        }
+      } catch (e) { /* 忽略 */ }
+    });
   }
 };
+
+/* ===================== [多模型对比修复] 自动重建勾选区 ===================== */
+
+/** 对比页可见且模型列表确实变化时重建勾选区与列；
+ * 正在竞速或结果未变时不重建，避免打断运行/清空已完成结果。
+ * @returns {void} */
+function refreshCompareChecks() {
+  try {
+    if (typeof CompareApp === 'undefined' || !CompareApp || CompareApp.running) return;
+    const root = document.getElementById('chat-compare');
+    const wrap = document.getElementById('compareModelChecks');
+    if (!root || !wrap) return;
+    // 仅当前停留在聊天页且对比模式可见时重建
+    const pageChat = document.getElementById('page-chat');
+    if (pageChat && (pageChat.classList.contains('hidden') || pageChat.offsetParent === null)) return;
+    if (root.classList.contains('hidden')) return;
+    const key = CompareApp.validModels().join('\u0001');
+    if (key === CompareApp.__lastModelsKey && wrap.querySelector('[data-compare-model]')) return;
+    CompareApp.renderModelChecks();
+  } catch (e) { /* 自动重建失败不影响主流程 */ }
+}
+
+// 模型列表拉取成功（AI.detectBackend/listModels 成功分支）后自动重建
+try { window.addEventListener('moray-models-updated', refreshCompareChecks); } catch (e) { /* 忽略 */ }
+// 用户进入对比模式 / 切回聊天页时补一次刷新（覆盖模型列表更新发生在隐藏期间的场景）
+try {
+  document.addEventListener('click', (ev) => {
+    const t = ev.target;
+    const btn = t && t.closest ? t.closest('#chatModeSwitch button[data-mode="compare"], .nav-icon-btn[data-page="chat"]') : null;
+    if (btn) setTimeout(refreshCompareChecks, 0);
+  });
+} catch (e) { /* 忽略 */ }
 
 /** 启发式质量评分：长度 / 结构 / 代码块 / 列表
  * @param {string} text - 生成文本
@@ -774,7 +905,7 @@ const ABTest = {
         <div><label class="form-label">变体 A</label><select id="abSelA" class="form-select">${opts}</select></div>
         <div><label class="form-label">变体 B</label><select id="abSelB" class="form-select">${opts}</select></div>
         <div><label class="form-label">模型</label><select id="abModel" class="form-select">
-          ${AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('') || '<option value="">默认</option>'}
+          ${AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(uniqueModelName(m.name))}</option>`).join('') || '<option value="">默认</option>'}
         </select></div>
       </div>
       <div class="form-row">

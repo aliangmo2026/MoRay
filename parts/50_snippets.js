@@ -569,8 +569,8 @@ const DocsApp = {
     const el = document.getElementById('docSidebarList');
     if (!el) return;
     if (!this.cache.length) {
-      el.innerHTML = `<div class="text-center py-8 text-text-tertiary text-xs">
-        <i data-lucide="inbox" class="w-8 h-8 mx-auto mb-2 opacity-40"></i>暂无文档</div>`;
+      el.innerHTML = `<div class="empty-state"><i data-lucide="inbox"></i>
+        <div class="empty-title">暂无文档</div><div class="empty-hint">在上方粘贴或导入 Markdown / PDF，即可开始构建知识库</div></div>`;
       refreshIcons();
       return;
     }

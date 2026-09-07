@@ -10,7 +10,8 @@ PARTS = ['parts/10_db.js', 'parts/20_ai.js', 'parts/30_chat.js',
          'parts/85_robust.js', 'parts/90_perf.js', 'parts/95_features.js',
          'parts/100_gateway.js', 'parts/110_polish.js',
          'parts/115_backend_sync.js',
-         'parts/120_cost.js', 'parts/125_tools.js', 'parts/130_search.js']
+         'parts/120_cost.js', 'parts/125_tools.js', 'parts/130_search.js',
+         'parts/135_ui_polish.js']
 
 chunks = []
 for p in PARTS:

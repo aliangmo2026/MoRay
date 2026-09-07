@@ -25,6 +25,14 @@
 |---|---|
 | ![成本中心](docs/screenshots/06-cost.png) | ![设置](docs/screenshots/07-settings.png) |
 
+**本机 Agent（阶段演示）**：让模型在受控工作区里独立完成多步任务——先列计划、再逐步查找/读取/编辑，写文件与编辑需人工授权并展示 unified diff，全程审计可查
+
+| 计划 → 分步执行（任务计划卡 5/5） | 人工审批（unified diff 红绿对比） | 常驻文件树（只读，Agent 改动自动高亮） |
+|---|---|---|
+| ![Agent 计划卡](docs/screenshots/agent-plan-card.png) | ![Agent 审批 diff](docs/screenshots/agent-approval-diff.png) | ![Agent 文件树](docs/screenshots/agent-file-tree.png) |
+
+> 以上为本地实机截图（IAB 内嵌浏览器 1:1 视口抓取，无美化）。
+
 ---
 
 ## 一、为什么做这个
@@ -51,6 +59,14 @@
 - 🌐 在线版采用 **BYOK（Bring Your Own Key）**：访客填自己的 Key、只存自己浏览器，部署者不承担任何 token 费用。
 
 **工作台能力**
+- 🤖 **本机 Agent（v1.0 最大卖点）**：受控工作区隔离（默认 `D:\MoRayWorkspace`，路径越界 /
+  符号链接逃逸 / 危险后缀 / 非白名单命令全部被安全层拒绝），7 个本机工具——列目录、读文件、
+  写文件、**精确编辑**（edit_file，唯一匹配校验）、按文件名查找、全文搜索（支持正则）、
+  只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）；
+  多步任务**先列计划再逐步执行**（任务计划卡实时状态流转，失败自动重试、超限跳过防死循环）；
+  write/edit/命令执行前**人工审批**（含 unified diff 预览，Enter 允许 / Esc 拒绝）；
+  全部工具调用**审计落库**（时间/参数/审批/状态/耗时，可导出可清空）；常驻文件树侧栏
+  （可拖拽调宽，Agent 改动自动刷新并高亮 2 秒）；模型自检一键验证当前模型能否触发工具调用。
 - 提示词库、代码片段库（含受限 JS 运行器）、自动化工作流编排、知识库 RAG、收藏 / 分支 / 引用等完整消息操作；
 - 成本中心：基于服务端 `usage` **精确计费**（而非按字数估算）、预算阈值、触顶自动降级、CSV 导出、自定义价格表；
 - ⌘K 命令面板、深浅主题与自定义壁纸、PWA 可安装离线运行、1280/1024/768/390 响应式适配。
@@ -61,20 +77,21 @@
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  浏览器：moray-workbench.html（约 0.9MB 单文件，零 CDN）    │
+│  浏览器：moray-workbench.html（单文件，零 CDN）              │
 │  · 纯前端模式：IndexedDB 存储，Ollama / 云端直连           │
 │  · 后端模式：经 http://127.0.0.1:8000 访问                │
 └───────────────┬──────────────────────────┬───────────────┘
-                │ /api/*（同步 / 代理）       │ file:// 直开（无后端）
+                │ /api/*（同步 / 代理 / 工具） │ file:// 直开（无后端）
 ┌───────────────▼──────────────────────────┴───────────────┐
-│  server/  FastAPI 薄后端（约 700 行，仅监听 127.0.0.1）     │
+│  server/  FastAPI 薄后端（仅监听 127.0.0.1）                │
 │  · /api/health 健康检查      · /api/llm/chat 云端代理透传   │
 │  · conversations/messages/settings/kv 的 SQLite CRUD      │
-│  · 同源托管前端：访问 http://127.0.0.1:8000/ 即完整应用    │
+│  · /api/agent/* 本机 Agent：受控工作区安全层 + 四类执行      │
+│  · agent_tool_log 审计表 + 同源托管前端                     │
 └───────────────┬──────────────────────────┬───────────────┘
                 │                          │
        SQLite（server/data，自动建表）   云端 LLM（Key 在 server/.env）
-                 + Ollama（本机 11434，直连）
+                 + Ollama（本机 11434，直连）+ 工作区（D:\MoRayWorkspace）
 ```
 
 **关键设计决策（也是主要工程难点）**
@@ -87,11 +104,15 @@
 
 ## 四、快速开始
 
-### 方式 ① Windows 一键全栈（推荐）
+### 方式 ① Windows 一键全栈（推荐 · 完整能力）
 1. 安装 [Python 3.12/3.13](https://www.python.org/downloads/)（安装时勾选 *Add to PATH*）；
-2. （可选，本地模型）安装 [Ollama](https://ollama.com) 并 `ollama pull` 一个模型；
+2. 安装 [Ollama](https://ollama.com) 并拉取一个模型（本机 Agent 需要模型支持工具调用，见下方建议）；
 3. 双击 **`启动MoRay.bat`**：自动建虚拟环境 → 装依赖 → 起后端 → 打开浏览器。
    首次 1–3 分钟（官方源慢会自动回退阿里云镜像），之后秒开；换端口：`set MORAY_PORT=8123` 再启动。
+
+> ⚠️ **能力边界**：**本机 Agent（工作区工具）只在一键全栈 / 本地运行时可用**——它需要本地后端的
+> 安全层执行文件操作。纯前端打开（方式 ③）与在线部署版（BYOK）不携带本机 Agent 能力，其余
+> 对话 / 对比 / 路由 / 成本等功能不受影响。
 
 ### 方式 ② macOS / Linux
 ```bash
@@ -101,7 +122,17 @@ MORAY_PORT=8123 ./start_moray.sh   # 换端口
 ```
 
 ### 方式 ③ 纯前端免后端
-直接双击 `moray-workbench.html`（数据存 IndexedDB）。本地 Ollama 对话、云端直连、智能路由、思考三态、多模型对比、成本统计均可用；SQLite 同步与"Key 不进浏览器"的后端代理需要方式 ①/②。
+直接双击 `moray-workbench.html`（数据存 IndexedDB）。本地 Ollama 对话、云端直连、智能路由、思考三态、多模型对比、成本统计均可用；SQLite 同步、"Key 不进浏览器"的后端代理与本机 Agent 需要方式 ①/②。
+
+### Agent 模型建议（工具调用真机实测，3 轮/模型）
+| 模型 | 非流式 | 流式 | 结论 |
+|---|---|---|---|
+| **qwen2.5:7b** | 3/3 | 3/3 | ✅ 最稳，Agent 任务首选 |
+| qwen3.5:9b / 4b | 2/3 | 3/3·2/3 | ⚠️ 基本可用，偶发漏调 |
+| qwen2.5:1.5b | 2/3 | 1/3 | ❌ 不可靠 |
+
+使用前可点顶部提示条「自检」一键验证当前模型能否触发工具调用；云端 DeepSeek 的 tools
+支持由 OpenAI 兼容协议保证（本地冒烟通过）。
 
 ### 云端 Key（可选）
 复制 `server/.env.example` 为 `server/.env`，填写后重启后端，并在「设置 → 云端 API」选择"经本地后端代理"：
@@ -123,10 +154,10 @@ MoRay/
 ├── moray-workbench.html   # 单文件前端（双击即用，构建产物）
 ├── 启动MoRay.bat / start_moray.sh   # 一键启动（Win / mac·Linux）
 ├── assemble.py            # 前端构建：parts/ 分片 → 单文件（幂等）
-├── parts/                 # 前端源码：18 个功能分片
+├── parts/                 # 前端源码：19 个功能分片
 ├── vendor/                # 运行依赖本地化（tailwind/marked/highlight/lucide…，零 CDN）
 ├── wallpapers/            # 内置壁纸
-├── scripts/               # 后端启动、发布构建、布局/重复 id/括号校验脚本
+├── scripts/               # 一键启动、发布构建、e2e/安全/截图校验脚本
 ├── server/                # FastAPI + SQLite 薄后端（app/、requirements、.env.example）
 ├── deploy/                # 在线版 Cloudflare Worker 跨域代理（可选）
 ├── web/                   # assemble --web 导出的静态部署目录
@@ -138,7 +169,7 @@ MoRay/
 
 | 层 | 选型 |
 |---|---|
-| 前端 | 原生 JavaScript（18 分片组装为约 0.9MB 单文件）、Tailwind 风格 CSS、Lucide 图标、marked / DOMPurify / highlight（全部本地化，零 CDN） |
+| 前端 | 原生 JavaScript（19 分片组装为单文件）、Tailwind 风格 CSS、Lucide 图标、marked / DOMPurify / highlight（全部本地化，零 CDN） |
 | 前端存储 | IndexedDB（本地优先，含禁用时的内存降级） |
 | 后端 | FastAPI + Uvicorn（Python 3.12/3.13），标准库 sqlite3 参数化查询、无 ORM |
 | 模型接入 | Ollama（`/api/chat` 与 OpenAI 兼容口）+ 任意 OpenAI 兼容云端，SSE 流式 |
@@ -155,6 +186,15 @@ python scripts/build_release.py    # 生成干净发布包 release/（自动排�
 
 ## 九、路线图
 
+**已完成**
+- [x] 本地薄后端（FastAPI + SQLite，双存储离线降级、一键全栈启动）
+- [x] 本机 Agent（受控工作区 · 7 工具 · 计划→分步执行 · unified diff 审批 · 全程审计 · 常驻文件树）
+- [x] 多模型对比（并排流式、同步滚动、对比报告）
+- [x] 智能路由与成本中心（难度分流、熔断亲和、精确计费、预算降级）
+- [x] PWA 可安装离线运行
+- [x] 在线 BYOK 部署（web/ 静态站 + Cloudflare Worker 透传）
+
+**规划中**
 - 定时工作流的后端调度；图片附件 DataURL 入 SQLite 同步；
 - Tauri / 免 Python 的 Windows 便携安装包；
 - 可选多用户与加密云同步（需自托管）。

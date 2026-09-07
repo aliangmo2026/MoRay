@@ -79,6 +79,12 @@ async def llm_chat(request: Request):
     # 推理参数：部分服务商（Ollama 兼容口等）支持；不支持的会自行忽略
     if body.get("think") is not None:
         payload["think"] = bool(body["think"])
+    # [阶段0 本机 Agent] 工具调用协议透传：仅请求体显式携带时才透传（无 tools 的旧请求行为完全不变）
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        payload["tools"] = tools
+    if body.get("tool_choice") is not None:
+        payload["tool_choice"] = body["tool_choice"]
 
     headers = {
         "Authorization": "Bearer " + config.LLM_API_KEY,
@@ -111,7 +117,7 @@ async def llm_chat(request: Request):
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
-        return {
+        out = {
             "ok": True,
             "content": message.get("content") or "",
             "reasoning": message.get("reasoning_content") or message.get("thinking") or "",
@@ -122,6 +128,10 @@ async def llm_chat(request: Request):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        # [阶段0 本机 Agent] 工具轮：上游返回 tool_calls 时原样透传（无 tools 的旧请求不含此键，行为不变）
+        if message.get("tool_calls"):
+            out["tool_calls"] = message["tool_calls"]
+        return out
 
     async def _stream():
         """流式：SSE 逐块透传；前端断开（cancel）时 finally 中 aclose 同步中止上游"""

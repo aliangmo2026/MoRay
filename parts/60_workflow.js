@@ -286,12 +286,18 @@ const WorkflowEngine = {
       { role: 'user', content: prompt }
     ];
     if (node.config && node.config.multiModel) {
-      // 多模型并发：取前2个选中模型
-      const models = (MoraySettings.get('compareModels') || []).slice(0, 2);
-      const useModels = models.length ? models : [AI.models[0] && AI.models[0].name].filter(Boolean);
+      // [多模型对比修复] 多模型并发：先按当前真实模型列表清洗 compareModels
+      // （过滤占位串/失效模型，避免空名/占位名下发给 Ollama 产生 400），再取前 2 个
+      const allNames = (AI.models || []).map(m => m && m.name).filter(Boolean);
+      const stored = MoraySettings.get('compareModels');
+      const models = (Array.isArray(stored) ? stored : []).filter(n => allNames.includes(n)).slice(0, 2);
+      const useModels = models.length ? models : allNames.slice(0, 1);
+      if (!useModels.length) return '';
       const parts = await Promise.all(useModels.map(async (m) => {
         try {
-          const r = await AI.chat({ model: m, messages });
+          // [深度思考/常驻] 与普通对话一致的 think 决策；keep_alive:30m 由 AI.chat 的 Ollama 分支统一附带
+          const think = (typeof decideThinkFor === 'function') ? decideThinkFor(m, messages) : false;
+          const r = await AI.chat({ model: m, messages, think });
           recordPerf(m, r.stats, true);
           return `### 模型：${m}\n（${r.stats.tokPerSec || '?'} tok/s · ${r.stats.ms}ms）\n\n${r.content}`;
         } catch (e) { return `### 模型：${m}\n请求失败：${e.message}`; }

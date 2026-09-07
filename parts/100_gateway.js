@@ -383,15 +383,18 @@ const GatewayBreaker = {
 
 /** Ollama 当前驻留模型名（GET /api/ps，5 秒短缓存；失败静默返回空，不报错不阻塞路由） */
 let __psCache = { at: 0, list: null };
+let __lastPsMs = 0;
 async function ollamaLoadedModels() {
   if (!AI || AI.backend !== 'ollama') return [];
   const now = Date.now();
   if (__psCache.list && now - __psCache.at < 5000) return __psCache.list;
   try {
+    const p0 = performance.now();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 1500);
     const res = await fetch(AI.ollamaURL + '/api/ps', { signal: ctrl.signal });
     clearTimeout(timer);
+    __lastPsMs = performance.now() - p0;
     if (!res.ok) return [];
     const j = await res.json();
     __psCache = { at: now, list: ((j.models || []).map(m => m && m.name)).filter(Boolean) };
@@ -779,6 +782,32 @@ const Gateway = {
   /** 路由降级日志（最近20条）
    * @type {Array} */
   fallbackLog: [],
+  /** 最近一次“最终模型预热”状态（串行：不同模型先等上一轮结束，禁止并发争显存） */
+  __warm: null,
+
+  /** [首字延迟修复] 路由定稿后的对齐预热：
+   * 仅对“最终要用的模型”在真实请求前预热；已驻留则直接跳过；
+   * 若已有其它模型预热进行中，先等其结束（OLLAMA_MAX_LOADED_MODELS=1 下不同模型会互踢）。
+   * 失败静默；预热与真实对话串行，绝不并发。
+   * @param {string} model - 最终模型名 */
+  async ensureWarmup(model) {
+    try {
+      if (!model || !AI || AI.backend !== 'ollama' || typeof AI.warmupModel !== 'function') return;
+      const loaded = await ollamaLoadedModels();
+      if (loaded.includes(model)) return;
+      // 若正在预热不同模型，先等它结束（避免两个模型同时加载互踢）
+      if (this.__warm && this.__warm.p && this.__warm.model !== model) {
+        await this.__warm.p.catch(() => {});
+      }
+      if (this.__warm && this.__warm.p && this.__warm.model === model) {
+        await this.__warm.p.catch(() => {});
+        return;
+      }
+      const p = AI.warmupModel(model);
+      this.__warm = { model, p };
+      await p.catch(() => {});
+    } catch (e) { /* 预热失败静默 */ }
+  },
 
   /**
    * 是否允许云端调用（预算/暂停/网关开关）
@@ -813,15 +842,29 @@ const Gateway = {
     const localNames = eligBase.names;
     let affinityApplied = false;
     // 已驻留模型亲和：simple/medium 且已驻留模型仍可用时优先复用（不依赖 routingLocalFirst）
-    if (MoraySettings.get('routingPreferLoaded') && type !== 'complex' && localNames.length) {
+    if (MoraySettings.get('routingPreferLoaded') && localNames.length) {
       const loaded = await ollamaLoadedModels();
-      const loadedPick = loaded.find(n => localNames.includes(n) && n !== decision.model);
-      if (loadedPick) {
+      const loadedCandidates = loaded.filter(n => localNames.includes(n));
+      // 已驻留模型选法：simple/medium 直接复用任一驻留模型；
+      // complex 仅在驻留模型是本地最大参数量时复用（否则仍按原策略选最大，叠加冷却过滤）。
+      let loadedPick = null;
+      if (loadedCandidates.length) {
+        if (type === 'complex') {
+          const maxSize = Math.max.apply(null, localNames.map(n => modelSizeB(n) || 0));
+          loadedPick = loadedCandidates.find(n => modelSizeB(n) === maxSize) || null;
+        } else {
+          loadedPick = loadedCandidates[0];
+        }
+      }
+      if (loadedPick && loadedPick === decision.model) {
+        // 决策模型本就驻留：标记亲和命中，阻止后续“本地优先”再切成理论最小造成重载
+        affinityApplied = true;
+      } else if (loadedPick) {
         const fbSet = [];
         [decision.model].concat(localNames.filter(n => n !== loadedPick)).forEach(n => {
           if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
         });
-        decision = { model: loadedPick, fallbacks: fbSet, reason: type + '任务 → 复用已驻留模型（' + loadedPick + '）' };
+        decision = { model: loadedPick, fallbacks: fbSet, reason: type + '任务 → 复用已驻留模型，避免重载（' + loadedPick + '）' };
         affinityApplied = true;
       }
     }
@@ -835,13 +878,18 @@ const Gateway = {
       const ranked = sized.concat(unsized).map(x => x.n);
       const localBest = ranked[0];
       if (typeof localBest === 'string' && localBest.trim() && localBest !== decision.model) {
-        const extra = ranked.slice(1).filter(n => typeof n === 'string' && n.trim() && n !== localBest);
-        const fbSet = [];
-        [decision.model].concat(extra).forEach(n => {
-          if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
-        });
-        const cooling = eligBase.cooling.length ? '；冷却跳过 ' + eligBase.cooling.join('、') : '';
-        decision = { model: localBest, fallbacks: fbSet, reason: type + '任务 → 本地优先（' + localBest + '）' + cooling };
+        // [速度优化] complex 任务保持“参数量最大”策略，不被本地优先降级成最小模型
+        const complexKeepMax = type === 'complex' &&
+          (modelSizeB(decision.model) || 0) >= (modelSizeB(localBest) || 0);
+        if (!complexKeepMax) {
+          const extra = ranked.slice(1).filter(n => typeof n === 'string' && n.trim() && n !== localBest);
+          const fbSet = [];
+          [decision.model].concat(extra).forEach(n => {
+            if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
+          });
+          const cooling = eligBase.cooling.length ? '；冷却跳过 ' + eligBase.cooling.join('、') : '';
+          decision = { model: localBest, fallbacks: fbSet, reason: type + '任务 → 本地优先（' + localBest + '）' + cooling };
+        }
       }
     }
     // [路由修复] 兜底：decision.model 必须非空合法字符串，否则回退默认模型
@@ -984,8 +1032,13 @@ Gateway.chatStream = function (opts) {
   this._currentOpts = opts;
   const self = this;
   const promise = (async () => {
+    const T0 = performance.now();
+    const timing = { startMs: 0 };
     await self.guardCloud();
     const routed = await self.route(opts);
+    timing.routeMs = performance.now() - T0; // 含路由决策 + /api/ps(缓存) + 冷却/亲和判断
+    timing.psMs = (typeof __lastPsMs === 'number') ? __lastPsMs : 0;
+    timing.tagsMs = (AI && typeof AI.__lastTagsMs === 'number') ? AI.__lastTagsMs : 0;
     // [小补丁] 路由结果早期回调：加载态气泡立即刷新为实际命中模型/reason（不等流式结束）
     if (typeof opts.onRoute === 'function') {
       try { opts.onRoute(routed); } catch (e) { /* 回调异常不影响主链路 */ }
@@ -1000,8 +1053,11 @@ Gateway.chatStream = function (opts) {
     });
     if (metaModelQ) effective.messages = injectModelMetaNote(effective.messages, routed.model);
     const canCache = MoraySettings.get('cacheEnabled') && !effective.bypassCache && !effective.hasImages;
-    // [工具调用] 仅 openai 后端 + 总开关 + 有可用工具时启用；Ollama/不支持/报错自动回退普通流式；对比等场景可传 noTools 强制关闭
-    const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') && AI.backend === 'openai' && typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
+    // [工具调用] 仅 openai/ollama 后端 + 总开关 + 有可用工具时启用；Ollama 走前端直连原生 tools；
+    // 不支持/报错自动回退普通流式；对比等场景可传 noTools 强制关闭
+    const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') &&
+      (AI.backend === 'openai' || AI.backend === 'ollama') &&
+      typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
     if (canCache) {
       try {
         const exact = await GatewayCache.lookupExact(GatewayCache.requestHash(effective));
@@ -1012,6 +1068,25 @@ Gateway.chatStream = function (opts) {
         await GatewayCache.bumpMeta('miss');
       } catch (e) { console.warn('[MoRay] cache lookup failed:', e); }
     }
+    // [首字延迟修复] 路由已定稿：若本地模型未驻留，先串行预热最终模型再发真实请求
+    if (AI.backend === 'ollama' && effective.model) {
+      const w0 = performance.now();
+      await self.ensureWarmup(effective.model);
+      timing.warmMs = performance.now() - w0;
+    }
+    // TTFT 埋点：首个 token 到达时间（routingDebug=true 或 ?ttft=1 时输出）
+    let firstTokenAt = 0;
+    const origChunk = opts.onChunk;
+    effective.onChunk = function (...args) {
+      if (!firstTokenAt) {
+        firstTokenAt = performance.now();
+        timing.firstTokenMs = firstTokenAt - T0;
+        if (MoraySettings.get('routingDebug') || (typeof location !== 'undefined' && /ttft=1/.test(location.search))) {
+          console.log('[MoRay TTFT]', JSON.stringify(timing));
+        }
+      }
+      if (typeof origChunk === 'function') origChunk.apply(this, args);
+    };
     let abortWasTimeout = false;
     const attemptFn = (model) => {
       const timeoutMs = (MoraySettings.get('requestTimeout') || 30) * 1000;
@@ -1025,6 +1100,7 @@ Gateway.chatStream = function (opts) {
     // [工具兜底] 标志位：工具模式失败后最多做一次"去 tools 普通流式"重试，防死循环
     let toolsFallbackTried = false;
     let usedFallback = false; // [显示统一] 是否真的发生了备用模型回退
+    timing.requestStartMs = performance.now() - T0;
     try {
       if (useTools) {
         // [工具调用] 工具闭环（内部逐轮 record 成本；异常回退下方兜底/降级链路）
@@ -1071,6 +1147,12 @@ Gateway.chatStream = function (opts) {
           self.fallbackLog = self.fallbackLog.slice(0, 20);
           if (metaModelQ) effective.messages = injectModelMetaNote(effective.messages, fallbacks[0]);
           try {
+            // 备用模型同样先串行预热再发起（保持 MAX_LOADED=1 下不并发）
+            if (AI.backend === 'ollama') {
+              const w1 = performance.now();
+              await self.ensureWarmup(fallbacks[0]);
+              timing.fallbackWarmMs = performance.now() - w1;
+            }
             result = await self.withRetry(() => attemptFn(fallbacks[0]), MoraySettings.get('routingFallbacks') || 2);
           } catch (fbErr) {
             GatewayBreaker.record(fallbacks[0], (fbErr && fbErr.message) || String(fbErr));
@@ -1106,7 +1188,12 @@ Gateway.chatStream = function (opts) {
     }
     // [工具调用] 工具轮结果不写缓存（时间/库内容敏感，避免过时快照）
     if (canCache && !useTools) GatewayCache.save(effective, result).catch(() => {});
+    if (MoraySettings.get('routingDebug') || (typeof location !== 'undefined' && /ttft=1/.test(location.search))) {
+      if (!timing.firstTokenMs) timing.firstTokenMs = performance.now() - T0;
+      console.log('[MoRay TTFT] done', JSON.stringify(timing));
+    }
     return Object.assign({}, result, {
+      _timing: timing,
       _routed: routed.routeInfo ? {
         model: effective.model,
         type: routed.routeInfo.type,
@@ -1133,7 +1220,8 @@ Gateway.chatStream = function (opts) {
 Gateway.runWithTools = async function (opts, onToolStep) {
   const model = opts.model;
   const tools = ToolRegistry.listForRequest();
-  const maxRounds = Math.max(1, Math.min(10, MoraySettings.get('toolsMaxRounds') || 3));
+  // [阶段0] 轮次默认 8、上限 12（设置页本机 Agent 分区与 AI 工具卡可调）
+  const maxRounds = Math.max(1, Math.min(12, MoraySettings.get('toolsMaxRounds') || 8));
   const msgs = (opts.messages || []).map(m => Object.assign({}, m));
   const steps = [];
   let promptTotal = 0, completionTotal = 0;
@@ -1190,7 +1278,12 @@ Gateway.runWithTools = async function (opts, onToolStep) {
       const name = fn.name || '';
       const callId = call.id || ('call_' + steps.length);
       let args = {};
-      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) { args = {}; }
+      // [阶段0] arguments 兼容字符串（OpenAI）与对象（Ollama 原生形态统一为协议字符串后仍可被解析）
+      try {
+        args = (typeof AI !== 'undefined' && typeof AI.toolArgsToObject === 'function')
+          ? AI.toolArgsToObject(fn.arguments)
+          : JSON.parse(fn.arguments || '{}');
+      } catch (e) { args = {}; }
       const toolDef = ToolRegistry.get(name);
       const label = toolDef ? toolDef.label : name;
       const t0 = performance.now();
@@ -1206,14 +1299,21 @@ Gateway.runWithTools = async function (opts, onToolStep) {
       }
       let res;
       try {
-        res = await ToolRegistry.run(name, args, { model, signal: toolCtl.signal });
+        res = await ToolRegistry.run(name, args, {
+          model, signal: toolCtl.signal,
+          // [阶段0] 审批过程事件：native 工具等待人工授权时把本步骤转"待审批"（时间线实时可见）
+          onStatus: (st) => emit({ index: idx, name, label, args, status: st, ms: Math.round(performance.now() - t0), resultPreview: '' })
+        });
       } finally {
         if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort);
       }
       const ms = Math.round(performance.now() - t0);
+      // [阶段0] 用户拒绝（data.denied）：步骤卡显示"已拒绝"，回灌内容让模型如实回应
+      const denied = !!(res.ok && res.data && res.data.denied);
+      const stepStatus = denied ? 'denied' : (res.ok ? 'success' : 'error');
       const preview = res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : res.error;
       const resultFull = (res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : ('错误：' + res.error)).slice(0, 10000);
-      emit({ index: idx, name, label, args, status: res.ok ? 'success' : 'error', ms, resultPreview: preview || '', resultFull });
+      emit({ index: idx, name, label, args, status: stepStatus, ms, resultPreview: preview || '', resultFull });
       msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: callId, type: 'function', function: { name, arguments: fn.arguments || '{}' } }] });
       msgs.push({ role: 'tool', tool_call_id: callId, name, content: res.ok ? JSON.stringify(res.data).slice(0, 4000) : ('错误：' + res.error) });
     }

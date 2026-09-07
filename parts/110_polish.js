@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    MoRay V3 体验打磨与健壮性
    P1 连接闭环：Ollama检测引导卡 / 错误诊断 / 拉取进度增强
    P2 引导与空状态：3步Onboarding / 统一空状态组件
@@ -858,7 +858,7 @@ function installModelSelector() {
     } else {
       pop.innerHTML = models.map(m => `
         <div class="model-pop-item ${m === current ? 'selected' : ''}" data-pick-model="${escapeHtml(m)}">
-          <span class="truncate">${escapeHtml(m)}</span>
+          <span class="truncate" title="${escapeHtml(m)}">${escapeHtml(uniqueModelName(m))}</span>
           ${m === current ? '<i data-lucide="check" class="w-3.5 h-3.5 text-brand-cobalt"></i>' : ''}
         </div>`).join('');
       pop.querySelectorAll('[data-pick-model]').forEach(item => {
@@ -1302,15 +1302,15 @@ Onboarding.openV2 = function () {
     const prev = box.querySelector('#ob2Prev');
     if (prev) prev.addEventListener('click', () => { step = Math.max(0, step - 1); render(); });
   };
-  const finish = async () => {
-    Onboarding.done();
-    closeModal();
-    if (box.querySelector('#ob2Sample') && box.querySelector('#ob2Sample').checked) {
-      const n = await loadSamplePack();
-      showNotification('示例包已载入', n ? `共写入 ${n} 条示例数据` : '示例数据已存在', 'success', 3000);
-    }
-    showNotification('一切就绪', '按 ⌘/Ctrl+K 打开命令面板；成本中心在左侧导航', 'success', 4000);
-  };
+    const finish = async () => {
+      Onboarding.done();
+      closeModal();
+      if (box.querySelector('#ob2Sample') && box.querySelector('#ob2Sample').checked) {
+        const n = await loadSamplePack();
+        showNotification('示例包已载入', n ? `共写入 ${n} 条示例数据` : '示例数据已存在', 'success', 3000);
+      }
+      // [阶段1.5 A] 启动摘要由 probeBackend 统一弹出（此处不再叠加“一切就绪”，避免启动连叠）
+    };
   render();
 };
 
@@ -1858,8 +1858,8 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
-window.MORAY_VERSION = '0.3.0';
-window.MORAY_BUILD = '3.15.13';
+window.MORAY_VERSION = '1.0.0';
+window.MORAY_BUILD = '3.18.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -1914,9 +1914,9 @@ window.MORAY_BUILD = '3.15.13';
       label.textContent = '本地后端 ● 已连接';
       label.style.color = 'var(--color-success)';
     } else {
-      item.title = '本地后端未运行，纯前端模式（IndexedDB 照常工作）';
+      item.title = '本地同步后端未启动：当前用浏览器存储，Ollama 本地对话不受影响；启动后端可多设备同步';
       if (dot) dot.style.background = 'var(--color-text-tertiary)';
-      label.textContent = '本地后端 ○ 离线模式';
+      label.textContent = '本地后端未启动';
       label.style.color = 'var(--color-text-tertiary)';
     }
   }
@@ -1932,7 +1932,7 @@ window.MORAY_BUILD = '3.15.13';
     item.id = 'statusBackendItem';
     item.title = '本地后端连接状态（探测中...）';
     item.innerHTML = '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-text-tertiary)"></span>' +
-      '<span class="backend-status-text" style="color:var(--color-text-tertiary)">本地后端 ○ 离线模式</span>';
+      '<span class="backend-status-text" style="color:var(--color-text-tertiary)">本地后端未启动</span>';
     group.appendChild(item);
   }
 
@@ -1957,22 +1957,16 @@ window.MORAY_BUILD = '3.15.13';
       }
     } catch (e) { /* 静默：离线/超时/网络错误均不打扰用户 */ window.MorayBackend = { connected: false, checked: true, url: HEALTH_URL, origin: BACKEND_ORIGIN }; }
     refreshBackendStatus();
-    // [M5.1修复] 启动 toast 在探测完成后生成（状态文案准确，不再写死"后端未连接"）
+    // [阶段1.5 A] 启动通知合并为唯一一条状态摘要（消除“已就绪/持久化/纯前端”三连叠）：
+    // 后端连接状态 + Ollama 模型数一并在摘要中；纯前端提示并入同一句话（不再单独弹）
     try {
       const ok = !!(window.MorayBackend && window.MorayBackend.connected);
-      showNotification('MoRay v' + window.MORAY_VERSION + ' 已就绪',
-        'IndexedDB 持久化 · ' + (ok ? ('本地后端已连接：' + BACKEND_ORIGIN) : '本地后端离线模式（纯前端照常可用）'),
-        ok ? 'success' : 'info', 4000);
+      const modelN = (window.AI && Array.isArray(window.AI.models)) ? window.AI.models.length : null;
+      const msg = ok
+        ? ('本地后端已连接：' + BACKEND_ORIGIN + (modelN != null ? ' · 本地模型 ' + modelN + ' 个' : ''))
+        : '本地同步后端未启动：当前用浏览器存储，Ollama 本地对话不受影响；启动后端可多设备同步';
+      showNotification('MoRay v' + window.MORAY_VERSION + ' 已就绪', msg, ok ? 'success' : 'info', 5000);
     } catch (e) { /* 忽略 */ }
-    // [M5.1] 纯前端模式一次性、非阻断轻提示（不反复打扰；完整工作台 = 启动MoRay.bat / start_moray.sh）
-    if (!(window.MorayBackend && window.MorayBackend.connected)) {
-      try {
-        if (!localStorage.getItem('moray_purefront_notice')) {
-          localStorage.setItem('moray_purefront_notice', '1');
-          showNotification('纯前端（离线）模式', '启动本地后端可获得 SQLite 数据同步与云端 Key 代理：双击「启动MoRay.bat」（完整工作台）', 'info', 6000);
-        }
-      } catch (e) { /* 忽略 */ }
-    }
     // [M2] 通知设置页等模块刷新"代理/直连"通道 UI
     try { window.dispatchEvent(new CustomEvent('moray-backend-probed')); } catch (e) { /* 忽略 */ }
   }

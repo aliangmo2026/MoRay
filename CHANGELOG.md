@@ -1,5 +1,291 @@
 # MoRay 变更日志
 
+## v1.0.0（2026-09-07）正式版封版定稿（仅版本/文档/清理，功能逻辑零改动）
+
+### 定版
+- 对外产品版本 **0.3.0 → 1.0.0**（前端 MORAY_VERSION、后端 config VERSION 同步）；
+  内部构建号统一 **3.18.0**（MORAY_BUILD / APP_VERSION / config BUILD）；
+- 设置→关于页版本行改为动态取 MORAY_VERSION（此前残留硬编码 v3.0.0）；页脚与状态栏
+  由运行时同步（原有机制）；server/README 头部版本同步；
+- `build_release.py` 按 config VERSION 自动产出 **release/MoRay-v1.0.0(.zip)**（脚本读
+  config，无需改逻辑）；产物内 html 版本号随构建同步。
+
+### 文档
+- README 升级正式版门面：界面预览新增本机 Agent 三张实机截图（任务计划卡 / 审批 unified
+  diff / 常驻文件树，取自 work/shots/agent-states 并归档 docs/screenshots/agent-*.png）；
+- 核心特性新增「本机 Agent」小节（受控工作区隔离、7 工具、计划→分步执行、unified diff
+  审批、全程审计、常驻文件树、模型自检）；
+- 快速开始：一键全栈标注为"完整能力"首选路径，并明确**纯前端/在线 BYOK 版不携带本机
+  Agent**；新增 Agent 模型建议表（真机实测 qwen2.5:7b 最稳、qwen3.5 偶发漏调、1.5b 不可靠）；
+- 技术架构图补 /api/agent 与审计表；目录结构 parts 18→19；路线图勾选六项已完成。
+
+### 清理
+- 删除无引用的临时勘察脚本 scripts/peek_copy.py、scripts/scan_tmp2.py
+  （正式测试脚本 test_agent_tools.py / test_llm_proxy_tools.py / agent_e2e_check.py 保留）。
+
+### 验证
+- 19 分片 node --check 全过；server/app py_compile 全过；
+- agent_e2e_check.py 37 PASS / 0 FAIL（功能零回退自证）；
+- assemble.py 幂等 ×2 + --web web + build_release.py：根 html / web/index.html /
+  web/moray-workbench.html / release/MoRay-v1.0.0/moray-workbench.html **四份 SHA256 一致**
+  （见定稿报告）；产物含 MORAY_VERSION=1.0.0 与 MORAY_BUILD=3.18.0。
+
+## v3.17.2（2026-09-05）阶段1.6：启动残留修复 + Agent 工作面真机精修 + 演示顺滑度
+
+### M1 启动通知彻底收敛
+- 全局排查定位残留源：静态骨架第一阶段脚本的“MoRay 已就绪（按 ⌘K 打开命令面板）”（不可改区）
+  与 onboarding 完成路径的“一切就绪”——采用通知层**启动窗口合并**根治（135_ui_polish.js）：
+  页面加载后 12s 内的启动类通知（标题含已就绪/一切就绪，或消息含 ⌘K 引导/后端状态摘要）
+  只允许第一条显示，⌘K 引导自动并入其消息；后续同类静默丢弃，且后端连接状态反向并入首条。
+- 实测（IAB，加载后 0.8s/3s/6s 三时刻截图+DOM 计数）：右上角启动类通知总数恒 ≤1，
+  6s 时按分类时长自动消失；`work/shots/agent-states/boot_toasts_*.png`。
+
+### M2 Agent 工作面真机精修（mock 全流程逐状态截图）
+- mock 新增 s10_demo 完整演示剧本（计划→find_files→read_file×2→edit_file 审批→总结），
+  IAB clip 截图管线绕开视口模拟平铺伪影（clip≤980×640 走正确合成路径），逐状态留档
+  `work/shots/agent-states/`：s1_plan_card（计划卡 5 步）、s2_timeline（时间线执行+edit 待审批）、
+  s3_approval_diff（审批卡：居中/scrim/等宽路径/红绿 diff/主次按钮/信任勾选）、s4_done
+  （计划 5/5+时间线全 success+总结）、s5_tree_highlight（文件树侧栏：notes 展开/文件类型图标/
+  变更高亮/与对话同屏不遮挡）。
+- 修复：ensureWsSidebar 重构时误删 createElement/id 两行导致侧栏无法创建（报错即现）；
+  计划步骤状态流转同步到消息持久化（会话重建后计划卡显示最新状态而非初始待办）。
+
+### M3 演示顺滑度
+- **示例工作区**：顶部提示条新增「示例」按钮——一键创建 notes/a.txt（会议要点素材A）、
+  notes/b.txt（调研记录素材B）、todo.md（待办清单）三个中文自洽示例；已存在的文件自动跳过
+  （绝不覆盖用户文件）；创建后经事件刷新文件树并高亮。
+- 欢迎页：新增第 5 张「试试本地 Agent」引导卡（仅本机工具可用+后端在线时出现）——点击后
+  自动开启开关（如未开）、开关高亮脉冲 2 秒、载入示例工作区、自动填好一句演示任务并聚焦；
+  快捷卡片精修（图标底/边框/hover 抬升/间距/浅色适配），欢迎区垂直重心上移。
+- 模型选择器提示：当前模型自检未通过时，顶部提示条内给一行温和警示
+  （“该模型工具调用偶发失败（自检未通过），Agent 任务建议 qwen2.5:7b”），不打断输入。
+
+### 验证
+- 19 分片 node --check 全过；server py_compile 全过；assemble 图标校验 115 个有效；
+- agent_e2e_check.py 37 PASS / 0 FAIL、test_agent_tools.py 97 通过 0 失败（零回退）；
+- 四份产物 SHA256 一致；测试端口/进程清理。
+
+## v3.17.1（2026-09-05）阶段1.5：全局 UI/UX 精修与体验闭环（纯界面层，零功能变更）
+
+### A 通知系统治理
+- 新增 parts/135_ui_polish.js（第 19 个分片）：以同名覆盖升级 showNotification——
+  同屏最多 3 条（新顶旧）、成功 3.5s/信息 5s/警告 8s/错误 10s 分类时长、hover 暂停倒计时
+  （进度条暂停）、类型图标+状态色左缘条、深色 scrim+blur 保证壁纸下可读、手动关闭按钮、
+  右上 16px 安全边距、窄屏 max-width 自适应、role=status/alert 无障碍。
+- 启动通知合并为唯一一条状态摘要（后端连接 + 本地模型数；后端未启动时按新文案提示
+  “本地同步后端未启动：当前用浏览器存储，Ollama 本地对话不受影响；启动后端可多设备同步”），
+  删除“纯前端（离线）模式”独立通知与 onboarding 完成时的“一切就绪”叠加通知；
+  底部状态栏“本地后端 ○ 离线模式”改为“本地后端未启动”（两处 + title 同步）。
+
+### B 壁纸适配与可读性
+- 模态/确认框/命令面板/右键菜单统一深色渐变 scrim+blur（浅色主题对应浅色渐变）；
+  遮罩层加深；输入台/卡片 backdrop-filter 统一；全部取既有设计令牌。
+
+### C 网格自适应
+- 提示词库/片段库/文档库网格：≥1600 四列、1280-1599 三列、768-1279 两列、<768 单列，
+  内容区 max-width 1560 居中（消除宽屏右侧空白），卡片 min-width:0 防溢出。
+
+### D 输入台
+- 工具栏 overflow-x 横向滚动（隐藏滚动条）不再换行挤压；本机工具 ON 态品牌描边+轻 glow、
+  OFF 态 62% 弱化 hover 恢复。
+
+### E 设置页
+- OpenAI 模型输入框占位符改中性文案（去 gpt-4o-mini）；“删除模型”二次确认确认弹窗已有
+  （复核保留）；设置侧导航平滑定位+active 高亮已有（复核保留）；本机 Agent 分区新增
+  Agent 系统提示查看/覆盖/恢复内置（M5 已建）；审计日志升级为表格（时间/工具/参数摘要/
+  审批/状态色/耗时）+ 分页（25 条/页）+ 导出 JSON + 清空（二次确认，新增后端
+  DELETE /api/agent/log + crud.clear_agent_log）。
+
+### F Agent 组件精修
+- 计划卡：头部可点击整体折叠（chevron）、步骤状态图标（circle/loader/check-circle/x-circle/
+  skip-forward）、进行步浅蓝高亮+spin；
+- 审批卡：Enter=允许一次（输入框聚焦时豁免）/Esc=拒绝路径不变；
+- 文件树侧栏：左缘拖拽调宽（220-460px）、目录展开箭头（chevron 旋转动画）、按扩展名的
+  文件类型小图标（file-code/cog/image/archive/warning）、空工作区引导文案；
+- 时间线展开/收起 150-200ms ease-out、展开阴影层级。
+
+### G 微交互与无障碍
+- 全局过渡统一 160ms ease-out；细滚动条统一；所有可交互元素 :focus-visible 品牌焦点环；
+  prefers-reduced-motion 下关闭 pulse/spin/位移/进度条动画与平滑滚动；
+- 图标按钮补 aria-label（通知关闭/刷新/收起侧栏）。
+
+### 验证
+- 19 分片（新增 135_ui_polish.js）node --check 全过；assemble 图标校验 115 个图标名有效；
+- agent_e2e_check.py 37 PASS / 0 FAIL、test_agent_tools.py 97 通过 0 失败（零功能回退）；
+- 响应式四档（1920/1440/1280/900）：DOM 程序化诊断（无横向滚动/无关键元素重叠/可见性）
+  + 截图留档（IAB 截图管线在本机 DPI 环境对超窗格视口存在平铺伪影，已用 DOM 诊断佐证
+  布局正确性，详见交付报告）；
+- 四份产物 SHA256 一致；测试进程/端口清理。
+
+## v3.17.0（2026-09-05）阶段1：本机 Agent 独立完成多步骤工作区任务（M1→M5）
+
+### M1 真机工具调用适配 + Agent 自检
+- Ollama 本地模型真机探测（scripts/ollama_tools_probe.py，3 轮统计，非流式+流式）：
+  **qwen2.5:7b 3/3 全稳定 ✔；qwen3.5:9b 流式 3/3、非流式 2/3；qwen3.5:4b 均 2/3；
+  qwen2.5:1.5b 流式仅 1/3 不可靠**——流式 tool_calls 实测一次性全量到达（frag=1，无分片），
+  解析按增量分片兼容实现。
+- tool_calls 解析加固（20_ai.js）：sanitizeToolCalls（空调用过滤/arguments 对象↔字符串统一/
+  tryCompleteJson 截断补全）应用于非流式全部三分支；chatStream 三后端新增流式 tool_calls 增量
+  聚合（accToolCallDeltas/accToolCallsFinalize，OpenAI delta 分片 + Ollama 对象形态），经
+  _finish 透出 toolCalls 字段（无工具调用时 null，向后兼容）。
+- 云端链路真机冒烟（scripts/cloud_tools_smoke.py）：server/.env 实际指向本地 Ollama 的 OpenAI
+  兼容端点（/v1，qwen3.5:4b）——经 llm_proxy 全链路 tools 透传实测 PASS，标准 OpenAI 形态
+  tool_calls（id/index/字符串 arguments）正确透传；**DeepSeek 官方 tools 未验**（.env 无官方
+  key），如实登记。
+- Agent 自检：顶部提示条「自检」按钮 → 用当前模型发一个必然触发工具调用的最小请求（1 次、
+  非流式），支持/不支持/失败三态明确提示，未通过时推荐实测稳定模型（qwen2.5:7b / deepseek-chat）；
+  结果持久化并在设置页展示。
+
+### M2 三个高价值安全工具（server/app/agent_tools.py，走既有安全层）
+- find_files(path?, pattern?)：文件名通配递归查找，限 1000 条；手动 scandir 跳过
+  symlink/junction（防遍历逃逸）；只读自动执行。
+- search_text(query, path?, glob?, regex?)：全文检索 [{file,line,text}]，默认 200 条命中、
+  单行 200 字符截断、扫描 2000 文件上限；非法正则明确报错；二进制/非 UTF-8 跳过并计数；
+  只读自动执行。
+- edit_file(path, old_str, new_str, replace_all?)：精确字符串替换；old_str 唯一匹配校验
+  （0/多处且未 replace_all 报错引导补上下文）；返回替换次数与变更前后片段；危险后缀/二进制/
+  非 UTF-8 拒绝；加入副作用集合（审批双保险 + 审计）。
+- 安全单测 97 项全过（74 原有 + 23 新增：越界/截断/正则非法/多匹配/replace_all/危险后缀/
+  二进制/未审批/审计）。
+
+### M3 计划-执行编排（复用现有 Loop，零新引擎）
+- submit_plan 纯前端工具（native 门控）：模型多步任务先提交编号计划（≤12 步，含意图与工具）→
+  PlanTracker 登记并渲染计划卡（时间线之上的汇总层：待办/进行中/完成/失败/已跳过 状态色）；
+- 真实工具事件（onToolStep）按"工具名+最早待办"匹配推进步骤状态；单步失败真实错误回灌模型
+  自行重试（同一步失败满 3 次标记已跳过防死循环，maxRounds 兜底）；计划随消息持久化，
+  会话重建时恢复展示。
+
+### M4 工作区面板常驻化 + 变更可视
+- 文件树从模态弹窗改为可收起的常驻侧栏（fixed 右侧浮层，不阻塞聊天输入，浅色主题适配）；
+  Agent write_file/edit_file 后经 moray:ws-file-written 事件自动刷新并高亮 2 秒。
+- 审批升级：write_file / edit_file 审批卡展示 unified diff（行级 LCS，- 红 / + 绿 / 上下文灰，
+  零依赖；超 400 行截取头部；write_file 自动 read_file 旧内容比对，原文件超 64KB 时注明）；
+  拒绝路径与既有 denied 审计一致。
+
+### M5 命中率系统提示 + 全量回归
+- 内置 Agent 系统提示（PlanTracker.SYSTEM_PROMPT：工具清单与时机/工作区边界/多步先列计划/
+  不确定先 find_files/read_file/修改优先 edit_file/禁止臆造路径/命令只读白名单/old_str 唯一性）；
+  设置→本机 Agent 可查看、自定义覆盖（保存覆盖/恢复内置）；仅本机工具开启时追加到系统提示。
+- e2e 扩展至 37 断言全绿：新增 S7 计划多步（submit_plan→find_files→search_text→总结）、
+  S8 edit_file 审批→替换→read 验证、S9 edit 被拒内容不变、SEC find_files 越界抽检；
+  阶段0/0.5 既有 27 项与安全攻击实测（越界/未审批/命令注入/危险后缀/junction 逃逸）零回退。
+
+### 残留风险
+- DeepSeek 官方 tools 未真机验证（.env 无官方 key）；流式 tool_calls 聚合为兼容实现
+  （Ollama 实测一次性到达，分片路径按 OpenAI 增量协议实现并有单测覆盖解析）；
+- qwen3.5 系列工具调用非 100%（实测 2/3），自检与系统提示用于规避；不稳定属模型行为；
+- 计划步骤与工具的匹配是"工具名+最早待办"的宽松策略，模型乱序执行时计划卡状态可能滞后
+  （不影响实际执行与回灌正确性）；计划卡仅当前会话展示，跨会话不恢复执行状态。
+
+
+## v3.16.1（2026-09-05）阶段0.5：本机 Agent 闭环打磨 + 全链路自动化回归
+
+### 新增
+
+1. **Agent 全链路自动化回归**（scripts/agent_e2e_check.py，一条命令跑通，exit 0=全绿）：
+   mock OpenAI 兼容上游（线程 HTTPServer 剧本驱动，记录完整请求供回灌断言）+ 真实 FastAPI app
+   经 TestClient（MORAY_DB/MORAY_WORKSPACE 指 %TEMP%，真实文件系统/子进程/同一套安全层）+
+   协议模拟器 1:1 复刻前端 runWithTools 协议（非第二套实现）。6 场景 27 断言：只读单工具无审批 /
+   写文件 needsApproval→approved 落盘→审计 approved=1 / decision=denied 不落盘+"用户拒绝"回灌 /
+   多工具多轮顺序与 tool_call_id 一一对应与轮次计数 / 超 maxRounds 恰好 3 轮即止 / 后端不在线
+   连接错误（前端映射"需要启动本地后端"）+ 模型不支持 tools 去 tools 优雅回退；内含安全抽检
+   （越界/非白名单命令拒绝）。
+2. **过程时间线可操作化**（125_tools.js）：
+   - 摘要行展示完整可读入参（write=目标路径+字符数、command=完整命令行、read/list=路径），
+     超长截断+title 全文；
+   - 展开区显示完整结果（resultFull 不再截 300 字，CSS 限高滚动不撑爆会话）+ 一键复制（已有）；
+   - 失败步骤显示后端真实错误（danger 等宽字体）并提供"重试该步"：按消息持久化的 name/args
+     重新执行同一工具（不经模型、走完整安全层与审批），就地更新步骤卡与持久化数据，成功后
+     提示可用"重新生成"让模型基于最新结果作答；
+   - 全部步骤到终态自动折叠为一行"共 N 步 · 总耗时 Xs"（含 pending/running 判定，新事件自动
+     展开；历史消息重建同样折叠，点击展开/收起）；样式全部沿用现有设计令牌，零新依赖。
+3. **工作区文件树面板**（125_tools.js，只读）：顶部轻提示条新增「文件树」按钮 → 弹窗内
+   懒加载目录树（list_directory，dirCache 缓存不重复请求）、点击文本文件 read_file 只读预览
+   （前 64KB，二进制/越界错误原样显示）、刷新按钮；Agent write_file 成功经
+   moray:ws-file-written 事件自动刷新并高亮新文件 2 秒。数据全部来自现有只读接口，零新写能力。
+4. **相同操作指纹本会话免重复确认**（默认关）：审批卡新增勾选"本会话对完全相同的工具+参数
+   不再询问"（仅非 run_command 工具显示，命令永远每次审批）；指纹=工具名+键排序稳定 JSON；
+   内存 Map 存储刷新即失效；设置→本机 Agent 新增"已信任操作"计数与"清除"按钮；
+   后端 approved 双保险与审计照常，未改动。
+
+### 修复
+
+5. 多模型对比"本地串行"停止时，尚未轮到的列此前一直空白占位 → 现明确显示"已停止（未开始）"；
+   状态栏停止后保持"已停止"，不被 run 收尾覆盖为"本轮完成"（40_compare_prompts.js）。
+6. 后端健康探测 60s 定时器 document.hidden 跳过：核查确认 startHealthMonitor 已实现
+   （70_models_settings_boot.js `if (document.hidden) return;`，v3.15 期间已落地），本次复核
+   全部 setInterval 清单（5 处）后未做重复改动。
+
+### 验证
+
+- scripts/agent_e2e_check.py：**27 PASS / 0 FAIL（ALL GREEN）**；
+- 阶段0 安全实测 scripts/test_agent_tools.py 重跑 74 项全过（安全层零回退）；
+- node --check 18 parts 全过；server/app py_compile 全过；
+- assemble.py 幂等 ×2 + --web web，根 html 与 web 副本（及 web/index.html、release 包）
+  SHA256 一致；版本三处 3.16.1；测试进程/端口/临时库清理。
+
+### 残留风险
+
+- "重试该步"只重放工具本身并更新时间线，不自动改写已生成的模型回复（引导用户点"重新生成"）；
+- 文件树默认全收起、懒加载，超大目录（>500 条）依赖后端截断（显示截断标记但不分页）；
+- 信任表为本会话内存态，刷新失效（设计如此）；同指纹不同内容顺序（如 write 后又写同路径）
+  视为同指纹——勾选信任后不再询问，请谨慎勾选；run_command 不受影响；
+- e2e 的"后端不在线"断言验证连接层失败与前端降级文案存在性，完整 UI 行为沿用阶段0浏览器实测；
+- 真实 DeepSeek 冒烟未发（server/.env 未配置 MORAY_LLM_API_KEY），mock 全覆盖协议层。
+
+## v3.16.0（2026-09-05）阶段0 本机 Agent：受控工作区工具闭环（列目录/读文件/写文件/只读命令）
+
+### 新增能力
+
+1. 本机工具四件套（全部在受控工作区内执行，工作区默认 D:\MoRayWorkspace，可设置页修改/环境变量
+   MORAY_WORKSPACE 锁定；工具默认关，输入台"本机工具"按钮显式开启后才进入 listForRequest）：
+   - list_directory：列目录（单层 500 条截断）；read_file：UTF-8 文本读取（默认 64KB/2000 行截断，
+     二进制与不可解码明确报错不乱码）；两者只读、默认自动执行。
+   - write_file：写文件（自动建父目录；危险后缀 .exe/.bat/.cmd/.ps1/.reg 等拒绝；overwrite 语义）；
+     run_command：只读白名单命令（git status/log/diff/branch、python/node/npm --version、
+     where <名>；shell=False 列表参数、参数逐字符校验禁元字符/管道、15s 超时）——两者为副作用工具，
+     执行前必须人工审批（允许一次/拒绝；拒绝绝不执行并把"用户拒绝了该操作"回灌模型）。
+2. 后端 agent_tools 安全层（server/app/agent_tools.py）：pathlib resolve+commonpath 双保险路径校验
+   （.. 越界/绝对路径/UNC/盘符/CON 保留名/符号链接与 junction 逃逸全拒，normcase 大小写归一）、
+   审批双保险（approved!==true 绝不执行副作用，返回 needsApproval+可读摘要）、命令白名单+危险后缀黑名单、
+   全部调用审计落 SQLite agent_tool_log（含被拒/未审批/客户端拒绝），GET /api/agent/log 分页可查。
+3. Agent Loop 能力补齐（100_gateway.js runWithTools）：轮次默认 8 上限 12；native 工具审批为可 await
+   中断点（等待期间步骤卡转"待审批"脉冲）；"停止生成"可中止整任务（AbortController，停止后不再发起
+   后续工具与请求）；Ollama 后端原生 tools 支持（前端直连 /api/chat 带 tools + 协议消息规范化，
+   arguments 字符串/对象互转）。
+4. llm_proxy 云端链路 tools 透传：请求侧透传 tools/tool_choice、非流式响应透传 tool_calls
+   （无 tools 的旧请求零变化）；AI.chat 云端代理分支与 Ollama 分支补齐 tools 下发与 tool_calls 解析。
+5. 时间线/UI：步骤卡新增"待审批/已拒绝"状态（warning 色）与 4 个本机工具图标；会话区顶部
+   "本机工具已开启 · 工作区 X"轻提示；设置页新增"本机 Agent"卡（后端在线状态/工作区根修改并校验
+   可写/审批策略只读自动或全部审批/最大轮数 1-12/审计日志查看）。
+6. 降级提示：后端离线/未配置时开关与工具执行给明确中文提示（"本机工具需要启动本地后端…"），
+   模型不支持 tools 时通知并自动切换普通对话，不卡死不白屏。
+
+### 验证
+
+- 后端安全单测 scripts/test_agent_tools.py：74/74（默认工作区自动创建/越界/绝对路径/UNC/junction
+  逃逸拒绝/未审批副作用 needsApproval/危险后缀与保留名拒绝/64KB 与 2000 行与 500 条截断/命令白名单
+  与元字符拒绝/审计落库含 ok·rejected·needs_approval·denied/工作区设置修改与不可写拒绝）；
+- llm_proxy 透传单测 scripts/test_llm_proxy_tools.py：12/12（无 tools 旧请求零变化、tools/tool_choice
+  透传、tool_calls 响应透传、空 tools 不破坏、无 tools 流式兼容）；
+- 浏览器 mock LLM 端到端（scripts/mock_llm_server.py，直连与云端代理两种形态）：
+  "看看工作区里有什么"→ 列目录成功（只读无审批）；"写 hello.txt"→ 审批允许 → 磁盘真实出现
+  "你好"；拒绝 → 磁盘无文件且模型如实告知取消（步骤卡"已拒绝"）；读 a.txt+b.txt 汇总写 summary.txt
+  → 三步骤顺序正确+落盘；审批等待中点"停止生成" → 无写盘、无后续轮次、审计无对应记录；
+  "读 C:\Windows\win.ini" → 安全层拒绝且模型转述原因；模型不支持 tools（400）→ 提示+切换普通对话；
+  后端离线 → 开关 warning 提示+banner 离线文案+工具失败步骤不卡死。
+- node --check 18 parts 全过；python 编译/import 过；空库 MORAY_DB 指 %TEMP% 启动不碰真实库；
+  assemble.py 与 --web web 双份产物 SHA256 一致；测试端口/进程/临时库全部清理。
+
+### 残留风险
+
+- 本机工具仅工作区内可用是刻意边界（删除/移动/联网下载执行属 v2，未实现）；
+- run_command 白名单保守，需要新命令时须扩展白名单+参数校验（安全评审后再加）；
+- 命令输出按 64KB 截断，超长输出可能不完整（有截断提示字段）；
+- 浏览器端工具 5s 超时对 native 工具放宽为 30s~5min（含审批等待），审批长挂不误杀；
+- 本机 Ollama 工具调用依赖 Ollama 版本支持 tools（旧版本不支持时自动回退普通对话并提示）。
+
+
 ## v3.15.13（2026-09-03）路由体验定点修复：熔断/驻留亲和/元问题直答/名字统一/光标收尾
 
 ### 修复

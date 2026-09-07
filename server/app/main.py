@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import config, db
 from .llm_proxy import router as llm_router
 from .api import router as api_router
+from .agent_tools import router as agent_tools_router
 from .crud import counts as db_counts
 
 # 工程根（server/ 的上一级；moray-workbench.html / vendor/ 所在处）
@@ -36,9 +37,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="MoRay 本地薄后端", version=config.VERSION, lifespan=lifespan)
 
-# M2 云端 LLM 代理路由 + M3 会话/消息/设置 CRUD 路由
+# M2 云端 LLM 代理路由 + M3 会话/消息/设置 CRUD 路由 + [阶段0] 本机 Agent 工具路由
 app.include_router(llm_router)
 app.include_router(api_router)
+app.include_router(agent_tools_router)
 
 # 关键坑：前端可能以 file:// 打开（Origin 为字符串 "null"），也可能来自
 # http://127.0.0.1 或 http://localhost 的任意端口 —— 正则统一放行

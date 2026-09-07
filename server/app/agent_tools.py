@@ -1,0 +1,834 @@
+"""本机 Agent 工具路由（阶段0：让 Agent 能受控操作本机，最小可用闭环）
+
+只读/写文件与白名单只读命令四类本机工具，全部限制在"受控工作区"内执行：
+
+安全模型（层层设防，全部可脱离模型单测）：
+1. 工作区根：MORAY_WORKSPACE 环境变量 > SQLite kv(agent_workspace，设置页可改) > 默认 D:\\MoRayWorkspace；
+   目录不存在时自动创建。所有路径解析后必须仍位于工作区内。
+2. 路径安全：pathlib + resolve()（解析符号链接/junction）+ commonpath 前缀判定 + normcase 大小写归一；
+   拒绝绝对路径（盘符/UNC/根斜杠）、.. 越界、符号链接/junction 逃逸、Windows 保留设备名（CON/NUL/...）。
+3. 副作用双保险：write_file / run_command 在 approved !== true 时绝不执行，返回 {needsApproval, summary}；
+   只读工具默认直接执行（审批策略由前端控制，后端不重复拦截只读）。
+4. 写文件安全：父目录自动创建；危险/可执行后缀命中即拒；overwrite=false 且文件存在即拒；内容有大小上限。
+5. run_command：subprocess.run(shell=False, 列表参数)，命令名必须在只读白名单（git 子命令受限 /
+   python|node|npm --version / where <名>），参数逐个正则校验并黑名单敏感词，杜绝 shell 元字符与管道；
+   单命令 15s 超时；stdout/stderr 截断。
+6. 结果截断：read_file 默认 64KB（可传 maxBytes，上限 1MB），超过 2000 行再截断；list_directory 单层最多 500 条。
+7. 审计：所有到达本路由的工具调用（含被拒/未审批/客户端拒绝）写入 SQLite agent_tool_log，GET /api/agent/log 分页。
+
+约束：只绑 127.0.0.1（config.HOST）；不做删除/移动/联网下载执行；本模块自身无任何 shell 拼串。
+"""
+import codecs
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+from . import config, crud
+
+router = APIRouter()
+_logger = logging.getLogger("moray.agent")
+
+# ---------------------------------------------------------------- 常量
+
+# 危险/可执行后缀（大小写不敏感，命中即拒写）。不含纯文本扩展的常用类型。
+DANGEROUS_EXTS = frozenset(
+    ".exe .dll .bat .cmd .ps1 .vbs .vbe .msi .msp .scr .reg .com .pif .jar .hta .cpl .wsf .wsh .lnk "
+    ".sh .pyc .pyd .sys .drv .ocx .fon .appx .msix".split()
+)
+
+# Windows 保留设备名（作为文件名写会落到设备而非磁盘）
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+# 副作用工具：approved !== true 绝不执行
+SIDE_EFFECT_TOOLS = frozenset({"write_file", "run_command", "edit_file"})
+
+# 参数合法字符（纯 token：字母数字 + 少量安全标点；禁空格/引号/重定向/管道/百分号等元字符）
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:@/\\+~-]+$")
+# git 子命令参数黑名单子串：可导致写文件/执行外挂/网络动作的选项一律拒绝
+_GIT_FORBIDDEN = ("output", "ext-diff", "ext_diff", "exec", "upload-pack", "upload_pack", "recurse", "object-format")
+
+# 只读命令白名单：{命令名: 参数校验函数}；校验函数返回 (bool, 拒绝原因)
+def _no_args(args):
+    return (not args), "该命令不允许带参数（仅支持裸命令形态，如 git status）"
+
+
+def _git_args(args):
+    if not args:
+        return True, ""
+    if args[0] not in ("status", "log", "diff", "branch"):
+        return False, f"git 仅允许 status/log/diff/branch 子命令，收到「{args[0]}」"
+    for a in args[1:]:
+        if not _TOKEN_RE.match(a) or ".." in a:
+            return False, f"git 参数含非法字符：{a[:40]}"
+        low = a.lower()
+        if any(f in low for f in _GIT_FORBIDDEN):
+            return False, f"git 参数被安全策略拒绝（敏感选项）：{a[:40]}"
+    return True, ""
+
+
+def _version_args(args):
+    return (args == ["--version"]), "该命令仅允许 --version 形态"
+
+
+def _where_args(args):
+    if not args:
+        return False, "where 需要一个命令名参数（如 where python）"
+    for a in args:
+        if not _TOKEN_RE.match(a) or not re.match(r"^[A-Za-z0-9._\-]+$", a):
+            return False, f"where 参数含非法字符：{a[:40]}"
+    return True, ""
+
+
+CMD_WHITELIST = {
+    "git": _git_args,
+    "python": _version_args,
+    "python3": _version_args,
+    "node": _version_args,
+    "npm": _version_args,
+    "where": _where_args,
+}
+
+MAX_LIST_ITEMS = 500          # list_directory 单层上限
+DEFAULT_MAX_BYTES = 64 * 1024  # read_file 默认字节上限（或 2000 行，先到先截）
+MAX_READ_BYTES = 1024 * 1024   # read_file maxBytes 上限
+MAX_WRITE_BYTES = 5 * 1024 * 1024  # write_file 内容上限
+MAX_LINES = 2000              # read_file 行数上限
+CMD_TIMEOUT_SECONDS = 15      # run_command 单命令超时
+OUTPUT_LIMIT = 64 * 1024      # run_command stdout/stderr 各截断
+FIND_LIMIT = 1000             # find_files 结果上限
+SEARCH_LIMIT = 200            # search_text 命中上限
+SEARCH_SCAN_LIMIT = 2000      # search_text 单次扫描文件数上限
+SEARCH_LINE_CHARS = 200       # search_text 单行截断
+EDIT_SNIPPET_CHARS = 80       # edit_file 变更前后片段上下文宽度
+
+# ---------------------------------------------------------------- 错误
+
+class ToolError(Exception):
+    """工具可预期错误（参数/文件状态等），以 {ok:false, code, message} 返回"""
+
+    def __init__(self, message, code="tool_error"):
+        super().__init__(message)
+        self.code = code
+
+
+class SafeError(ToolError):
+    """安全层拒绝：越界 / 危险后缀 / 白名单外命令等（审计 status=rejected）"""
+
+    def __init__(self, message):
+        super().__init__(message, code="unsafe")
+
+
+# ---------------------------------------------------------------- 工作区
+
+def _workspace_root(create: bool = True) -> Path:
+    """解析工作区根：环境变量 > kv(agent_workspace) > 默认；必要时自动创建。
+
+    环境变量优先级最高（进程级配置，运维/测试可用）；设置页修改写 kv。
+    """
+    env_ws = os.environ.get("MORAY_WORKSPACE", "").strip()
+    if env_ws:
+        root = Path(env_ws)
+    else:
+        saved = crud.kv_get("agent_workspace") or ""
+        root = Path(saved.strip()) if saved.strip() else Path(config.WORKSPACE_DEFAULT)
+    try:
+        root = root.expanduser().resolve()
+    except OSError:
+        root = Path(str(root).replace("/", os.sep)).resolve()
+    if create:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:  # noqa: BLE001
+            raise ToolError(f"无法创建工作区目录 {root}：{e}") from e
+    return root
+
+
+def _is_reserved_name(name: str) -> bool:
+    base = name.split(".")[0].upper()
+    return base in _RESERVED_NAMES
+
+
+def _safe_path(raw, *, allow_missing: bool = True) -> Path:
+    """把相对工作区的入参 path 解析为受控绝对路径；任何逃逸/越界/保留名都拒绝。
+
+    - 拒绝：绝对路径（盘符 C:/x、UNC \\\\server\\share、根斜杠 /x、\\x）、.. 越界、
+      解析后（含符号链接/junction 指向）超出工作区根、Windows 保留设备名、含 NUL 等非法字符。
+    - 大小写：Windows 路径比较经 normcase 归一（盘符/全路径小写化），盘符不同会抛 ValueError → 拒绝。
+    """
+    ws = _workspace_root()
+    if raw is None:
+        raw = ""
+    p = Path(str(raw).strip().replace("\\", "/"))
+    if _is_reserved_name(p.name):
+        raise SafeError(f"「{p.name}」是 Windows 保留设备名，不允许作为工作区文件")
+    # 绝对路径逃逸：pathlib 在 Windows 上 Path(ws) / 'C:/x' 会整体替换为 'C:/x'，必须先行拒绝
+    # 注意 drive-relative 形态（'C:secret.txt'）is_absolute()=False 但带盘符，同样拒绝
+    if p.is_absolute() or p.drive:
+        raise SafeError("不允许绝对路径，请使用相对工作区的路径（如 sub/hello.txt）")
+    try:
+        target = (ws / p).resolve(strict=False)
+    except OSError as e:  # noqa: BLE001 - NUL 等非法字符在 resolve 阶段抛
+        raise SafeError(f"路径非法：{e}") from e
+    # 解析后（symlink/junction 已展开）必须仍在工作区内；commonpath 不同盘会抛 ValueError
+    try:
+        ws_n = os.path.normcase(str(ws))
+        tgt_n = os.path.normcase(str(target))
+        if os.path.commonpath([ws_n, tgt_n]) != ws_n:
+            raise SafeError(f"路径越界被拒绝：{raw}（解析后 {target} 不在工作区 {ws} 内）")
+    except ValueError:
+        raise SafeError(f"路径越界被拒绝：{raw}（跨盘符路径不被允许）") from None
+    if not allow_missing and not target.exists():
+        raise ToolError(f"路径不存在：{raw}")
+    return target
+
+
+def _summarize_args(name: str, args: dict) -> str:
+    """审计用参数摘要：写文件记录目标路径+字节数，命令记录完整命令，其余截断 JSON"""
+    try:
+        if name == "write_file":
+            path = str(args.get("path") or "").strip()
+            content = args.get("content")
+            size = len(content) if isinstance(content, str) else (len(json.dumps(content, ensure_ascii=False)) if content is not None else 0)
+            return f"path={path} bytes={size}"
+        if name == "run_command":
+            cmd = str(args.get("command") or "").strip()
+            a = args.get("args")
+            if isinstance(a, list):
+                cmd += " " + " ".join(str(x) for x in a)
+            return "command=" + cmd[:200]
+        return json.dumps(args, ensure_ascii=False)[:200]
+    except Exception:  # noqa: BLE001
+        return str(args)[:200]
+
+
+def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, detail: str = ""):
+    try:
+        crud.append_agent_log(name, _summarize_args(name, args), approved, status, ms, detail)
+    except Exception as e:  # noqa: BLE001 - 审计失败不影响工具结果
+        _logger.warning("agent audit write failed: %s", e)
+
+
+def _err(status_code: int, code: str, message: str):
+    return JSONResponse(status_code=status_code, content={"ok": False, "code": code, "message": message})
+
+
+# ---------------------------------------------------------------- 四个工具实现
+
+def _rel(ws: Path, target: Path) -> str:
+    """工作区内路径的展示形式（相对正斜杠）"""
+    try:
+        return str(target.relative_to(ws)).replace(os.sep, "/")
+    except ValueError:
+        return str(target)
+
+
+def _read_bytes(path: Path, max_bytes: int):
+    """读文件字节；截断读取由调用方计算（此处按 max_bytes 截断读取）。返回 (data, truncated)"""
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        data = f.read(min(size, max_bytes))
+    return data, size > max_bytes
+
+
+def _tool_list_directory(args: dict):
+    raw = (args.get("path") or "").strip()
+    ws = _workspace_root()
+    target = ws if not raw or raw in (".", "./") else _safe_path(raw)
+    if not target.exists():
+        raise ToolError(f"目录不存在：{_rel(ws, target)}")
+    if not target.is_dir():
+        raise ToolError(f"不是目录：{_rel(ws, target)}")
+    entries = []
+    truncated = False
+    try:
+        for child in sorted(target.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
+            if len(entries) >= MAX_LIST_ITEMS:
+                truncated = True
+                break
+            try:
+                st = child.stat()
+                entries.append({
+                    "name": child.name,
+                    "type": "dir" if child.is_dir() else "file",
+                    "size": st.st_size if child.is_file() else 0,
+                    "mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime)),
+                })
+            except OSError:
+                entries.append({"name": child.name, "type": "file", "size": 0, "mtime": ""})
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"列目录失败：{e}") from e
+    return {
+        "path": _rel(ws, target),
+        "count": len(entries),
+        "truncated": truncated,
+        "note": f"条目超过 {MAX_LIST_ITEMS} 条，已截断" if truncated else "",
+        "items": entries,
+    }
+
+
+def _tool_read_file(args: dict):
+    ws = _workspace_root()
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        raise ToolError("缺少 path 参数（相对工作区的文件路径）")
+    target = _safe_path(raw)
+    if not target.exists():
+        raise ToolError(f"文件不存在：{_rel(ws, target)}")
+    if not target.is_file():
+        raise ToolError(f"不是文件：{_rel(ws, target)}")
+    try:
+        max_bytes = int(args.get("maxBytes") or DEFAULT_MAX_BYTES)
+    except (TypeError, ValueError):
+        max_bytes = DEFAULT_MAX_BYTES
+    max_bytes = min(max(1024, max_bytes), MAX_READ_BYTES)
+    try:
+        data, truncated = _read_bytes(target, max_bytes)
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"读取失败：{e}") from e
+    # 二进制探测：前 8KB 含 NUL 判定为二进制，返回明确错误而非乱码
+    if b"\x00" in data[:8192]:
+        raise ToolError(f"「{_rel(ws, target)}」是二进制文件或含 NUL 数据，不支持文本读取", code="binary_file")
+    # UTF-8 严格解码；截断边界若正好切在多字节序列中，允许丢弃尾部不完整序列（用增量解码器）
+    dec = codecs.getincrementaldecoder("utf-8")("strict")
+    try:
+        text = dec.decode(data)
+    except UnicodeDecodeError as e:
+        raise ToolError(f"「{_rel(ws, target)}」不是 UTF-8 文本（解码失败：{e}），拒绝返回乱码", code="not_utf8") from None
+    try:
+        tail = dec.decode(b"", final=True)  # 截断边界不完整多字节会在此报错
+    except UnicodeDecodeError:
+        tail = ""  # 仅因截断导致：丢弃尾部不完整字节，truncated 已为 True
+    text += tail
+    # 行数上限：截断后仍超过 MAX_LINES 行则按行再截
+    lines = text.splitlines()
+    if len(lines) > MAX_LINES:
+        text = "\n".join(lines[:MAX_LINES])
+        truncated = True
+    return {
+        "path": _rel(ws, target),
+        "content": text,
+        "truncated": truncated,
+        "bytes": len(data),
+        "note": ("内容超过限制已截断" if truncated else ""),
+    }
+
+
+def _tool_write_file(args: dict):
+    ws = _workspace_root()
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        raise ToolError("缺少 path 参数（相对工作区的目标文件路径）")
+    target = _safe_path(raw)
+    if target.suffix.lower() in DANGEROUS_EXTS:
+        raise SafeError(f"禁止写入危险/可执行后缀文件：{target.suffix}（{_rel(ws, target)}）")
+    content = args.get("content")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        try:
+            content = json.dumps(content, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            content = str(content)
+    if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
+        raise ToolError(f"写入内容超过 {MAX_WRITE_BYTES // 1048576}MB 上限，已拒绝")
+    overwrite = args.get("overwrite", True)
+    if overwrite is False and target.exists():
+        raise ToolError(f"文件已存在且 overwrite=false，已拒绝覆盖：{_rel(ws, target)}")
+    try:
+        if not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"写入失败：{e}") from e
+    return {"path": _rel(ws, target), "bytes": len(content.encode("utf-8")), "written": True}
+
+
+def _decode_output(data: bytes) -> str:
+    """命令输出解码：优先 UTF-8 严格；失败（GBK 代码页等）回退 gbk + replace"""
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("gbk", errors="replace")
+        except Exception:  # noqa: BLE001
+            return data.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- M2 三个高价值工具
+
+def _iter_workspace_files(root: Path, rel_dir: str, limit: int):
+    """递归枚举工作区内真实文件（跳过符号链接/junction，不跟随逃逸），yield (abs_path, rel_path)。
+
+    手动 scandir 而非 rglob：显式跳过 symlink/junction 目录，防止链接逃逸进入遍历。
+    """
+    base = root if not rel_dir or rel_dir == "." else root / rel_dir
+    stack = [base]
+    scanned = 0
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = sorted(os.scandir(cur), key=lambda e: e.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue  # 链接不进结果也不深入
+                if entry.is_dir(follow_symlinks=False):
+                    # junction/挂载点在 Windows 上 is_symlink() 可能为 False，再核对解析位置仍在工作区
+                    try:
+                        real = Path(entry.path).resolve()
+                        if os.path.normcase(str(real)) != os.path.normcase(str(Path(entry.path))) and \
+                           os.path.commonpath([os.path.normcase(str(root)), os.path.normcase(str(real))]) != os.path.normcase(str(root)):
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                    stack.append(Path(entry.path))
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    scanned += 1
+                    if scanned > limit:
+                        return
+                    yield Path(entry.path)
+            except OSError:
+                continue
+
+
+def _tool_find_files(args: dict):
+    """find_files(path?, pattern?)：工作区内按文件名通配递归查找（只读，限 1000 条）"""
+    ws = _workspace_root()
+    raw_dir = str(args.get("path") or "").strip()
+    pattern = str(args.get("pattern") or "*").strip() or "*"
+    if len(pattern) > 200:
+        raise ToolError("pattern 过长（>200 字符）")
+    target_dir = "." if not raw_dir or raw_dir in (".", "./") else raw_dir
+    # path 本身也要过安全校验（目录存在性在遍历时体现）
+    dir_abs = ws if target_dir == "." else _safe_path(target_dir)
+    if not dir_abs.is_dir():
+        raise ToolError(f"目录不存在：{target_dir}")
+
+    import fnmatch
+    matched = []
+    truncated = False
+    scanned = 0
+    for f in _iter_workspace_files(ws, target_dir, SEARCH_SCAN_LIMIT * 2):
+        scanned += 1
+        rel = _rel(ws, f)
+        if dir_abs != ws and not os.path.normcase(str(f)).startswith(os.path.normcase(str(dir_abs) + os.sep)):
+            if os.path.normcase(str(f)) != os.path.normcase(str(dir_abs)):
+                continue
+        if fnmatch.fnmatch(f.name.lower(), pattern.lower()):
+            if len(matched) >= FIND_LIMIT:
+                truncated = True
+                break
+            try:
+                st = f.stat()
+                mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+                size = st.st_size
+            except OSError:
+                size, mtime = 0, ""
+            matched.append({"path": rel, "size": size, "mtime": mtime})
+    return {
+        "pattern": pattern,
+        "path": target_dir,
+        "count": len(matched),
+        "truncated": truncated,
+        "scanned": scanned,
+        "items": matched,
+        "note": f"结果超过 {FIND_LIMIT} 条已截断" if truncated else "",
+    }
+
+
+def _tool_search_text(args: dict):
+    """search_text(query, path?, glob?, regex?)：工作区内全文检索（只读，默认 200 条命中）。
+
+    - 二进制（含 NUL）/非 UTF-8 文件跳过并计数（不中断检索，返回 skipped 计数）；
+    - regex=true 时 query 为正则，非法正则明确报错；
+    - 单行截断 SEARCH_LINE_CHARS 字符。
+    """
+    import fnmatch
+    import re as _re
+
+    ws = _workspace_root()
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise ToolError("缺少 query 参数（要搜索的文本或正则）")
+    raw_dir = str(args.get("path") or "").strip()
+    glob_pat = str(args.get("glob") or "").strip()
+    use_regex = args.get("regex") is True
+
+    if use_regex:
+        try:
+            rx = _re.compile(query)
+        except _re.error as e:  # noqa: BLE001
+            raise ToolError(f"正则表达式非法：{e}（query={query[:80]}）") from None
+        matcher = lambda s: rx.search(s)  # noqa: E731
+    else:
+        needle = query.lower()
+        matcher = lambda s: needle in s.lower()  # noqa: E731
+
+    target_dir = "." if not raw_dir or raw_dir in (".", "./") else raw_dir
+    dir_abs = ws if target_dir == "." else _safe_path(target_dir)
+    if not dir_abs.is_dir():
+        raise ToolError(f"目录不存在：{target_dir}")
+
+    hits = []
+    skipped_binary = 0
+    scanned = 0
+    truncated = False
+    for f in _iter_workspace_files(ws, target_dir, SEARCH_SCAN_LIMIT):
+        scanned += 1
+        rel = _rel(ws, f)
+        if dir_abs != ws and os.path.normcase(str(f)) != os.path.normcase(str(dir_abs)) and \
+           not os.path.normcase(str(f)).startswith(os.path.normcase(str(dir_abs) + os.sep)):
+            continue
+        if glob_pat and not fnmatch.fnmatch(f.name.lower(), glob_pat.lower()):
+            continue
+        try:
+            if f.stat().st_size > MAX_READ_BYTES:
+                data = f.read_bytes()[:MAX_READ_BYTES]
+            else:
+                data = f.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in data[:8192]:
+            skipped_binary += 1
+            continue
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            skipped_binary += 1  # 非 UTF-8 文本同样跳过计数
+            continue
+        file_hits = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if matcher(line):
+                file_hits.append({"file": rel, "line": lineno, "text": line[:SEARCH_LINE_CHARS]})
+                if len(hits) + len(file_hits) >= SEARCH_LIMIT:
+                    break
+        hits.extend(file_hits)
+        if len(hits) >= SEARCH_LIMIT:
+            hits = hits[:SEARCH_LIMIT]
+            truncated = True
+            break
+    return {
+        "query": query,
+        "regex": use_regex,
+        "glob": glob_pat or None,
+        "count": len(hits),
+        "truncated": truncated,
+        "scanned_files": scanned,
+        "skipped_binary": skipped_binary,
+        "items": hits,
+        "note": f"命中超过 {SEARCH_LIMIT} 条已截断" if truncated else "",
+    }
+
+
+def _tool_edit_file(args: dict):
+    """edit_file(path, old_str, new_str, replace_all?)：精确字符串替换（副作用，需审批）。
+
+    - old_str 必须在文件中唯一匹配（除非 replace_all=true），0 个或多个匹配都报错并提示补充上下文；
+    - 返回替换次数与变更前后片段（各 EDIT_SNIPPET_CHARS 上下文宽度）；
+    - 危险后缀/二进制/非 UTF-8 明确拒绝。
+    """
+    ws = _workspace_root()
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        raise ToolError("缺少 path 参数")
+    old_str = args.get("old_str")
+    new_str = args.get("new_str")
+    if not isinstance(old_str, str) or old_str == "":
+        raise ToolError("old_str 必须是非空字符串（要被替换的精确文本）")
+    if not isinstance(new_str, str):
+        raise ToolError("new_str 必须是字符串（替换后的文本，可为空串表示删除）")
+    replace_all = args.get("replace_all") is True
+
+    target = _safe_path(raw)
+    if target.suffix.lower() in DANGEROUS_EXTS:
+        raise SafeError(f"禁止编辑危险/可执行后缀文件：{target.suffix}（{_rel(ws, target)}）")
+    if not target.exists():
+        raise ToolError(f"文件不存在：{_rel(ws, target)}（新建文件请用 write_file）")
+    if not target.is_file():
+        raise ToolError(f"不是文件：{_rel(ws, target)}")
+    try:
+        content = target.read_bytes()
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"读取失败：{e}") from e
+    if b"\x00" in content[:8192]:
+        raise ToolError(f"「{_rel(ws, target)}」是二进制文件（含 NUL），edit_file 仅支持文本文件", code="binary_file")
+    try:
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ToolError(f"「{_rel(ws, target)}」不是 UTF-8 文本，edit_file 拒绝编辑（避免编码损坏）", code="not_utf8") from None
+
+    occurrences = text.count(old_str)
+    if occurrences == 0:
+        raise ToolError(
+            f"old_str 在文件中未找到（0 处匹配）。请先用 read_file 核对实际内容（注意空白与换行），"
+            f"或提供更长的上下文片段"
+        )
+    if occurrences > 1 and not replace_all:
+        raise ToolError(
+            f"old_str 在文件中匹配 {occurrences} 处，不唯一。请提供更长的上下文使匹配唯一，"
+            f"或指定 replace_all=true 全部替换"
+        )
+    count = occurrences if replace_all else 1
+    idx = text.find(old_str)
+    ctx_lo = max(0, idx - EDIT_SNIPPET_CHARS)
+    ctx_hi = min(len(text), idx + len(old_str) + EDIT_SNIPPET_CHARS)
+    before_snippet = text[ctx_lo:ctx_hi]
+    new_text = text.replace(old_str, new_str) if replace_all else text.replace(old_str, new_str, 1)
+    after_idx = new_text.find(new_str[:64]) if new_str else idx
+    after_lo = max(0, after_idx - EDIT_SNIPPET_CHARS)
+    after_hi = min(len(new_text), after_idx + len(new_str) + EDIT_SNIPPET_CHARS)
+    after_snippet = new_text[after_lo:after_hi]
+    try:
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(new_text)
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"写入失败：{e}") from e
+    return {
+        "path": _rel(ws, target),
+        "replacements": count,
+        "before_snippet": before_snippet,
+        "after_snippet": after_snippet,
+        "bytes": len(new_text.encode("utf-8")),
+        "edited": True,
+    }
+
+
+def _tool_run_command(args: dict):
+    ws = _workspace_root()
+    command = str(args.get("command") or "").strip()
+    raw_args = args.get("args")
+    if raw_args is None:
+        cmd_args = []
+    elif isinstance(raw_args, list):
+        cmd_args = [str(a) for a in raw_args]
+    else:
+        cmd_args = [str(raw_args)]
+    # 1) 命令名白名单
+    checker = CMD_WHITELIST.get(command)
+    if checker is None:
+        raise SafeError(
+            f"命令「{command}」不在只读白名单（允许：git status/log/diff/branch、python --version、"
+            "node --version、npm --version、where <命令名>），已拒绝"
+        )
+    # 2) 显式拒绝 shell 元字符（纵深防御；token 正则已排除绝大部分）
+    for a in cmd_args:
+        if any(ch in a for ch in '&|;<>^`"\'()%$!*\r\n\t '):
+            raise SafeError(f"参数含 shell 元字符/空白，已拒绝：{a[:40]}")
+    ok, why = checker(cmd_args)
+    if not ok:
+        raise SafeError(f"命令参数被拒绝：{why}")
+    # 3) 解析真实可执行文件（防 PATH 注入歧义；npm 在 Windows 为 npm.cmd，CreateProcess 可直接执行）
+    exe = shutil.which(command)
+    if not exe:
+        raise SafeError(f"在系统中找不到可执行文件：{command}")
+    # 4) shell=False + 列表参数执行；cwd 锁定工作区；15s 超时
+    full = [exe] + cmd_args
+    try:
+        t0 = time.perf_counter()
+        proc = subprocess.run(
+            full,
+            capture_output=True,
+            timeout=CMD_TIMEOUT_SECONDS,
+            shell=False,
+            cwd=str(ws),
+            check=False,
+        )
+        ms = int((time.perf_counter() - t0) * 1000)
+    except subprocess.TimeoutExpired as e:
+        raise ToolError(
+            f"命令执行超过 {CMD_TIMEOUT_SECONDS}s 超时，已终止（输出截断）："
+            + (_decode_output((e.stdout or b""))[:200] if e.stdout else ""),
+            code="timeout",
+        ) from None
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"命令无法启动：{e}") from e
+    return {
+        "command": command,
+        "args": cmd_args,
+        "stdout": _decode_output(proc.stdout)[:OUTPUT_LIMIT],
+        "stderr": _decode_output(proc.stderr)[:OUTPUT_LIMIT],
+        "exitCode": proc.returncode,
+        "ms": ms,
+    }
+
+
+TOOL_IMPLS = {
+    "list_directory": _tool_list_directory,
+    "read_file": _tool_read_file,
+    "write_file": _tool_write_file,
+    "run_command": _tool_run_command,
+    "find_files": _tool_find_files,
+    "search_text": _tool_search_text,
+    "edit_file": _tool_edit_file,
+}
+
+
+def _human_summary(name: str, args: dict) -> dict:
+    """needsApproval 响应中的可读摘要（前端审批卡同样自渲染参数，此字段供 API 直调方/审计展示）"""
+    ws = _workspace_root()
+    if name == "write_file":
+        path = str(args.get("path") or "").strip()
+        content = str(args.get("content") or "")
+        preview = content[:200] + ("…" if len(content) > 200 else "")
+        overwrite = "覆盖" if args.get("overwrite", True) is not False else "仅新建（不覆盖）"
+        return {
+            "tool": name,
+            "title": f"写文件 {path}",
+            "detail": f"将{'创建' if overwrite == '仅新建（不覆盖）' else '写入/覆盖'}工作区内文件 {path}（{len(content.encode('utf-8'))} 字节，{overwrite}）",
+            "preview": preview,
+        }
+    if name == "run_command":
+        cmd = str(args.get("command") or "").strip()
+        a = args.get("args")
+        if isinstance(a, list):
+            cmd += " " + " ".join(str(x) for x in a)
+        return {"tool": name, "title": f"执行命令 {cmd[:120]}", "detail": f"将在工作区 {ws} 内执行只读白名单命令：{cmd}"}
+    if name == "edit_file":
+        path = str(args.get("path") or "").strip()
+        old = str(args.get("old_str") or "")
+        new = str(args.get("new_str") or "")
+        mode = "全部替换" if args.get("replace_all") is True else "唯一匹配替换"
+        return {
+            "tool": name,
+            "title": f"编辑文件 {path}",
+            "detail": f"精确替换 {path} 中的文本（{len(old.encode('utf-8'))} 字节 → {len(new.encode('utf-8'))} 字节，{mode}）",
+            "preview": old[:200] + ("…" if len(old) > 200 else ""),
+        }
+    return {"tool": name, "title": name, "detail": json.dumps(args, ensure_ascii=False)[:300]}
+
+
+# ---------------------------------------------------------------- 路由
+
+@router.post("/api/agent/tool")
+async def agent_tool_call(request: Request):
+    """执行一个本机工具。
+
+    body: {name, args, approved?, decision?}
+    - 只读工具（list_directory/read_file）：approved 无关，直接执行；
+    - 副作用工具（write_file/run_command）：approved !== true → {needsApproval:true, summary} 绝不执行；
+    - decision='denied'：客户端拒绝上报，仅写审计（status=denied），绝不执行。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _err(400, "bad_json", "请求体不是合法 JSON")
+    name = str(body.get("name") or "").strip()
+    args = body.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    impl = TOOL_IMPLS.get(name)
+    if impl is None:
+        return _err(400, "unknown_tool", f"未知本机工具：{name}（可用：{', '.join(sorted(TOOL_IMPLS))}）")
+    is_side_effect = name in SIDE_EFFECT_TOOLS
+    approved = body.get("approved") is True
+    # 客户端拒绝上报：只审计，绝不执行任何工具（即使是只读的也按上报处理）
+    if str(body.get("decision") or "") == "denied":
+        _audit(name, args, False, "denied", 0, "客户端明确拒绝")
+        return {"ok": True, "data": {"denied": True}}
+    # 副作用双保险：未带 approved:true 一律不执行
+    if is_side_effect and not approved:
+        _audit(name, args, False, "needs_approval", 0, "副作用工具未获审批，未执行")
+        return {"ok": True, "needsApproval": True, "summary": _human_summary(name, args)}
+    t0 = time.perf_counter()
+    try:
+        data = impl(args)
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, True, "ok", ms)
+        return {"ok": True, "data": data}
+    except SafeError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "rejected", ms, str(e)[:200])
+        return {"ok": False, "code": e.code, "message": str(e)}
+    except ToolError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "error", ms, str(e)[:200])
+        return {"ok": False, "code": e.code, "message": str(e)}
+    except Exception as e:  # noqa: BLE001 - 兜底：内部错误不泄漏堆栈
+        _logger.exception("agent tool %s crashed", name)
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "error", ms, "internal: " + type(e).__name__)
+        return {"ok": False, "code": "internal_error", "message": f"工具执行内部错误：{type(e).__name__}"}
+
+
+@router.get("/api/agent/config")
+def agent_config():
+    """当前本机 Agent 配置（工作区根/版本/副作用工具清单），供前端展示与探测"""
+    try:
+        ws = _workspace_root(create=True)
+        writable = os.access(str(ws), os.W_OK) if ws.exists() else False
+        return {
+            "ok": True,
+            "data": {
+                "workspace": str(ws),
+                "workspaceExists": ws.exists(),
+                "writable": bool(writable),
+                "fromEnv": bool(os.environ.get("MORAY_WORKSPACE", "").strip()),
+                "version": config.VERSION,
+                "build": config.BUILD,
+                "sideEffectTools": sorted(SIDE_EFFECT_TOOLS),
+                "approvalPolicy": "readonly_auto",  # 只读自动执行；前端设置决定是否把只读也纳入人工审批
+            },
+        }
+    except ToolError as e:
+        return {"ok": False, "code": e.code, "message": str(e)}
+
+
+@router.post("/api/agent/config")
+async def agent_config_set(request: Request):
+    """修改工作区根（设置页）：校验目录可创建/可写后持久化到 kv(agent_workspace)。只读回 config"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _err(400, "bad_json", "请求体不是合法 JSON")
+    raw = str(body.get("workspace") or "").strip()
+    if not raw:
+        return _err(400, "bad_request", "缺少 workspace 字段")
+    try:
+        ws = Path(raw).expanduser().resolve()
+        ws.mkdir(parents=True, exist_ok=True)
+        probe = ws / ".moray_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as e:  # noqa: BLE001
+        return _err(400, "not_writable", f"目录不可写或无法创建：{e}")
+    try:
+        crud.kv_put("agent_workspace", str(ws))
+    except Exception as e:  # noqa: BLE001
+        return _err(500, "db_error", f"保存失败：{e}")
+    _audit("config_set_workspace", {"workspace": str(ws)}, True, "ok", 0)
+    return {"ok": True, "data": {"workspace": str(ws), "workspaceExists": True, "writable": True}}
+
+
+@router.get("/api/agent/log")
+def agent_log(limit: int = 50, offset: int = 0):
+    """审计日志分页（新→旧）"""
+    try:
+        rows, total = crud.list_agent_log(limit, offset)
+    except Exception as e:  # noqa: BLE001
+        return _err(500, "db_error", f"读取审计失败：{e}")
+    return {"ok": True, "data": {"rows": rows, "total": total, "limit": min(max(int(limit or 50), 1), 500), "offset": max(int(offset or 0), 0)}}
+
+
+@router.delete("/api/agent/log")
+def agent_log_clear():
+    """清空审计日志（设置页手动清空，前端二次确认后调用）"""
+    try:
+        n = crud.clear_agent_log()
+        _audit("config_clear_audit", {}, True, "ok", 0, f"cleared {n}")
+        return {"ok": True, "data": {"cleared": n}}
+    except Exception as e:  # noqa: BLE001
+        return _err(500, "db_error", f"清空失败：{e}")

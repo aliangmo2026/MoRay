@@ -285,6 +285,67 @@ def kv_put(key: str, value: str) -> None:
         conn.close()
 
 
+# ---------------- agent_tool_log（本机工具审计） ----------------
+
+def append_agent_log(tool: str, args_summary: str, approved: bool, status: str, ms: int = 0, detail: str = "") -> None:
+    """写一条本机工具审计（参数化插入，单事务）
+
+    status 取值：ok（执行成功）/ error（执行失败）/ timeout（命令超时）/
+    rejected（安全层拒绝：越界/危险后缀/白名单外命令等）/
+    needs_approval（副作用工具未带 approved）/ denied（客户端明确拒绝）
+    """
+    conn = _conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO agent_tool_log (tool, args_summary, approved, status, ms, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(tool)[:64],
+                str(args_summary)[:500],
+                1 if approved else 0,
+                str(status)[:24],
+                int(ms or 0),
+                str(detail)[:1000],
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_agent_log(limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
+    """审计日志分页（新→旧）。返回 (rows, total)"""
+    limit = min(max(int(limit or 50), 1), 500)
+    offset = max(int(offset or 0), 0)
+    conn = _conn()
+    try:
+        total = conn.execute("SELECT COUNT(*) AS c FROM agent_tool_log").fetchone()["c"]
+        rows = conn.execute(
+            "SELECT * FROM agent_tool_log ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows], total
+    finally:
+        conn.close()
+
+
+def clear_agent_log() -> int:
+    """清空审计日志（设置页手动清空用，前端带确认）。返回删除条数"""
+    conn = _conn()
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute("DELETE FROM agent_tool_log")
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ---------------- 计数（health 用） ----------------
 
 def counts() -> dict:

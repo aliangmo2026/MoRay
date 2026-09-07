@@ -338,7 +338,7 @@ const SettingsApp = {
               </div>
               <div>
                 <label class="form-label">默认模型</label>
-                <input type="text" id="setOpenaiModel" class="form-input" value="${escapeHtml(c.openaiModel)}" placeholder="gpt-4o-mini">
+                <input type="text" id="setOpenaiModel" class="form-input" value="${escapeHtml(c.openaiModel)}" placeholder="留空跟随服务商（示例：deepseek-chat / qwen-max）">
               </div>
               <div class="flex items-center justify-between">
                 <button class="text-[10px] text-danger hover:opacity-80" id="clearKeyBtn">清除存储的 API Key</button>
@@ -568,7 +568,7 @@ const SettingsApp = {
               <i data-lucide="sparkles" class="w-3.5 h-3.5 text-brand-cobalt"></i>重新查看新手引导
             </button>
             <div class="space-y-2 text-xs text-text-secondary">
-              <div class="flex justify-between"><span>版本</span><span class="font-mono text-text-primary">v3.0.0</span></div>
+              <div class="flex justify-between"><span>版本</span><span class="font-mono text-text-primary">v${(typeof window.MORAY_VERSION !== 'undefined') ? window.MORAY_VERSION : '1.0.0'}</span></div>
               <div class="flex justify-between"><span>开源协议</span><span class="text-text-primary">MIT License</span></div>
               <div class="flex justify-between"><span>运行模式</span><span class="text-text-primary">本地优先 · 单文件应用</span></div>
               <div class="flex justify-between"><span>数据存储</span><span class="text-text-primary">IndexedDB（moray_db）</span></div>
@@ -1089,7 +1089,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.15.13'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.18.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -1171,6 +1171,11 @@ async function bootApp() {
       if (typeof appendCostSettings === 'function') appendCostSettings();
       // [工具调用] 设置卡片（AI 工具总开关/轮数/每工具开关）
       if (typeof appendToolsSettings === 'function') appendToolsSettings();
+      // [阶段0 本机 Agent] 设置分区 + 顶部轻提示 + 按钮态同步（按钮已由 30_chat 文件尾安装，
+      // 但彼时 MoraySettings 未初始化，需在设置就绪后按持久化状态刷新按钮高亮）
+      if (typeof appendAgentSettings === 'function') appendAgentSettings();
+      if (typeof syncNativeAgentBtn === 'function') syncNativeAgentBtn();
+      if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
       // [工具调用] 对比模式提示（CompareApp.build 已重建面板，此时注入不被清掉）
       if (typeof installCompareToolsTip === 'function') installCompareToolsTip();
       // [任务1] 统一全局搜索面板（接管 ⌘K）

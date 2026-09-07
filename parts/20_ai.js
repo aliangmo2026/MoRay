@@ -68,7 +68,11 @@ const MoraySettings = {
     // ---- [工具调用] Function Calling ----
     toolsEnabled: false,           // 工具调用总开关（默认关：请求体不含 tools，链路与之前完全一致）
     toolsDisabled: [],             // 独立禁用的工具名列表
-    toolsMaxRounds: 3,             // 工具循环最大轮数（1-10）
+    toolsMaxRounds: 3,             // 工具循环最大轮数（1-12）
+    // ---- [阶段0 本机 Agent] 本机工具（受控工作区文件操作，需本地后端） ----
+    nativeToolsEnabled: false,     // 本机工具/Agent 开关（输入台显式开启；开启后才进入 listForRequest）
+    agentApprovalMode: 'readonly_auto', // 审批策略：readonly_auto=只读工具自动执行 | all=全部工具需人工审批
+    agentWorkspaceHint: '',        // 最近一次探测到的工作区根（仅展示缓存，权威在工作区在后端）
     // ---- [V3] 体验打磨 ----
     autoNaming: true,              // AI 自动命名会话
     namingStyle: '简洁',            // 命名风格：简洁 | 专业 | 活泼
@@ -191,10 +195,46 @@ class MorayAI {
     }
   }
 
+  /** [多模型对比修复] 模型列表刷新成功后通知依赖方（对比页据此自动重建勾选区/列）
+   * @returns {void} */
+  _notifyModelsUpdated() {
+    try {
+      window.dispatchEvent(new CustomEvent('moray-models-updated', {
+        detail: { backend: this.backend, count: (this.models || []).length }
+      }));
+    } catch (e) { /* 无监听方时安全忽略 */ }
+  }
+
+  /** [速度优化] 后台预热指定模型：空载极短请求让 Ollama 提前加载并驻留 30m；失败静默
+   * @param {string} model - 模型名 */
+  async warmupModel(model) {
+    try {
+      if (this.backend !== 'ollama' || !model) return;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2500);
+      const res = await fetch(this.ollamaURL + '/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          model: String(model),
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: false,
+          keep_alive: '30m',
+          options: { num_predict: 1, temperature: 0 }
+        })
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      await res.arrayBuffer();
+    } catch (e) { /* 预热失败静默，不影响主流程 */ }
+  }
+
   /** 探测后端可用性：先 Ollama 后 OpenAI
    * @returns {Promise<'ollama'|'openai'|'none'>} 后端类型 */
   async detectBackend() {
     this.health = 'checking';
+    const d0 = performance.now();
     // 1) Ollama
     try {
       const ctrl = new AbortController();
@@ -202,12 +242,16 @@ class MorayAI {
       const res = await fetch(this.ollamaURL + '/api/tags', { signal: ctrl.signal });
       clearTimeout(timer);
       if (res.ok) {
+        this.__lastTagsMs = performance.now() - d0;
+        this.__lastDetectMs = this.__lastTagsMs;
         const data = await res.json();
         this.models = (data.models || []).map(m => ({ name: m.name, size: m.size, details: m.details || {}, modifiedAt: m.modified_at }));
         this.backend = 'ollama';
         this.health = 'ok';
         // [P0] 默认模型为空时自动选定首个模型
         await this.autoSelectDefaultModel();
+        // [多模型对比修复] 通知依赖方：模型列表已就绪
+        this._notifyModelsUpdated();
         return this.backend;
       }
     } catch (e) { /* Ollama 不可达 */ }
@@ -228,6 +272,8 @@ class MorayAI {
           this.health = 'ok';
           // [P0] 默认模型为空时自动选定首个模型
           await this.autoSelectDefaultModel();
+          // [多模型对比修复] 通知依赖方：模型列表已就绪
+          this._notifyModelsUpdated();
           return this.backend;
         }
         if (res.status === 401) throw new Error('API Key 无效（401）');
@@ -269,7 +315,7 @@ class MorayAI {
    */
   chatStream(opts) {
     const controller = new AbortController();
-    const state = { content: '', reasoning: '' };
+    const state = { content: '', reasoning: '', toolAcc: { map: {}, order: [] } }; // [阶段1 M1] 流式 tool_calls 聚合器
     const startedAt = performance.now();
     let firstChunkAt = 0;
     const self = this;
@@ -289,6 +335,7 @@ class MorayAI {
             model: opts.model,
             messages: opts.messages,
             stream: true,
+            keep_alive: '30m', // [速度优化] 显式常驻 30 分钟，避免逐请求冷加载
             // [深度思考] think 是 /api/chat 顶层字段（与 model/messages 平级），不是 options 采样参数；
             // 仅思考型模型且显式指定 think 才带（qwen2.x 等非思考模型绝不含 think）
             ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
@@ -317,8 +364,13 @@ class MorayAI {
               const think = (j.message && j.message.thinking) || '';
               if (piece) state.content += piece;
               if (think) state.reasoning += think;
+              // [阶段1 M1] Ollama 流式 tool_calls 聚合（一次性/分片兼容，真机实测 qwen2.5:7b/qwen3.5 一次性全量）
+              if (j.message && j.message.tool_calls && j.message.tool_calls.length) {
+                accToolCallDeltas(state.toolAcc, j.message.tool_calls);
+              }
               if (opts.onChunk) opts.onChunk({ content: piece, reasoning: think, done: !!j.done });
               if (j.done) {
+                state.toolCalls = accToolCallsFinalize(state.toolAcc);
                 return self._finish(state, startedAt, firstChunkAt, j.eval_count, j.eval_duration);
               }
             } catch (e) { /* 跳过不完整行 */ }
@@ -379,9 +431,14 @@ class MorayAI {
               const ppiece = pdelta.content || '';
               if (ppiece) state.content += ppiece;
               if (pthink) state.reasoning += pthink;
+              // [阶段1 M1] 云端代理流式 delta.tool_calls 增量聚合（llm_proxy SSE 透传上游分片）
+              if (pdelta.tool_calls && pdelta.tool_calls.length) {
+                accToolCallDeltas(state.toolAcc, pdelta.tool_calls);
+              }
               if ((ppiece || pthink) && opts.onChunk) opts.onChunk({ content: ppiece, reasoning: pthink, done: false });
             }
           }
+          state.toolCalls = accToolCallsFinalize(state.toolAcc);
           return self._finish(state, startedAt, firstChunkAt, 0, 0);
         }
         const res = await fetch(self.openaiBase + '/chat/completions', {
@@ -443,44 +500,103 @@ class MorayAI {
     return { controller, promise };
   }
 
+  /** 工具参数序列化/解析统一：OpenAI 协议 arguments=JSON 字符串，Ollama 原生为对象
+   * @param {*} a - 参数
+   * @returns {Object} 对象 */
+  toolArgsToObject(a) {
+    if (a == null) return {};
+    if (typeof a === 'object') return a;
+    try { return JSON.parse(a); } catch (e) { return {}; }
+  }
+
+  /** 工具参数转协议字符串
+   * @param {*} a - 参数
+   * @returns {string} JSON 字符串 */
+  toolArgsToString(a) {
+    if (a == null) return '{}';
+    if (typeof a === 'string') return a;
+    try { return JSON.stringify(a); } catch (e) { return '{}'; }
+  }
+
+  /** [阶段0] Ollama 协议消息规范化：assistant.tool_calls[].function.arguments 由
+   * OpenAI 形态（字符串）转为 Ollama 原生形态（对象）；role:"tool" 消息保持不变
+   * @param {Array} msgs - 消息
+   * @returns {Array} 转换后消息 */
+  _ollamaMessages(msgs) {
+    return (msgs || []).map(m => {
+      if (!m) return m;
+      // Ollama tool 消息仅需 role+content（多余字段由 struct 解析忽略，这里显式收敛）
+      if (m.role === 'tool') return { role: 'tool', content: m.content || '' };
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        return Object.assign({}, m, {
+          content: m.content || '',
+          tool_calls: m.tool_calls.map(c => Object.assign({}, c, {
+            function: {
+              name: (c.function || {}).name || '',
+              arguments: this.toolArgsToObject((c.function || {}).arguments)
+            }
+          }))
+        });
+      }
+      return m;
+    });
+  }
+
   /** 非流式聊天（流式失败时回退）
    * @param {Object} opts - 同 chatStream
    * @returns {Promise<{content:string, reasoning:string, stats:Object}>} 结果 */
   async chat(opts) {
     const temperature = opts.temperature != null ? opts.temperature : MoraySettings.get('temperature');
     if (this.backend === 'ollama') {
+      const obody = {
+        model: opts.model,
+        messages: this._ollamaMessages(opts.messages),
+        stream: false,
+        keep_alive: '30m', // [速度优化] 非流式（工具轮/工作流/摘要）同样常驻
+        // [深度思考] 同流式：think 顶层下发，options 不含 think（非思考模型行为与之前完全一致）
+        ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
+        options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
+      };
+      // [阶段0] Ollama 原生 tools：请求体带 tools 才下发（无 tools 的旧请求行为完全一致）
+      if (opts.tools && opts.tools.length) obody.tools = opts.tools;
       const res = await fetch(this.ollamaURL + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: opts.model, messages: opts.messages, stream: false,
-          // [深度思考] 同流式：think 顶层下发，options 不含 think（非思考模型行为与之前完全一致）
-          ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
-          options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
-        })
+        body: JSON.stringify(obody)
       });
       if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
       const j = await res.json();
+      const mc = j.message || {};
+      // [阶段1 M1] 解析经 sanitize 容错：空调用过滤、arguments 对象↔字符串统一、截断补全
+      const toolCalls = sanitizeToolCalls(mc.tool_calls);
       return {
-        content: (j.message && j.message.content) || '',
-        reasoning: (j.message && j.message.thinking) || '',
-        stats: { tokPerSec: j.eval_count && j.eval_duration ? +(j.eval_count / (j.eval_duration / 1e9)).toFixed(1) : null, ms: 0, tokens: j.eval_count || 0 }
+        content: mc.content || '',
+        reasoning: mc.thinking || '',
+        toolCalls,
+        promptTokens: j.prompt_eval_count || 0,
+        stats: {
+          tokPerSec: j.eval_count && j.eval_duration ? +(j.eval_count / (j.eval_duration / 1e9)).toFixed(1) : null,
+          ms: 0, tokens: j.eval_count || 0, promptTokens: j.prompt_eval_count || 0
+        }
       };
     }
     if (this.backend === 'openai') {
       // [M2] 经本地后端代理（非流式：工具轮/摘要等场景）
       const proxyUrl = this._useProxy();
       if (proxyUrl) {
+        const pbody = {
+          model: opts.model || MoraySettings.get('openaiModel'),
+          messages: opts.messages, stream: false,
+          temperature, top_p: MoraySettings.get('topP'),
+          max_tokens: MoraySettings.get('maxTokens'),
+          think: opts.think
+        };
+        // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
+        if (opts.tools && opts.tools.length) pbody.tools = opts.tools;
         const pres = await fetch(proxyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: opts.model || MoraySettings.get('openaiModel'),
-            messages: opts.messages, stream: false,
-            temperature, top_p: MoraySettings.get('topP'),
-            max_tokens: MoraySettings.get('maxTokens'),
-            think: opts.think
-          })
+          body: JSON.stringify(pbody)
         });
         if (!pres.ok) {
           let msg = '云端代理请求失败（' + pres.status + '）';
@@ -491,6 +607,9 @@ class MorayAI {
         return {
           content: pj.content || '',
           reasoning: pj.reasoning || '',
+          // [阶段1 M1] 代理统一结构 tool_calls 经 sanitize 容错（空调用过滤/截断补全）
+          toolCalls: sanitizeToolCalls(pj.tool_calls),
+          promptTokens: (pj.usage && pj.usage.prompt_tokens) || 0,
           stats: { tokPerSec: null, ms: 0, tokens: (pj.usage && pj.usage.completion_tokens) || 0, promptTokens: (pj.usage && pj.usage.prompt_tokens) || 0 }
         };
       }
@@ -511,7 +630,7 @@ class MorayAI {
       const msg = j.choices && j.choices[0] && j.choices[0].message || {};
       return {
         content: msg.content || '', reasoning: msg.reasoning_content || '',
-        toolCalls: (msg.tool_calls && msg.tool_calls.length) ? msg.tool_calls : null,
+        toolCalls: sanitizeToolCalls(msg.tool_calls), // [阶段1 M1] 容错解析
         promptTokens: (j.usage && j.usage.prompt_tokens) || 0,
         stats: { tokPerSec: null, ms: 0, tokens: (j.usage && j.usage.completion_tokens) || 0 }
       };
@@ -663,9 +782,105 @@ class MorayAI {
     return {
       content: state.content,
       reasoning: state.reasoning,
+      // [阶段1 M1] 流式 tool_calls 聚合结果（无工具调用时为 null，向后兼容）
+      toolCalls: state.toolCalls || null,
       stats: { tokPerSec, ms: Math.round(totalMs), firstMs: firstChunkAt ? Math.round(firstChunkAt - startedAt) : null, tokens: completionTokens, cachedTokens: state.cachedTokens, promptTokens: state.promptTokens || est.tokens }
     };
   }
+}
+
+/** [阶段1 M1] 工具调用 JSON 截断补全：补齐未闭合的字符串引号与括号（流式分片/模型截断容错）
+ * @param {string} s - 可能被截断的 JSON 文本
+ * @returns {string} 补全后的文本 */
+function tryCompleteJson(s) {
+  let t = String(s || '').trim();
+  if (!t) return t;
+  try { JSON.parse(t); return t; } catch (e) { /* 继续补全 */ }
+  t = t.replace(/\\+$/, ''); // 去掉截断的尾部不完整转义
+  let inStr = false, esc = false;
+  const stack = [];
+  for (const ch of t) {
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inStr) t += '"';
+  while (stack.length) t += stack.pop();
+  return t;
+}
+
+/** [阶段1 M1] tool_calls 解析容错：过滤空/无名调用、arguments 对象↔字符串统一、
+ * JSON 截断尝试补全。兼容 Ollama 对象形态与 OpenAI 字符串形态。
+ * @param {Array} rawCalls - 原始 tool_calls
+ * @returns {Array|null} 规范化 [{id,type,function:{name,arguments:string}}] 或 null */
+function sanitizeToolCalls(rawCalls) {
+  if (!Array.isArray(rawCalls)) return null;
+  const out = [];
+  for (const c of rawCalls) {
+    if (!c || typeof c !== 'object') continue;
+    const fn = c.function || {};
+    const name = String(fn.name || '').trim();
+    if (!name) continue; // 空调用过滤
+    let args = fn.arguments;
+    if (args == null) args = {};
+    if (typeof args === 'object') {
+      try { args = JSON.stringify(args); } catch (e) { args = '{}'; }
+    } else if (typeof args === 'string') {
+      args = tryCompleteJson(args); // 截断尝试补全；解析失败保留原文（工具层再容错）
+    } else {
+      args = '{}';
+    }
+    out.push({
+      id: c.id || ('call_' + out.length + '_' + Date.now()),
+      type: 'function',
+      function: { name, arguments: args }
+    });
+  }
+  return out.length ? out : null;
+}
+
+/** [阶段1 M1] 流式 delta.tool_calls 聚合（OpenAI 兼容增量协议 + Ollama 对象形态兼容）。
+ * acc 由调用方持有：{map:{}, order:[]}；Ollama 无 index 时按到达顺序累加。
+ * @param {Object} acc - 聚合器
+ * @param {Array} deltas - delta.tool_calls 数组
+ * @returns {void} */
+function accToolCallDeltas(acc, deltas) {
+  if (!acc || !Array.isArray(deltas)) return;
+  for (const d of deltas) {
+    if (!d || typeof d !== 'object') continue;
+    const idx = (d.index != null) ? d.index : acc.order.length;
+    let slot = acc.map[idx];
+    if (!slot) { slot = acc.map[idx] = { id: '', name: '', arguments: '' }; acc.order.push(idx); }
+    if (d.id) slot.id = slot.id ? slot.id : String(d.id);
+    const fn = d.function || {};
+    if (fn.name) {
+      // Ollama 一次性给全名；OpenAI 增量给分片——两者用"未设置即赋值、已设置且不同则拼接"兼容
+      slot.name = slot.name ? (slot.name === fn.name ? slot.name : slot.name + fn.name) : fn.name;
+    }
+    if (fn.arguments != null) {
+      if (typeof fn.arguments === 'string') slot.arguments += fn.arguments;
+      else { try { slot.arguments = JSON.stringify(fn.arguments); } catch (e) { /* 忽略坏分片 */ } }
+    }
+  }
+}
+
+/** [阶段1 M1] 聚合器 → 规范 tool_calls（经 sanitize 容错）
+ * @param {Object} acc - accToolCallDeltas 的聚合器
+ * @returns {Array|null} */
+function accToolCallsFinalize(acc) {
+  if (!acc || !acc.order.length) return null;
+  const calls = acc.order.map(idx => {
+    const s = acc.map[idx];
+    return { id: s.id, type: 'function', function: { name: s.name, arguments: s.arguments || '{}' } };
+  });
+  return sanitizeToolCalls(calls);
 }
 
 /** [深度思考] 是否思考型模型（大小写不敏感，集中一处便于维护）。

@@ -6347,7 +6347,11 @@ const MoraySettings = {
     // ---- [工具调用] Function Calling ----
     toolsEnabled: false,           // 工具调用总开关（默认关：请求体不含 tools，链路与之前完全一致）
     toolsDisabled: [],             // 独立禁用的工具名列表
-    toolsMaxRounds: 3,             // 工具循环最大轮数（1-10）
+    toolsMaxRounds: 3,             // 工具循环最大轮数（1-12）
+    // ---- [阶段0 本机 Agent] 本机工具（受控工作区文件操作，需本地后端） ----
+    nativeToolsEnabled: false,     // 本机工具/Agent 开关（输入台显式开启；开启后才进入 listForRequest）
+    agentApprovalMode: 'readonly_auto', // 审批策略：readonly_auto=只读工具自动执行 | all=全部工具需人工审批
+    agentWorkspaceHint: '',        // 最近一次探测到的工作区根（仅展示缓存，权威在工作区在后端）
     // ---- [V3] 体验打磨 ----
     autoNaming: true,              // AI 自动命名会话
     namingStyle: '简洁',            // 命名风格：简洁 | 专业 | 活泼
@@ -6470,10 +6474,46 @@ class MorayAI {
     }
   }
 
+  /** [多模型对比修复] 模型列表刷新成功后通知依赖方（对比页据此自动重建勾选区/列）
+   * @returns {void} */
+  _notifyModelsUpdated() {
+    try {
+      window.dispatchEvent(new CustomEvent('moray-models-updated', {
+        detail: { backend: this.backend, count: (this.models || []).length }
+      }));
+    } catch (e) { /* 无监听方时安全忽略 */ }
+  }
+
+  /** [速度优化] 后台预热指定模型：空载极短请求让 Ollama 提前加载并驻留 30m；失败静默
+   * @param {string} model - 模型名 */
+  async warmupModel(model) {
+    try {
+      if (this.backend !== 'ollama' || !model) return;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2500);
+      const res = await fetch(this.ollamaURL + '/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          model: String(model),
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: false,
+          keep_alive: '30m',
+          options: { num_predict: 1, temperature: 0 }
+        })
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      await res.arrayBuffer();
+    } catch (e) { /* 预热失败静默，不影响主流程 */ }
+  }
+
   /** 探测后端可用性：先 Ollama 后 OpenAI
    * @returns {Promise<'ollama'|'openai'|'none'>} 后端类型 */
   async detectBackend() {
     this.health = 'checking';
+    const d0 = performance.now();
     // 1) Ollama
     try {
       const ctrl = new AbortController();
@@ -6481,12 +6521,16 @@ class MorayAI {
       const res = await fetch(this.ollamaURL + '/api/tags', { signal: ctrl.signal });
       clearTimeout(timer);
       if (res.ok) {
+        this.__lastTagsMs = performance.now() - d0;
+        this.__lastDetectMs = this.__lastTagsMs;
         const data = await res.json();
         this.models = (data.models || []).map(m => ({ name: m.name, size: m.size, details: m.details || {}, modifiedAt: m.modified_at }));
         this.backend = 'ollama';
         this.health = 'ok';
         // [P0] 默认模型为空时自动选定首个模型
         await this.autoSelectDefaultModel();
+        // [多模型对比修复] 通知依赖方：模型列表已就绪
+        this._notifyModelsUpdated();
         return this.backend;
       }
     } catch (e) { /* Ollama 不可达 */ }
@@ -6507,6 +6551,8 @@ class MorayAI {
           this.health = 'ok';
           // [P0] 默认模型为空时自动选定首个模型
           await this.autoSelectDefaultModel();
+          // [多模型对比修复] 通知依赖方：模型列表已就绪
+          this._notifyModelsUpdated();
           return this.backend;
         }
         if (res.status === 401) throw new Error('API Key 无效（401）');
@@ -6548,7 +6594,7 @@ class MorayAI {
    */
   chatStream(opts) {
     const controller = new AbortController();
-    const state = { content: '', reasoning: '' };
+    const state = { content: '', reasoning: '', toolAcc: { map: {}, order: [] } }; // [阶段1 M1] 流式 tool_calls 聚合器
     const startedAt = performance.now();
     let firstChunkAt = 0;
     const self = this;
@@ -6568,6 +6614,7 @@ class MorayAI {
             model: opts.model,
             messages: opts.messages,
             stream: true,
+            keep_alive: '30m', // [速度优化] 显式常驻 30 分钟，避免逐请求冷加载
             // [深度思考] think 是 /api/chat 顶层字段（与 model/messages 平级），不是 options 采样参数；
             // 仅思考型模型且显式指定 think 才带（qwen2.x 等非思考模型绝不含 think）
             ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
@@ -6596,8 +6643,13 @@ class MorayAI {
               const think = (j.message && j.message.thinking) || '';
               if (piece) state.content += piece;
               if (think) state.reasoning += think;
+              // [阶段1 M1] Ollama 流式 tool_calls 聚合（一次性/分片兼容，真机实测 qwen2.5:7b/qwen3.5 一次性全量）
+              if (j.message && j.message.tool_calls && j.message.tool_calls.length) {
+                accToolCallDeltas(state.toolAcc, j.message.tool_calls);
+              }
               if (opts.onChunk) opts.onChunk({ content: piece, reasoning: think, done: !!j.done });
               if (j.done) {
+                state.toolCalls = accToolCallsFinalize(state.toolAcc);
                 return self._finish(state, startedAt, firstChunkAt, j.eval_count, j.eval_duration);
               }
             } catch (e) { /* 跳过不完整行 */ }
@@ -6658,9 +6710,14 @@ class MorayAI {
               const ppiece = pdelta.content || '';
               if (ppiece) state.content += ppiece;
               if (pthink) state.reasoning += pthink;
+              // [阶段1 M1] 云端代理流式 delta.tool_calls 增量聚合（llm_proxy SSE 透传上游分片）
+              if (pdelta.tool_calls && pdelta.tool_calls.length) {
+                accToolCallDeltas(state.toolAcc, pdelta.tool_calls);
+              }
               if ((ppiece || pthink) && opts.onChunk) opts.onChunk({ content: ppiece, reasoning: pthink, done: false });
             }
           }
+          state.toolCalls = accToolCallsFinalize(state.toolAcc);
           return self._finish(state, startedAt, firstChunkAt, 0, 0);
         }
         const res = await fetch(self.openaiBase + '/chat/completions', {
@@ -6722,44 +6779,103 @@ class MorayAI {
     return { controller, promise };
   }
 
+  /** 工具参数序列化/解析统一：OpenAI 协议 arguments=JSON 字符串，Ollama 原生为对象
+   * @param {*} a - 参数
+   * @returns {Object} 对象 */
+  toolArgsToObject(a) {
+    if (a == null) return {};
+    if (typeof a === 'object') return a;
+    try { return JSON.parse(a); } catch (e) { return {}; }
+  }
+
+  /** 工具参数转协议字符串
+   * @param {*} a - 参数
+   * @returns {string} JSON 字符串 */
+  toolArgsToString(a) {
+    if (a == null) return '{}';
+    if (typeof a === 'string') return a;
+    try { return JSON.stringify(a); } catch (e) { return '{}'; }
+  }
+
+  /** [阶段0] Ollama 协议消息规范化：assistant.tool_calls[].function.arguments 由
+   * OpenAI 形态（字符串）转为 Ollama 原生形态（对象）；role:"tool" 消息保持不变
+   * @param {Array} msgs - 消息
+   * @returns {Array} 转换后消息 */
+  _ollamaMessages(msgs) {
+    return (msgs || []).map(m => {
+      if (!m) return m;
+      // Ollama tool 消息仅需 role+content（多余字段由 struct 解析忽略，这里显式收敛）
+      if (m.role === 'tool') return { role: 'tool', content: m.content || '' };
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        return Object.assign({}, m, {
+          content: m.content || '',
+          tool_calls: m.tool_calls.map(c => Object.assign({}, c, {
+            function: {
+              name: (c.function || {}).name || '',
+              arguments: this.toolArgsToObject((c.function || {}).arguments)
+            }
+          }))
+        });
+      }
+      return m;
+    });
+  }
+
   /** 非流式聊天（流式失败时回退）
    * @param {Object} opts - 同 chatStream
    * @returns {Promise<{content:string, reasoning:string, stats:Object}>} 结果 */
   async chat(opts) {
     const temperature = opts.temperature != null ? opts.temperature : MoraySettings.get('temperature');
     if (this.backend === 'ollama') {
+      const obody = {
+        model: opts.model,
+        messages: this._ollamaMessages(opts.messages),
+        stream: false,
+        keep_alive: '30m', // [速度优化] 非流式（工具轮/工作流/摘要）同样常驻
+        // [深度思考] 同流式：think 顶层下发，options 不含 think（非思考模型行为与之前完全一致）
+        ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
+        options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
+      };
+      // [阶段0] Ollama 原生 tools：请求体带 tools 才下发（无 tools 的旧请求行为完全一致）
+      if (opts.tools && opts.tools.length) obody.tools = opts.tools;
       const res = await fetch(this.ollamaURL + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: opts.model, messages: opts.messages, stream: false,
-          // [深度思考] 同流式：think 顶层下发，options 不含 think（非思考模型行为与之前完全一致）
-          ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
-          options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
-        })
+        body: JSON.stringify(obody)
       });
       if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
       const j = await res.json();
+      const mc = j.message || {};
+      // [阶段1 M1] 解析经 sanitize 容错：空调用过滤、arguments 对象↔字符串统一、截断补全
+      const toolCalls = sanitizeToolCalls(mc.tool_calls);
       return {
-        content: (j.message && j.message.content) || '',
-        reasoning: (j.message && j.message.thinking) || '',
-        stats: { tokPerSec: j.eval_count && j.eval_duration ? +(j.eval_count / (j.eval_duration / 1e9)).toFixed(1) : null, ms: 0, tokens: j.eval_count || 0 }
+        content: mc.content || '',
+        reasoning: mc.thinking || '',
+        toolCalls,
+        promptTokens: j.prompt_eval_count || 0,
+        stats: {
+          tokPerSec: j.eval_count && j.eval_duration ? +(j.eval_count / (j.eval_duration / 1e9)).toFixed(1) : null,
+          ms: 0, tokens: j.eval_count || 0, promptTokens: j.prompt_eval_count || 0
+        }
       };
     }
     if (this.backend === 'openai') {
       // [M2] 经本地后端代理（非流式：工具轮/摘要等场景）
       const proxyUrl = this._useProxy();
       if (proxyUrl) {
+        const pbody = {
+          model: opts.model || MoraySettings.get('openaiModel'),
+          messages: opts.messages, stream: false,
+          temperature, top_p: MoraySettings.get('topP'),
+          max_tokens: MoraySettings.get('maxTokens'),
+          think: opts.think
+        };
+        // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
+        if (opts.tools && opts.tools.length) pbody.tools = opts.tools;
         const pres = await fetch(proxyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: opts.model || MoraySettings.get('openaiModel'),
-            messages: opts.messages, stream: false,
-            temperature, top_p: MoraySettings.get('topP'),
-            max_tokens: MoraySettings.get('maxTokens'),
-            think: opts.think
-          })
+          body: JSON.stringify(pbody)
         });
         if (!pres.ok) {
           let msg = '云端代理请求失败（' + pres.status + '）';
@@ -6770,6 +6886,9 @@ class MorayAI {
         return {
           content: pj.content || '',
           reasoning: pj.reasoning || '',
+          // [阶段1 M1] 代理统一结构 tool_calls 经 sanitize 容错（空调用过滤/截断补全）
+          toolCalls: sanitizeToolCalls(pj.tool_calls),
+          promptTokens: (pj.usage && pj.usage.prompt_tokens) || 0,
           stats: { tokPerSec: null, ms: 0, tokens: (pj.usage && pj.usage.completion_tokens) || 0, promptTokens: (pj.usage && pj.usage.prompt_tokens) || 0 }
         };
       }
@@ -6790,7 +6909,7 @@ class MorayAI {
       const msg = j.choices && j.choices[0] && j.choices[0].message || {};
       return {
         content: msg.content || '', reasoning: msg.reasoning_content || '',
-        toolCalls: (msg.tool_calls && msg.tool_calls.length) ? msg.tool_calls : null,
+        toolCalls: sanitizeToolCalls(msg.tool_calls), // [阶段1 M1] 容错解析
         promptTokens: (j.usage && j.usage.prompt_tokens) || 0,
         stats: { tokPerSec: null, ms: 0, tokens: (j.usage && j.usage.completion_tokens) || 0 }
       };
@@ -6942,9 +7061,105 @@ class MorayAI {
     return {
       content: state.content,
       reasoning: state.reasoning,
+      // [阶段1 M1] 流式 tool_calls 聚合结果（无工具调用时为 null，向后兼容）
+      toolCalls: state.toolCalls || null,
       stats: { tokPerSec, ms: Math.round(totalMs), firstMs: firstChunkAt ? Math.round(firstChunkAt - startedAt) : null, tokens: completionTokens, cachedTokens: state.cachedTokens, promptTokens: state.promptTokens || est.tokens }
     };
   }
+}
+
+/** [阶段1 M1] 工具调用 JSON 截断补全：补齐未闭合的字符串引号与括号（流式分片/模型截断容错）
+ * @param {string} s - 可能被截断的 JSON 文本
+ * @returns {string} 补全后的文本 */
+function tryCompleteJson(s) {
+  let t = String(s || '').trim();
+  if (!t) return t;
+  try { JSON.parse(t); return t; } catch (e) { /* 继续补全 */ }
+  t = t.replace(/\\+$/, ''); // 去掉截断的尾部不完整转义
+  let inStr = false, esc = false;
+  const stack = [];
+  for (const ch of t) {
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inStr) t += '"';
+  while (stack.length) t += stack.pop();
+  return t;
+}
+
+/** [阶段1 M1] tool_calls 解析容错：过滤空/无名调用、arguments 对象↔字符串统一、
+ * JSON 截断尝试补全。兼容 Ollama 对象形态与 OpenAI 字符串形态。
+ * @param {Array} rawCalls - 原始 tool_calls
+ * @returns {Array|null} 规范化 [{id,type,function:{name,arguments:string}}] 或 null */
+function sanitizeToolCalls(rawCalls) {
+  if (!Array.isArray(rawCalls)) return null;
+  const out = [];
+  for (const c of rawCalls) {
+    if (!c || typeof c !== 'object') continue;
+    const fn = c.function || {};
+    const name = String(fn.name || '').trim();
+    if (!name) continue; // 空调用过滤
+    let args = fn.arguments;
+    if (args == null) args = {};
+    if (typeof args === 'object') {
+      try { args = JSON.stringify(args); } catch (e) { args = '{}'; }
+    } else if (typeof args === 'string') {
+      args = tryCompleteJson(args); // 截断尝试补全；解析失败保留原文（工具层再容错）
+    } else {
+      args = '{}';
+    }
+    out.push({
+      id: c.id || ('call_' + out.length + '_' + Date.now()),
+      type: 'function',
+      function: { name, arguments: args }
+    });
+  }
+  return out.length ? out : null;
+}
+
+/** [阶段1 M1] 流式 delta.tool_calls 聚合（OpenAI 兼容增量协议 + Ollama 对象形态兼容）。
+ * acc 由调用方持有：{map:{}, order:[]}；Ollama 无 index 时按到达顺序累加。
+ * @param {Object} acc - 聚合器
+ * @param {Array} deltas - delta.tool_calls 数组
+ * @returns {void} */
+function accToolCallDeltas(acc, deltas) {
+  if (!acc || !Array.isArray(deltas)) return;
+  for (const d of deltas) {
+    if (!d || typeof d !== 'object') continue;
+    const idx = (d.index != null) ? d.index : acc.order.length;
+    let slot = acc.map[idx];
+    if (!slot) { slot = acc.map[idx] = { id: '', name: '', arguments: '' }; acc.order.push(idx); }
+    if (d.id) slot.id = slot.id ? slot.id : String(d.id);
+    const fn = d.function || {};
+    if (fn.name) {
+      // Ollama 一次性给全名；OpenAI 增量给分片——两者用"未设置即赋值、已设置且不同则拼接"兼容
+      slot.name = slot.name ? (slot.name === fn.name ? slot.name : slot.name + fn.name) : fn.name;
+    }
+    if (fn.arguments != null) {
+      if (typeof fn.arguments === 'string') slot.arguments += fn.arguments;
+      else { try { slot.arguments = JSON.stringify(fn.arguments); } catch (e) { /* 忽略坏分片 */ } }
+    }
+  }
+}
+
+/** [阶段1 M1] 聚合器 → 规范 tool_calls（经 sanitize 容错）
+ * @param {Object} acc - accToolCallDeltas 的聚合器
+ * @returns {Array|null} */
+function accToolCallsFinalize(acc) {
+  if (!acc || !acc.order.length) return null;
+  const calls = acc.order.map(idx => {
+    const s = acc.map[idx];
+    return { id: s.id, type: 'function', function: { name: s.name, arguments: s.arguments || '{}' } };
+  });
+  return sanitizeToolCalls(calls);
 }
 
 /** [深度思考] 是否思考型模型（大小写不敏感，集中一处便于维护）。
@@ -7198,7 +7413,7 @@ function renderSessionList() {
 function shortModelName(model) {
   if (!model) return '默认';
   const p = model.split(':');
-  return p[0] || '默认';
+  return (typeof p[0] === 'string' && p[0]) ? p[0] : '默认';
 }
 
 /** [路由修复] 精确模型名（保留 :4b/:9b 参数量后缀，气泡头部展示实际命中模型用）
@@ -7206,6 +7421,24 @@ function shortModelName(model) {
  * @returns {string} */
 function preciseModelName(model) {
   return model || '默认';
+}
+
+/** [显示去重] 唯一可区分的模型显示名：
+ * 当前模型列表中“冒号前家族名”唯一时显示家族名（如 qwen3.5）；
+ * 同家族存在多个模型时保留完整名（如 qwen2.5:1.5b / qwen2.5:7b），
+ * 用于对比勾选区/栏标题/模型下拉等需要“同屏不重名”的场景。
+ * @param {string} model - 完整模型名
+ * @returns {string} */
+function uniqueModelName(model) {
+  const full = String(model || '');
+  if (!full) return '默认';
+  let names = [];
+  try { names = (AI && Array.isArray(AI.models) ? AI.models : []).map(m => m && m.name).filter(Boolean); } catch (e) { names = []; }
+  if (!names.length) return shortModelName(full);
+  const family = (n) => { const s = String(n).split(':'); return (typeof s[0] === 'string' && s[0]) ? s[0] : n; };
+  const base = family(full);
+  const sameFamCount = names.reduce((c, n) => c + (family(n) === base ? 1 : 0), 0);
+  return sameFamCount > 1 ? full : base;
 }
 
 /* ---------- [显示统一] 实际生效模型单一状态（气泡 / 输入台 / 状态栏共用） ---------- */
@@ -7306,6 +7539,21 @@ const THINK_MODES = [
   { key: 'off',  tag: 'OFF',  title: '深度思考：关闭（所有请求不思考）',         cls: 'think-off' }
 ];
 
+/** [深度思考] 与普通对话完全一致的 think 决策（对比页/工作流复用，不另写一套）：
+ * on→true；off→false；auto 档对 qwen3.5 系列默认 think=false（复杂任务也不自动开），
+ * 其余思考型模型仅复杂任务才 true；非思考模型由 20_ai 的 isThinkingModel 过滤不下发。
+ * @param {string} model - 完整模型名
+ * @param {Array} [messages] - 已组装的请求消息（auto 档分类用）
+ * @returns {boolean} */
+function decideThinkFor(model, messages) {
+  const mode = MoraySettings.get('thinkMode') || 'auto';
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  // [速度/思考优化] qwen3.5 系列默认 think=false：仅用户把深度思考切到 ON 才下发 think=true
+  if (/^qwen3\.5/i.test(String(model || ''))) return false;
+  return !!(typeof TaskRouter !== 'undefined' && TaskRouter.classify(messages || []) === 'complex');
+}
+
 /** [深度思考] 按钮 UI 同步：按当前 thinkMode 设置 图标高亮/小标/禁用态
  * @returns {void} */
 function refreshThinkModeBtn() {
@@ -7359,6 +7607,98 @@ function installThinkModeBtn() {
   }
   refreshIcons();
   refreshThinkModeBtn();
+}
+
+/** [阶段0 本机 Agent] 输入工具栏"本机工具/Agent"开关按钮（对齐深度思考按钮模式）：
+ * 控制 nativeToolsEnabled（native 工具进入 listForRequest 的总门）。
+ * 点击异步探测本地后端：在线 → 成功开启并提示工作区；离线 → 仍可开启（工具执行时给出
+ * 明确降级错误，不卡死），banner 展示离线态。 */
+function installNativeAgentToggle() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar || document.getElementById('nativeAgentBtn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'nativeAgentBtn';
+  btn.className = 'input-toolbar-btn native-agent-btn';
+  btn.setAttribute('aria-label', '本机工具');
+  btn.innerHTML = '<i data-lucide="bot" class="w-4 h-4"></i><span class="native-agent-tag">ON</span>';
+  on(btn, 'click', toggleNativeAgent);
+  const divider = toolbar.querySelector('.input-toolbar-divider');
+  if (divider) toolbar.insertBefore(btn, divider);
+  else toolbar.appendChild(btn);
+  if (!document.getElementById('nativeAgentBtnStyle')) {
+    const st = document.createElement('style');
+    st.id = 'nativeAgentBtnStyle';
+    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
+    document.head.appendChild(st);
+  }
+  syncNativeAgentBtn();
+  refreshIcons();
+}
+
+/** 同步按钮态（开启高亮 + ON 标 + 提示文案）
+ * @returns {void} */
+function syncNativeAgentBtn() {
+  const btn = document.getElementById('nativeAgentBtn');
+  if (!btn) return;
+  const on = MoraySettings.get('nativeToolsEnabled') === true;
+  btn.classList.toggle('native-on', on);
+  btn.title = on
+    ? '本机工具已开启：模型可列目录/读文件/写文件/执行只读命令（写与命令需人工审批；点击关闭）'
+    : '本机工具/Agent（默认关）：开启后模型可操作工作区文件与只读命令（需本地后端，写/命令会先征求你同意）';
+}
+
+/** 点击切换本机工具开关
+ * @returns {Promise<void>} */
+async function toggleNativeAgent() {
+  const next = !(MoraySettings.get('nativeToolsEnabled') === true);
+  await MoraySettings.set('nativeToolsEnabled', next);
+  syncNativeAgentBtn();
+  refreshNativeAgentBanner();
+  if (next) {
+    const cfg = await agentBackendConfig(true);
+    if (cfg) showNotification('本机工具已开启', '工作区：' + cfg.workspace, 'success', 2600);
+    else showNotification('本机工具已开启，但本地后端离线', '本机动作需启动后端（默认 http://127.0.0.1:8000）后可用', 'warning', 4200);
+  } else {
+    showNotification('本机工具已关闭', '已回到纯聊天模式（请求不再携带本机工具）', 'info', 1800);
+  }
+}
+
+/** 会话区顶部轻提示条："本机工具已开启 · 工作区 X"（含自检/文件树入口，常驻显示）
+ * @returns {Promise<void>} */
+async function refreshNativeAgentBanner() {
+  const content = document.getElementById('chatNormalContent');
+  if (!content) return;
+  let banner = document.getElementById('nativeAgentBanner');
+  const on = MoraySettings.get('nativeToolsEnabled') === true;
+  if (!on) {
+    if (banner) banner.remove();
+    return;
+  }
+  const cfg = await agentBackendConfig();
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'nativeAgentBanner';
+    banner.className = 'native-agent-banner text-[10px] text-text-tertiary flex items-center gap-2 px-3 py-1.5 mx-3 mt-2 rounded-lg border border-line-ghost/50 bg-surface-panel/50';
+    const anchor = content.querySelector('#chatMessagesNormal');
+    content.insertBefore(banner, anchor || content.firstChild);
+  }
+  const ok = !!cfg;
+  banner.innerHTML = ok
+    ? '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-success)"></span>本机工具已开启 · 工作区 <span class="font-mono text-text-secondary">' + escapeHtml(cfg.workspace || '') + '</span><span class="text-text-tertiary">（写文件与只读命令需你授权）</span>' +
+      '<span class="ml-auto flex items-center gap-1.5 shrink-0">' +
+      '<button data-agent-selfcheck-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="检测当前模型能否触发工具调用"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
+      '<button data-ws-sample-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="载入示例工作区（notes/a.txt、notes/b.txt、todo.md，不覆盖已有文件）"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
+      '<button data-ws-tree-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="查看工作区文件树（只读）"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
+      '</span>'
+    : '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-warning)"></span>本机工具已开启，但本地后端离线 —— 本机动作不可用，需启动后端（默认 http://127.0.0.1:8000）';
+  // [阶段1.6 M3] 当前模型自检未通过 → 输入台上方一行温和提示（不打断输入）
+  const selfCheck = MoraySettings.get('agentSelfCheck');
+  const curModel = (typeof activeModelName === 'function') ? activeModelName() : '';
+  if (ok && selfCheck && selfCheck.ok === false && curModel && selfCheck.model === curModel) {
+    banner.innerHTML += '<div class="w-full text-[10px] text-warning mt-1 flex items-center gap-1.5">' +
+      '<i data-lucide="alert-triangle" class="w-3 h-3"></i>该模型（' + escapeHtml(curModel) + '）工具调用偶发失败（自检未通过），Agent 任务建议 qwen2.5:7b，或点「自检」复测</div>';
+  }
+  refreshIcons();
 }
 
 /** 打开会话：加载消息并渲染
@@ -7682,7 +8022,8 @@ function buildMessageEl(msg, animate) {
           <span class="text-[10px] text-text-tertiary">${escapeHtml(preciseModelName(msg.model))} · ${time}</span>
           ${typeof renderCostPills === 'function' ? renderCostPills(msg) : ''}
         </div>
-        ${typeof renderToolSteps === 'function' ? renderToolSteps(msg.toolCalls) : ''}
+        ${(typeof renderToolSteps === 'function') ? renderToolSteps(msg.toolCalls) : ''}
+        ${(typeof PlanTracker !== 'undefined' && msg.plan) ? PlanTracker.renderStatic(msg.plan) : ''}
         <div class="rounded-xl px-4 py-3 bg-surface-card border border-line-ghost/60 msg-bubble__ai-box">
           <div class="ai-msg-inner"></div>
           ${msgActionsHtml(msg)}
@@ -7749,6 +8090,8 @@ function renderMessages() {
   if (!AppState.messages.length) {
     box.classList.add('hidden');
     showWelcomeView();
+    // [阶段0] 欢迎页存在时不显示本机工具 banner（避免干扰欢迎布局）
+    if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
     return;
   }
   box.classList.remove('hidden');
@@ -7772,6 +8115,8 @@ function renderMessages() {
   box.classList.remove('msg-fade');
   void box.offsetWidth;
   box.classList.add('msg-fade');
+  // [阶段0] 有消息时刷新本机工具顶部轻提示（10s 缓存，不阻塞渲染）
+  if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
 }
 
 /** 显示欢迎视图（无会话/空会话时）
@@ -7804,6 +8149,11 @@ function showWelcomeView() {
         <div class="welcome-suggestion-icon" style="background:rgba(242,178,76,0.12);color:#F2B24C;"><i data-lucide="bug" class="w-4 h-4"></i></div>
         <div class="welcome-suggestion-text"><strong>调试错误</strong>排查问题原因</div>
       </div>
+      ${(typeof MoraySettings !== 'undefined' && MoraySettings.get('nativeToolsEnabled') === true && window.MorayBackend && window.MorayBackend.connected) ? `
+      <div class="welcome-suggestion welcome-suggestion--agent" onclick="tryLocalAgentSuggestion()" title="载入示例工作区并演示本机 Agent">
+        <div class="welcome-suggestion-icon" style="background:rgba(74,222,128,0.12);color:#4ADE80;"><i data-lucide="bot" class="w-4 h-4"></i></div>
+        <div class="welcome-suggestion-text"><strong>试试本地 Agent</strong>演示查找→读取→汇总工作区文件</div>
+      </div>` : ''}
     </div>`;
   content.insertBefore(welcome, content.firstChild);
   refreshIcons();
@@ -7814,6 +8164,41 @@ function showWelcomeView() {
 function removeWelcomeView() {
   const w = document.getElementById('welcomeScreen');
   if (w) w.remove();
+}
+
+/** [阶段1.6 M3] “试试本地 Agent”引导卡动作：
+ * 1) 载入示例工作区（不覆盖已有文件）；2) 确保本机工具开关开启并高亮 2 秒；
+ * 3) 自动填好一句演示任务并聚焦输入台。
+ * @returns {Promise<void>} */
+async function tryLocalAgentSuggestion() {
+  try {
+    // 1) 本机工具开关：未开启则自动开启
+    if (MoraySettings.get('nativeToolsEnabled') !== true) {
+      await MoraySettings.set('nativeToolsEnabled', true);
+      syncNativeAgentBtn();
+      refreshNativeAgentBanner();
+    }
+    // 2) 开关高亮 2 秒（克制 beacon）
+    const btn = document.getElementById('nativeAgentBtn');
+    if (btn) {
+      btn.classList.add('native-on-pulse');
+      setTimeout(() => btn.classList.remove('native-on-pulse'), 2000);
+    }
+    // 3) 示例工作区（后端在线时；失败不阻塞演示任务填写）
+    try {
+      if (typeof loadSampleWorkspace === 'function') await loadSampleWorkspace();
+    } catch (e) { /* 离线等：用户仍可看输入台里的演示任务 */ }
+    // 4) 自动填好演示任务
+    const ta = document.getElementById('chatInputNormal');
+    if (ta) {
+      ta.value = '先列出计划，然后找到工作区里所有 txt 文件，读取 notes/a.txt 与 notes/b.txt，把两个素材的要点汇总写入 summary.md';
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.focus();
+    }
+    showNotification('演示就绪', '示例文件已就位，任务已填入输入框——点发送即可观看完整 Agent 流程', 'info', 5000);
+  } catch (e) {
+    showNotification('引导失败', String((e && e.message) || e).slice(0, 140), 'error', 3000);
+  }
 }
 
 /** 滚动消息区到底部
@@ -7953,6 +8338,8 @@ async function sendUserMessage() {
   if (typeof updateInputStats === 'function') updateInputStats('');
   if (typeof ChatRefs !== 'undefined') ChatRefs.clear();
   if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+  // [阶段0] 首条消息落地（欢迎页已移除）→ 显示本机工具顶部轻提示
+  if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
 
   // [V2 功能9] 视觉能力提示：附件图片 + 疑似不支持视觉的模型
   if ((AppState.attachments || []).length && typeof isVisionModel === 'function' && !isVisionModel(conv.model || MoraySettings.get('defaultModel'))) {
@@ -7983,7 +8370,14 @@ async function buildRequestMessages(conv, extraContext) {
   const rawSys = (conv.systemPrompt || MoraySettings.get('systemPrompt') || '').trim();
   const sysSrc = rawSys || buildSystemPrompt();
   // [V2 功能3] 系统提示词清洗：去冗余空白与重复，节省 token
-  const sys = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(sysSrc).text : sysSrc;
+  let sys = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(sysSrc).text : sysSrc;
+  // [阶段1 M5] 本机 Agent 系统提示：开关开启且请求携带本机工具时追加（用户自定义覆盖内置）
+  if (MoraySettings.get('nativeToolsEnabled') && typeof ToolRegistry !== 'undefined' &&
+      ToolRegistry.listForRequest().some(t => t.function.name === 'list_directory' || t.function.name === 'submit_plan')) {
+    const override = (MoraySettings.get('agentSysPromptOverride') || '').trim();
+    const agentPrompt = override || (typeof PlanTracker !== 'undefined' && PlanTracker.SYSTEM_PROMPT) || '';
+    if (agentPrompt) sys = (sys ? sys + '\n\n' : '') + agentPrompt;
+  }
   if (sys) msgs.push({ role: 'system', content: sys });
   const limit = MoraySettings.get('historyRetention') || 100;
   // [P0 治本] 严格只认当前会话：conversationId 必须全等 conv.id，无 id 的旧/脏消息一律不放行
@@ -8161,10 +8555,32 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   const requestMessages = await buildRequestMessages(conv, extraContext);
   // [小补丁] auto 档在 requestMessages 就绪后补齐 classify 决策并回写占位消息（on/off 已提前定）
   if (thinkMode === 'auto') {
-    think = (typeof TaskRouter !== 'undefined' && TaskRouter.classify(requestMessages) === 'complex');
+    // [深度思考] 统一决策入口（qwen3.5 auto 默认 false 逻辑已并入 decideThinkFor）
+    think = decideThinkFor(model, requestMessages);
     assistantMsg.think = think === true;
   }
   const genStart = performance.now();
+  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥60ms 才整段重绘 Markdown）
+  let rafPending = false, lastStreamPaint = 0;
+  const scheduleStreamPaint = () => {
+    if (rafPending || !AppState.generating) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      if (!AppState.generating) return; // 完成/停止后不再补画流式光标
+      const now = performance.now();
+      if (now - lastStreamPaint < 60) {
+        setTimeout(scheduleStreamPaint, Math.max(1, 60 - (now - lastStreamPaint)));
+        return;
+      }
+      lastStreamPaint = now;
+      const ce = inner.querySelector('.ai-content');
+      if (ce && ce.isConnected) {
+        ce.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
+        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+      }
+    });
+  };
   // [V2] 经由 API 智能网关：缓存 → 智能路由 → 超时 → 重试 → 降级
   const useGateway = MoraySettings.get('gatewayEnabled') !== false && typeof Gateway !== 'undefined';
   const chatFn = useGateway ? Gateway : AI;
@@ -8187,6 +8603,18 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       if (hdr) {
         const thinkingNow = assistantMsg.think === true && isThinkingModel(assistantMsg.model);
         hdr.innerHTML = escapeHtml(preciseModelName(assistantMsg.model)) + ' · <span class="gen-status-text">' + (thinkingNow ? '思考中' : '正在生成') + '</span>';
+        // [TTFT 反馈] 实际模型确定后区分“已驻留”与“正在唤醒（冷加载）”
+        (async () => {
+          try {
+            if (typeof isLocalModelName !== 'function' || !isLocalModelName(assistantMsg.model)) return;
+            if (typeof ollamaLoadedModels !== 'function') return;
+            const loaded = await ollamaLoadedModels();
+            const st = hdr.querySelector('.gen-status-text');
+            if (st && !assistantMsg.content && AppState.generating) {
+              st.textContent = loaded.includes(assistantMsg.model) ? '响应中…' : '正在唤醒模型，约 5-10 秒…';
+            }
+          } catch (e) { /* 反馈失败不影响请求 */ }
+        })();
       }
       // 思考面板按实际模型重新评估：非思考型/think=false 立即移除占位"深度思考中"
       const tp = inner.querySelector('.thinking-panel');
@@ -8201,8 +8629,12 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     // 全局 defaultModel 仅作兜底候选，不锁路由
     _userPicked: conv.userPickedModel === true,
     // [工具调用] 步骤事件 → 实时步骤卡（首个事件自动插入最终回复之前）
-    onToolStep: (evt) => { if (typeof ToolRegistry !== 'undefined') ToolRegistry.renderLiveStep(el, evt); },
-    onChunk: throttle(({ content, reasoning }) => {
+    onToolStep: (evt) => {
+      if (typeof ToolRegistry !== 'undefined') ToolRegistry.renderLiveStep(el, evt);
+      // [阶段1 M3] 计划编排：submit_plan 登记 / 真实工具事件推进计划步骤状态
+      if (typeof PlanTracker !== 'undefined') PlanTracker.observe(evt, el);
+    },
+    onChunk: ({ content, reasoning }) => {
       if (content) assistantMsg.content += content;
       if (reasoning) assistantMsg.reasoning += reasoning;
       // [夜间优化3.1] 生成速度实时显示
@@ -8213,14 +8645,10 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           ? `生成中 · ${Math.round((assistantMsg.content.length / 4) / Math.max(0.5, secs))} tok/s`
           : (assistantMsg.think === true && isThinkingModel(assistantMsg.model) ? '深度思考中' : '正在生成'));
       }
-      // 流式节流渲染：仅正文区更新，避免整段重建开销
+      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥60ms 才真正整段重绘 Markdown），
+      // 避免每个 token 全量 reparse；代码高亮统一留到结束后的完整渲染，不在流式中逐 token 高亮。
       if (typingEl.isConnected) typingEl.remove();
-      const contentEl = inner.querySelector('.ai-content');
-      if (contentEl) {
-        contentEl.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
-        // 流式期间不做完整代码块增强（等结束后统一处理），但保持滚动
-        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
-      }
+      scheduleStreamPaint();
       if (reasoning) {
         const tp = inner.querySelector('.thinking-panel');
         if (tp && !assistantMsg.reasoningRendered) {
@@ -8232,7 +8660,7 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           if (tc) tc.textContent = assistantMsg.reasoning;
         }
       }
-    }, 80)
+    }
   });
   AppState.generating = true;
   AppState.genController = controller;
@@ -8243,6 +8671,20 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     assistantMsg.reasoning = result.reasoning || assistantMsg.reasoning;
     assistantMsg.stats = result.stats;
     assistantMsg.tokens = result.stats.tokens || 0;
+    // [阶段1 M3] 全部步骤结束：模型总结已输出 → 计划剩余待办步骤标记完成
+    if (typeof PlanTracker !== 'undefined' && PlanTracker.current) {
+      PlanTracker.current.steps.forEach(s => { if (s.status === 'todo' || s.status === 'running') s.status = 'done'; });
+      PlanTracker.render(el);
+      // [阶段1.6] 同步最终状态到消息持久化
+      try {
+        const msgId = el && el.dataset ? el.dataset.msgId : null;
+        const msg = msgId ? (AppState.messages || []).find(m => m.id === msgId) : null;
+        if (msg && msg.plan) {
+          msg.plan.steps.forEach((ps, i) => { if (PlanTracker.current.steps[i]) ps.status = PlanTracker.current.steps[i].status; });
+          if (typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
+        }
+      } catch (e) { /* 忽略 */ }
+    }
     // [V2] 记录缓存命中与路由信息
     if (result._cache) assistantMsg.cacheInfo = { from: result._cache.from, similarity: result._cache.similarity, tokens: result._cache.tokens || 0 };
     if (result._routed) {
@@ -8815,6 +9257,12 @@ bindNewChatMain();
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installThinkModeBtn);
 else installThinkModeBtn();
 
+// [阶段0 本机 Agent] 输入工具栏"本机工具"开关（同工具栏、同装载时机；幂等）
+if (typeof installNativeAgentToggle === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installNativeAgentToggle);
+  else installNativeAgentToggle();
+}
+
 /* ============================================================
    模块：多模型对比（任务二.4）/ 提示词库（任务四）
    ============================================================ */
@@ -8835,8 +9283,8 @@ const CompareApp = {
   build() {
     const root = document.getElementById('chat-compare');
     if (!root) return;
-    this.selected = MoraySettings.get('compareModels') && MoraySettings.get('compareModels').length
-      ? MoraySettings.get('compareModels') : (AI.models.slice(0, 2).map(m => m.name));
+    // [多模型对比修复] 读取持久化勾选时立即清洗（剔除占位串/失效模型），脏数据不再进入界面
+    this.selected = this.cleanSelected(MoraySettings.get('compareModels'));
     root.innerHTML = `
       <div class="h-9 px-5 flex items-center justify-between border-b border-line-ghost/30 flex-shrink-0">
         <div class="flex items-center gap-3 text-[10px] text-text-tertiary" id="compareStatusText">勾选模型后输入提示词开始竞速</div>
@@ -8919,23 +9367,66 @@ const CompareApp = {
     }
   },
 
+  /** [多模型对比修复] 当前真实模型名列表（AI.models 的权威名）
+   * @returns {string[]} */
+  validModels() {
+    return (AI && Array.isArray(AI.models) ? AI.models : [])
+      .map(m => m && m.name)
+      .filter(n => typeof n === 'string' && n.trim());
+  },
+
+  /** [多模型对比修复] 统一清洗勾选模型：
+   * 剔除空名与历史占位串；模型列表非空时只保留真实存在的模型（失效/已删除模型不残留）。
+   * @param {*} sel - 待清洗勾选（兼容非法/非数组持久化值）
+   * @returns {string[]} */
+  cleanSelected(sel) {
+    const arr = Array.isArray(sel) ? sel : [];
+    const valid = this.validModels();
+    return arr.filter(n => typeof n === 'string' && n && n !== '（未检测到模型）' && (!valid.length || valid.includes(n)));
+  },
+
+  /** [多模型对比修复] 规范化选中集并回写存储：
+   * 清洗后为空且有真实模型 → 默认选前 2 个；无模型 → 空数组；同时清除持久化脏数据。
+   * @returns {string[]} */
+  normalizeSelected() {
+    let next = this.cleanSelected(this.selected);
+    if (!next.length) {
+      const valid = this.validModels();
+      if (valid.length) next = valid.slice(0, 2);
+    }
+    this.selected = next;
+    try { MoraySettings.set('compareModels', next); } catch (e) { /* 持久化失败不影响界面 */ }
+    return next;
+  },
+
   /** 渲染模型勾选区与列
    * @returns {void} */
   renderModelChecks() {
     const wrap = document.getElementById('compareModelChecks');
     if (!wrap) return;
-    const models = AI.models.length ? AI.models.map(m => m.name) : ['（未检测到模型）'];
-    if (!this.selected.length) this.selected = models.slice(0, 2);
+    const models = this.validModels();
+    const cols = document.getElementById('compareColumns');
+    if (!models.length) {
+      // [多模型对比修复] 模型未就绪：只显示禁用纯文字提示；
+      // 不生成可勾选 checkbox、不 addColumn、不写 MoraySettings（占位串永不再进入界面与存储）
+      this.selected = this.cleanSelected(this.selected);
+      wrap.innerHTML = '<span class="text-xs text-text-tertiary select-none" style="opacity:.75">未检测到可用模型，请先连接 Ollama / 云端 API</span>';
+      if (cols) cols.innerHTML = '';
+      this.__lastModelsKey = '';
+      return;
+    }
+    const clean = this.normalizeSelected();
+    const allowed = new Set(clean);
     wrap.innerHTML = models.map(name => `
       <label class="flex items-center gap-1.5 cursor-pointer">
-        <input type="checkbox" data-compare-model="${escapeHtml(name)}" ${this.selected.includes(name) ? 'checked' : ''} class="accent-brand-cobalt w-3.5 h-3.5">
+        <input type="checkbox" data-compare-model="${escapeHtml(name)}" ${allowed.has(name) ? 'checked' : ''} class="accent-brand-cobalt w-3.5 h-3.5">
         <span class="beacon-dot" style="width:6px;height:6px"></span>
-        <span>${escapeHtml(shortModelName(name))}</span>
+        <span title="${escapeHtml(name)}">${escapeHtml(uniqueModelName(name))}</span>
       </label>`).join('');
     wrap.querySelectorAll('[data-compare-model]').forEach(cb => {
       cb.addEventListener('change', () => {
         const name = cb.dataset.compareModel;
-        if (cb.checked) { this.selected.push(name); this.addColumn(name); }
+        if (cb.checked) { if (!this.selected.includes(name)) this.selected.push(name); this.addColumn(name); }
         else {
           this.selected = this.selected.filter(n => n !== name);
           const col = document.querySelector(`#compareColumns [data-col-model="${CSS.escape(name)}"]`);
@@ -8944,11 +9435,11 @@ const CompareApp = {
         MoraySettings.set('compareModels', this.selected);
       });
     });
-    const cols = document.getElementById('compareColumns');
     if (cols) {
       cols.innerHTML = '';
       this.selected.forEach(name => this.addColumn(name));
     }
+    this.__lastModelsKey = models.join('\u0001');
   },
 
   /** 添加一列（模型通道）
@@ -8963,7 +9454,7 @@ const CompareApp = {
     sec.innerHTML = `
       <div class="h-10 px-4 flex items-center gap-2 border-b border-line-ghost/50 flex-shrink-0">
         <span class="beacon-dot"></span>
-        <span class="text-sm font-medium text-text-primary truncate" title="${escapeHtml(model)}">${escapeHtml(shortModelName(model))}</span>
+        <span class="text-sm font-medium text-text-primary truncate" title="${escapeHtml(model)}">${escapeHtml(uniqueModelName(model))}</span>
       </div>
       <div class="flex-1 overflow-y-auto p-4 space-y-3 col-messages">
         <div class="text-center text-[11px] text-text-tertiary py-8">等待输入…</div>
@@ -8991,39 +9482,68 @@ const CompareApp = {
   async run(prompt) {
     if (!prompt || !prompt.trim()) return;
     if (this.running) { showNotification('进行中', '上一轮对比尚未结束', 'warning'); return; }
-    if (!this.selected.length) { showNotification('未选择模型', '请至少勾选一个模型', 'warning'); return; }
     if (AI.backend === 'none') await AI.detectBackend();
     if (AI.backend === 'none') { showNotification('未连接后端', '请先在设置页配置 AI 服务', 'error', 4000); return; }
+    // [多模型对比修复] 发送前最终校验：占位串/失效模型一律不得进入请求体（杜绝 400 invalid model name）
+    const validNow = this.validModels();
+    if (!validNow.length) {
+      showNotification('未检测到可用模型', '未检测到可用模型，请先连接 Ollama/API 或勾选模型', 'warning');
+      return;
+    }
+    const useModels = this.selected.filter(m => validNow.includes(m));
+    if (!useModels.length) {
+      showNotification('未选择模型', '请至少勾选一个模型', 'warning');
+      return;
+    }
+    if (useModels.length !== this.selected.length) {
+      this.selected = useModels;
+      try { MoraySettings.set('compareModels', useModels); } catch (e) { /* 忽略 */ }
+    }
 
     this.running = true;
+    this.__stoppedByUser = false; // [阶段0.5] 停止标志：run 收尾不得覆盖 stop() 设置的状态文案
     const input = document.getElementById('compareInput');
     input.value = '';
     document.getElementById('compareStopBtn').style.display = '';
-    document.getElementById('compareStatusText').textContent = '竞速中 · ' + this.selected.length + ' 个模型并发';
+    document.getElementById('compareStatusText').textContent = '竞速中 · ' + useModels.length + ' 个模型并发';
 
     this.controllers = [];
     const results = [];
-    const tasks = this.selected.map(async (model) => {
+    // [体验优化] 对比页与普通对话统一走默认系统提示（优先级：用户自定义 rawSys > buildSystemPrompt；对比不带历史的设计不变）
+    const rawSys = (typeof MoraySettings !== 'undefined' ? (MoraySettings.get('systemPrompt') || '') : '').trim();
+    const sys = (typeof buildSystemPrompt === 'function') ? (rawSys || buildSystemPrompt()) : (rawSys || '');
+    const msgs = sys ? [{ role: 'system', content: sys }, { role: 'user', content: prompt }] : [{ role: 'user', content: prompt }];
+    // 先为所有列铺好本轮消息骨架：串行执行时用户也能看到全部待命列（不提前计时）
+    const colHolders = new Map();
+    useModels.forEach(model => {
       const sec = document.querySelector(`#compareColumns [data-col-model="${CSS.escape(model)}"]`);
       if (!sec) return;
       const msgBox = sec.querySelector('.col-messages');
       msgBox.innerHTML = `
         <div class="flex justify-end"><div class="max-w-[80%] rounded-xl px-3 py-2 bg-brand-cobalt/14 border border-brand-cobalt/20"><p class="text-xs text-text-primary">${escapeHtml(prompt)}</p></div></div>
         <div class="flex justify-start"><div class="max-w-[90%] rounded-xl px-3 py-2 bg-surface-card border border-line-ghost/60"><div class="md-body col-ai-content"></div></div></div>`;
-      const contentEl = msgBox.querySelector('.col-ai-content');
-
+      colHolders.set(model, { sec, contentEl: msgBox.querySelector('.col-ai-content') });
+    });
+    // [阶段0.5 C1] 待命列登记：串行停止时把"尚未轮到"的列明确标为已停止，不留空白占位
+    this.__pendingCols = new Set(colHolders.keys());
+    // 单模型一轮对比也正常（见 run() 顶部校验）；runOne 只负责本列自身请求，计时不含排队
+    const runOne = async (model) => {
+      if (this.__pendingCols) this.__pendingCols.delete(model);
+      const holder = colHolders.get(model);
+      if (!holder) return;
+      const { sec, contentEl } = holder;
       const controller = new AbortController();
       this.controllers.push(controller);
-      const started = performance.now();
+      const started = performance.now(); // 串行场景：轮到本模型真正发起请求才开始计时
       let firstMs = 0, text = '';
-      // [体验优化] 对比页与普通对话统一走默认系统提示（优先级：用户自定义 rawSys > buildSystemPrompt；对比不带历史的设计不变）
-      const rawSys = (typeof MoraySettings !== 'undefined' ? (MoraySettings.get('systemPrompt') || '') : '').trim();
-      const sys = (typeof buildSystemPrompt === 'function') ? (rawSys || buildSystemPrompt()) : (rawSys || '');
-      const msgs = sys ? [{ role: 'system', content: sys }, { role: 'user', content: prompt }] : [{ role: 'user', content: prompt }];
       try {
+        // [深度思考/常驻] 与普通对话完全一致的 think 决策（auto 档 qwen3.5 默认 false）；
+        // keep_alive:30m 由 AI.chatStream 的 Ollama 分支统一附带，这里只透传 think
+        const think = (typeof decideThinkFor === 'function') ? decideThinkFor(model, msgs) : false;
         const { promise } = AI.chatStream({
           model,
           messages: msgs,
+          think,
           onChunk: throttle(({ content }) => {
             if (!content) return;
             if (!firstMs) firstMs = performance.now() - started;
@@ -9059,8 +9579,20 @@ const CompareApp = {
           results.push({ model, error: String(e.message || e) });
         }
       }
-    });
-    await Promise.all(tasks);
+    };
+    // [单卡显存] 勾选全部为本地 Ollama 模型时改为串行：MAX_LOADED_MODELS=1 下避免反复换入换出；
+    // 任一模型属云端后端则维持并发。串行队列等待不计入已完成列计时（started 在各自轮次才起表）。
+    const allLocal = AI.backend === 'ollama' && useModels.every(m => (AI.models || []).some(x => x && x.name === m));
+    if (allLocal && useModels.length > 1) {
+      document.getElementById('compareStatusText').textContent = '本地模型将依次对比以避免显存抢占 · ' + useModels.length + ' 个';
+      for (const m of useModels) {
+        if (!this.running) break; // 用户点击停止后不再发起后续模型
+        await runOne(m);
+      }
+    } else {
+      document.getElementById('compareStatusText').textContent = '竞速中 · ' + useModels.length + ' 个模型并发';
+      await Promise.all(useModels.map(runOne));
+    }
     this.running = false;
     this.lastResults = results;
     this.lastPrompt = prompt;
@@ -9069,10 +9601,11 @@ const CompareApp = {
     const exportBtn = document.getElementById('compareExportBtn');
     if (exportBtn) exportBtn.style.display = results.some(r => !r.error) ? '' : 'none';
     document.getElementById('compareStopBtn').style.display = 'none';
-    document.getElementById('compareStatusText').textContent = '本轮完成 · 可继续输入';
+    // [阶段0.5 C1] 用户停止时保持"已停止"文案，不覆盖为"本轮完成"
+    if (!this.__stoppedByUser) document.getElementById('compareStatusText').textContent = '本轮完成 · 可继续输入';
     if (results.length >= 2 && results.every(r => !r.error)) {
       const best = results.slice().sort((a, b) => (b.quality + Math.min(100, b.stats.tokPerSec || 0) / 2) - (a.quality + Math.min(100, a.stats.tokPerSec || 0) / 2))[0];
-      showNotification('竞速结果', shortModelName(best.model) + ' 综合表现最佳（质量 ' + best.quality + '）', 'success', 3500);
+      showNotification('竞速结果', uniqueModelName(best.model) + ' 综合表现最佳（质量 ' + best.quality + '）', 'success', 3500);
     }
   },
 
@@ -9081,12 +9614,58 @@ const CompareApp = {
   stop() {
     this.controllers.forEach(c => { try { c.abort(); } catch (e) { /* 忽略 */ } });
     this.running = false;
+    this.__stoppedByUser = true;
     const btn = document.getElementById('compareStopBtn');
     if (btn) btn.style.display = 'none';
     const st = document.getElementById('compareStatusText');
     if (st) st.textContent = '已停止';
+    // [阶段0.5 C1] 串行队列中尚未轮到的列：明确显示"已停止（未开始）"，不留空白占位
+    const pending = this.__pendingCols || new Set();
+    this.__pendingCols = null;
+    pending.forEach(model => {
+      try {
+        const sec = document.querySelector('#compareColumns [data-col-model="' + CSS.escape(model) + '"]');
+        if (!sec) return;
+        const contentEl = sec.querySelector('.col-ai-content');
+        if (contentEl && !contentEl.firstChild) {
+          contentEl.innerHTML = '<span class="text-xs text-text-tertiary">已停止（未开始）</span>';
+        }
+      } catch (e) { /* 忽略 */ }
+    });
   }
 };
+
+/* ===================== [多模型对比修复] 自动重建勾选区 ===================== */
+
+/** 对比页可见且模型列表确实变化时重建勾选区与列；
+ * 正在竞速或结果未变时不重建，避免打断运行/清空已完成结果。
+ * @returns {void} */
+function refreshCompareChecks() {
+  try {
+    if (typeof CompareApp === 'undefined' || !CompareApp || CompareApp.running) return;
+    const root = document.getElementById('chat-compare');
+    const wrap = document.getElementById('compareModelChecks');
+    if (!root || !wrap) return;
+    // 仅当前停留在聊天页且对比模式可见时重建
+    const pageChat = document.getElementById('page-chat');
+    if (pageChat && (pageChat.classList.contains('hidden') || pageChat.offsetParent === null)) return;
+    if (root.classList.contains('hidden')) return;
+    const key = CompareApp.validModels().join('\u0001');
+    if (key === CompareApp.__lastModelsKey && wrap.querySelector('[data-compare-model]')) return;
+    CompareApp.renderModelChecks();
+  } catch (e) { /* 自动重建失败不影响主流程 */ }
+}
+
+// 模型列表拉取成功（AI.detectBackend/listModels 成功分支）后自动重建
+try { window.addEventListener('moray-models-updated', refreshCompareChecks); } catch (e) { /* 忽略 */ }
+// 用户进入对比模式 / 切回聊天页时补一次刷新（覆盖模型列表更新发生在隐藏期间的场景）
+try {
+  document.addEventListener('click', (ev) => {
+    const t = ev.target;
+    const btn = t && t.closest ? t.closest('#chatModeSwitch button[data-mode="compare"], .nav-icon-btn[data-page="chat"]') : null;
+    if (btn) setTimeout(refreshCompareChecks, 0);
+  });
+} catch (e) { /* 忽略 */ }
 
 /** 启发式质量评分：长度 / 结构 / 代码块 / 列表
  * @param {string} text - 生成文本
@@ -9591,7 +10170,7 @@ const ABTest = {
         <div><label class="form-label">变体 A</label><select id="abSelA" class="form-select">${opts}</select></div>
         <div><label class="form-label">变体 B</label><select id="abSelB" class="form-select">${opts}</select></div>
         <div><label class="form-label">模型</label><select id="abModel" class="form-select">
-          ${AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('') || '<option value="">默认</option>'}
+          ${AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(uniqueModelName(m.name))}</option>`).join('') || '<option value="">默认</option>'}
         </select></div>
       </div>
       <div class="form-row">
@@ -10283,8 +10862,8 @@ const DocsApp = {
     const el = document.getElementById('docSidebarList');
     if (!el) return;
     if (!this.cache.length) {
-      el.innerHTML = `<div class="text-center py-8 text-text-tertiary text-xs">
-        <i data-lucide="inbox" class="w-8 h-8 mx-auto mb-2 opacity-40"></i>暂无文档</div>`;
+      el.innerHTML = `<div class="empty-state"><i data-lucide="inbox"></i>
+        <div class="empty-title">暂无文档</div><div class="empty-hint">在上方粘贴或导入 Markdown / PDF，即可开始构建知识库</div></div>`;
       refreshIcons();
       return;
     }
@@ -10976,12 +11555,18 @@ const WorkflowEngine = {
       { role: 'user', content: prompt }
     ];
     if (node.config && node.config.multiModel) {
-      // 多模型并发：取前2个选中模型
-      const models = (MoraySettings.get('compareModels') || []).slice(0, 2);
-      const useModels = models.length ? models : [AI.models[0] && AI.models[0].name].filter(Boolean);
+      // [多模型对比修复] 多模型并发：先按当前真实模型列表清洗 compareModels
+      // （过滤占位串/失效模型，避免空名/占位名下发给 Ollama 产生 400），再取前 2 个
+      const allNames = (AI.models || []).map(m => m && m.name).filter(Boolean);
+      const stored = MoraySettings.get('compareModels');
+      const models = (Array.isArray(stored) ? stored : []).filter(n => allNames.includes(n)).slice(0, 2);
+      const useModels = models.length ? models : allNames.slice(0, 1);
+      if (!useModels.length) return '';
       const parts = await Promise.all(useModels.map(async (m) => {
         try {
-          const r = await AI.chat({ model: m, messages });
+          // [深度思考/常驻] 与普通对话一致的 think 决策；keep_alive:30m 由 AI.chat 的 Ollama 分支统一附带
+          const think = (typeof decideThinkFor === 'function') ? decideThinkFor(m, messages) : false;
+          const r = await AI.chat({ model: m, messages, think });
           recordPerf(m, r.stats, true);
           return `### 模型：${m}\n（${r.stats.tokPerSec || '?'} tok/s · ${r.stats.ms}ms）\n\n${r.content}`;
         } catch (e) { return `### 模型：${m}\n请求失败：${e.message}`; }
@@ -12065,7 +12650,7 @@ const SettingsApp = {
               </div>
               <div>
                 <label class="form-label">默认模型</label>
-                <input type="text" id="setOpenaiModel" class="form-input" value="${escapeHtml(c.openaiModel)}" placeholder="gpt-4o-mini">
+                <input type="text" id="setOpenaiModel" class="form-input" value="${escapeHtml(c.openaiModel)}" placeholder="留空跟随服务商（示例：deepseek-chat / qwen-max）">
               </div>
               <div class="flex items-center justify-between">
                 <button class="text-[10px] text-danger hover:opacity-80" id="clearKeyBtn">清除存储的 API Key</button>
@@ -12295,7 +12880,7 @@ const SettingsApp = {
               <i data-lucide="sparkles" class="w-3.5 h-3.5 text-brand-cobalt"></i>重新查看新手引导
             </button>
             <div class="space-y-2 text-xs text-text-secondary">
-              <div class="flex justify-between"><span>版本</span><span class="font-mono text-text-primary">v3.0.0</span></div>
+              <div class="flex justify-between"><span>版本</span><span class="font-mono text-text-primary">v${(typeof window.MORAY_VERSION !== 'undefined') ? window.MORAY_VERSION : '1.0.0'}</span></div>
               <div class="flex justify-between"><span>开源协议</span><span class="text-text-primary">MIT License</span></div>
               <div class="flex justify-between"><span>运行模式</span><span class="text-text-primary">本地优先 · 单文件应用</span></div>
               <div class="flex justify-between"><span>数据存储</span><span class="text-text-primary">IndexedDB（moray_db）</span></div>
@@ -12816,7 +13401,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.15.13'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.18.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -12898,6 +13483,11 @@ async function bootApp() {
       if (typeof appendCostSettings === 'function') appendCostSettings();
       // [工具调用] 设置卡片（AI 工具总开关/轮数/每工具开关）
       if (typeof appendToolsSettings === 'function') appendToolsSettings();
+      // [阶段0 本机 Agent] 设置分区 + 顶部轻提示 + 按钮态同步（按钮已由 30_chat 文件尾安装，
+      // 但彼时 MoraySettings 未初始化，需在设置就绪后按持久化状态刷新按钮高亮）
+      if (typeof appendAgentSettings === 'function') appendAgentSettings();
+      if (typeof syncNativeAgentBtn === 'function') syncNativeAgentBtn();
+      if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
       // [工具调用] 对比模式提示（CompareApp.build 已重建面板，此时注入不被清掉）
       if (typeof installCompareToolsTip === 'function') installCompareToolsTip();
       // [任务1] 统一全局搜索面板（接管 ⌘K）
@@ -15185,15 +15775,18 @@ const GatewayBreaker = {
 
 /** Ollama 当前驻留模型名（GET /api/ps，5 秒短缓存；失败静默返回空，不报错不阻塞路由） */
 let __psCache = { at: 0, list: null };
+let __lastPsMs = 0;
 async function ollamaLoadedModels() {
   if (!AI || AI.backend !== 'ollama') return [];
   const now = Date.now();
   if (__psCache.list && now - __psCache.at < 5000) return __psCache.list;
   try {
+    const p0 = performance.now();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 1500);
     const res = await fetch(AI.ollamaURL + '/api/ps', { signal: ctrl.signal });
     clearTimeout(timer);
+    __lastPsMs = performance.now() - p0;
     if (!res.ok) return [];
     const j = await res.json();
     __psCache = { at: now, list: ((j.models || []).map(m => m && m.name)).filter(Boolean) };
@@ -15581,6 +16174,32 @@ const Gateway = {
   /** 路由降级日志（最近20条）
    * @type {Array} */
   fallbackLog: [],
+  /** 最近一次“最终模型预热”状态（串行：不同模型先等上一轮结束，禁止并发争显存） */
+  __warm: null,
+
+  /** [首字延迟修复] 路由定稿后的对齐预热：
+   * 仅对“最终要用的模型”在真实请求前预热；已驻留则直接跳过；
+   * 若已有其它模型预热进行中，先等其结束（OLLAMA_MAX_LOADED_MODELS=1 下不同模型会互踢）。
+   * 失败静默；预热与真实对话串行，绝不并发。
+   * @param {string} model - 最终模型名 */
+  async ensureWarmup(model) {
+    try {
+      if (!model || !AI || AI.backend !== 'ollama' || typeof AI.warmupModel !== 'function') return;
+      const loaded = await ollamaLoadedModels();
+      if (loaded.includes(model)) return;
+      // 若正在预热不同模型，先等它结束（避免两个模型同时加载互踢）
+      if (this.__warm && this.__warm.p && this.__warm.model !== model) {
+        await this.__warm.p.catch(() => {});
+      }
+      if (this.__warm && this.__warm.p && this.__warm.model === model) {
+        await this.__warm.p.catch(() => {});
+        return;
+      }
+      const p = AI.warmupModel(model);
+      this.__warm = { model, p };
+      await p.catch(() => {});
+    } catch (e) { /* 预热失败静默 */ }
+  },
 
   /**
    * 是否允许云端调用（预算/暂停/网关开关）
@@ -15615,15 +16234,29 @@ const Gateway = {
     const localNames = eligBase.names;
     let affinityApplied = false;
     // 已驻留模型亲和：simple/medium 且已驻留模型仍可用时优先复用（不依赖 routingLocalFirst）
-    if (MoraySettings.get('routingPreferLoaded') && type !== 'complex' && localNames.length) {
+    if (MoraySettings.get('routingPreferLoaded') && localNames.length) {
       const loaded = await ollamaLoadedModels();
-      const loadedPick = loaded.find(n => localNames.includes(n) && n !== decision.model);
-      if (loadedPick) {
+      const loadedCandidates = loaded.filter(n => localNames.includes(n));
+      // 已驻留模型选法：simple/medium 直接复用任一驻留模型；
+      // complex 仅在驻留模型是本地最大参数量时复用（否则仍按原策略选最大，叠加冷却过滤）。
+      let loadedPick = null;
+      if (loadedCandidates.length) {
+        if (type === 'complex') {
+          const maxSize = Math.max.apply(null, localNames.map(n => modelSizeB(n) || 0));
+          loadedPick = loadedCandidates.find(n => modelSizeB(n) === maxSize) || null;
+        } else {
+          loadedPick = loadedCandidates[0];
+        }
+      }
+      if (loadedPick && loadedPick === decision.model) {
+        // 决策模型本就驻留：标记亲和命中，阻止后续“本地优先”再切成理论最小造成重载
+        affinityApplied = true;
+      } else if (loadedPick) {
         const fbSet = [];
         [decision.model].concat(localNames.filter(n => n !== loadedPick)).forEach(n => {
           if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
         });
-        decision = { model: loadedPick, fallbacks: fbSet, reason: type + '任务 → 复用已驻留模型（' + loadedPick + '）' };
+        decision = { model: loadedPick, fallbacks: fbSet, reason: type + '任务 → 复用已驻留模型，避免重载（' + loadedPick + '）' };
         affinityApplied = true;
       }
     }
@@ -15637,13 +16270,18 @@ const Gateway = {
       const ranked = sized.concat(unsized).map(x => x.n);
       const localBest = ranked[0];
       if (typeof localBest === 'string' && localBest.trim() && localBest !== decision.model) {
-        const extra = ranked.slice(1).filter(n => typeof n === 'string' && n.trim() && n !== localBest);
-        const fbSet = [];
-        [decision.model].concat(extra).forEach(n => {
-          if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
-        });
-        const cooling = eligBase.cooling.length ? '；冷却跳过 ' + eligBase.cooling.join('、') : '';
-        decision = { model: localBest, fallbacks: fbSet, reason: type + '任务 → 本地优先（' + localBest + '）' + cooling };
+        // [速度优化] complex 任务保持“参数量最大”策略，不被本地优先降级成最小模型
+        const complexKeepMax = type === 'complex' &&
+          (modelSizeB(decision.model) || 0) >= (modelSizeB(localBest) || 0);
+        if (!complexKeepMax) {
+          const extra = ranked.slice(1).filter(n => typeof n === 'string' && n.trim() && n !== localBest);
+          const fbSet = [];
+          [decision.model].concat(extra).forEach(n => {
+            if (typeof n === 'string' && n.trim() && !fbSet.includes(n)) fbSet.push(n);
+          });
+          const cooling = eligBase.cooling.length ? '；冷却跳过 ' + eligBase.cooling.join('、') : '';
+          decision = { model: localBest, fallbacks: fbSet, reason: type + '任务 → 本地优先（' + localBest + '）' + cooling };
+        }
       }
     }
     // [路由修复] 兜底：decision.model 必须非空合法字符串，否则回退默认模型
@@ -15786,8 +16424,13 @@ Gateway.chatStream = function (opts) {
   this._currentOpts = opts;
   const self = this;
   const promise = (async () => {
+    const T0 = performance.now();
+    const timing = { startMs: 0 };
     await self.guardCloud();
     const routed = await self.route(opts);
+    timing.routeMs = performance.now() - T0; // 含路由决策 + /api/ps(缓存) + 冷却/亲和判断
+    timing.psMs = (typeof __lastPsMs === 'number') ? __lastPsMs : 0;
+    timing.tagsMs = (AI && typeof AI.__lastTagsMs === 'number') ? AI.__lastTagsMs : 0;
     // [小补丁] 路由结果早期回调：加载态气泡立即刷新为实际命中模型/reason（不等流式结束）
     if (typeof opts.onRoute === 'function') {
       try { opts.onRoute(routed); } catch (e) { /* 回调异常不影响主链路 */ }
@@ -15802,8 +16445,11 @@ Gateway.chatStream = function (opts) {
     });
     if (metaModelQ) effective.messages = injectModelMetaNote(effective.messages, routed.model);
     const canCache = MoraySettings.get('cacheEnabled') && !effective.bypassCache && !effective.hasImages;
-    // [工具调用] 仅 openai 后端 + 总开关 + 有可用工具时启用；Ollama/不支持/报错自动回退普通流式；对比等场景可传 noTools 强制关闭
-    const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') && AI.backend === 'openai' && typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
+    // [工具调用] 仅 openai/ollama 后端 + 总开关 + 有可用工具时启用；Ollama 走前端直连原生 tools；
+    // 不支持/报错自动回退普通流式；对比等场景可传 noTools 强制关闭
+    const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') &&
+      (AI.backend === 'openai' || AI.backend === 'ollama') &&
+      typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
     if (canCache) {
       try {
         const exact = await GatewayCache.lookupExact(GatewayCache.requestHash(effective));
@@ -15814,6 +16460,25 @@ Gateway.chatStream = function (opts) {
         await GatewayCache.bumpMeta('miss');
       } catch (e) { console.warn('[MoRay] cache lookup failed:', e); }
     }
+    // [首字延迟修复] 路由已定稿：若本地模型未驻留，先串行预热最终模型再发真实请求
+    if (AI.backend === 'ollama' && effective.model) {
+      const w0 = performance.now();
+      await self.ensureWarmup(effective.model);
+      timing.warmMs = performance.now() - w0;
+    }
+    // TTFT 埋点：首个 token 到达时间（routingDebug=true 或 ?ttft=1 时输出）
+    let firstTokenAt = 0;
+    const origChunk = opts.onChunk;
+    effective.onChunk = function (...args) {
+      if (!firstTokenAt) {
+        firstTokenAt = performance.now();
+        timing.firstTokenMs = firstTokenAt - T0;
+        if (MoraySettings.get('routingDebug') || (typeof location !== 'undefined' && /ttft=1/.test(location.search))) {
+          console.log('[MoRay TTFT]', JSON.stringify(timing));
+        }
+      }
+      if (typeof origChunk === 'function') origChunk.apply(this, args);
+    };
     let abortWasTimeout = false;
     const attemptFn = (model) => {
       const timeoutMs = (MoraySettings.get('requestTimeout') || 30) * 1000;
@@ -15827,6 +16492,7 @@ Gateway.chatStream = function (opts) {
     // [工具兜底] 标志位：工具模式失败后最多做一次"去 tools 普通流式"重试，防死循环
     let toolsFallbackTried = false;
     let usedFallback = false; // [显示统一] 是否真的发生了备用模型回退
+    timing.requestStartMs = performance.now() - T0;
     try {
       if (useTools) {
         // [工具调用] 工具闭环（内部逐轮 record 成本；异常回退下方兜底/降级链路）
@@ -15873,6 +16539,12 @@ Gateway.chatStream = function (opts) {
           self.fallbackLog = self.fallbackLog.slice(0, 20);
           if (metaModelQ) effective.messages = injectModelMetaNote(effective.messages, fallbacks[0]);
           try {
+            // 备用模型同样先串行预热再发起（保持 MAX_LOADED=1 下不并发）
+            if (AI.backend === 'ollama') {
+              const w1 = performance.now();
+              await self.ensureWarmup(fallbacks[0]);
+              timing.fallbackWarmMs = performance.now() - w1;
+            }
             result = await self.withRetry(() => attemptFn(fallbacks[0]), MoraySettings.get('routingFallbacks') || 2);
           } catch (fbErr) {
             GatewayBreaker.record(fallbacks[0], (fbErr && fbErr.message) || String(fbErr));
@@ -15908,7 +16580,12 @@ Gateway.chatStream = function (opts) {
     }
     // [工具调用] 工具轮结果不写缓存（时间/库内容敏感，避免过时快照）
     if (canCache && !useTools) GatewayCache.save(effective, result).catch(() => {});
+    if (MoraySettings.get('routingDebug') || (typeof location !== 'undefined' && /ttft=1/.test(location.search))) {
+      if (!timing.firstTokenMs) timing.firstTokenMs = performance.now() - T0;
+      console.log('[MoRay TTFT] done', JSON.stringify(timing));
+    }
     return Object.assign({}, result, {
+      _timing: timing,
       _routed: routed.routeInfo ? {
         model: effective.model,
         type: routed.routeInfo.type,
@@ -15935,7 +16612,8 @@ Gateway.chatStream = function (opts) {
 Gateway.runWithTools = async function (opts, onToolStep) {
   const model = opts.model;
   const tools = ToolRegistry.listForRequest();
-  const maxRounds = Math.max(1, Math.min(10, MoraySettings.get('toolsMaxRounds') || 3));
+  // [阶段0] 轮次默认 8、上限 12（设置页本机 Agent 分区与 AI 工具卡可调）
+  const maxRounds = Math.max(1, Math.min(12, MoraySettings.get('toolsMaxRounds') || 8));
   const msgs = (opts.messages || []).map(m => Object.assign({}, m));
   const steps = [];
   let promptTotal = 0, completionTotal = 0;
@@ -15992,7 +16670,12 @@ Gateway.runWithTools = async function (opts, onToolStep) {
       const name = fn.name || '';
       const callId = call.id || ('call_' + steps.length);
       let args = {};
-      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) { args = {}; }
+      // [阶段0] arguments 兼容字符串（OpenAI）与对象（Ollama 原生形态统一为协议字符串后仍可被解析）
+      try {
+        args = (typeof AI !== 'undefined' && typeof AI.toolArgsToObject === 'function')
+          ? AI.toolArgsToObject(fn.arguments)
+          : JSON.parse(fn.arguments || '{}');
+      } catch (e) { args = {}; }
       const toolDef = ToolRegistry.get(name);
       const label = toolDef ? toolDef.label : name;
       const t0 = performance.now();
@@ -16008,14 +16691,21 @@ Gateway.runWithTools = async function (opts, onToolStep) {
       }
       let res;
       try {
-        res = await ToolRegistry.run(name, args, { model, signal: toolCtl.signal });
+        res = await ToolRegistry.run(name, args, {
+          model, signal: toolCtl.signal,
+          // [阶段0] 审批过程事件：native 工具等待人工授权时把本步骤转"待审批"（时间线实时可见）
+          onStatus: (st) => emit({ index: idx, name, label, args, status: st, ms: Math.round(performance.now() - t0), resultPreview: '' })
+        });
       } finally {
         if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort);
       }
       const ms = Math.round(performance.now() - t0);
+      // [阶段0] 用户拒绝（data.denied）：步骤卡显示"已拒绝"，回灌内容让模型如实回应
+      const denied = !!(res.ok && res.data && res.data.denied);
+      const stepStatus = denied ? 'denied' : (res.ok ? 'success' : 'error');
       const preview = res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : res.error;
       const resultFull = (res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : ('错误：' + res.error)).slice(0, 10000);
-      emit({ index: idx, name, label, args, status: res.ok ? 'success' : 'error', ms, resultPreview: preview || '', resultFull });
+      emit({ index: idx, name, label, args, status: stepStatus, ms, resultPreview: preview || '', resultFull });
       msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: callId, type: 'function', function: { name, arguments: fn.arguments || '{}' } }] });
       msgs.push({ role: 'tool', tool_call_id: callId, name, content: res.ok ? JSON.stringify(res.data).slice(0, 4000) : ('错误：' + res.error) });
     }
@@ -16282,7 +16972,7 @@ function isVisionModel(model) {
   return /llava|bakllava|vision|-vl|vl-|moondream|minicpm-v|gpt-4o|gpt-4-turbo|claude-3|gemini|pixtral|qwen2.*vl/i.test(model || '');
 }
 
-﻿/* ============================================================
+/* ============================================================
    MoRay V3 体验打磨与健壮性
    P1 连接闭环：Ollama检测引导卡 / 错误诊断 / 拉取进度增强
    P2 引导与空状态：3步Onboarding / 统一空状态组件
@@ -17142,7 +17832,7 @@ function installModelSelector() {
     } else {
       pop.innerHTML = models.map(m => `
         <div class="model-pop-item ${m === current ? 'selected' : ''}" data-pick-model="${escapeHtml(m)}">
-          <span class="truncate">${escapeHtml(m)}</span>
+          <span class="truncate" title="${escapeHtml(m)}">${escapeHtml(uniqueModelName(m))}</span>
           ${m === current ? '<i data-lucide="check" class="w-3.5 h-3.5 text-brand-cobalt"></i>' : ''}
         </div>`).join('');
       pop.querySelectorAll('[data-pick-model]').forEach(item => {
@@ -17586,15 +18276,15 @@ Onboarding.openV2 = function () {
     const prev = box.querySelector('#ob2Prev');
     if (prev) prev.addEventListener('click', () => { step = Math.max(0, step - 1); render(); });
   };
-  const finish = async () => {
-    Onboarding.done();
-    closeModal();
-    if (box.querySelector('#ob2Sample') && box.querySelector('#ob2Sample').checked) {
-      const n = await loadSamplePack();
-      showNotification('示例包已载入', n ? `共写入 ${n} 条示例数据` : '示例数据已存在', 'success', 3000);
-    }
-    showNotification('一切就绪', '按 ⌘/Ctrl+K 打开命令面板；成本中心在左侧导航', 'success', 4000);
-  };
+    const finish = async () => {
+      Onboarding.done();
+      closeModal();
+      if (box.querySelector('#ob2Sample') && box.querySelector('#ob2Sample').checked) {
+        const n = await loadSamplePack();
+        showNotification('示例包已载入', n ? `共写入 ${n} 条示例数据` : '示例数据已存在', 'success', 3000);
+      }
+      // [阶段1.5 A] 启动摘要由 probeBackend 统一弹出（此处不再叠加“一切就绪”，避免启动连叠）
+    };
   render();
 };
 
@@ -18142,8 +18832,8 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
-window.MORAY_VERSION = '0.3.0';
-window.MORAY_BUILD = '3.15.13';
+window.MORAY_VERSION = '1.0.0';
+window.MORAY_BUILD = '3.18.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -18198,9 +18888,9 @@ window.MORAY_BUILD = '3.15.13';
       label.textContent = '本地后端 ● 已连接';
       label.style.color = 'var(--color-success)';
     } else {
-      item.title = '本地后端未运行，纯前端模式（IndexedDB 照常工作）';
+      item.title = '本地同步后端未启动：当前用浏览器存储，Ollama 本地对话不受影响；启动后端可多设备同步';
       if (dot) dot.style.background = 'var(--color-text-tertiary)';
-      label.textContent = '本地后端 ○ 离线模式';
+      label.textContent = '本地后端未启动';
       label.style.color = 'var(--color-text-tertiary)';
     }
   }
@@ -18216,7 +18906,7 @@ window.MORAY_BUILD = '3.15.13';
     item.id = 'statusBackendItem';
     item.title = '本地后端连接状态（探测中...）';
     item.innerHTML = '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-text-tertiary)"></span>' +
-      '<span class="backend-status-text" style="color:var(--color-text-tertiary)">本地后端 ○ 离线模式</span>';
+      '<span class="backend-status-text" style="color:var(--color-text-tertiary)">本地后端未启动</span>';
     group.appendChild(item);
   }
 
@@ -18241,22 +18931,16 @@ window.MORAY_BUILD = '3.15.13';
       }
     } catch (e) { /* 静默：离线/超时/网络错误均不打扰用户 */ window.MorayBackend = { connected: false, checked: true, url: HEALTH_URL, origin: BACKEND_ORIGIN }; }
     refreshBackendStatus();
-    // [M5.1修复] 启动 toast 在探测完成后生成（状态文案准确，不再写死"后端未连接"）
+    // [阶段1.5 A] 启动通知合并为唯一一条状态摘要（消除“已就绪/持久化/纯前端”三连叠）：
+    // 后端连接状态 + Ollama 模型数一并在摘要中；纯前端提示并入同一句话（不再单独弹）
     try {
       const ok = !!(window.MorayBackend && window.MorayBackend.connected);
-      showNotification('MoRay v' + window.MORAY_VERSION + ' 已就绪',
-        'IndexedDB 持久化 · ' + (ok ? ('本地后端已连接：' + BACKEND_ORIGIN) : '本地后端离线模式（纯前端照常可用）'),
-        ok ? 'success' : 'info', 4000);
+      const modelN = (window.AI && Array.isArray(window.AI.models)) ? window.AI.models.length : null;
+      const msg = ok
+        ? ('本地后端已连接：' + BACKEND_ORIGIN + (modelN != null ? ' · 本地模型 ' + modelN + ' 个' : ''))
+        : '本地同步后端未启动：当前用浏览器存储，Ollama 本地对话不受影响；启动后端可多设备同步';
+      showNotification('MoRay v' + window.MORAY_VERSION + ' 已就绪', msg, ok ? 'success' : 'info', 5000);
     } catch (e) { /* 忽略 */ }
-    // [M5.1] 纯前端模式一次性、非阻断轻提示（不反复打扰；完整工作台 = 启动MoRay.bat / start_moray.sh）
-    if (!(window.MorayBackend && window.MorayBackend.connected)) {
-      try {
-        if (!localStorage.getItem('moray_purefront_notice')) {
-          localStorage.setItem('moray_purefront_notice', '1');
-          showNotification('纯前端（离线）模式', '启动本地后端可获得 SQLite 数据同步与云端 Key 代理：双击「启动MoRay.bat」（完整工作台）', 'info', 6000);
-        }
-      } catch (e) { /* 忽略 */ }
-    }
     // [M2] 通知设置页等模块刷新"代理/直连"通道 UI
     try { window.dispatchEvent(new CustomEvent('moray-backend-probed')); } catch (e) { /* 忽略 */ }
   }
@@ -19232,23 +19916,25 @@ const ToolRegistry = {
    * @param {string} name - 工具名 */
   get(name) { return this.tools[name] || null; },
 
-  /** 某工具当前是否启用（总开关 + 独立开关）
+  /** 某工具当前是否启用（总开关 + 独立开关 + [阶段0] 本机工具门）
    * @param {string} name - 工具名 */
   isEnabled(name) {
     const t = this.tools[name];
     if (!t) return false;
     if (!MoraySettings.get('toolsEnabled')) return false;
+    // [阶段0 本机 Agent] native 工具须输入台显式开启"本机工具/Agent"才可用（默认关）
+    if (t.native && !MoraySettings.get('nativeToolsEnabled')) return false;
     const disabled = MoraySettings.get('toolsDisabled') || [];
     return !disabled.includes(name);
   },
 
   /** 请求体可用的协议描述（关闭总开关时返回空数组 → 请求体绝无 tools 字段）
+   * 各工具经 isEnabled 统一过滤（含独立禁用与 native 门）
    * @returns {Array<{type:string, function:Object}>} */
   listForRequest() {
     if (!MoraySettings.get('toolsEnabled')) return [];
-    const disabled = MoraySettings.get('toolsDisabled') || [];
     return Object.values(this.tools)
-      .filter(t => !disabled.includes(t.name))
+      .filter(t => this.isEnabled(t.name))
       .map(t => ({
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.parameters || { type: 'object', properties: {} } }
@@ -19274,10 +19960,13 @@ const ToolRegistry = {
       else ctx.signal.addEventListener('abort', onOuterAbort, { once: true });
     }
     let timedOut = false;
+    // [阶段0] 工具级超时：native 工具含人工审批等待与后端执行（run_command 最长 15s），
+    // 按工具定义 timeoutMs 放宽（默认仍 5s，与改造前一致）；审批等待也纳入但不误杀
+    const tmo = Math.max(1000, parseInt(t.timeoutMs || 5000, 10) || 5000);
     const timer = setTimeout(() => {
       timedOut = true;
       if (!internal.signal.aborted) internal.abort(); // 协作式取消底层工具
-    }, 5000);
+    }, tmo);
     try {
       // 传给具体工具的 ctx：signal 换成合并后的 internal.signal（工具检查 aborted 即覆盖"外部取消+超时"）
       const toolCtx = Object.assign({}, ctx || {}, { signal: internal.signal });
@@ -19291,7 +19980,7 @@ const ToolRegistry = {
       return { ok: true, data, ms: Math.round(performance.now() - started) };
     } catch (e) {
       // 三类结果可辨：超时=超时文案（不传播，工具循环继续）；用户取消=AbortError（传播，立即停止）；工具错误=原始错误
-      if (internal.signal.aborted && timedOut) return { ok: false, error: '工具执行超时（5s）', ms: Math.round(performance.now() - started), timeout: true };
+      if (internal.signal.aborted && timedOut) return { ok: false, error: '工具执行超时（' + (tmo / 1000) + 's）', ms: Math.round(performance.now() - started), timeout: true };
       if (e && e.name === 'AbortError') throw e;
       return { ok: false, error: String((e && e.message) || e).slice(0, 200), ms: Math.round(performance.now() - started) };
     } finally {
@@ -19301,67 +19990,172 @@ const ToolRegistry = {
     }
   },
 
-  /** 单步事件 → 步骤卡 HTML（进行中脉冲 / 成功 / 失败 + 可折叠结果预览）
-   * @param {Object} evt - {index, name, label, args, status, resultPreview, ms}
+  /** 参数可读化（步骤卡摘要行/展开区共用；write 显示目标路径，command 显示完整命令）
+   * @param {string} name - 工具名
+   * @param {Object} args - 参数
+   * @returns {string} 可读参数文本 */
+  formatArgs(name, args) {
+    const a = args || {};
+    try {
+      if (name === 'write_file') {
+        const bytes = (typeof a.content === 'string') ? a.content.length : JSON.stringify(a.content || '').length;
+        return '写入 ' + (a.path || '') + '（' + bytes + ' 字符' + (a.overwrite === false ? '，不覆盖' : '') + '）';
+      }
+      if (name === 'run_command') {
+        return '$ ' + String(a.command || '') + (Array.isArray(a.args) && a.args.length ? ' ' + a.args.join(' ') : '');
+      }
+      if (name === 'read_file') return '读取 ' + (a.path || '');
+      if (name === 'list_directory') return '列出 ' + (a.path || '工作区根');
+      if (name === 'find_files') return '查找「' + (a.pattern || '*') + '」' + (a.path ? '于 ' + a.path : '（全工作区）');
+      if (name === 'search_text') return '搜索「' + String(a.query || '').slice(0, 40) + '」' + (a.regex ? '（正则）' : '') + (a.path ? '于 ' + a.path : '');
+      if (name === 'edit_file') return '编辑 ' + (a.path || '') + '（' + String(a.old_str || '').length + '→' + String(a.new_str || '').length + ' 字符）';
+      const s = JSON.stringify(a);
+      return s.length > 120 ? s.slice(0, 120) + '…' : s;
+    } catch (e) {
+      return String(JSON.stringify(a)).slice(0, 120);
+    }
+  },
+
+  /** 单步事件 → 步骤卡 HTML（进行中脉冲 / 待审批 / 成功 / 失败(可重试) / 已拒绝
+   * 摘要行：完整可读入参 + 耗时 + 状态；展开区：完整结果或真实错误，不撑爆会话）
+   * @param {Object} evt - {index, name, label, args, status, resultPreview, ms, resultFull}
    * @returns {string} HTML */
   stepHtml(evt) {
     const iconMap = {
       get_current_time: 'clock', calculator: 'calculator', query_knowledge_base: 'library',
-      save_snippet: 'save', run_workflow: 'workflow', get_cost_usage: 'wallet'
+      save_snippet: 'save', run_workflow: 'workflow', get_cost_usage: 'wallet',
+      // [阶段0 本机 Agent] 本机工具图标
+      list_directory: 'folder', read_file: 'file-text', write_file: 'file-pen-line', run_command: 'terminal',
+      // [阶段1 M2] 高价值三工具
+      find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen'
     };
     const icon = iconMap[evt.name] || 'wrench';
     const label = evt.label || evt.name;
-    let argText = '';
-    try { argText = (typeof evt.args === 'string' ? evt.args : JSON.stringify(evt.args || {})).slice(0, 60); } catch (e) { argText = ''; }
-    const msText = evt.ms != null ? (evt.ms >= 1000 ? (evt.ms / 1000).toFixed(1) + 's' : Math.round(evt.ms) + 'ms') : '';
+    const argFull = this.formatArgs(evt.name, evt.args);
+    const argShort = argFull.length > 52 ? argFull.slice(0, 52) + '…' : argFull;    const msText = evt.ms != null ? (evt.ms >= 1000 ? (evt.ms / 1000).toFixed(1) + 's' : Math.round(evt.ms) + 'ms') : '';
     let badge, color;
     if (evt.status === 'running') { badge = '<span class="animate-pulse text-[10px] text-brand-cyan">执行中…</span>'; color = 'text-brand-cyan'; }
+    // [阶段0] 审批态：pending=等待用户授权（warning 脉冲），denied=用户拒绝（warning 稳态）
+    else if (evt.status === 'pending') { badge = '<span class="animate-pulse text-[10px] text-warning">待审批</span>'; color = 'text-warning'; }
+    else if (evt.status === 'denied') { badge = '<span class="text-[10px] text-warning">已拒绝</span>'; color = 'text-warning'; }
     else if (evt.status === 'error') { badge = '<span class="text-[10px] text-danger">失败</span>'; color = 'text-danger'; }
     else { badge = '<span class="text-[10px] text-success">成功</span>'; color = 'text-success'; }
-    const preview = evt.resultPreview != null ? String(evt.resultPreview).slice(0, 300) : '';
-    // 完整结果（复制用，不截断；预览仍截断展示）
-    const full = evt.resultFull != null ? String(evt.resultFull) : preview;
-    const open = evt.status === 'running' ? ' open' : '';
-    return '<details class="tool-step rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2" data-tool-step="' + evt.index + '"' + open + '>' +
+    // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
+    // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
+    const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
+    let body = '';
+    if (evt.status === 'error') {
+      body = '<div class="text-[10px] text-danger mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
+    } else if (evt.status === 'denied') {
+      body = '<div class="text-[10px] text-warning mt-1.5">' + escapeHtml(full || '用户拒绝了该操作') + '</div>';
+    } else if (full) {
+      body = '<div class="text-[10px] text-text-tertiary mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all" data-tool-full>' + escapeHtml(full) + '</div>';
+    }
+    const retry = evt.status === 'error' && evt.name
+      ? '<button data-tool-retry="' + evt.index + '" class="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-warning hover:bg-surface-panel flex items-center gap-1 text-[10px]" title="重新执行本步骤（走完整安全层与审批）"><i data-lucide="rotate-cw" class="w-3 h-3"></i>重试该步</button>'
+      : '';
+    const copyBtn = full && evt.status !== 'error'
+      ? '<button class="tool-step-copy ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" data-tool-copy title="复制完整结果" data-full="' + escapeHtml(full) + '"><i data-lucide="copy" class="w-3 h-3"></i>复制</button>'
+      : '';
+    const actions = (copyBtn || retry)
+      ? '<span class="ml-auto flex items-center gap-1">' + copyBtn + retry + '</span>'
+      : '';
+    const open = evt.status === 'running' || evt.status === 'pending' ? ' open' : '';
+    return '<details class="tool-step rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2" data-tool-step="' + evt.index + '" data-status="' + (evt.status || '') + '" data-ms="' + (evt.ms || 0) + '"' + open + '>' +
       '<summary class="flex items-center gap-2 cursor-pointer list-none text-[11px] select-none">' +
       '<i data-lucide="' + icon + '" class="w-3.5 h-3.5 ' + color + '"></i>' +
       '<span class="text-text-primary font-medium">' + escapeHtml(label) + '</span>' +
-      (argText ? '<span class="text-text-tertiary truncate">' + escapeHtml(argText) + '</span>' : '') +
-      (msText ? '<span class="text-text-tertiary">' + msText + '</span>' : '') + badge +
-      (full ? '<button class="tool-step-copy ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" data-tool-copy title="复制完整结果" data-full="' + escapeHtml(full) + '"><i data-lucide="copy" class="w-3 h-3"></i>复制</button>' : '') +
-      '</summary>' +
-      (preview ? '<div class="text-[10px] text-text-tertiary mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-all">' + escapeHtml(preview) + '</div>' : '') +
+      (argShort ? '<span class="text-text-tertiary truncate font-mono" title="' + escapeHtml(argFull) + '">' + escapeHtml(argShort) + '</span>' : '') +
+      (msText ? '<span class="text-text-tertiary shrink-0">' + msText + '</span>' : '') + badge + actions +
+      '</summary>' + body +
       '</details>';
   },
 
+  /** 步骤时间线整体摘要文本："共 N 步 · 总耗时 Xs"
+   * @param {HTMLElement|NodeList|Array} stepEls - .tool-step 元素集合
+   * @returns {string} 摘要文本 */
+  stepsSummaryText(stepEls) {
+    const arr = Array.from(stepEls || []);
+    let ms = 0;
+    arr.forEach(el => { ms += parseInt(el.getAttribute('data-ms') || '0', 10) || 0; });
+    return '共 ' + arr.length + ' 步 · 总耗时 ' + (ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms');
+  },
+
   /** 消息持久化 steps → 静态步骤卡 HTML（重开会话渲染用）
+   * [阶段0.5] 默认折叠为一行"共 N 步 · 总耗时 Xs"，点击展开完整时间线
    * @param {Array} toolCalls - [{name,label,args,status,resultPreview,ms}]
    * @returns {string} HTML */
   renderSteps(toolCalls) {
     if (!toolCalls || !toolCalls.length) return '';
-    return '<div class="tool-steps space-y-1.5 my-2">' + toolCalls.map((s, i) => this.stepHtml(Object.assign({}, s, { index: i }))).join('') + '</div>';
+    const stepsHtml = toolCalls.map((s, i) => this.stepHtml(Object.assign({}, s, { index: i }))).join('');
+    const tmp = document.createElement('div');
+    tmp.innerHTML = stepsHtml;
+    const summaryText = this.stepsSummaryText(tmp.querySelectorAll('.tool-step'));
+    return '<div class="tool-steps-wrap my-2">' +
+      '<div class="tool-steps-summary rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2 text-[11px] text-text-secondary flex items-center gap-2 cursor-pointer select-none hover:border-line-ghost" data-steps-toggle title="点击展开完整时间线">' +
+      '<i data-lucide="list-tree" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
+      '<span data-steps-summary-text>' + escapeHtml(summaryText) + '</span>' +
+      '<span class="text-[10px] text-text-tertiary ml-auto" data-steps-hint>展开</span></div>' +
+      '<div class="tool-steps space-y-1.5" style="display:none">' + stepsHtml + '</div></div>';
+  },
+
+  /** [阶段0.5] 全部步骤到终态 → 把时间线折叠为摘要行（不改变 DOM 结构，只切换可见性）
+   * @param {HTMLElement} wrapEl - .tool-steps-wrap 容器
+   * @returns {void} */
+  maybeCollapseSteps(wrapEl) {
+    if (!wrapEl || !wrapEl.isConnected) return;
+    const summaryEl = wrapEl.querySelector('.tool-steps-summary');
+    const list = wrapEl.querySelector('.tool-steps');
+    if (!summaryEl || !list) return;
+    const steps = list.querySelectorAll('.tool-step[data-status]');
+    if (!steps.length) return;
+    const busy = Array.from(steps).some(el => el.getAttribute('data-status') === 'running' || el.getAttribute('data-status') === 'pending');
+    if (busy) return;
+    const textEl = summaryEl.querySelector('[data-steps-summary-text]');
+    if (textEl) textEl.textContent = this.stepsSummaryText(steps);
+    const hint = summaryEl.querySelector('[data-steps-hint]');
+    if (hint) hint.textContent = '展开';
+    summaryEl.style.display = '';
+    list.style.display = 'none';
   },
 
   /** 实时步骤卡：事件驱动（首个事件建容器于最终回复之前，后续按 index 原位更新）
    * 同时管理"工具执行中"发送按钮状态（running 进入 / 终态退出）
+   * [阶段0.5] 全部步骤到终态后自动折叠为"共 N 步 · 总耗时 Xs"摘要行（可点击展开）
    * @param {HTMLElement} bubbleEl - 消息气泡
    * @param {Object} evt - 步骤事件 */
   renderLiveStep(bubbleEl, evt) {
     if (!bubbleEl) return;
-    if (evt.status === 'running') this.enterToolBusy();
+    if (evt.status === 'running' || evt.status === 'pending') this.enterToolBusy();
     else this.exitToolBusy();
-    let wrap = bubbleEl.querySelector('.tool-steps');
+    let wrap = bubbleEl.querySelector('.tool-steps-wrap');
     if (!wrap) {
       wrap = document.createElement('div');
-      wrap.className = 'tool-steps space-y-1.5 my-2';
+      wrap.className = 'tool-steps-wrap my-2';
+      wrap.innerHTML = '<div class="tool-steps-summary rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2 text-[11px] text-text-secondary flex items-center gap-2 cursor-pointer select-none hover:border-line-ghost" data-steps-toggle title="点击展开完整时间线" style="display:none">' +
+        '<i data-lucide="list-tree" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
+        '<span data-steps-summary-text></span>' +
+        '<span class="text-[10px] text-text-tertiary ml-auto" data-steps-hint>展开</span></div>' +
+        '<div class="tool-steps space-y-1.5"></div>';
       const inner = bubbleEl.querySelector('.ai-msg-inner');
       if (inner) inner.parentElement.insertBefore(wrap, inner); // 最终回复之前
       else bubbleEl.appendChild(wrap);
     }
-    const old = wrap.querySelector('[data-tool-step="' + evt.index + '"]');
+    // 新事件到来 → 保持展开态（从摘要折叠恢复）
+    const summaryEl = wrap.querySelector('.tool-steps-summary');
+    const list = wrap.querySelector('.tool-steps');
+    if (summaryEl && list) {
+      summaryEl.style.display = 'none';
+      list.style.display = '';
+    }
+    const old = list.querySelector('[data-tool-step="' + evt.index + '"]');
     if (old) old.outerHTML = this.stepHtml(evt);
-    else wrap.insertAdjacentHTML('beforeend', this.stepHtml(evt));
+    else list.insertAdjacentHTML('beforeend', this.stepHtml(evt));
     refreshIcons();
+    // 终态事件 → 延迟检查整条时间线是否全部完成，完成则折叠为摘要
+    if (evt.status !== 'running' && evt.status !== 'pending') {
+      setTimeout(() => this.maybeCollapseSteps(wrap), 250);
+    }
   },
 
   /** 工具执行中计数 @type {number} */
@@ -19419,12 +20213,31 @@ const ToolRegistry = {
     this.restoreSendBtn();
   },
 
-  /** 步骤结果复制：事件委托（复制完整结果而非预览截断）
+  /** 步骤结果复制 / 时间线摘要折叠切换 / 失败步骤重试：事件委托（加载即装，幂等）
    * @returns {void} */
   _installCopyHandler() {
     if (this.__copyBound) return;
     this.__copyBound = true;
     document.addEventListener('click', (e) => {
+      // [阶段0.5] 时间线摘要行：展开/收起完整时间线
+      const toggle = e.target.closest('[data-steps-toggle]');
+      if (toggle) {
+        const wrapEl = toggle.closest('.tool-steps-wrap');
+        const list = wrapEl ? wrapEl.querySelector('.tool-steps') : null;
+        if (!list) return;
+        const expanded = list.style.display !== 'none';
+        list.style.display = expanded ? 'none' : '';
+        const hint = toggle.querySelector('[data-steps-hint]');
+        if (hint) hint.textContent = expanded ? '展开' : '收起';
+        return;
+      }
+      // [阶段0.5] 失败步骤"重试该步"：重新执行同一工具（走完整安全层与审批），就地更新结果
+      const retryBtn = e.target.closest('[data-tool-retry]');
+      if (retryBtn) {
+        e.stopPropagation();
+        this.retryStep(retryBtn);
+        return;
+      }
       const b = e.target.closest('[data-tool-copy]');
       if (!b) return;
       e.stopPropagation(); // 防止折叠 details
@@ -19433,6 +20246,47 @@ const ToolRegistry = {
       if (typeof copyToClipboard === 'function') copyToClipboard(full).then(done, () => done(false));
       else if (navigator.clipboard) navigator.clipboard.writeText(full).then(() => done(true), () => done(false));
     });
+  },
+
+  /** [阶段0.5] 重试失败步骤：按消息持久化的 name/args 重新执行（不经模型，走完整
+   * 安全层与审批），就地更新该步骤卡与消息持久化数据。不改变已生成的模型回复——
+   * 重试成功后提示用户可用"重新生成"让模型基于最新结果作答。
+   * @param {HTMLElement} btn - [data-tool-retry] 按钮
+   * @returns {Promise<void>} */
+  async retryStep(btn) {
+    if (this.__retrying) return;
+    const idx = parseInt(btn.getAttribute('data-tool-retry'), 10);
+    const bubble = btn.closest('.msg-bubble');
+    const msgId = bubble && bubble.dataset ? bubble.dataset.msgId : null;
+    const msg = (typeof AppState !== 'undefined' && msgId) ? (AppState.messages || []).find(m => m.id === msgId) : null;
+    const steps = msg && Array.isArray(msg.toolCalls) ? msg.toolCalls : null;
+    const step = steps ? steps[idx] : null;
+    if (!step || !step.name) {
+      showNotification('无法重试', '未找到该步骤的原始参数', 'error', 2200);
+      return;
+    }
+    this.__retrying = true;
+    btn.disabled = true;
+    btn.innerHTML = '<i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i>重试中';
+    refreshIcons();
+    try {
+      const res = await ToolRegistry.run(step.name, step.args || {}, {});
+      step.status = res.ok ? 'success' : 'error';
+      step.ms = res.ms;
+      const text = res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : res.error;
+      step.resultPreview = text;
+      step.resultFull = (res.ok ? text : ('错误：' + res.error)).slice(0, 10000);
+      const card = btn.closest('.tool-step');
+      if (card && card.isConnected) card.outerHTML = this.stepHtml(Object.assign({}, step, { index: idx }));
+      refreshIcons();
+      if (res.ok) showNotification('重试成功', '可点击该回复的「重新生成」让模型基于最新结果作答', 'success', 3200);
+      else showNotification('重试失败', String(res.error || '').slice(0, 140), 'error', 3000);
+      if (msg && typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
+    } catch (e) {
+      showNotification('重试失败', String((e && e.message) || e).slice(0, 140), 'error', 3000);
+    } finally {
+      this.__retrying = false;
+    }
   }
 };
 
@@ -19703,7 +20557,17 @@ async function appendToolsSettings() {
   const container = document.querySelector('#page-settings .max-w-2xl');
   if (!container || container.querySelector('#toolsSettingsCard')) return;
   const disabled = MoraySettings.get('toolsDisabled') || [];
+  const nativeOn = !!MoraySettings.get('nativeToolsEnabled');
   const toolRows = Object.values(ToolRegistry.tools).map(t => {
+    // [阶段0] native 工具开关由输入台"本机工具/Agent"统一控制，此处只读展示（不渲染误导性独立开关）
+    if (t.native) {
+      return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
+        '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
+        ' <span class="font-mono text-[10px] text-text-tertiary">' + t.name + '</span>' +
+        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span></div>' +
+        '<div class="text-[10px] text-text-tertiary mt-0.5">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
+        '<div class="text-[10px] text-text-tertiary shrink-0 ' + (nativeOn ? 'text-success' : '') + '">' + (nativeOn ? '已由输入台开启' : '由输入台「本机工具」开关控制') + '</div></div>';
+    }
     const on = !disabled.includes(t.name);
     return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
       '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
@@ -19747,6 +20611,213 @@ async function appendToolsSettings() {
   }));
 }
 
+/* ===================== [阶段0 本机 Agent] 设置卡 + 审计日志 ===================== */
+
+/** [阶段1.5 E] 审计日志查看（表格呈现：时间/工具/参数摘要/审批/状态色/耗时；分页/导出/清空带确认）
+ * @param {number} [page] - 页码（从 1 起）
+ * @returns {Promise<void>} */
+async function showAgentAuditLog(page) {
+  page = Math.max(1, page || 1);
+  const pageSize = 25;
+  const base = agentBackendBase();
+  let rows = [], total = 0;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(base + '/api/agent/log?limit=' + pageSize + '&offset=' + ((page - 1) * pageSize), { signal: ctrl.signal, cache: 'no-store' });
+    clearTimeout(timer);
+    const j = await res.json();
+    if (j && j.ok) { rows = j.data.rows || []; total = j.data.total || 0; }
+  } catch (e) { /* 离线 → 下方提示 */ }
+  const statusLabel = {
+    ok: ['成功', 'text-success'], error: ['失败', 'text-danger'], timeout: ['超时', 'text-danger'],
+    rejected: ['安全拒绝', 'text-danger'], needs_approval: ['未审批', 'text-warning'], denied: ['用户拒绝', 'text-warning']
+  };
+  const esc = (s) => escapeHtml(String(s == null ? '' : s));
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const body = rows.length
+    ? '<div class="overflow-auto max-h-[52vh] rounded-lg border border-line-ghost/50"><table class="w-full text-[10px]">' +
+      '<thead><tr class="text-text-tertiary bg-surface-panel/70 sticky top-0">' +
+      '<th class="text-left px-2 py-1.5 font-medium">时间</th><th class="text-left px-2 py-1.5 font-medium">工具</th>' +
+      '<th class="text-left px-2 py-1.5 font-medium">参数摘要</th><th class="text-left px-2 py-1.5 font-medium">审批</th>' +
+      '<th class="text-left px-2 py-1.5 font-medium">状态</th><th class="text-right px-2 py-1.5 font-medium">耗时</th></tr></thead><tbody>' +
+      rows.map(r => {
+        const st = statusLabel[r.status] || [r.status, 'text-text-tertiary'];
+        return '<tr class="border-t border-line-ghost/40 hover:bg-surface-panel/50">' +
+          '<td class="px-2 py-1.5 text-text-tertiary whitespace-nowrap">' + esc(r.ts) + '</td>' +
+          '<td class="px-2 py-1.5 font-mono text-text-primary whitespace-nowrap">' + esc(r.tool) + '</td>' +
+          '<td class="px-2 py-1.5 text-text-tertiary max-w-[260px] truncate" title="' + esc(r.args_summary) + '">' + esc(r.args_summary) + '</td>' +
+          '<td class="px-2 py-1.5 ' + (r.approved ? 'text-success' : 'text-text-tertiary') + ' whitespace-nowrap">' + (r.approved ? '是' : '否') + '</td>' +
+          '<td class="px-2 py-1.5 ' + st[1] + ' whitespace-nowrap">' + st[0] + '</td>' +
+          '<td class="px-2 py-1.5 text-text-tertiary text-right whitespace-nowrap">' + (r.ms ? r.ms + 'ms' : '—') + '</td></tr>';
+      }).join('') + '</tbody></table></div>'
+    : '<div class="empty-state"><i data-lucide="scroll-text"></i><div class="empty-title">暂无审计记录</div><div class="empty-hint">审计存于本地后端 SQLite；后端离线时无法读取</div></div>';
+  const html = '<div class="space-y-2">' +
+    '<div class="flex items-center gap-2 text-[10px] text-text-tertiary">' +
+    '<span>共 ' + total + ' 条 · 第 ' + page + '/' + totalPages + ' 页</span>' +
+    '<span class="ml-auto flex items-center gap-1.5">' +
+    '<button data-audit-page="prev" class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
+    '<button data-audit-page="next" class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost" ' + (page >= totalPages ? 'disabled' : '') + '>下一页</button>' +
+    '<button data-audit-export class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost">导出 JSON</button>' +
+    '<button data-audit-clear class="px-2 py-0.5 rounded-md text-[10px] bg-danger/10 text-danger border border-danger/30">清空</button>' +
+    '</span></div>' + body + '</div>';
+  const box = showModal(html, { title: '本机工具审计日志', icon: 'scroll-text', wide: true, footer: false });
+  box.querySelector('[data-audit-page="prev"]')?.addEventListener('click', () => { closeModal(); showAgentAuditLog(page - 1); });
+  box.querySelector('[data-audit-page="next"]')?.addEventListener('click', () => { closeModal(); showAgentAuditLog(page + 1); });
+  box.querySelector('[data-audit-export]')?.addEventListener('click', () => {
+    downloadJson('moray_agent_audit.json', { exportedAt: new Date().toISOString(), total, page, rows });
+    showNotification('已导出', '本页审计记录已导出为 JSON', 'success', 2000);
+  });
+  box.querySelector('[data-audit-clear]')?.addEventListener('click', () => {
+    showConfirm('清空审计日志', '将删除全部 ' + total + ' 条审计记录，此操作不可恢复。确定？', async () => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        const res = await fetch(base + '/api/agent/log', { method: 'DELETE', signal: ctrl.signal });
+        clearTimeout(timer);
+        const j = await res.json();
+        if (!res.ok || !j.ok) throw new Error(j.message || ('后端返回 ' + res.status));
+        showNotification('已清空', '审计日志已清空（' + j.data.cleared + ' 条）', 'success', 2200);
+        closeModal();
+        showAgentAuditLog(1);
+      } catch (e) {
+        showNotification('清空失败', String((e && e.message) || e).slice(0, 140), 'error', 3000);
+      }
+    }, { danger: true, okText: '清空' });
+  });
+  refreshIcons();
+}
+
+/** [阶段0] 设置页"本机 Agent"卡：后端连接/工作区根修改/审批策略/最大轮次/审计入口
+ * @returns {Promise<void>} */
+async function appendAgentSettings() {
+  const container = document.querySelector('#page-settings .max-w-2xl');
+  if (!container || container.querySelector('#agentSettingsCard')) return;
+  const cfg = await agentBackendConfig(true); // 强刷（避免设置页打开时读到陈旧缓存）
+  const online = !!cfg;
+  const approval = MoraySettings.get('agentApprovalMode') || 'readonly_auto';
+  const rounds = Math.max(1, Math.min(12, parseInt(MoraySettings.get('toolsMaxRounds') || 8, 10) || 8));
+  const card = document.createElement('div');
+  card.id = 'agentSettingsCard';
+  card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
+  card.innerHTML = [
+    '<h3 class="text-sm font-semibold text-text-primary mb-1 flex items-center gap-2"><i data-lucide="square-terminal" class="w-4 h-4 text-brand-violet"></i>本机 Agent（受控工作区工具）</h3>',
+    '<p class="text-[10px] text-text-tertiary mb-3">本机动作由本地后端执行并审计：列目录/读文件自动执行，写文件与只读命令需人工授权；全部操作限制在工作区内，越界/危险后缀/白名单外命令会被安全层拒绝。开关在输入台「本机工具」按钮。</p>',
+    online
+      ? '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-success"><span class="beacon-dot success"></span>本地后端已连接 · 版本 ' + escapeHtml(cfg.version || '') + ' · 构建 ' + escapeHtml(cfg.build || '') + '</div>'
+      : '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-warning"><span class="beacon-dot warn-dot"></span>本地后端离线：本机工具不可用（需启动后端，默认 http://127.0.0.1:8000）</div>',
+    '<div class="rounded-lg border border-line-ghost/60 p-3 mb-3">',
+    '<div class="flex items-center justify-between mb-2"><span class="text-xs text-text-secondary">工作区根</span>' +
+    (cfg && cfg.fromEnv ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/20">环境变量 MORAY_WORKSPACE 锁定</span>' : '') + '</div>',
+    '<div class="flex gap-2">',
+    '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:11px;padding:4px 8px">',
+    '<button id="agentWorkspaceSave" class="btn-ghost px-3 py-1.5 rounded-lg text-[10px] border border-line-ghost" ' + (cfg && cfg.fromEnv ? 'disabled' : '') + '>保存并校验</button>',
+    '</div>',
+    (cfg && cfg.fromEnv ? '<div class="text-[10px] text-text-tertiary mt-1.5">环境变量优先于此处设置；如需修改请调整 MORAY_WORKSPACE 后重启后端</div>' : '<div class="text-[10px] text-text-tertiary mt-1.5">修改后立即生效并写入后端（自动创建目录并校验可写；仅影响本机 Agent 工具）</div>'),
+    '</div>',
+    '<div class="space-y-2 text-xs">',
+    '<div class="flex items-center justify-between"><span class="text-text-secondary">审批策略</span>' +
+    '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">' +
+    '<option value="readonly_auto"' + (approval === 'readonly_auto' ? ' selected' : '') + '>只读自动执行（写文件/命令需审批）</option>' +
+    '<option value="all"' + (approval === 'all' ? ' selected' : '') + '>全部工具需人工审批</option></select></div>',
+    '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
+    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:11px"></div>',
+    '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
+    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button></div>',
+    // [阶段1 M1] 上次 Agent 自检结果
+    (() => {
+      const sc = MoraySettings.get('agentSelfCheck');
+      if (!sc || !sc.model) return '';
+      const when = sc.at ? new Date(sc.at).toLocaleString() : '';
+      return '<div class="flex items-center justify-between"><span class="text-text-secondary">上次模型自检</span>' +
+        '<span class="text-[10px] ' + (sc.ok ? 'text-success' : 'text-warning') + '">' + escapeHtml(sc.model) + ' · ' + (sc.ok ? '✓ 支持工具调用' : '✘ 未返回工具调用') + ' · ' + escapeHtml(when) + '</span></div>';
+    })(),
+    // [阶段0.5 E] 本会话已信任操作（默认 0=每次都询问；勾选信任后累积；run_command 永不入表）
+    '<div class="flex items-center justify-between"><span class="text-text-secondary">已信任操作（本会话，相同工具+参数免重复确认）</span>' +
+    '<div class="flex items-center gap-2"><span class="font-mono text-[10px] text-text-tertiary" id="agentTrustedCount">' + agentTrustedCount() + '</span>' +
+    '<button id="agentTrustedClear" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">清除</button></div></div>',
+    // [阶段1 M5] Agent 系统提示：查看内置 / 自定义覆盖
+    (() => {
+      const override = (MoraySettings.get('agentSysPromptOverride') || '').trim();
+      const effective = override || PlanTracker.SYSTEM_PROMPT;
+      return '<div class="pt-2 mt-2 border-t border-line-ghost/40">' +
+        '<div class="text-xs text-text-secondary mb-1.5">Agent 系统提示（多步任务先列计划、工具时机、工作区边界）</div>' +
+        '<textarea id="agentSysPromptInput" class="form-input w-full font-mono" rows="6" style="font-size:10px;line-height:1.6" placeholder="留空 = 使用内置规范">' + escapeHtml(effective) + '</textarea>' +
+        '<div class="flex items-center gap-2 mt-1.5">' +
+        '<button id="agentSysPromptSave" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">保存覆盖</button>' +
+        '<button id="agentSysPromptReset" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">恢复内置</button>' +
+        '<span class="text-[9px] text-text-tertiary">仅在本机工具开启时追加到系统提示</span></div></div>';
+    })(),
+    '<div class="flex items-center justify-between pt-1 border-t border-line-ghost/40"><span class="text-[10px] text-text-tertiary">工具：列目录 / 读文件（自动）；写文件 / 只读命令（审批）。命令白名单：git status/log/diff/branch、python/node/npm --version、where &lt;名&gt;</span></div>',
+    '</div>'
+  ].join('');
+  container.insertBefore(card, container.querySelector('#gatewaySettingsCard') || container.querySelector('#enhanceSettingsCard') || container.lastElementChild);
+  refreshIcons();
+  // ---- 事件 ----
+  on(card.querySelector('#agentApprovalSelect'), 'change', async function () {
+    await MoraySettings.set('agentApprovalMode', this.value);
+    showNotification('审批策略已更新', this.value === 'all' ? '全部工具需人工审批' : '只读工具自动执行', 'success', 1600);
+  });
+  const roundsInput = card.querySelector('#agentMaxRoundsInput');
+  on(roundsInput, 'change', async () => {
+    const v = Math.max(1, Math.min(12, parseInt(roundsInput.value, 10) || 8));
+    roundsInput.value = v;
+    await MoraySettings.set('toolsMaxRounds', v);
+    showNotification('已保存', '最大工具轮数 = ' + v, 'success', 1500);
+  });
+  on(card.querySelector('#agentAuditViewBtn'), 'click', () => showAgentAuditLog());
+  // [阶段0.5 E] 清除本会话已信任操作（相同工具+参数将重新询问）
+  const trustedClear = card.querySelector('#agentTrustedClear');
+  if (trustedClear) on(trustedClear, 'click', () => {
+    const n = agentTrustedCount();
+    __agentTrustedOps.clear();
+    const cnt = card.querySelector('#agentTrustedCount');
+    if (cnt) cnt.textContent = String(agentTrustedCount());
+    showNotification('已清除', '本会话已信任操作已清空（' + n + ' 条），之后全部重新询问', 'success', 2200);
+  });
+  // [阶段1 M5] Agent 系统提示保存/恢复
+  const sysInput = card.querySelector('#agentSysPromptInput');
+  const sysSave = card.querySelector('#agentSysPromptSave');
+  const sysReset = card.querySelector('#agentSysPromptReset');
+  if (sysSave) on(sysSave, 'click', async () => {
+    const v = String(sysInput.value || '').trim();
+    if (!v) { showNotification('不能为空', '留空请用「恢复内置」；覆盖内容不能为空', 'warning', 2600); return; }
+    await MoraySettings.set('agentSysPromptOverride', v);
+    showNotification('已保存', '自定义 Agent 系统提示已生效（本机工具开启时追加）', 'success', 2600);
+  });
+  if (sysReset) on(sysReset, 'click', async () => {
+    await MoraySettings.set('agentSysPromptOverride', '');
+    sysInput.value = PlanTracker.SYSTEM_PROMPT;
+    showNotification('已恢复内置', 'Agent 系统提示回到内置规范', 'success', 2200);
+  });
+  const saveBtn = card.querySelector('#agentWorkspaceSave');
+  const wsInput = card.querySelector('#agentWorkspaceInput');
+  if (saveBtn) on(saveBtn, 'click', async () => {
+    const v = String(wsInput.value || '').trim();
+    if (!v) { showNotification('未修改', '请输入新的工作区路径', 'warning', 1800); return; }
+    saveBtn.textContent = '校验中…';
+    saveBtn.disabled = true;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(agentBackendBase() + '/api/agent/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace: v }), signal: ctrl.signal
+      });
+      clearTimeout(timer);
+      const j = await res.json().catch(() => null);
+      if (!res.ok || !j || !j.ok) throw new Error((j && j.message) || ('后端返回 ' + res.status));
+      showNotification('工作区已更新', j.data.workspace, 'success', 2500);
+      card.querySelector('#agentWorkspaceInput').value = j.data.workspace;
+    } catch (e) {
+      showNotification('工作区修改失败', String((e && e.message) || e).slice(0, 200), 'error', 3500);
+    } finally {
+      saveBtn.textContent = '保存并校验';
+      saveBtn.disabled = false;
+    }
+  });
+}
+
 // 复制事件委托（加载即装，幂等）
 ToolRegistry._installCopyHandler();
 
@@ -19761,6 +20832,915 @@ function installCompareToolsTip() {
     tip.className = 'compare-tools-tip text-[10px] text-text-tertiary mt-1';
     tip.textContent = '对比模式不启用工具调用';
     wrap.appendChild(tip);
+  }
+}
+
+/* ============================================================
+   [阶段0 本机 Agent] 本机工具（受控工作区文件/只读命令）
+   - 后端执行：本机动作必须由本地后端（127.0.0.1）执行，浏览器只发受控请求
+   - 协议：POST /api/agent/tool {name, args, approved} → {ok,data} / {ok:false,error} / {needsApproval}
+   - 审批：write_file / run_command 属副作用 → 先弹人工审批（允许一次/拒绝）；
+     拒绝不上报执行，把"用户拒绝了该操作"作为 tool 结果回灌模型
+   - 开关：nativeToolsEnabled=false 时（输入台未开启）native 工具不进入 listForRequest
+   - 降级：后端离线/未配置时工具执行给出明确中文错误，绝不白屏/卡死
+   ============================================================ */
+
+/** 后端 origin（与 MorayBackend 探测/后端同步同一事实源；file:// 回退默认端口）
+ * @returns {string} 后端 origin（无尾斜杠） */
+function agentBackendBase() {
+  try {
+    const mb = window.MorayBackend;
+    if (mb && mb.origin) return mb.origin;
+  } catch (e) { /* 忽略 */ }
+  if (typeof window.resolveBackendOrigin === 'function') {
+    try { return window.resolveBackendOrigin(); } catch (e) { /* 忽略 */ }
+  }
+  return 'http://127.0.0.1:8000';
+}
+
+/** 后端 /api/agent/config 探测（10s 短缓存，供开关/提示/设置页复用）
+ * @param {boolean} [force] - 强制刷新
+ * @returns {Promise<Object|null>} 配置（null=后端离线/未提供本机 Agent） */
+let __agentCfgCache = { at: 0, data: null };
+async function agentBackendConfig(force) {
+  const now = Date.now();
+  if (!force && __agentCfgCache.data && now - __agentCfgCache.at < 10000) return __agentCfgCache.data;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3000);
+  try {
+    const res = await fetch(agentBackendBase() + '/api/agent/config', { signal: ctrl.signal, cache: 'no-store' });
+    if (!res.ok) { __agentCfgCache = { at: now, data: null }; return null; }
+    const j = await res.json();
+    __agentCfgCache = { at: now, data: (j && j.ok) ? j.data : null };
+    return __agentCfgCache.data;
+  } catch (e) {
+    __agentCfgCache = { at: now, data: null };
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** [阶段0.5 E] 参数稳定序列化（键排序，保证"相同参数"指纹稳定）
+ * @param {*} v - 任意 JSON 值
+ * @returns {string} 稳定 JSON 串 */
+function agentStableStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(x => agentStableStringify(x)).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + agentStableStringify(v[k])).join(',') + '}';
+}
+
+/** [阶段0.5 E] 本会话已信任操作表（内存态，刷新即失效；默认空=每次都询问）
+ * 指纹 = 工具名 + 规范化参数 JSON；run_command 永不入表（命令永远每次审批）
+ * @type {Map<string, boolean>} */
+const __agentTrustedOps = new Map();
+
+/** 操作指纹
+ * @param {string} name - 工具名
+ * @param {Object} args - 参数
+ * @returns {string} 指纹 */
+function agentFingerprint(name, args) {
+  return name + '::' + agentStableStringify(args || {});
+}
+
+/** 已信任操作数（设置页展示/清除用）
+ * @returns {number} 数量 */
+function agentTrustedCount() {
+  return __agentTrustedOps.size;
+}
+
+/** 人工审批弹窗：展示工具名 + 参数（写文件=目标路径+内容预览；命令=完整命令），
+ * "允许一次 / 拒绝"两个明确按钮；X/遮罩点击/ESC/生成停止一律收敛为"拒绝"（安全默认）。
+ * [阶段0.5 E] 非 run_command 工具可勾选"本会话对完全相同的工具+参数不再询问"（默认不勾）。
+ * 挂载期间若 modalOverlay 失去 active（任何途径关闭）→ 按拒绝处理，绝不留悬挂 Promise。
+ * @param {Object} def - 工具定义
+ * @param {Object} args - 参数
+ * @param {Object} [ctx] - 上下文（signal 中止时关闭并按拒绝处理，上层据此抛 AbortError）
+ * @returns {Promise<{allowed:boolean, trusted:boolean}>} allowed=用户允许一次 */
+function agentApproval(def, args, ctx) {
+  return (async () => {
+    let settled = false;
+    let resolveFn = null;
+    const promise = new Promise((resolve) => { resolveFn = resolve; });
+    let done = (v, trusted) => {
+      if (settled) return;
+      settled = true;
+      try { obs.disconnect(); } catch (e) { /* 忽略 */ }
+      try { if (ctx && ctx.signal) ctx.signal.removeEventListener('abort', onAbort); } catch (e) { /* 忽略 */ }
+      closeModal();
+      resolveFn({ allowed: v, trusted: !!trusted });
+    };
+    const onAbort = () => done(false, false);
+    if (ctx && ctx.signal) {
+      if (ctx.signal.aborted) { setTimeout(() => done(false, false), 0); return promise; }
+      ctx.signal.addEventListener('abort', onAbort, { once: true });
+    }
+    // [阶段1 M4] write_file 审批带 unified diff：异步取旧文件内容（新文件=全 +；过大截取 64KB）
+    let writeDiff = '';
+    if (def.name === 'write_file') {
+      const p = String((args && args.path) || '').trim();
+      try {
+        const probe = await fetch(agentBackendBase() + '/api/agent/tool', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'read_file', args: { path: p, maxBytes: 65536 } })
+        });
+        const pj = await probe.json().catch(() => null);
+        const oldContent = (pj && pj.ok && pj.data && pj.data.content != null) ? pj.data.content : '';
+        const newContent = String((args && args.content) || '');
+        if (oldContent) {
+          writeDiff = buildApprovalDiff(oldContent, newContent, 400) +
+            (pj.data.truncated ? '<div class="text-[9px] text-warning mt-1">原文件超过 64KB，diff 仅基于前 64KB</div>' : '');
+        }
+      } catch (e) { /* 读不到旧内容（新文件/离线）→ 不渲染 diff */ }
+    }
+    // 参数卡展示（写文件=路径+预览；命令=完整命令；其余=参数 JSON）
+    let argCards = '';
+    const cell = 'rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2';
+    if (def.name === 'write_file') {
+      const c = String(args.content || '');
+      const diffBlock = writeDiff
+        ? '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">变更预览（- 原内容 / + 新内容）</div>' + writeDiff + '</div>'
+        : '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">内容预览（前 300 字符）</div>' +
+          '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' + (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空内容）</span>') + '</div></div>';
+      argCards = '<div class="rounded-lg bg-surface-panel/60 border border-line-ghost/50 p-3">' +
+        '<div class="text-[10px] text-text-tertiary mb-1.5">目标文件（工作区内，相对路径）</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
+        (args.overwrite === false ? '<div class="text-[10px] text-warning mt-1">仅新建，不覆盖已有文件</div>' : '<div class="text-[10px] text-text-tertiary mt-1">已有同名文件将被覆盖</div>') +
+        '</div>' + diffBlock;
+    } else if (def.name === 'run_command') {
+      const parts = [String(args.command || '')].concat(Array.isArray(args.args) ? args.args.map(String) : []);
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">将执行的只读白名单命令</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">$ ' + escapeHtml(parts.join(' ')) + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mt-1.5">命令只读、15s 超时，在工作区内执行（git status/log/diff/branch、python/node/npm --version、where &lt;命令名&gt;）</div></div>';
+    } else if (def.name === 'edit_file') {
+      const oldS = String(args.old_str || '');
+      const newS = String(args.new_str || '');
+      const diffHtml = (typeof buildApprovalDiff === 'function')
+        ? buildApprovalDiff(oldS, newS, 400)
+        : '<div class="text-[10px] text-text-primary font-mono whitespace-pre-wrap break-all max-h-40 overflow-auto">' + escapeHtml(oldS.slice(0, 200)) + '</div>';
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">编辑目标（工作区内）</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
+        (args.replace_all === true ? '<div class="text-[10px] text-warning mt-1">replace_all：替换文件中全部匹配处</div>' : '<div class="text-[10px] text-text-tertiary mt-1">仅替换唯一匹配处（不唯一将被拒绝）</div>') +
+        '</div>' +
+        '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">变更预览（- 原内容 / + 新内容）</div>' + diffHtml + '</div>';
+    } else {
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">参数</div>' +
+        '<div class="font-mono text-[10px] text-text-primary break-all max-h-24 overflow-auto">' + escapeHtml(JSON.stringify(args || {})) + '</div></div>';
+    }
+    // [阶段0.5 E] 信任勾选：仅非 run_command 工具提供（命令永远每次审批）；默认不勾选
+    const trustRow = def.name !== 'run_command'
+      ? '<label class="flex items-start gap-2 pt-1 cursor-pointer select-none">' +
+        '<input type="checkbox" data-agent-trust class="mt-0.5 accent-brand-cobalt">' +
+        '<span class="text-[10px] text-text-tertiary leading-relaxed">本会话对完全相同的工具+参数不再询问（刷新后失效；可在设置→本机 Agent 清除）</span></label>'
+      : '';
+    const html = '<div class="space-y-2.5 text-xs">' +
+      '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">工具（' + (def.sideEffect ? '副作用，需要你授权' : '只读') + '）</div>' +
+      '<div class="flex items-center gap-1.5 font-medium text-text-primary">' +
+      '<i data-lucide="' + (def.name === 'run_command' ? 'terminal' : def.name === 'write_file' ? 'file-pen-line' : 'folder-search') + '" class="w-3.5 h-3.5 text-warning"></i>' +
+      escapeHtml(def.label) + ' <span class="font-mono text-[10px] text-text-tertiary">' + def.name + '</span></div></div>' +
+      argCards +
+      trustRow +
+      '<div class="flex gap-2 justify-end pt-1">' +
+      '<button data-agent-approve-no class="px-4 py-2 rounded-lg text-[12px] border border-line-ghost text-text-secondary hover:bg-surface-panel">拒绝</button>' +
+      '<button data-agent-approve-ok class="px-4 py-2 rounded-lg text-[12px] btn-primary">允许一次</button>' +
+      '</div></div>';
+    let box;
+    try { box = showModal(html, { title: '本机工具需要你的授权', icon: 'shield-alert', footer: false }); }
+    catch (e) { done(false, false); return; }
+    const okBtn = box.querySelector('[data-agent-approve-ok]');
+    const noBtn = box.querySelector('[data-agent-approve-no]');
+    if (okBtn) okBtn.addEventListener('click', () => {
+      const trust = box.querySelector('[data-agent-trust]');
+      const trusted = !!(trust && trust.checked);
+      if (trusted) __agentTrustedOps.set(agentFingerprint(def.name, args || {}), true);
+      done(true, trusted);
+    });
+    if (noBtn) noBtn.addEventListener('click', () => done(false, false));
+    // 任何途径关闭（X/遮罩/ESC，由 20_ai 全局监听移除 active）→ 一律按拒绝
+    const overlay = document.getElementById('modalOverlay');
+    const obs = overlay ? new MutationObserver(() => {
+      if (!overlay.classList.contains('active') && !settled) done(false, false);
+    }) : { disconnect() {} };
+    if (overlay) obs.observe(overlay, { attributes: true, attributeFilter: ['class'] });
+    // [阶段1.5 F] 键盘：Enter=允许一次 / Esc=拒绝（Esc 由全局监听关 modal → 按"拒绝"收敛，
+    // 这里补 Enter 快捷键；避免输入元素聚焦时误触）
+    const keyHandler = (e) => {
+      if (settled) return;
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'TEXTAREA' || (tag === 'INPUT' && document.activeElement.type !== 'checkbox')) return;
+      if (e.key === 'Enter') { e.preventDefault(); done(true, !!(box.querySelector('[data-agent-trust]') || {}).checked); }
+    };
+    document.addEventListener('keydown', keyHandler);
+    const _origDone = done;
+    done = function (v, trusted) { document.removeEventListener('keydown', keyHandler); _origDone(v, trusted); };
+    refreshIcons();
+    return promise;
+  })();
+}
+
+/** 拒绝上报（仅写审计，后端绝不执行）
+ * @param {string} name - 工具名
+ * @param {Object} args - 参数 */
+function agentReportDenied(name, args) {
+  return fetch(agentBackendBase() + '/api/agent/tool', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, args: args || {}, decision: 'denied' })
+  }).catch(() => null);
+}
+
+/** native 工具通用执行体：
+ * [阶段0.5 E] 相同操作指纹本会话免重复确认（默认关：仅当用户在审批卡勾选信任后才入表；
+ * run_command 永不享受）→ 审批（副作用工具或"全部审批"策略，未信任时）→ approved:true →
+ * POST /api/agent/tool
+ * @param {Object} def - 工具定义
+ * @param {Object} args - 参数
+ * @param {Object} [ctx] - 上下文（signal 取消 + onStatus('pending') 通知步骤卡）
+ * @returns {Promise<Object>} 后端 data */
+async function agentNativeRun(def, args, ctx) {
+  const fp = agentFingerprint(def.name, args || {});
+  // run_command 永不入信任表：指纹命中也照样弹审批
+  const trusted = def.name !== 'run_command' && __agentTrustedOps.has(fp);
+  const needApprove = (def.sideEffect === true || MoraySettings.get('agentApprovalMode') === 'all') && !trusted;
+  if (needApprove) {
+    // 步骤卡先转"待审批"（时间线可见等待授权）
+    if (ctx && typeof ctx.onStatus === 'function') { try { ctx.onStatus('pending'); } catch (e) { /* 忽略 */ } }
+    const verdict = await agentApproval(def, args || {}, ctx);
+    // 生成被停止（AbortController）→ 抛 AbortError 交由循环整体中止
+    if (ctx && ctx.signal && ctx.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    if (!verdict || !verdict.allowed) {
+      // 用户拒绝：绝不执行；上报审计 + 把拒绝作为 tool 结果回灌模型（模型据此回应）
+      agentReportDenied(def.name, args || {}).catch(() => {});
+      return { denied: true, message: '用户拒绝了该操作（' + def.label + ' 未执行）' };
+    }
+  }
+  let res;
+  try {
+    res = await fetch(agentBackendBase() + '/api/agent/tool', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: def.name, args: args || {}, approved: true }),
+      signal: (ctx && ctx.signal) || undefined
+    });
+  } catch (e) {
+    // 网络层失败：fetch 抛 TypeError（后端离线）或 AbortError（用户停止）
+    if (e && e.name === 'AbortError') throw e;
+    throw new Error('本机工具需要启动本地后端（未连接 127.0.0.1），' + def.label + ' 未执行');
+  }
+  let j = null;
+  try { j = await res.json(); } catch (e) { /* 兜底 */ }
+  if (!res.ok) throw new Error((j && j.message) || ('本机后端返回 ' + res.status));
+  if (j && j.needsApproval) throw new Error('后端要求人工审批，请求未执行（' + def.label + '）');
+  if (!j || j.ok !== true) throw new Error((j && j.message) || '本机工具执行失败');
+  // [阶段0.5 D] 写文件成功 → 通知工作区文件树刷新（面板开着时自动刷新并高亮新文件）
+  if (def.name === 'write_file' && j.data && j.data.path) {
+    try { window.dispatchEvent(new CustomEvent('moray:ws-file-written', { detail: { path: j.data.path } })); } catch (e) { /* 忽略 */ }
+  }
+  return j.data;
+}
+
+/** [阶段0] 四个本机工具定义（enabledByDefault=false 语义由 ToolRegistry.isEnabled 的
+ * nativeToolsEnabled 门实现；native=true 的工具默认不进入 listForRequest） */
+const NATIVE_TOOLS = [
+  {
+    name: 'list_directory', label: '列出目录', native: true, sideEffect: false, timeoutMs: 30000,
+    description: '列出受控工作区内指定目录的文件与子目录（名称/类型/大小/修改时间，单层最多 500 条）。当用户问"工作区里有什么文件 / 目录里有哪些内容 / 看看 X 文件夹"时使用；path 省略表示工作区根。工作区是本地后端隔离目录（默认 D:\\MoRayWorkspace），与聊天记录无关。',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: '相对工作区根的目录路径（省略 = 工作区根）' } }
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'read_file', label: '读取文件', native: true, sideEffect: false, timeoutMs: 30000,
+    description: '读取工作区内文本文件内容（UTF-8，默认最多 64KB，可用 maxBytes 调大，上限 1MB；二进制或不可解码文件返回明确错误）。当用户说"读一下 X 文件 / X 文件里写了什么 / 看看这段配置"时使用；path 为相对工作区根的文件路径。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区根的文件路径（必填）' },
+        maxBytes: { type: 'integer', description: '最大读取字节数（默认 65536，上限 1048576）' }
+      },
+      required: ['path']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'write_file', label: '写文件', native: true, sideEffect: true, timeoutMs: 300000,
+    description: '在工作区内创建或覆盖一个文本文件（UTF-8，需用户授权；父目录自动创建；禁止写入可执行/危险后缀）。当用户要求"把内容保存成文件 / 新建 X 文件写入… / 把结果写到 Y"时使用；path 必须相对工作区根，禁止越界访问工作区以外的路径。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区根的目标文件路径（必填）' },
+        content: { type: 'string', description: '文件内容（UTF-8）' },
+        overwrite: { type: 'boolean', description: '已存在时是否覆盖（默认 true）' }
+      },
+      required: ['path', 'content']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'run_command', label: '运行只读命令', native: true, sideEffect: true, timeoutMs: 300000,
+    description: '在工作区内执行只读白名单命令并返回输出（需用户授权）。仅支持：git status/log/diff/branch、python --version、node --version、npm --version、where <命令名>；15 秒超时；禁止 shell 管道与危险参数。当用户想"查看目录是不是 git 仓库 / git 状态 / 环境里有没有装 python/node / 某个命令在哪"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '白名单命令名：git / python / node / npm / where' },
+        args: { type: 'array', items: { type: 'string' }, description: '命令参数数组（如 ["--version"] 或 git 的 ["status"]）' }
+      },
+      required: ['command']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'find_files', label: '查找文件', native: true, sideEffect: false, timeoutMs: 30000,
+    description: '在工作区内按文件名通配模式递归查找文件（如 "*.txt"、"*report*"、"config*"），返回匹配路径/大小/修改时间，最多 1000 条。当用户说"找到所有 txt 文件 / 哪里有 config 文件 / 找一下名字带 report 的文件"时使用；不确定路径时先用它定位再 read_file。pattern 省略为列出全部文件。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '起始目录（相对工作区根，省略为全工作区）' },
+        pattern: { type: 'string', description: '文件名通配模式（如 *.txt、*report*；省略为全部文件）' }
+      }
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'search_text', label: '全文搜索', native: true, sideEffect: false, timeoutMs: 30000,
+    description: '在工作区文本文件内容中搜索关键词或正则，返回 [{文件, 行号, 行内容}]，默认最多 200 条。当用户说"哪个文件里有 XXX / 搜一下 TODO / 找到包含某函数名的代码"时使用；比 find_files（按文件名）更准。regex=true 时 query 按正则解释；二进制/非 UTF-8 文件自动跳过。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '要搜索的文本或正则表达式（必填）' },
+        path: { type: 'string', description: '起始目录（相对工作区根，省略为全工作区）' },
+        glob: { type: 'string', description: '文件名过滤（如 *.py，只搜这类文件）' },
+        regex: { type: 'boolean', description: 'query 是否为正则表达式（默认 false 按普通文本）' }
+      },
+      required: ['query']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'edit_file', label: '编辑文件', native: true, sideEffect: true, timeoutMs: 300000,
+    description: '对工作区内已有文本文件做精确字符串替换（需用户授权）：old_str 必须与文件内容完全一致且唯一（不唯一时报错，应先 read_file 获取更多上下文；replace_all=true 替换全部）。当用户要求"把 X 改成 Y / 修改文件中的某处"时优先使用它而不是 write_file 整体重写；修改前建议先 read_file。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区根的目标文件路径（必填，文件必须已存在）' },
+        old_str: { type: 'string', description: '要被替换的精确文本（必填，非空；需与文件内容逐字符一致）' },
+        new_str: { type: 'string', description: '替换后的文本（可为空串表示删除该段）' },
+        replace_all: { type: 'boolean', description: 'old_str 出现多次时是否全部替换（默认 false，不唯一时报错）' }
+      },
+      required: ['path', 'old_str', 'new_str']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [阶段1 M3] 计划编排：纯前端工具（不调后端），native 门控（随"本机工具"开关进入请求）
+    name: 'submit_plan', label: '提交任务计划', native: true, sideEffect: false, timeoutMs: 5000,
+    description: '把多步任务的执行计划提交给用户查看（每步含简短意图与预计使用的工具名）。规则：任务需要 2 个以上步骤时，在开始任何文件操作前先调用本工具登记计划；然后按计划顺序逐步执行；全部完成后用一段话总结。steps 最多 12 步。',
+    parameters: {
+      type: 'object',
+      properties: {
+        steps: {
+          type: 'array',
+          description: '有序步骤数组（2-12 项）',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: '这一步做什么（简短一句话）' },
+              tool: { type: 'string', description: '预计使用的工具名（如 find_files / read_file / edit_file）' }
+            },
+            required: ['title']
+          }
+        }
+      },
+      required: ['steps']
+    },
+    run(args) { return PlanTracker.submit(args); }
+  }
+];
+NATIVE_TOOLS.forEach(t => ToolRegistry.register(t));
+
+/* ============================================================
+   [阶段1 M3] 计划-执行编排（复用现有 Agent Loop 与 onToolStep 时间线）
+   - submit_plan 为纯前端工具：模型多步任务先提交计划 → PlanTracker 登记 → 计划卡渲染
+     在时间线之上；随后每次真实工具事件（onToolStep）按"工具名+最早待办"匹配推进步骤状态
+   - 单步失败：真实错误由工具结果回灌模型自行重试（同一步骤失败满 3 次标记"已跳过"防死循环；
+     maxRounds 兜底）；全部步骤结束由模型输出总结
+   ============================================================ */
+
+const PlanTracker = {
+  /** [阶段1 M5] 内置 Agent 系统提示（设置→本机 Agent 可自定义覆盖）
+   * @type {string} */
+  SYSTEM_PROMPT: [
+    '# 本机 Agent 工作规范（受控工作区内操作）',
+    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
+    '- 工作区边界：所有 path 都必须是相对工作区根的路径；你无法访问工作区以外的任何文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。',
+    '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
+    '- 授权与拒绝：write_file / edit_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
+    '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
+    '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。'
+  ].join('\n'),
+
+  /** 当前会话活动计划 @type {null|{steps:Array, startedAt:number}} */
+  current: null,
+
+  /** submit_plan 工具入口：登记计划（数据），渲染交给 observe 的 success 事件
+   * @param {Object} args - {steps:[{title,tool}]}
+   * @returns {Object} 确认与执行指引 */
+  submit(args) {
+    const raw = Array.isArray(args && args.steps) ? args.steps : [];
+    const steps = raw.slice(0, 12).map(s => ({
+      title: String((s && s.title) || '').trim().slice(0, 100),
+      tool: String((s && s.tool) || '').trim().slice(0, 40),
+      status: 'todo', // todo|running|done|failed|skipped
+      fails: 0
+    })).filter(s => s.title);
+    if (!steps.length) throw new Error('计划至少需要一个有效步骤（steps[].title）');
+    this.current = { steps, startedAt: Date.now() };
+    return {
+      registered: steps.length,
+      message: '计划已登记并展示给用户（共 ' + steps.length + ' 步）。请按顺序逐步执行：' +
+        '每步用对应的工具完成，完成一步再进行下一步；若某步失败请修正参数重试' +
+        '（同一失败两次以上请调整方案）；全部完成后用一段话向用户总结结果。'
+    };
+  },
+
+  /** onToolStep 观察入口：submit_plan 自身事件只负责渲染，真实工具事件推进步骤状态
+   * @param {Object} evt - {name, status, ...}
+   * @param {HTMLElement} [el] - 当前助手气泡 */
+  observe(evt, el) {
+    if (!evt || !evt.name) return;
+    if (evt.name === 'submit_plan') {
+      if (evt.status === 'success' && this.current && el) {
+        // 计划挂到消息持久化（会话重建时经 renderStatic 恢复展示）
+        try {
+          const msgId = el.dataset ? el.dataset.msgId : null;
+          const msg = (typeof AppState !== 'undefined' && msgId) ? (AppState.messages || []).find(m => m.id === msgId) : null;
+          if (msg) {
+            msg.plan = { steps: this.current.steps.map(s => ({ title: s.title, tool: s.tool, status: s.status })) };
+            if (typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
+          }
+        } catch (e) { /* 持久化失败不影响展示 */ }
+        this.render(el);
+      }
+      return;
+    }
+    if (!this.current) return;
+    const steps = this.current.steps;
+    // 匹配：最早的 待办/进行中 且 工具匹配（计划未指定工具则任意工具可匹配）
+    const idx = steps.findIndex(s => (s.status === 'todo' || s.status === 'running') && (!s.tool || s.tool === evt.name));
+    if (idx < 0) return;
+    const s = steps[idx];
+    if (evt.status === 'running' || evt.status === 'pending') {
+      if (s.status === 'todo') s.status = 'running';
+    } else if (evt.status === 'success') {
+      s.status = 'done';
+    } else if (evt.status === 'error' || evt.status === 'denied') {
+      s.fails = (s.fails || 0) + 1;
+      s.status = s.fails >= 3 ? 'skipped' : 'failed';
+      // 回到待办让模型重试（skipped 不再匹配）
+      if (s.status === 'failed') s.status = 'todo';
+    }
+    // [阶段1.6] 状态流转同步到消息持久化（会话重建时计划卡显示最新状态）
+    try {
+      const msgId = el && el.dataset ? el.dataset.msgId : null;
+      const msg = (typeof AppState !== 'undefined' && msgId) ? (AppState.messages || []).find(m => m.id === msgId) : null;
+      if (msg && msg.plan && msg.plan.steps[idx]) {
+        msg.plan.steps[idx].status = s.status;
+        if (typeof persistMessage === 'function') persistMessage(msg).catch(() => {});
+      }
+    } catch (e) { /* 忽略 */ }
+    if (el) this.render(el);
+  },
+
+  /** 计划卡 HTML（时间线之上的汇总层；[阶段1.5 F] 头部可点击整体折叠，进行步高亮）
+   * @param {HTMLElement} el - 当前助手气泡
+   * @returns {void} */
+  render(el) {
+    if (!this.current || !el) return;
+    const stMap = {
+      todo: ['待办', 'text-text-tertiary', ''],
+      running: ['进行中', 'text-brand-cyan', 'animate-pulse'],
+      done: ['完成', 'text-success', ''],
+      failed: ['失败', 'text-danger', ''],
+      skipped: ['已跳过', 'text-warning', '']
+    };
+    const stIcon = { todo: 'circle', running: 'loader-2', done: 'check-circle-2', failed: 'x-circle', skipped: 'skip-forward' };
+    const rows = this.current.steps.map((s, i) => {
+      const [label, color, pulse] = stMap[s.status] || stMap.todo;
+      const icon = stIcon[s.status] || 'circle';
+      return '<div class="plan-step-row flex items-center gap-2 py-0.5 px-1' + (s.status === 'running' ? ' running' : '') + '">' +
+        '<span class="font-mono text-[10px] text-text-tertiary w-4">' + (i + 1) + '.</span>' +
+        '<i data-lucide="' + icon + '" class="w-3 h-3 ' + color + (s.status === 'running' ? ' animate-spin' : '') + '"></i>' +
+        '<span class="text-[11px] ' + color + (pulse ? ' ' + pulse : '') + ' shrink-0">' + label + '</span>' +
+        '<span class="text-[11px] text-text-primary truncate flex-1">' + escapeHtml(s.title) + '</span>' +
+        (s.tool ? '<span class="font-mono text-[9px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
+        '</div>';
+    }).join('');
+    const doneN = this.current.steps.filter(s => s.status === 'done').length;
+    const html = '<div class="plan-card rounded-lg bg-surface-panel/60 border border-brand-violet/25 px-3 py-2 my-2" data-plan-card>' +
+      '<div class="plan-head flex items-center gap-1.5 mb-1" data-plan-toggle title="点击折叠/展开计划">' +
+      '<i data-lucide="list-checks" class="w-3.5 h-3.5 text-brand-violet"></i>' +
+      '<span class="text-[11px] font-medium text-text-primary">任务计划</span>' +
+      '<span class="text-[10px] text-text-tertiary ml-auto">' + doneN + '/' + this.current.steps.length + ' 完成</span>' +
+      '<i data-lucide="chevron-down" class="w-3 h-3 text-text-tertiary"></i></div>' +
+      '<div class="plan-steps space-y-0.5">' + rows + '</div></div>';
+    let wrap = el.querySelector('.tool-steps-wrap');
+    const box = el.querySelector('[data-plan-card]');
+    if (box) box.outerHTML = html;
+    else if (wrap) wrap.insertAdjacentHTML('beforebegin', html);
+    else {
+      const inner = el.querySelector('.ai-msg-inner');
+      if (inner) inner.parentElement.insertAdjacentHTML('beforebegin', html);
+      else el.insertAdjacentHTML('afterbegin', html);
+    }
+    const head = el.querySelector('[data-plan-toggle]:last-of-type') || el.querySelector('[data-plan-toggle]');
+    if (head && !head._planToggleBound) {
+      head._planToggleBound = true;
+      head.addEventListener('click', () => head.closest('.plan-card')?.classList.toggle('collapsed'));
+    }
+    refreshIcons();
+  },
+
+  /** 历史消息静态计划卡
+   * @param {Object} plan - {steps:[{title,tool,status}]}
+   * @returns {string} HTML */
+  renderStatic(plan) {
+    if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) return '';
+    const fake = { current: { steps: plan.steps } };
+    const save = this.current;
+    this.current = fake.current;
+    let html = '';
+    try {
+      // 复用 render 的行生成（无气泡时返回字符串）
+      const stMap = { todo: '待办', running: '进行中', done: '完成', failed: '失败', skipped: '已跳过' };
+      const rows = plan.steps.map((s, i) => {
+        const color = { todo: 'text-text-tertiary', running: 'text-brand-cyan', done: 'text-success', failed: 'text-danger', skipped: 'text-warning' }[s.status] || 'text-text-tertiary';
+        return '<div class="flex items-center gap-2 py-0.5">' +
+          '<span class="font-mono text-[10px] text-text-tertiary w-4">' + (i + 1) + '.</span>' +
+          '<span class="text-[11px] ' + color + '">' + (stMap[s.status] || s.status || '待办') + '</span>' +
+          '<span class="text-[11px] text-text-primary truncate flex-1">' + escapeHtml(s.title || '') + '</span>' +
+          (s.tool ? '<span class="font-mono text-[9px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
+          '</div>';
+      }).join('');
+      const doneN = plan.steps.filter(s => s.status === 'done').length;
+      html = '<div class="plan-card rounded-lg bg-surface-panel/60 border border-brand-violet/25 px-3 py-2 my-2" data-plan-card>' +
+        '<div class="flex items-center gap-1.5 mb-1"><i data-lucide="list-checks" class="w-3.5 h-3.5 text-brand-violet"></i>' +
+        '<span class="text-[11px] font-medium text-text-primary">任务计划</span>' +
+        '<span class="text-[10px] text-text-tertiary ml-auto">' + doneN + '/' + plan.steps.length + ' 完成</span></div>' + rows + '</div>';
+    } finally {
+      this.current = save;
+    }
+    return html;
+  }
+};
+
+/* ============================================================
+   [阶段0.5 D] 工作区文件树面板（只读）
+   - 数据全部来自现有只读接口：list_directory（展开）/ read_file（文本预览），
+     不新增任何写能力；Agent write_file 成功后经 moray:ws-file-written 事件刷新+高亮 2s
+   - 入口：会话区顶部"本机工具已开启"轻提示条内的「文件树」按钮（仅在线时显示）
+   ============================================================ */
+
+let __wsTree = null; // {dirCache:{path:items}, expanded:Set, highlight:path}
+
+/** 只读工具直调（list_directory/read_file 无需审批，与工具执行同一后端端点）
+ * @param {string} name - 工具名
+ * @param {Object} args - 参数
+ * @returns {Promise<Object>} data */
+async function wsFetchTool(name, args) {
+  const res = await fetch(agentBackendBase() + '/api/agent/tool', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, args: args || {} })
+  });
+  const j = await res.json().catch(() => null);
+  if (!res.ok || !j || j.ok !== true) throw new Error((j && j.message) || ('本机后端返回 ' + res.status));
+  return j.data;
+}
+
+/** [阶段1 M4] 工作区文件树：改为可收起的常驻侧栏（fixed 浮层，打开期间仍可正常聊天，
+ * 解决阶段0.5 模态弹窗与聊天互斥的问题）；渲染逻辑与容器查询按 class 共享。 */
+function openWorkspaceTree() {
+  toggleWsSidebar(true);
+}
+
+function ensureWsSidebar() {
+  let bar = document.getElementById('wsSidebar');
+  if (bar) return bar;
+  bar = document.createElement('div');
+  bar.id = 'wsSidebar';
+  bar.innerHTML = '<div class="ws-resize-handle" title="拖拽调整宽度"></div>' +
+    '<div class="flex items-center gap-1.5 mb-1.5">' +
+    '<i data-lucide="folder-tree" class="w-3.5 h-3.5 text-brand-violet"></i>' +
+    '<span class="text-[11px] font-medium text-text-primary">工作区</span>' +
+    '<span class="text-[9px] text-text-tertiary">只读</span>' +
+    '<button data-ws-sidebar-refresh class="ml-auto text-text-tertiary hover:text-brand-cyan" title="刷新" aria-label="刷新文件树"><i data-lucide="refresh-cw" class="w-3 h-3"></i></button>' +
+    '<button data-ws-sidebar-collapse class="text-text-tertiary hover:text-brand-cyan" title="收起侧栏（可从顶部提示条再打开）" aria-label="收起侧栏"><i data-lucide="chevrons-right" class="w-3.5 h-3.5"></i></button></div>' +
+    '<div class="ws-tree-list rounded-lg border border-line-ghost/50 p-1.5 flex-1 overflow-auto text-[11px]"></div>' +
+    '<div class="ws-tree-preview hidden rounded-lg border border-line-ghost/50 p-2 bg-surface-panel/40 mt-1.5 max-h-48 overflow-auto text-[10px]"></div>';
+  (document.getElementById('page-chat') || document.body).appendChild(bar);
+  bar.querySelector('[data-ws-sidebar-refresh]').addEventListener('click', () => { if (__wsTree) __wsTree.dirCache = {}; wsTreeRender(); });
+  bar.querySelector('[data-ws-sidebar-collapse]').addEventListener('click', () => toggleWsSidebar(false));
+  // [阶段1.5 F] 左缘拖拽调宽（220–460px）
+  const wsHandle = bar.querySelector('.ws-resize-handle');
+  if (wsHandle) {
+    wsHandle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = bar.getBoundingClientRect().width;
+      const move = (ev) => {
+        const w = Math.min(460, Math.max(220, startW + (startX - ev.clientX)));
+        bar.style.width = w + 'px';
+      };
+      const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  }
+  if (!document.getElementById('wsSidebarStyle')) {
+    const st = document.createElement('style');
+    st.id = 'wsSidebarStyle';
+    st.textContent = '#wsSidebar{position:fixed;top:74px;right:14px;bottom:158px;width:292px;z-index:26;display:flex;flex-direction:column;padding:10px;border-radius:12px;background:rgba(15,18,28,.94);border:1px solid rgba(120,140,180,.25);box-shadow:0 8px 28px rgba(0,0,0,.4)}' +
+      '#wsSidebar.collapsed{display:none}' +
+      '[data-theme="light"] #wsSidebar{background:rgba(247,249,252,.96);border-color:rgba(90,110,150,.25)}';
+    document.head.appendChild(st);
+  }
+  return bar;
+}
+
+/** 打开/收起侧栏（force 缺省=切换）
+ * @param {boolean} [force] - true=打开 false=收起
+ * @returns {void} */
+function toggleWsSidebar(force) {
+  const bar = ensureWsSidebar();
+  const wasOpen = !bar.classList.contains('collapsed');
+  const show = (force != null) ? force : !wasOpen;
+  bar.classList.toggle('collapsed', !show);
+  if (show) {
+    closeModal(); // 若 modal 开着（如审批外的弹窗）先收起，避免遮挡
+    if (!__wsTree) __wsTree = { dirCache: {}, expanded: new Set(), highlight: null };
+    wsTreeRender();
+    refreshIcons();
+  }
+}
+
+/** 渲染整棵树（按 expanded 懒加载展开；highlight 高亮 2s）
+ * @returns {Promise<void>} */
+async function wsTreeRender() {
+  const box = document.querySelector('.ws-tree-list');
+  if (!box) return;
+  box.innerHTML = '<div class="text-[10px] text-text-tertiary py-3 text-center">加载中…</div>';
+  try {
+    const html = await wsTreeRenderDir('.', 0);
+    box.innerHTML = html || '<div class="ws-empty"><i data-lucide="folder-open"></i><div class="empty-title">工作区是空的</div><div class="empty-hint">让 Agent 帮你新建第一个文件，例如“新建 hello.txt 写入你好”</div></div>';
+  } catch (e) {
+    box.innerHTML = '<div class="text-[10px] text-danger py-2">加载失败：' + escapeHtml(String((e && e.message) || e)) + '</div>';
+  }
+  refreshIcons();
+}
+
+/** [阶段1.5 F] 按文件扩展名取小图标（文件类型可视化）
+ * @param {string} name - 文件名
+ * @returns {string} lucide 图标名 */
+function wsFileTypeIcon(name) {
+  const n = String(name || '').toLowerCase();
+  if (/\.(md|txt|log)$/.test(n)) return 'file-text';
+  if (/\.(js|ts|mjs|cjs|jsx|tsx)$/.test(n)) return 'file-code';
+  if (/\.(py)$/.test(n)) return 'file-code';
+  if (/\.(json|ya?ml|toml|ini|cfg|conf)$/.test(n)) return 'file-cog';
+  if (/\.(png|jpe?g|gif|webp|svg|bmp)$/.test(n)) return 'file-image';
+  if (/\.(zip|7z|rar|tar|gz)$/.test(n)) return 'file-archive';
+  if (/\.(exe|dll|bat|cmd|ps1|msi)$/.test(n)) return 'file-warning';
+  return 'file';
+}
+
+/** 递归渲染目录（dirCache 缓存目录列表，展开/折叠不重复请求）
+ * @param {string} dirPath - 目录相对路径
+ * @param {number} depth - 层级
+ * @returns {Promise<string>} HTML */
+async function wsTreeRenderDir(dirPath, depth) {
+  if (!__wsTree) return '';
+  if (!__wsTree.dirCache[dirPath]) {
+    const data = await wsFetchTool('list_directory', { path: dirPath });
+    __wsTree.dirCache[dirPath] = (data && data.items) || [];
+  }
+  const items = __wsTree.dirCache[dirPath];
+  let html = '';
+  for (const it of items) {
+    const rel = (dirPath === '.' || dirPath === '') ? it.name : (dirPath + '/' + it.name);
+    const isDir = it.type === 'dir';
+    const expanded = isDir && __wsTree.expanded.has(rel);
+    const hl = __wsTree.highlight === rel ? ' ring-1 ring-brand-cyan bg-brand-cyan/10' : '';
+    const typeIcon = isDir ? (expanded ? 'folder-open' : 'folder') : wsFileTypeIcon(it.name);
+    const sizeText = isDir ? '' : (' · ' + (it.size >= 1024 ? (it.size / 1024).toFixed(1) + 'KB' : it.size + 'B'));
+    html += '<div class="ws-tree-row flex items-center gap-1.5 py-1 rounded px-1 hover:bg-surface-panel cursor-pointer' + hl + '" style="padding-left:' + (depth * 14 + 4) + 'px" data-ws-path="' + escapeHtml(rel) + '" data-ws-type="' + it.type + '" title="' + escapeHtml(rel) + '">' +
+      (isDir ? '<i data-lucide="chevron-right" class="ws-caret w-2.5 h-2.5 text-text-tertiary' + (expanded ? ' open' : '') + '"></i>' : '<span class="w-2.5"></span>') +
+      '<i data-lucide="' + typeIcon + '" class="w-3.5 h-3.5 ' + (isDir ? 'text-brand-cobalt' : 'text-text-tertiary') + '"></i>' +
+      '<span class="text-text-primary truncate">' + escapeHtml(it.name) + '</span>' +
+      '<span class="text-[9px] text-text-tertiary shrink-0">' + sizeText + '</span></div>';
+    if (isDir && expanded) html += await wsTreeRenderDir(rel, depth + 1);
+  }
+  return html;
+}
+
+/** 树行点击：目录展开/折叠（懒加载），文件只读预览
+ * @param {string} path - 相对路径
+ * @param {string} type - dir|file
+ * @returns {Promise<void>} */
+async function wsTreeToggle(path, type) {
+  if (!__wsTree) return;
+  if (type === 'dir') {
+    if (__wsTree.expanded.has(path)) __wsTree.expanded.delete(path);
+    else __wsTree.expanded.add(path);
+    await wsTreeRender();
+  } else {
+    await wsTreePreviewFile(path);
+  }
+}
+
+/** 文本文件只读预览（read_file，前 64KB；二进制/越界等错误原样显示）
+ * @param {string} path - 相对路径
+ * @returns {Promise<void>} */
+async function wsTreePreviewFile(path) {
+  const prev = document.querySelector('.ws-tree-preview');
+  if (!prev) return;
+  const head = (note, cls) => '<div class="flex items-center justify-between mb-1">' +
+    '<span class="text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(path) + (note ? ' · ' + note : '') + '</span>' +
+    '<button class="text-[10px] text-text-tertiary hover:text-brand-cyan shrink-0" data-ws-prev-close>关闭</button></div>';
+  prev.classList.remove('hidden');
+  prev.innerHTML = head('只读预览（前 64KB）') + '<div class="text-[10px] text-text-tertiary">加载中…</div>';
+  let closeBtn = prev.querySelector('[data-ws-prev-close]');
+  if (closeBtn) closeBtn.onclick = () => prev.classList.add('hidden');
+  try {
+    const data = await wsFetchTool('read_file', { path, maxBytes: 65536 });
+    const body = data && data.content != null ? data.content : '';
+    const note = data && data.truncated ? '内容已截断' : '';
+    prev.innerHTML = head(note, '') +
+      '<pre class="text-[10px] font-mono text-text-primary whitespace-pre-wrap break-all max-h-56 overflow-auto">' + escapeHtml(body) + '</pre>';
+  } catch (e) {
+    prev.innerHTML = head('预览失败') + '<div class="text-[10px] text-danger">' + escapeHtml(String((e && e.message) || e)) + '</div>';
+  }
+  closeBtn = prev.querySelector('[data-ws-prev-close]');
+  if (closeBtn) closeBtn.onclick = () => prev.classList.add('hidden');
+}
+
+/** 文件树行点击/入口按钮委托 + Agent 写入事件（只装一次）
+ * @returns {void} */
+function installWsTreeHandlers() {
+  if (window.__wsTreeBound) return;
+  window.__wsTreeBound = true;
+  document.addEventListener('click', async (e) => {
+    const entry = e.target.closest('[data-ws-tree-btn]');
+    if (entry) { e.preventDefault(); toggleWsSidebar(); return; }
+    // [阶段1 M1] Agent 自检入口
+    const sc = e.target.closest('[data-agent-selfcheck-btn]');
+    if (sc) { e.preventDefault(); runAgentSelfCheck(); return; }
+    // [阶段1.6 M3] 示例工作区载入
+    const sample = e.target.closest('[data-ws-sample-btn]');
+    if (sample) {
+      e.preventDefault();
+      loadSampleWorkspace().catch(err => showNotification('示例载入失败', String((err && err.message) || err).slice(0, 140), 'error', 3000));
+      return;
+    }
+    const row = e.target.closest('.ws-tree-row[data-ws-path]');
+    if (row && document.querySelector('.ws-tree-list')) {
+      await wsTreeToggle(row.getAttribute('data-ws-path'), row.getAttribute('data-ws-type'));
+    }
+  });
+  // Agent write_file 成功 → 面板开着时刷新并高亮新文件 2s
+  window.addEventListener('moray:ws-file-written', async (ev) => {
+    if (!__wsTree || !document.querySelector('.ws-tree-list')) return;
+    const p = ev.detail && ev.detail.path;
+    if (!p) { __wsTree.dirCache = {}; await wsTreeRender(); return; }
+    const parts = String(p).split('/');
+    for (let i = 1; i < parts.length; i++) __wsTree.expanded.add(parts.slice(0, i).join('/'));
+    __wsTree.dirCache = {};
+    __wsTree.highlight = p;
+    await wsTreeRender();
+    setTimeout(() => {
+      if (__wsTree && __wsTree.highlight === p) {
+        __wsTree.highlight = null;
+        wsTreeRender();
+      }
+    }, 2000);
+  });
+}
+installWsTreeHandlers();
+
+/** [阶段1 M4] 行级 diff → unified 风格 HTML（- 原内容红 / + 新内容绿 / 上下文灰）。
+ * 简易 LCS（限制行数防 O(n²) 爆炸，超限截取头部）；零外部依赖。
+ * @param {string} oldText - 原文本
+ * @param {string} newText - 新文本
+ * @param {number} [maxLines] - 渲染行数上限（默认 400）
+ * @returns {string} HTML */
+function buildApprovalDiff(oldText, newText, maxLines) {
+  maxLines = maxLines || 400;
+  const a = String(oldText == null ? '' : oldText).split('\n');
+  const b = String(newText == null ? '' : newText).split('\n');
+  if (a.length > maxLines) a.length = maxLines;
+  if (b.length > maxLines) b.length = maxLines;
+  const n = a.length, m = b.length;
+  // LCS DP（n*m ≤ 160k 可接受）
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = (a[i] === b[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops = []; // {t:'-'|'+'|' ', line}
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ t: ' ', line: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ t: '-', line: a[i] }); i++; }
+    else { ops.push({ t: '+', line: b[j] }); j++; }
+  }
+  while (i < n) { ops.push({ t: '-', line: a[i] }); i++; }
+  while (j < m) { ops.push({ t: '+', line: b[j] }); j++; }
+  // 压缩纯上下文区：只保留变更行前后 2 行
+  const keep = new Array(ops.length).fill(false);
+  ops.forEach((o, k) => { if (o.t !== ' ') { for (let x = Math.max(0, k - 2); x <= Math.min(ops.length - 1, k + 2); x++) keep[x] = true; } });
+  let html = '';
+  let skip = 0;
+  ops.forEach((o, k) => {
+    if (!keep[k]) { skip++; if (skip === 1) html += '<div class="text-[9px] text-text-tertiary px-1">⋯</div>'; return; }
+    skip = 0;
+    const cls = o.t === '-' ? 'text-danger bg-danger/10' : o.t === '+' ? 'text-success bg-success/10' : 'text-text-tertiary';
+    html += '<div class="font-mono text-[10px] whitespace-pre-wrap break-all px-1 ' + cls + '">' + escapeHtml((o.t === ' ' ? '  ' : o.t) + o.line) + '</div>';
+  });
+  if (!html) html = '<div class="text-[10px] text-text-tertiary px-1">（内容无差异）</div>';
+  return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-1.5 max-h-44 overflow-auto">' + html + '</div>';
+}
+
+/** [阶段1.6 M3] 载入示例工作区：写入 3 个中文自洽示例文件（notes/a.txt、notes/b.txt、todo.md）。
+ * 只创建工作区内新文件——已存在的同名文件一律跳过（绝不覆盖用户文件）；按钮点击即用户授权。
+ * @returns {Promise<void>} */
+async function loadSampleWorkspace() {
+  const samples = [
+    { path: 'notes/a.txt', content: '项目启动会要点（素材A）\n- 目标：两周内完成 Agent 工作区演示\n- 分工：小王负责检索，小李负责汇总\n- 风险：模型偶发漏调工具，需自检兜底' },
+    { path: 'notes/b.txt', content: '用户调研记录（素材B）\n- 用户希望一键载入示例数据\n- 汇总报告要保留原始出处\n- 编辑文件前先看清原文再替换' },
+    { path: 'todo.md', content: '# 待办清单\n- [ ] 整理 notes/ 下的会议与调研要点\n- [ ] 把两个素材的结论写入 summary.md\n- [ ] 检查 Agent 时间线每一步的状态\n- [ ] 演示前运行一次模型自检' }
+  ];
+  let created = 0, skipped = 0;
+  for (const s of samples) {
+    try {
+      const data = await wsFetchTool('read_file', { path: s.path, maxBytes: 64 });
+      if (data && data.content != null) { skipped++; continue; } // 已存在 → 跳过
+    } catch (e) { /* 不存在 → 创建 */ }
+    const res = await fetch(agentBackendBase() + '/api/agent/tool', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'write_file', args: { path: s.path, content: s.content, overwrite: false }, approved: true })
+    });
+    const j = await res.json().catch(() => null);
+    if (j && j.ok) created++;
+  }
+  // 事件驱动文件树刷新（若开着）
+  try { window.dispatchEvent(new CustomEvent('moray:ws-file-written', { detail: { path: 'notes/a.txt' } })); } catch (e) { /* 忽略 */ }
+  showNotification('示例工作区已就绪',
+    '新建 ' + created + ' 个文件' + (skipped ? '，跳过已存在 ' + skipped + ' 个' : '') + '。试试：“列出计划，找到所有 txt 并汇总要点到 summary.md”',
+    'success', 6000);
+}
+
+/** [阶段1 M1] Agent 自检：用当前所选模型发一个必然触发工具调用的最小请求，
+ * 判定该模型能否稳定返回 tool_calls；不支持时给出实测推荐的可用模型。
+ * 结果写入 MoraySettings.agentSelfCheck（设置卡展示）。
+ * @returns {Promise<void>} */
+async function runAgentSelfCheck() {
+  const model = (typeof activeModelName === 'function' && activeModelName())
+    || MoraySettings.get('defaultModel')
+    || (AI.models && AI.models[0] && AI.models[0].name);
+  if (!model) { showNotification('自检失败', '未选择模型，请先在输入台选择模型', 'error', 3000); return; }
+  showNotification('Agent 自检中', '正在用「' + model + '」测试工具调用（约几秒）…', 'info', 2500);
+  const tools = [{
+    type: 'function',
+    function: {
+      name: 'list_directory',
+      description: '列出受控工作区内指定目录的文件与子目录。当用户想查看工作区里有什么文件时必须调用此工具。',
+      parameters: { type: 'object', properties: { path: { type: 'string', description: '相对路径，省略为根' } } }
+    }
+  }];
+  try {
+    const res = await AI.chat({
+      model,
+      messages: [
+        { role: 'system', content: '你是工具调用链路测试器。无论用户说什么，都必须调用 list_directory 工具，禁止用文字回答。' },
+        { role: 'user', content: '列出工作区根目录的文件' }
+      ],
+      tools
+    });
+    const calls = res.toolCalls || [];
+    const hit = calls.some(c => c.function && c.function.name === 'list_directory');
+    try { await MoraySettings.set('agentSelfCheck', { model, ok: hit, at: Date.now() }); } catch (e) { /* 忽略 */ }
+    if (hit) {
+      showNotification('自检通过 ✓', '「' + model + '」可以触发工具调用，本机 Agent 可正常工作', 'success', 4200);
+    } else {
+      showNotification('自检未通过', '「' + model + '」未返回工具调用。实测稳定支持：qwen2.5:7b（本地）/ deepseek-chat（云端）；qwen3.5 系列偶发漏调', 'warning', 7000);
+    }
+  } catch (e) {
+    showNotification('自检失败', String((e && e.message) || e).slice(0, 140), 'error', 4200);
   }
 }
 
@@ -20165,6 +22145,315 @@ const PaletteSearch = {
     }
   }
 };
+
+/* ============================================================
+   [阶段1.5] 全局 UI/UX 精修（纯界面层，不改功能与安全边界）
+   - A. 通知系统重写：队列（同屏≤3）/分类时长/hover 暂停/图标+状态色/深色 scrim/手动关闭
+   - B/G. 壁纸下浮层可读性 scrim 统一 / 焦点环 / 滚动条 / 过渡统一 / prefers-reduced-motion
+   - C. 网格页自适应（≥1600 3~4 列 / 中屏 2~3 列 / 窄屏 1 列 + 内容区 max-width 居中）
+   - D. 输入台分组分隔与窄屏横向滚动 / 本机工具 ON 态品牌描边+轻 glow
+   - F. 计划卡/时间线/审批卡/文件树侧栏 的视觉精修（结构 JS 在 125_tools.js）
+   说明：showNotification 原实现位于静态骨架第一阶段脚本（不可改区），此处以同名覆盖方式升级。
+   ============================================================ */
+
+/* ===================== A. 通知系统（覆盖实现） ===================== */
+
+/** 通知运行时（队列/计时/暂停） */
+const NotificationRuntime = {
+  /** 同屏上限 @type {number} */
+  MAX_ONSCREEN: 3,
+  /** 类型默认时长 ms */
+  DURATION: { success: 3500, info: 5000, warning: 8000, error: 10000 },
+  /** 当前队列元素 @type {Array<HTMLElement>} */
+  live: [],
+  /** [阶段1.6 M1] 启动窗口：加载后 12s 内的启动类通知只允许一条（其余静默丢弃并
+   * 把后端状态/⌘K 引导并入首条），根治静态骨架与各 boot 路径的启动通知连叠 */
+  bootWindowUntil: Date.now() + 12000,
+  bootShown: false,
+  bootEl: null,
+
+  /** 判定是否启动类通知（标题含"已就绪/一切就绪"或消息含命令面板引导/后端状态摘要）
+   * @param {string} title - 标题
+   * @param {string} message - 消息
+   * @returns {boolean} */
+  isBootLike(title, message) {
+    const t = String(title || '');
+    const m = String(message || '');
+    return /已就绪|一切就绪/.test(t) || /⌘K|Ctrl\+K/.test(m) || /本地同步后端未启动|本地后端已连接/.test(m);
+  },
+
+  /** 启动类通知合并：首条正常显示（自动并入 ⌘K 引导），后续把后端状态并入首条后丢弃 */
+  mergeBoot(title, message, type) {
+    if (!this.bootShown) {
+      this.bootShown = true;
+      let m = String(message || '');
+      if (!/⌘K|Ctrl\+K/.test(m)) m = (m ? m + ' · ' : '') + '按 ⌘K 打开命令面板';
+      return { title, message: m, type };
+    }
+    // 已有首条：把新通知携带的后端状态并入首条 message 后丢弃
+    if (this.bootEl && this.bootEl.isConnected) {
+      const statusPart = /本地同步后端未启动|本地后端已连接/.test(String(message || '')) ? String(message) : '';
+      if (statusPart) {
+        const msgEl = this.bootEl.querySelector('.notification-message');
+        if (msgEl && !/本地同步后端未启动|本地后端已连接/.test(msgEl.textContent || '')) {
+          msgEl.textContent = statusPart;
+        }
+      }
+    }
+    return null;
+  },
+
+  /** 按类型取图标
+   * @param {string} type - success|error|warning|info
+   * @returns {string} lucide 图标名 */
+  icon(type) {
+    return { success: 'check-circle-2', error: 'x-circle', warning: 'alert-triangle', info: 'info' }[type] || 'info';
+  },
+
+  /** 队列超员时顶掉最旧的一条
+   * @returns {void} */
+  evictOldest() {
+    while (this.live.length >= this.MAX_ONSCREEN) {
+      const oldest = this.live.shift();
+      if (oldest && oldest.isConnected) this.dismiss(oldest, true);
+    }
+  },
+
+  /** 关闭一条通知（带退场动画）
+   * @param {HTMLElement} el - 通知元素
+   * @param {boolean} [instant] - 立即移除
+   * @returns {void} */
+  dismiss(el, instant) {
+    if (!el || !el.isConnected) return;
+    this.live = this.live.filter(x => x !== el);
+    if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; }
+    if (instant) { el.remove(); return; }
+    el.classList.add('closing');
+    setTimeout(() => el.remove(), 220);
+  }
+};
+
+/** 通知（覆盖静态骨架同名实现）：同屏≤3 条新顶旧、类型时长（成功 3.5s/信息 5s/警告与错误
+ * 更久）、hover 暂停倒计时、类型图标+状态色、深色 scrim 保证壁纸下可读、右上安全边距。
+ * @param {string} title - 标题
+ * @param {string} [message] - 说明
+ * @param {string} [type] - success|error|warning|info
+ * @param {number} [duration] - 自定义时长 ms（0=不自动消失） */
+window.showNotification = function (title, message, type = 'info', duration) {
+  const container = document.getElementById('notificationContainer');
+  if (!container) return;
+  type = ['success', 'error', 'warning', 'info'].includes(type) ? type : 'info';
+  // [阶段1.6 M1] 启动窗口合并：整个启动流程只出现一条启动类通知
+  if (Date.now() < NotificationRuntime.bootWindowUntil &&
+      NotificationRuntime.isBootLike(title, message) && (type === 'success' || type === 'info')) {
+    const merged = NotificationRuntime.mergeBoot(title, message, type);
+    if (!merged) return; // 后续启动类静默丢弃（状态已并入首条）
+    title = merged.title;
+    message = merged.message;
+    type = merged.type;
+  }
+  const ms = (duration != null && duration > 0) ? duration : (NotificationRuntime.DURATION[type] || 5000);
+  NotificationRuntime.evictOldest();
+
+  const el = document.createElement('div');
+  el.className = 'notification notification--polished type-' + type;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  el.innerHTML =
+    '<div class="notification-icon ' + type + '"><i data-lucide="' + NotificationRuntime.icon(type) + '" class="w-4 h-4"></i></div>' +
+    '<div class="notification-content">' +
+    '<div class="notification-title">' + escapeHtml(String(title == null ? '' : title)) + '</div>' +
+    (message ? '<div class="notification-message">' + escapeHtml(String(message)) + '</div>' : '') +
+    '</div>' +
+    '<button class="notification-close" aria-label="关闭通知" title="关闭"><i data-lucide="x" class="w-3 h-3"></i></button>' +
+    '<div class="notification-progress" style="animation-duration:' + ms + 'ms"></div>';
+  container.appendChild(el);
+  refreshIcons();
+  NotificationRuntime.live.push(el);
+  // [阶段1.6 M1] 记录首条启动摘要（后续启动类通知的状态并入它）
+  if (NotificationRuntime.bootShown && !NotificationRuntime.bootEl &&
+      /已就绪/.test(String(title || ''))) {
+    NotificationRuntime.bootEl = el;
+  }
+
+  // 手动关闭
+  const closeBtn = el.querySelector('.notification-close');
+  if (closeBtn) closeBtn.addEventListener('click', (e) => { e.stopPropagation(); NotificationRuntime.dismiss(el); });
+  // hover 暂停倒计时（暂停进度条动画，移出后按剩余时间继续）
+  let remaining = ms;
+  let startedAt = Date.now();
+  const armTimer = () => {
+    el._hideTimer = setTimeout(() => NotificationRuntime.dismiss(el), remaining);
+  };
+  if (ms > 0) armTimer();
+  el.addEventListener('mouseenter', () => {
+    if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; }
+    remaining = Math.max(1000, remaining - (Date.now() - startedAt));
+    el.classList.add('paused');
+  });
+  el.addEventListener('mouseleave', () => {
+    startedAt = Date.now();
+    el.classList.remove('paused');
+    if (ms > 0) armTimer();
+  });
+};
+
+/* ===================== B/G/D/F/C. 全局精修样式（一次注入） ===================== */
+
+(function injectUiPolishCss() {
+  if (document.getElementById('uiPolishStyle')) return;
+  const st = document.createElement('style');
+  st.id = 'uiPolishStyle';
+  st.textContent = `
+/* ---------- A. 通知：壁纸下可读 scrim / 状态色 / 进度条 / 右上安全边距 ---------- */
+.notification-container { top: 16px; right: 16px; max-width: min(400px, calc(100vw - 32px)); }
+.notification--polished {
+  position: relative; overflow: hidden;
+  background: linear-gradient(180deg, rgba(16,19,29,.92), rgba(12,14,22,.95));
+  -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
+  border: 1px solid rgba(120,140,180,.28);
+  border-left: 3px solid var(--color-text-tertiary, #6b7280);
+  border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45);
+  padding-right: 14px;
+}
+[data-theme="light"] .notification--polished {
+  background: linear-gradient(180deg, rgba(250,251,253,.94), rgba(240,243,248,.96));
+  border-color: rgba(90,110,150,.3); box-shadow: 0 10px 28px rgba(30,40,70,.18);
+}
+.notification--polished.type-success { border-left-color: var(--color-success, #4ade80); }
+.notification--polished.type-error   { border-left-color: var(--color-danger, #f87171); }
+.notification--polished.type-warning { border-left-color: var(--color-warning, #fbbf24); }
+.notification--polished.type-info    { border-left-color: var(--color-brand-cobalt, #5b8cff); }
+.notification--polished .notification-icon.success { color: var(--color-success, #4ade80); }
+.notification--polished .notification-icon.error   { color: var(--color-danger, #f87171); }
+.notification--polished .notification-icon.warning { color: var(--color-warning, #fbbf24); }
+.notification--polished .notification-icon.info    { color: var(--color-brand-cobalt, #5b8cff); }
+.notification--polished .notification-close {
+  background: transparent; border: 0; color: var(--color-text-tertiary, #6b7280);
+  cursor: pointer; padding: 4px; border-radius: 6px; line-height: 0;
+}
+.notification--polished .notification-close:hover { color: var(--color-text-primary, #e5e7eb); background: rgba(255,255,255,.08); }
+.notification--polished .notification-progress {
+  position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+  background: var(--color-brand-cyan, #3ad6e8); opacity: .55;
+  animation-name: notif-progress; animation-timing-function: linear; animation-fill-mode: forwards;
+}
+.notification--polished.paused .notification-progress { animation-play-state: paused; }
+@keyframes notif-progress { from { width: 100%; } to { width: 0%; } }
+.notification--polished.closing { opacity: 0; transform: translateX(16px); transition: opacity .2s ease-out, transform .2s ease-out; }
+
+/* ---------- B. 浮层在壁纸亮部的统一 scrim：模态/下拉/确认/命令面板/右键菜单 ---------- */
+.modal-box, .confirm-box, .command-palette, .context-menu {
+  background: linear-gradient(180deg, rgba(17,20,31,.94), rgba(13,15,24,.97)) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(1.25) !important; backdrop-filter: blur(18px) saturate(1.25) !important;
+  border: 1px solid rgba(120,140,180,.28) !important;
+}
+[data-theme="light"] .modal-box, [data-theme="light"] .confirm-box,
+[data-theme="light"] .command-palette, [data-theme="light"] .context-menu {
+  background: linear-gradient(180deg, rgba(250,251,253,.96), rgba(241,244,249,.98)) !important;
+}
+.modal-overlay, .confirm-overlay { background: rgba(4,6,12,.55) !important; -webkit-backdrop-filter: blur(3px) !important; backdrop-filter: blur(3px) !important; }
+[data-theme="light"] .modal-overlay, [data-theme="light"] .confirm-overlay { background: rgba(30,40,60,.35) !important; }
+.input-toolbar, .input-container, .col-messages .msg-bubble > div { -webkit-backdrop-filter: blur(12px) !important; backdrop-filter: blur(12px) !important; }
+
+/* ---------- B/G. 焦点环 / 滚动条 / 过渡统一 ---------- */
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible, a:focus-visible {
+  outline: 2px solid rgba(91,140,255,.65); outline-offset: 2px; border-radius: 6px;
+}
+* { scrollbar-width: thin; scrollbar-color: rgba(120,140,180,.35) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(120,140,180,.35); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(120,140,180,.55); }
+::-webkit-scrollbar-track { background: transparent; }
+button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { transition: background-color .16s ease-out, border-color .16s ease-out, color .16s ease-out, box-shadow .16s ease-out, opacity .16s ease-out; }
+
+/* ---------- C. 网格页自适应 + 内容区居中 ---------- */
+#page-prompts .flex-1 > div, #page-snippets .flex-1 > div, #page-docs .flex-1 > div { max-width: 1560px; margin-left: auto; margin-right: auto; width: 100%; }
+@media (min-width: 1600px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; }
+}
+@media (min-width: 1280px) and (max-width: 1599px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+}
+@media (min-width: 768px) and (max-width: 1279px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 767px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: 1fr !important; }
+}
+#page-prompts .grid > *, #page-snippets .grid > * { min-width: 0; overflow: hidden; }
+
+/* ---------- D. 输入台：分组分隔 / 窄屏横向滚动 / ON 态 glow ---------- */
+.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap !important; }
+.input-toolbar::-webkit-scrollbar { display: none; }
+.input-toolbar > * { flex-shrink: 0; }
+.native-agent-btn.native-on {
+  box-shadow: inset 0 0 0 1px rgba(157,123,255,.5), 0 0 10px rgba(157,123,255,.28);
+}
+.native-agent-btn:not(.native-on) { opacity: .62; }
+.native-agent-btn:not(.native-on):hover { opacity: 1; }
+
+/* ---------- F. Agent 组件精修 ---------- */
+/* 欢迎页快捷卡片精修：图标底统一、hover 抬升、间距统一；Agent 引导卡高亮 */
+.welcome-suggestions { gap: 10px; }
+.welcome-suggestion {
+  border: 1px solid rgba(120,140,180,.22);
+  background: linear-gradient(180deg, rgba(20,24,36,.66), rgba(14,17,28,.78));
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  border-radius: 12px;
+  transition: transform .16s ease-out, border-color .16s ease-out, box-shadow .16s ease-out;
+}
+[data-theme="light"] .welcome-suggestion { background: rgba(250,251,253,.9); border-color: rgba(90,110,150,.25); }
+.welcome-suggestion:hover { transform: translateY(-2px); border-color: rgba(91,140,255,.5); box-shadow: 0 6px 20px rgba(40,60,120,.25); }
+.welcome-suggestion--agent { border-color: rgba(74,222,128,.45); }
+.welcome-suggestion--agent:hover { border-color: rgba(74,222,128,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
+.welcome-suggestion-icon { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; }
+/* Agent 开关“引导脉冲”（一次性高亮 2 秒） */
+.native-agent-btn.native-on-pulse { animation: nativePulse 0.9s ease-out 2; }
+@keyframes nativePulse {
+  0%, 100% { box-shadow: inset 0 0 0 1px rgba(157,123,255,.5), 0 0 10px rgba(157,123,255,.28); }
+  50% { box-shadow: inset 0 0 0 1px rgba(157,123,255,.85), 0 0 22px rgba(157,123,255,.55); }
+}
+/* 欢迎页垂直重心上移 */
+.welcome-screen { padding-top: 6vh !important; justify-content: flex-start !important; }
+
+/* 计划卡：整体可折叠（点击标题切换），进行步高亮由 JS 控制类 */
+.plan-card { cursor: default; }
+.plan-card .plan-steps { display: block; }
+.plan-card.collapsed .plan-steps { display: none; }
+.plan-card .plan-head { cursor: pointer; user-select: none; }
+.plan-card .plan-step-row.running { background: rgba(91,140,255,.08); border-radius: 6px; }
+/* 时间线：等宽字体块、耗时右对齐（.tool-step 结构由 125_tools.js 生成） */
+.tool-step summary .text-text-tertiary:not(.shrink-0) { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tool-step { transition: box-shadow .18s ease-out; }
+.tool-step[open] { box-shadow: 0 2px 12px rgba(0,0,0,.18); }
+/* 审批卡：目标路径/命令与 diff 已为等宽；主次按钮层级 */
+[data-agent-approve-ok] { min-width: 108px; }
+[data-agent-approve-no] { min-width: 84px; }
+/* 文件树侧栏：拖拽把手 */
+#wsSidebar .ws-resize-handle {
+  position: absolute; left: -5px; top: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 2;
+}
+#wsSidebar .ws-tree-row .ws-caret { transition: transform .16s ease-out; }
+#wsSidebar .ws-tree-row .ws-caret.open { transform: rotate(90deg); }
+#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #6b7280); }
+#wsSidebar .ws-empty .lucide { width: 26px; height: 26px; opacity: .5; margin-bottom: 8px; }
+
+/* ---------- B. 空状态统一 ---------- */
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #6b7280); }
+.empty-state .lucide { width: 30px; height: 30px; opacity: .45; margin-bottom: 10px; }
+.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9ca3af); margin-bottom: 4px; }
+.empty-state .empty-hint { font-size: 10px; }
+
+/* ---------- G. prefers-reduced-motion：关闭呼吸/脉冲/位移动画 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .animate-pulse, .animate-spin, .beacon-dot, .stream-cursor, .notification-progress,
+  .plan-card .animate-pulse, [class*="animate-"] { animation: none !important; }
+  .msg-enter, .msg-fade, .tool-step, .notification, .plan-card { transition: none !important; animation: none !important; }
+  * { scroll-behavior: auto !important; }
+}
+`;
+  document.head.appendChild(st);
+})();
 
 
 /* ===================== [任务十] PWA / Service Worker ===================== */

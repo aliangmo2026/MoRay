@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS kv (
   value       TEXT,
   updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS agent_tool_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  tool         TEXT NOT NULL,
+  args_summary TEXT NOT NULL DEFAULT '',
+  approved     INTEGER NOT NULL DEFAULT 0,
+  status       TEXT NOT NULL DEFAULT '',
+  ms           INTEGER NOT NULL DEFAULT 0,
+  detail       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_agent_log_ts ON agent_tool_log(id DESC);
 """
 
 

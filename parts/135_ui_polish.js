@@ -1,0 +1,308 @@
+/* ============================================================
+   [阶段1.5] 全局 UI/UX 精修（纯界面层，不改功能与安全边界）
+   - A. 通知系统重写：队列（同屏≤3）/分类时长/hover 暂停/图标+状态色/深色 scrim/手动关闭
+   - B/G. 壁纸下浮层可读性 scrim 统一 / 焦点环 / 滚动条 / 过渡统一 / prefers-reduced-motion
+   - C. 网格页自适应（≥1600 3~4 列 / 中屏 2~3 列 / 窄屏 1 列 + 内容区 max-width 居中）
+   - D. 输入台分组分隔与窄屏横向滚动 / 本机工具 ON 态品牌描边+轻 glow
+   - F. 计划卡/时间线/审批卡/文件树侧栏 的视觉精修（结构 JS 在 125_tools.js）
+   说明：showNotification 原实现位于静态骨架第一阶段脚本（不可改区），此处以同名覆盖方式升级。
+   ============================================================ */
+
+/* ===================== A. 通知系统（覆盖实现） ===================== */
+
+/** 通知运行时（队列/计时/暂停） */
+const NotificationRuntime = {
+  /** 同屏上限 @type {number} */
+  MAX_ONSCREEN: 3,
+  /** 类型默认时长 ms */
+  DURATION: { success: 3500, info: 5000, warning: 8000, error: 10000 },
+  /** 当前队列元素 @type {Array<HTMLElement>} */
+  live: [],
+  /** [阶段1.6 M1] 启动窗口：加载后 12s 内的启动类通知只允许一条（其余静默丢弃并
+   * 把后端状态/⌘K 引导并入首条），根治静态骨架与各 boot 路径的启动通知连叠 */
+  bootWindowUntil: Date.now() + 12000,
+  bootShown: false,
+  bootEl: null,
+
+  /** 判定是否启动类通知（标题含"已就绪/一切就绪"或消息含命令面板引导/后端状态摘要）
+   * @param {string} title - 标题
+   * @param {string} message - 消息
+   * @returns {boolean} */
+  isBootLike(title, message) {
+    const t = String(title || '');
+    const m = String(message || '');
+    return /已就绪|一切就绪/.test(t) || /⌘K|Ctrl\+K/.test(m) || /本地同步后端未启动|本地后端已连接/.test(m);
+  },
+
+  /** 启动类通知合并：首条正常显示（自动并入 ⌘K 引导），后续把后端状态并入首条后丢弃 */
+  mergeBoot(title, message, type) {
+    if (!this.bootShown) {
+      this.bootShown = true;
+      let m = String(message || '');
+      if (!/⌘K|Ctrl\+K/.test(m)) m = (m ? m + ' · ' : '') + '按 ⌘K 打开命令面板';
+      return { title, message: m, type };
+    }
+    // 已有首条：把新通知携带的后端状态并入首条 message 后丢弃
+    if (this.bootEl && this.bootEl.isConnected) {
+      const statusPart = /本地同步后端未启动|本地后端已连接/.test(String(message || '')) ? String(message) : '';
+      if (statusPart) {
+        const msgEl = this.bootEl.querySelector('.notification-message');
+        if (msgEl && !/本地同步后端未启动|本地后端已连接/.test(msgEl.textContent || '')) {
+          msgEl.textContent = statusPart;
+        }
+      }
+    }
+    return null;
+  },
+
+  /** 按类型取图标
+   * @param {string} type - success|error|warning|info
+   * @returns {string} lucide 图标名 */
+  icon(type) {
+    return { success: 'check-circle-2', error: 'x-circle', warning: 'alert-triangle', info: 'info' }[type] || 'info';
+  },
+
+  /** 队列超员时顶掉最旧的一条
+   * @returns {void} */
+  evictOldest() {
+    while (this.live.length >= this.MAX_ONSCREEN) {
+      const oldest = this.live.shift();
+      if (oldest && oldest.isConnected) this.dismiss(oldest, true);
+    }
+  },
+
+  /** 关闭一条通知（带退场动画）
+   * @param {HTMLElement} el - 通知元素
+   * @param {boolean} [instant] - 立即移除
+   * @returns {void} */
+  dismiss(el, instant) {
+    if (!el || !el.isConnected) return;
+    this.live = this.live.filter(x => x !== el);
+    if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; }
+    if (instant) { el.remove(); return; }
+    el.classList.add('closing');
+    setTimeout(() => el.remove(), 220);
+  }
+};
+
+/** 通知（覆盖静态骨架同名实现）：同屏≤3 条新顶旧、类型时长（成功 3.5s/信息 5s/警告与错误
+ * 更久）、hover 暂停倒计时、类型图标+状态色、深色 scrim 保证壁纸下可读、右上安全边距。
+ * @param {string} title - 标题
+ * @param {string} [message] - 说明
+ * @param {string} [type] - success|error|warning|info
+ * @param {number} [duration] - 自定义时长 ms（0=不自动消失） */
+window.showNotification = function (title, message, type = 'info', duration) {
+  const container = document.getElementById('notificationContainer');
+  if (!container) return;
+  type = ['success', 'error', 'warning', 'info'].includes(type) ? type : 'info';
+  // [阶段1.6 M1] 启动窗口合并：整个启动流程只出现一条启动类通知
+  if (Date.now() < NotificationRuntime.bootWindowUntil &&
+      NotificationRuntime.isBootLike(title, message) && (type === 'success' || type === 'info')) {
+    const merged = NotificationRuntime.mergeBoot(title, message, type);
+    if (!merged) return; // 后续启动类静默丢弃（状态已并入首条）
+    title = merged.title;
+    message = merged.message;
+    type = merged.type;
+  }
+  const ms = (duration != null && duration > 0) ? duration : (NotificationRuntime.DURATION[type] || 5000);
+  NotificationRuntime.evictOldest();
+
+  const el = document.createElement('div');
+  el.className = 'notification notification--polished type-' + type;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  el.innerHTML =
+    '<div class="notification-icon ' + type + '"><i data-lucide="' + NotificationRuntime.icon(type) + '" class="w-4 h-4"></i></div>' +
+    '<div class="notification-content">' +
+    '<div class="notification-title">' + escapeHtml(String(title == null ? '' : title)) + '</div>' +
+    (message ? '<div class="notification-message">' + escapeHtml(String(message)) + '</div>' : '') +
+    '</div>' +
+    '<button class="notification-close" aria-label="关闭通知" title="关闭"><i data-lucide="x" class="w-3 h-3"></i></button>' +
+    '<div class="notification-progress" style="animation-duration:' + ms + 'ms"></div>';
+  container.appendChild(el);
+  refreshIcons();
+  NotificationRuntime.live.push(el);
+  // [阶段1.6 M1] 记录首条启动摘要（后续启动类通知的状态并入它）
+  if (NotificationRuntime.bootShown && !NotificationRuntime.bootEl &&
+      /已就绪/.test(String(title || ''))) {
+    NotificationRuntime.bootEl = el;
+  }
+
+  // 手动关闭
+  const closeBtn = el.querySelector('.notification-close');
+  if (closeBtn) closeBtn.addEventListener('click', (e) => { e.stopPropagation(); NotificationRuntime.dismiss(el); });
+  // hover 暂停倒计时（暂停进度条动画，移出后按剩余时间继续）
+  let remaining = ms;
+  let startedAt = Date.now();
+  const armTimer = () => {
+    el._hideTimer = setTimeout(() => NotificationRuntime.dismiss(el), remaining);
+  };
+  if (ms > 0) armTimer();
+  el.addEventListener('mouseenter', () => {
+    if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; }
+    remaining = Math.max(1000, remaining - (Date.now() - startedAt));
+    el.classList.add('paused');
+  });
+  el.addEventListener('mouseleave', () => {
+    startedAt = Date.now();
+    el.classList.remove('paused');
+    if (ms > 0) armTimer();
+  });
+};
+
+/* ===================== B/G/D/F/C. 全局精修样式（一次注入） ===================== */
+
+(function injectUiPolishCss() {
+  if (document.getElementById('uiPolishStyle')) return;
+  const st = document.createElement('style');
+  st.id = 'uiPolishStyle';
+  st.textContent = `
+/* ---------- A. 通知：壁纸下可读 scrim / 状态色 / 进度条 / 右上安全边距 ---------- */
+.notification-container { top: 16px; right: 16px; max-width: min(400px, calc(100vw - 32px)); }
+.notification--polished {
+  position: relative; overflow: hidden;
+  background: linear-gradient(180deg, rgba(16,19,29,.92), rgba(12,14,22,.95));
+  -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
+  border: 1px solid rgba(120,140,180,.28);
+  border-left: 3px solid var(--color-text-tertiary, #6b7280);
+  border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45);
+  padding-right: 14px;
+}
+[data-theme="light"] .notification--polished {
+  background: linear-gradient(180deg, rgba(250,251,253,.94), rgba(240,243,248,.96));
+  border-color: rgba(90,110,150,.3); box-shadow: 0 10px 28px rgba(30,40,70,.18);
+}
+.notification--polished.type-success { border-left-color: var(--color-success, #4ade80); }
+.notification--polished.type-error   { border-left-color: var(--color-danger, #f87171); }
+.notification--polished.type-warning { border-left-color: var(--color-warning, #fbbf24); }
+.notification--polished.type-info    { border-left-color: var(--color-brand-cobalt, #5b8cff); }
+.notification--polished .notification-icon.success { color: var(--color-success, #4ade80); }
+.notification--polished .notification-icon.error   { color: var(--color-danger, #f87171); }
+.notification--polished .notification-icon.warning { color: var(--color-warning, #fbbf24); }
+.notification--polished .notification-icon.info    { color: var(--color-brand-cobalt, #5b8cff); }
+.notification--polished .notification-close {
+  background: transparent; border: 0; color: var(--color-text-tertiary, #6b7280);
+  cursor: pointer; padding: 4px; border-radius: 6px; line-height: 0;
+}
+.notification--polished .notification-close:hover { color: var(--color-text-primary, #e5e7eb); background: rgba(255,255,255,.08); }
+.notification--polished .notification-progress {
+  position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+  background: var(--color-brand-cyan, #3ad6e8); opacity: .55;
+  animation-name: notif-progress; animation-timing-function: linear; animation-fill-mode: forwards;
+}
+.notification--polished.paused .notification-progress { animation-play-state: paused; }
+@keyframes notif-progress { from { width: 100%; } to { width: 0%; } }
+.notification--polished.closing { opacity: 0; transform: translateX(16px); transition: opacity .2s ease-out, transform .2s ease-out; }
+
+/* ---------- B. 浮层在壁纸亮部的统一 scrim：模态/下拉/确认/命令面板/右键菜单 ---------- */
+.modal-box, .confirm-box, .command-palette, .context-menu {
+  background: linear-gradient(180deg, rgba(17,20,31,.94), rgba(13,15,24,.97)) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(1.25) !important; backdrop-filter: blur(18px) saturate(1.25) !important;
+  border: 1px solid rgba(120,140,180,.28) !important;
+}
+[data-theme="light"] .modal-box, [data-theme="light"] .confirm-box,
+[data-theme="light"] .command-palette, [data-theme="light"] .context-menu {
+  background: linear-gradient(180deg, rgba(250,251,253,.96), rgba(241,244,249,.98)) !important;
+}
+.modal-overlay, .confirm-overlay { background: rgba(4,6,12,.55) !important; -webkit-backdrop-filter: blur(3px) !important; backdrop-filter: blur(3px) !important; }
+[data-theme="light"] .modal-overlay, [data-theme="light"] .confirm-overlay { background: rgba(30,40,60,.35) !important; }
+.input-toolbar, .input-container, .col-messages .msg-bubble > div { -webkit-backdrop-filter: blur(12px) !important; backdrop-filter: blur(12px) !important; }
+
+/* ---------- B/G. 焦点环 / 滚动条 / 过渡统一 ---------- */
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible, a:focus-visible {
+  outline: 2px solid rgba(91,140,255,.65); outline-offset: 2px; border-radius: 6px;
+}
+* { scrollbar-width: thin; scrollbar-color: rgba(120,140,180,.35) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(120,140,180,.35); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(120,140,180,.55); }
+::-webkit-scrollbar-track { background: transparent; }
+button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { transition: background-color .16s ease-out, border-color .16s ease-out, color .16s ease-out, box-shadow .16s ease-out, opacity .16s ease-out; }
+
+/* ---------- C. 网格页自适应 + 内容区居中 ---------- */
+#page-prompts .flex-1 > div, #page-snippets .flex-1 > div, #page-docs .flex-1 > div { max-width: 1560px; margin-left: auto; margin-right: auto; width: 100%; }
+@media (min-width: 1600px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; }
+}
+@media (min-width: 1280px) and (max-width: 1599px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+}
+@media (min-width: 768px) and (max-width: 1279px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 767px) {
+  #page-prompts .grid, #page-snippets .grid, #page-docs .grid { grid-template-columns: 1fr !important; }
+}
+#page-prompts .grid > *, #page-snippets .grid > * { min-width: 0; overflow: hidden; }
+
+/* ---------- D. 输入台：分组分隔 / 窄屏横向滚动 / ON 态 glow ---------- */
+.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap !important; }
+.input-toolbar::-webkit-scrollbar { display: none; }
+.input-toolbar > * { flex-shrink: 0; }
+.native-agent-btn.native-on {
+  box-shadow: inset 0 0 0 1px rgba(157,123,255,.5), 0 0 10px rgba(157,123,255,.28);
+}
+.native-agent-btn:not(.native-on) { opacity: .62; }
+.native-agent-btn:not(.native-on):hover { opacity: 1; }
+
+/* ---------- F. Agent 组件精修 ---------- */
+/* 欢迎页快捷卡片精修：图标底统一、hover 抬升、间距统一；Agent 引导卡高亮 */
+.welcome-suggestions { gap: 10px; }
+.welcome-suggestion {
+  border: 1px solid rgba(120,140,180,.22);
+  background: linear-gradient(180deg, rgba(20,24,36,.66), rgba(14,17,28,.78));
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  border-radius: 12px;
+  transition: transform .16s ease-out, border-color .16s ease-out, box-shadow .16s ease-out;
+}
+[data-theme="light"] .welcome-suggestion { background: rgba(250,251,253,.9); border-color: rgba(90,110,150,.25); }
+.welcome-suggestion:hover { transform: translateY(-2px); border-color: rgba(91,140,255,.5); box-shadow: 0 6px 20px rgba(40,60,120,.25); }
+.welcome-suggestion--agent { border-color: rgba(74,222,128,.45); }
+.welcome-suggestion--agent:hover { border-color: rgba(74,222,128,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
+.welcome-suggestion-icon { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; }
+/* Agent 开关“引导脉冲”（一次性高亮 2 秒） */
+.native-agent-btn.native-on-pulse { animation: nativePulse 0.9s ease-out 2; }
+@keyframes nativePulse {
+  0%, 100% { box-shadow: inset 0 0 0 1px rgba(157,123,255,.5), 0 0 10px rgba(157,123,255,.28); }
+  50% { box-shadow: inset 0 0 0 1px rgba(157,123,255,.85), 0 0 22px rgba(157,123,255,.55); }
+}
+/* 欢迎页垂直重心上移 */
+.welcome-screen { padding-top: 6vh !important; justify-content: flex-start !important; }
+
+/* 计划卡：整体可折叠（点击标题切换），进行步高亮由 JS 控制类 */
+.plan-card { cursor: default; }
+.plan-card .plan-steps { display: block; }
+.plan-card.collapsed .plan-steps { display: none; }
+.plan-card .plan-head { cursor: pointer; user-select: none; }
+.plan-card .plan-step-row.running { background: rgba(91,140,255,.08); border-radius: 6px; }
+/* 时间线：等宽字体块、耗时右对齐（.tool-step 结构由 125_tools.js 生成） */
+.tool-step summary .text-text-tertiary:not(.shrink-0) { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tool-step { transition: box-shadow .18s ease-out; }
+.tool-step[open] { box-shadow: 0 2px 12px rgba(0,0,0,.18); }
+/* 审批卡：目标路径/命令与 diff 已为等宽；主次按钮层级 */
+[data-agent-approve-ok] { min-width: 108px; }
+[data-agent-approve-no] { min-width: 84px; }
+/* 文件树侧栏：拖拽把手 */
+#wsSidebar .ws-resize-handle {
+  position: absolute; left: -5px; top: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 2;
+}
+#wsSidebar .ws-tree-row .ws-caret { transition: transform .16s ease-out; }
+#wsSidebar .ws-tree-row .ws-caret.open { transform: rotate(90deg); }
+#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #6b7280); }
+#wsSidebar .ws-empty .lucide { width: 26px; height: 26px; opacity: .5; margin-bottom: 8px; }
+
+/* ---------- B. 空状态统一 ---------- */
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #6b7280); }
+.empty-state .lucide { width: 30px; height: 30px; opacity: .45; margin-bottom: 10px; }
+.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9ca3af); margin-bottom: 4px; }
+.empty-state .empty-hint { font-size: 10px; }
+
+/* ---------- G. prefers-reduced-motion：关闭呼吸/脉冲/位移动画 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .animate-pulse, .animate-spin, .beacon-dot, .stream-cursor, .notification-progress,
+  .plan-card .animate-pulse, [class*="animate-"] { animation: none !important; }
+  .msg-enter, .msg-fade, .tool-step, .notification, .plan-card { transition: none !important; animation: none !important; }
+  * { scroll-behavior: auto !important; }
+}
+`;
+  document.head.appendChild(st);
+})();
