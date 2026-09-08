@@ -452,11 +452,11 @@ async function appendCostSettings() {
     '<h3 class="text-sm font-semibold text-text-primary mb-2 flex items-center gap-2"><i data-lucide="coins" class="w-4 h-4 text-brand-cyan"></i>成本与省钱</h3>',
     '<p class="text-[10px] text-text-tertiary mb-3">价格为默认值、可能变动、以官方定价为准；成本中心按当前价格实时估算。</p>',
     '<div class="flex items-center justify-between mb-3">',
-    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">月度预算（元）</span><input type="number" min="0" step="1" value="' + (MoraySettings.get('costBudgetCNY') || 0) + '" id="setCostBudget" class="form-input" style="width:90px;padding:4px 8px;font-size:11px"></div>',
+    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">月度预算（元）</span><input type="number" min="0" step="1" value="' + (MoraySettings.get('costBudgetCNY') || 0) + '" id="setCostBudget" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>',
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">超预算自动降级</span><div class="toggle-track ' + (MoraySettings.get('autoDegrade') ? 'active' : '') + '" id="setAutoDegrade"><div class="toggle-thumb"></div></div></div></div>',
     '<div class="text-[10px] text-text-tertiary mb-1">价格表（元/百万token · 输入/输出/缓存命中）</div>',
     '<div class="space-y-1 mb-2" id="costPriceRows">' + priceRows + '</div>',
-    '<div class="flex gap-1.5 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:11px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
+    '<div class="flex gap-1.5 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
     '<button class="text-[10px] text-danger mt-2 hover:opacity-80" id="costResetOverrides">清除全部自定义价格</button>'
   ].join('');
   container.insertBefore(card, container.querySelector('#gatewaySettingsCard') || container.querySelector('#enhanceSettingsCard') || container.lastElementChild);

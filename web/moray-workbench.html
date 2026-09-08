@@ -7267,7 +7267,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-﻿/* ============================================================
+/* ============================================================
    模块：任务三 对话系统（会话CRUD / 消息渲染 / 流式发送 / 导出）
    ============================================================ */
 
@@ -7602,7 +7602,7 @@ function installThinkModeBtn() {
   if (!document.getElementById('thinkModeBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'thinkModeBtnStyle';
-    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(91,140,255,.15);color:#5B8CFF;box-shadow:inset 0 0 0 1px rgba(91,140,255,.3)}.think-mode-btn.think-off{opacity:.4}';
+    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(91,140,255,.15);color:#5B8CFF;box-shadow:inset 0 0 0 1px rgba(91,140,255,.3)}.think-mode-btn.think-off{opacity:.4}';
     document.head.appendChild(st);
   }
   refreshIcons();
@@ -7628,7 +7628,7 @@ function installNativeAgentToggle() {
   if (!document.getElementById('nativeAgentBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'nativeAgentBtnStyle';
-    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
+    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
     document.head.appendChild(st);
   }
   syncNativeAgentBtn();
@@ -7669,6 +7669,8 @@ async function toggleNativeAgent() {
     return;
   }
   await MoraySettings.set('nativeToolsEnabled', next);
+  // [通宵回归 3.2 修复] 开启本机 Agent 时联动总开关：toolsEnabled 默认关会让请求体无 tools 而静默失效（开 native 的意图即是用工具）
+  if (next && MoraySettings.get('toolsEnabled') !== true) await MoraySettings.set('toolsEnabled', true);
   syncNativeAgentBtn();
   refreshNativeAgentBanner();
   if (next) {
@@ -8194,7 +8196,7 @@ function showWelcomeView() {
       </div>
       ${(typeof MoraySettings !== 'undefined' && MoraySettings.get('nativeToolsEnabled') === true && window.MorayBackend && window.MorayBackend.connected) ? `
       <div class="welcome-suggestion welcome-suggestion--agent" onclick="tryLocalAgentSuggestion()" title="载入示例工作区并演示本机 Agent">
-        <div class="welcome-suggestion-icon" style="background:rgba(74,222,128,0.12);color:#4ADE80;"><i data-lucide="bot" class="w-4 h-4"></i></div>
+        <div class="welcome-suggestion-icon" style="background:rgba(63,214,143,0.12);color:#3FD68F;"><i data-lucide="bot" class="w-4 h-4"></i></div>
         <div class="welcome-suggestion-text"><strong>试试本地 Agent</strong>演示查找→读取→汇总工作区文件</div>
       </div>` : ''}
     </div>`;
@@ -8215,9 +8217,10 @@ function removeWelcomeView() {
  * @returns {Promise<void>} */
 async function tryLocalAgentSuggestion() {
   try {
-    // 1) 本机工具开关：未开启则自动开启
+    // 1) 本机工具开关：未开启则自动开启（联动总开关，避免请求体无 tools 静默失效）
     if (MoraySettings.get('nativeToolsEnabled') !== true) {
       await MoraySettings.set('nativeToolsEnabled', true);
+      await MoraySettings.set('toolsEnabled', true);
       syncNativeAgentBtn();
       refreshNativeAgentBanner();
     }
@@ -11329,7 +11332,7 @@ function openDocPreview(docId, chunkIdx) { return DocsApp.openPreview(docId, chu
   });
 })();
 
-﻿/* ============================================================
+/* ============================================================
    模块：自动化工作流引擎（任务七）/ 模型管理与监控（任务八）
    ============================================================ */
 
@@ -12125,7 +12128,7 @@ const WorkflowsApp = {
           <div class="flex items-center justify-between mb-2">
             <label class="form-label" style="margin:0">节点（按顺序执行）</label>
             <div class="flex gap-1">
-              <select id="weNodeType" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">
+              <select id="weNodeType" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">
                 <option value="input">输入节点</option><option value="ai">AI 处理</option><option value="code">代码执行</option>
                 <option value="condition">条件分支</option><option value="loop">循环</option><option value="output">输出</option>
               </select>
@@ -12159,7 +12162,7 @@ const WorkflowsApp = {
         nodeList().innerHTML = state.nodes.map((n, i) => `
           <div class="chunk-item flex items-center gap-2" data-node-idx="${i}">
             <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt flex-shrink-0">${n.type}</span>
-            <input type="text" class="form-input" style="flex:1;padding:4px 8px;font-size:11px" data-node-name="${i}" value="${escapeHtml(n.name)}">
+            <input type="text" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" data-node-name="${i}" value="${escapeHtml(n.name)}">
             <button class="tool-btn" data-node-op="cfg" title="配置"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i></button>
             <button class="tool-btn" data-node-op="up" title="上移"><i data-lucide="chevron-up" class="w-3.5 h-3.5"></i></button>
             <button class="tool-btn" data-node-op="down" title="下移"><i data-lucide="chevron-down" class="w-3.5 h-3.5"></i></button>
@@ -12782,7 +12785,7 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">显示模型思考过程</span>
-                <select id="setThinkingDisplay" class="form-select" style="width:auto;font-size:11px;padding:4px 8px">
+                <select id="setThinkingDisplay" class="form-select" style="width:auto;font-size:12px;padding:4px 8px">
                   <option value="folded" ${c.thinkingDisplay !== 'hidden' && c.thinkingDisplay !== 'auto' ? 'selected' : ''}>折叠显示（一行）</option>
                   <option value="auto" ${c.thinkingDisplay === 'auto' ? 'selected' : ''}>自动展开</option>
                   <option value="hidden" ${c.thinkingDisplay === 'hidden' ? 'selected' : ''}>完全隐藏</option>
@@ -12824,7 +12827,7 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">正文字号</span>
-                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 10px;font-size:11px">
+                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
                   <option value="sm" ${c.fontSize === 'sm' ? 'selected' : ''}>小</option>
                   <option value="md" ${c.fontSize === 'md' ? 'selected' : ''}>标准</option>
                   <option value="lg" ${c.fontSize === 'lg' ? 'selected' : ''}>大</option>
@@ -12870,7 +12873,7 @@ const SettingsApp = {
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">AI 自动命名会话</span>
                 <div class="flex items-center gap-2">
-                  <select id="setNamingStyle" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">
+                  <select id="setNamingStyle" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">
                     ${['简洁', '专业', '活泼'].map(s => `<option ${c.namingStyle === s ? 'selected' : ''}>${s}</option>`).join('')}
                   </select>
                   <input type="checkbox" id="setAutoNaming" ${c.autoNaming ? 'checked' : ''} class="accent-brand-cobalt w-4 h-4">
@@ -13469,7 +13472,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.18.6'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.19.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -14342,7 +14345,7 @@ function appendEnhanceSettings() {
           <div class="text-xs text-text-secondary">向量化后端</div>
           <div class="text-[10px] text-text-tertiary">auto=优先 Ollama；local=浏览器内 Transformers.js；hash=纯本地词频</div>
         </div>
-        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 10px;font-size:11px">
+        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
           <option value="auto" ${c.embeddingBackend === 'auto' ? 'selected' : ''}>auto</option>
           <option value="transformers" ${c.embeddingBackend === 'transformers' ? 'selected' : ''}>local (Transformers.js)</option>
           <option value="hash" ${c.embeddingBackend === 'hash' ? 'selected' : ''}>hash</option>
@@ -16847,9 +16850,9 @@ async function appendGatewaySettings() {
   const rs = meta.routeStats || { byType: {}, byModel: {} };
   const models = AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('');
   const rc = c.routingConfig || {};
-  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:11px" data-route-${type}-${field}>
+  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route-${type}-${field}>
     <option value="">（未配置）</option>${models}</select>`.replace(`data-route-${type}-${field}>`, `data-route-${type}-${field}>`).replace('</select>', '</select>');
-  const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:11px" data-route="${type}.${field}">
+  const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route="${type}.${field}">
     <option value="">（未配置）</option>${AI.models.map(m => `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}</select>`;
 
   const maxDay = Math.max(1, ...Object.values(cacheStats.byDay || {}).map(d => Math.max(d.hits || 0, d.queries || 0)));
@@ -16888,11 +16891,11 @@ async function appendGatewaySettings() {
       </div>
       <div class="space-y-2 text-xs">
         <div class="flex items-center justify-between"><span class="text-text-secondary">缓存有效期</span>
-          <select class="form-select" style="width:auto;padding:4px 8px;font-size:11px" id="setCacheTTL">
+          <select class="form-select" style="width:auto;padding:4px 8px;font-size:12px" id="setCacheTTL">
             ${[[1, '1小时'], [6, '6小时'], [24, '24小时'], [168, '7天'], [0, '永久']].map(([v, n]) => `<option value="${v}" ${c.cacheTTL === v ? 'selected' : ''}>${n}</option>`).join('')}
           </select></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">缓存大小限制</span>
-          <select class="form-select" style="width:auto;padding:4px 8px;font-size:11px" id="setCacheMaxMB">
+          <select class="form-select" style="width:auto;padding:4px 8px;font-size:12px" id="setCacheMaxMB">
             ${[[50, '50MB'], [100, '100MB'], [500, '500MB'], [0, '无限制']].map(([v, n]) => `<option value="${v}" ${c.cacheMaxMB === v ? 'selected' : ''}>${n}</option>`).join('')}
           </select></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">语义缓存（相似请求命中）</span>
@@ -16926,7 +16929,7 @@ async function appendGatewaySettings() {
           </div>`).join('')}
         <div class="flex items-center justify-between pt-2">
           <span class="text-text-secondary">降级重试上限</span>
-          <input type="number" min="1" max="5" value="${MoraySettings.get('routingFallbacks') || 2}" id="setRoutingFallbacks" class="form-input" style="width:64px;padding:4px 8px;font-size:11px">
+          <input type="number" min="1" max="5" value="${MoraySettings.get('routingFallbacks') || 2}" id="setRoutingFallbacks" class="form-input" style="width:64px;padding:4px 8px;font-size:12px">
           <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="viewFallbackLogBtn">降级日志</button>
         </div>
         <div class="flex gap-4 pt-2 border-t border-line-ghost/50">
@@ -16944,7 +16947,7 @@ async function appendGatewaySettings() {
       </div>
       <div class="flex items-center justify-between">
         <span class="text-text-secondary">失败熔断冷却（秒，10-600）</span>
-        <input type="number" min="10" max="600" value="${parseInt(c.circuitBreakerCooldownSec || 90, 10)}" id="setCircuitBreakerCooldownSec" class="form-input" style="width:80px;padding:4px 8px;font-size:11px">
+        <input type="number" min="10" max="600" value="${parseInt(c.circuitBreakerCooldownSec || 90, 10)}" id="setCircuitBreakerCooldownSec" class="form-input" style="width:80px;padding:4px 8px;font-size:12px">
       </div>
       <div class="flex items-center justify-between">
         <span class="text-text-secondary">模型身份元问题前端直答</span>
@@ -16982,7 +16985,7 @@ async function appendGatewaySettings() {
             <button class="text-[10px] text-brand-cobalt hover:text-brand-cyan" id="gotoCostCardBtn">设置预算</button>
           </div></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">请求超时（秒）</span>
-          <input type="number" min="10" max="120" value="${c.requestTimeout || 30}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:11px"></div>
+          <input type="number" min="10" max="120" value="${c.requestTimeout || 30}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
         ${c.pauseAPI ? `<div class="flex items-center justify-between rounded-lg bg-danger/10 border border-danger/30 px-3 py-2">
           <span class="text-[11px] text-danger">云端 API 已暂停</span>
           <button class="text-[10px] text-text-secondary underline" id="resumeCloudBtn">恢复</button></div>` : ''}
@@ -18133,9 +18136,9 @@ function openGroupManager() {
       ${groups.length ? groups.map(g => `
         <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-panel/60">
           <i data-lucide="folder" class="w-3.5 h-3.5 text-brand-cobalt flex-shrink-0"></i>
-          <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:11px"
+          <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:12px"
             onchange="renameSessionGroup('${g.id}', this.value)">
-          <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:11px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
+          <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:12px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
           </span>
         </div>`).join('') : '<div class="text-xs text-text-tertiary text-center py-4">还没有项目，输入名称创建一个</div>'}
@@ -18163,9 +18166,9 @@ function openGroupManager() {
     area.innerHTML = list.length ? list.map(g => `
       <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-panel/60">
         <i data-lucide="folder" class="w-3.5 h-3.5 text-brand-cobalt flex-shrink-0"></i>
-        <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:11px"
+        <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:12px"
           onchange="renameSessionGroup('${g.id}', this.value)">
-        <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:11px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
+        <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:12px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
           <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
         </span>
       </div>`).join('') : '<div class="text-xs text-text-tertiary text-center py-4">还没有项目，输入名称创建一个</div>';
@@ -18930,7 +18933,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.18.6';
+window.MORAY_BUILD = '3.19.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -19881,11 +19884,11 @@ async function appendCostSettings() {
     '<h3 class="text-sm font-semibold text-text-primary mb-2 flex items-center gap-2"><i data-lucide="coins" class="w-4 h-4 text-brand-cyan"></i>成本与省钱</h3>',
     '<p class="text-[10px] text-text-tertiary mb-3">价格为默认值、可能变动、以官方定价为准；成本中心按当前价格实时估算。</p>',
     '<div class="flex items-center justify-between mb-3">',
-    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">月度预算（元）</span><input type="number" min="0" step="1" value="' + (MoraySettings.get('costBudgetCNY') || 0) + '" id="setCostBudget" class="form-input" style="width:90px;padding:4px 8px;font-size:11px"></div>',
+    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">月度预算（元）</span><input type="number" min="0" step="1" value="' + (MoraySettings.get('costBudgetCNY') || 0) + '" id="setCostBudget" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>',
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">超预算自动降级</span><div class="toggle-track ' + (MoraySettings.get('autoDegrade') ? 'active' : '') + '" id="setAutoDegrade"><div class="toggle-thumb"></div></div></div></div>',
     '<div class="text-[10px] text-text-tertiary mb-1">价格表（元/百万token · 输入/输出/缓存命中）</div>',
     '<div class="space-y-1 mb-2" id="costPriceRows">' + priceRows + '</div>',
-    '<div class="flex gap-1.5 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:11px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
+    '<div class="flex gap-1.5 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
     '<button class="text-[10px] text-danger mt-2 hover:opacity-80" id="costResetOverrides">清除全部自定义价格</button>'
   ].join('');
   container.insertBefore(card, container.querySelector('#gatewaySettingsCard') || container.querySelector('#enhanceSettingsCard') || container.lastElementChild);
@@ -20691,7 +20694,7 @@ async function appendToolsSettings() {
     '<p class="text-[10px] text-text-tertiary mb-3">内置工具闭环：模型可调用时间、计算器、知识库检索、片段保存、工作流与费用查询；仅 OpenAI 兼容后端生效，Ollama 自动跳过。</p>',
     '<div class="flex items-center gap-4 mb-3">',
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">启用工具调用</span><div class="toggle-track ' + (MoraySettings.get('toolsEnabled') ? 'active' : '') + '" id="setToolsEnabled"><div class="toggle-thumb"></div></div></div>',
-    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">最大工具轮数</span><input type="number" min="1" max="10" value="' + (MoraySettings.get('toolsMaxRounds') || 3) + '" id="setToolsMaxRounds" class="form-input" style="width:64px;padding:2px 6px;font-size:11px"></div>',
+    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">最大工具轮数</span><input type="number" min="1" max="10" value="' + (MoraySettings.get('toolsMaxRounds') || 3) + '" id="setToolsMaxRounds" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '</div>',
     '<div class="text-[10px] text-text-tertiary mb-1">工具开关（关闭总开关时请求体不携带 tools 字段）</div>',
     '<div id="toolsToolRows">' + toolRows + '</div>'
@@ -20818,18 +20821,18 @@ async function appendAgentSettings() {
     '<div class="flex items-center justify-between mb-2"><span class="text-xs text-text-secondary">工作区根</span>' +
     (cfg && cfg.fromEnv ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/20">环境变量 MORAY_WORKSPACE 锁定</span>' : '') + '</div>',
     '<div class="flex gap-2">',
-    '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:11px;padding:4px 8px">',
+    '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:12px;padding:4px 8px">',
     '<button id="agentWorkspaceSave" class="btn-ghost px-3 py-1.5 rounded-lg text-[10px] border border-line-ghost" ' + (cfg && cfg.fromEnv ? 'disabled' : '') + '>保存并校验</button>',
     '</div>',
     (cfg && cfg.fromEnv ? '<div class="text-[10px] text-text-tertiary mt-1.5">环境变量优先于此处设置；如需修改请调整 MORAY_WORKSPACE 后重启后端</div>' : '<div class="text-[10px] text-text-tertiary mt-1.5">修改后立即生效并写入后端（自动创建目录并校验可写；仅影响本机 Agent 工具）</div>'),
     '</div>',
     '<div class="space-y-2 text-xs">',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审批策略</span>' +
-    '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">' +
+    '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">' +
     '<option value="readonly_auto"' + (approval === 'readonly_auto' ? ' selected' : '') + '>只读自动执行（写文件/命令需审批）</option>' +
     '<option value="all"' + (approval === 'all' ? ' selected' : '') + '>全部工具需人工审批</option></select></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
-    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:11px"></div>',
+    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
     '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button></div>',
     // [阶段1 M1] 上次 Agent 自检结果
@@ -22471,6 +22474,71 @@ window.showNotification = function (title, message, type = 'info', duration) {
   });
 };
 
+
+/* ===================== [UI6] 输入台三层结构（模型行 / 输入区 / 工具行） ===================== */
+
+/** UI6: 输入台重排为豆包式三层——模型选择行（独立首行）→ 输入区 → 底部工具行
+ * （左=工具图标按钮，右=Token/字数统计 + 圆形发送按钮）。仅移动既有 DOM 节点
+ * （事件监听随节点走，id/绑定原样保留）与改写 placeholder 属性；不新增/删除功能元素。
+ * @returns {void} */
+function installUi6Layout() {
+  const core = document.getElementById('coreInputContainer');
+  if (!core || core.__ui6Layout) return;
+  const model = core.querySelector('.input-toolbar-model');
+  const stats = core.querySelector(':scope > .input-stats');
+  const toolbar = model && model.parentElement &&
+    model.parentElement.classList.contains('input-toolbar') ? model.parentElement : null;
+  const ta = document.getElementById('chatInputNormal');
+  // 输入行 = #chatInputNormal 向上回溯到 core 的直接子行
+  let inputRow = ta ? ta.parentElement : null;
+  while (inputRow && inputRow.parentElement !== core) inputRow = inputRow.parentElement;
+  if (!model || !stats || !toolbar || !ta || !inputRow || inputRow === core) return; // 结构不符放弃，保持原布局
+  // 1) 模型选择行 → 独立首行
+  core.insertBefore(model, core.firstChild);
+  // 2) 圆形发送按钮（onclick=createRipple+sendChatMessage）从输入行移入工具行
+  const send = inputRow.querySelector('button[onclick*="sendChatMessage"]');
+  if (send) toolbar.appendChild(send);
+  // 3) 统计（字/token）与 Enter 提示移入工具行右组（发送前）
+  const statsLeft = stats.querySelector('.input-stats-left');
+  const hint = stats.querySelector('.input-stats-hint');
+  if (statsLeft) toolbar.insertBefore(statsLeft, send || null);
+  if (hint) toolbar.insertBefore(hint, send || null);
+  // 4) 工具行整体置于输入行之后（第三层）
+  core.insertBefore(toolbar, stats);
+  // 5) placeholder 缩短（默认态；骨架原长文案不改动）
+  ta.setAttribute('placeholder', '输入消息，/ 呼出快捷指令');
+  // 6) 纯 CSS 挂钩类
+  inputRow.classList.add('ui6-input-row');
+  if (send) send.classList.add('ui6-send');
+  core.__ui6Layout = true;
+}
+
+/** 包装骨架 toggleCodeMode：关闭代码模式后把 placeholder 收回 UI6 短文案
+ * （骨架原实现退出时会恢复超长默认文案；包装不改动其功能逻辑） */
+(function ui6GuardCodeModePlaceholder() {
+  const orig = window.toggleCodeMode;
+  if (typeof orig !== 'function') return;
+  window.toggleCodeMode = function () {
+    const r = orig.apply(this, arguments);
+    if (!window.morayCodeMode) {
+      const ta = document.getElementById('chatInputNormal');
+      if (ta && ta.getAttribute('placeholder') !== '输入消息，/ 呼出快捷指令') {
+        ta.setAttribute('placeholder', '输入消息，/ 呼出快捷指令');
+      }
+    }
+    return r;
+  };
+})();
+
+/* 执行（最后分片，DOM 与骨架导出均已就绪；失败则下一个宏任务重试一次） */
+(function ui6Go() {
+  const core = document.getElementById('coreInputContainer');
+  if (core && !core.__ui6Layout) {
+    try { installUi6Layout(); } catch (e) { /* 结构未就绪 */ }
+    if (!core.__ui6Layout) setTimeout(installUi6Layout, 0);
+  }
+})();
+
 /* ===================== B/G/D/F/C. 全局精修样式（一次注入） ===================== */
 
 (function injectUiPolishCss() {
@@ -22481,7 +22549,7 @@ window.showNotification = function (title, message, type = 'info', duration) {
 /* ---------- [批次修复 #4] 附件“仅存本机”角标 ---------- */
 .local-only-badge {
   font-size: 9px; line-height: 1.2; padding: 1px 5px; border-radius: 8px;
-  color: var(--color-text-secondary, #9ca3af);
+  color: var(--color-text-secondary, #9aa3b8);
   border: 1px solid rgba(120,140,180,.3); background: rgba(120,140,180,.08);
   cursor: help; white-space: nowrap;
 }
@@ -22493,7 +22561,7 @@ window.showNotification = function (title, message, type = 'info', duration) {
   background: linear-gradient(180deg, rgba(16,19,29,.92), rgba(12,14,22,.95));
   -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
   border: 1px solid rgba(120,140,180,.28);
-  border-left: 3px solid var(--color-text-tertiary, #6b7280);
+  border-left: 3px solid var(--color-text-tertiary, #616c82);
   border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45);
   padding-right: 14px;
 }
@@ -22501,16 +22569,16 @@ window.showNotification = function (title, message, type = 'info', duration) {
   background: linear-gradient(180deg, rgba(250,251,253,.94), rgba(240,243,248,.96));
   border-color: rgba(90,110,150,.3); box-shadow: 0 10px 28px rgba(30,40,70,.18);
 }
-.notification--polished.type-success { border-left-color: var(--color-success, #4ade80); }
-.notification--polished.type-error   { border-left-color: var(--color-danger, #f87171); }
+.notification--polished.type-success { border-left-color: var(--color-success, #3fd68f); }
+.notification--polished.type-error   { border-left-color: var(--color-danger, #ff5c6c); }
 .notification--polished.type-warning { border-left-color: var(--color-warning, #fbbf24); }
 .notification--polished.type-info    { border-left-color: var(--color-brand-cobalt, #5b8cff); }
-.notification--polished .notification-icon.success { color: var(--color-success, #4ade80); }
-.notification--polished .notification-icon.error   { color: var(--color-danger, #f87171); }
+.notification--polished .notification-icon.success { color: var(--color-success, #3fd68f); }
+.notification--polished .notification-icon.error   { color: var(--color-danger, #ff5c6c); }
 .notification--polished .notification-icon.warning { color: var(--color-warning, #fbbf24); }
 .notification--polished .notification-icon.info    { color: var(--color-brand-cobalt, #5b8cff); }
 .notification--polished .notification-close {
-  background: transparent; border: 0; color: var(--color-text-tertiary, #6b7280);
+  background: transparent; border: 0; color: var(--color-text-tertiary, #616c82);
   cursor: pointer; padding: 4px; border-radius: 6px; line-height: 0;
 }
 .notification--polished .notification-close:hover { color: var(--color-text-primary, #e5e7eb); background: rgba(255,255,255,.08); }
@@ -22547,6 +22615,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 ::-webkit-scrollbar-thumb:hover { background: rgba(120,140,180,.55); }
 ::-webkit-scrollbar-track { background: transparent; }
 button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { transition: background-color .16s ease-out, border-color .16s ease-out, color .16s ease-out, box-shadow .16s ease-out, opacity .16s ease-out; }
+/* [UI3] 按下反馈：瞬时缩小+提亮（禁用不触发）；确认类按钮带 0.12s 过渡 */
+button:not(:disabled):active, .btn:not(:disabled):active, [role="button"]:not(:disabled):active { transform: scale(.97); filter: brightness(1.12); transition: transform .12s ease-out, filter .12s ease-out; }
+button:disabled, .btn:disabled, [role="button"][aria-disabled="true"] { opacity: .38; cursor: not-allowed; filter: grayscale(.35); }
 
 /* ---------- C. 网格页自适应 + 内容区居中 ---------- */
 #page-prompts .flex-1 > div, #page-snippets .flex-1 > div, #page-docs .flex-1 > div { max-width: 1560px; margin-left: auto; margin-right: auto; width: 100%; }
@@ -22564,8 +22635,8 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 #page-prompts .grid > *, #page-snippets .grid > * { min-width: 0; overflow: hidden; }
 
-/* ---------- D. 输入台：分组分隔 / 窄屏横向滚动 / ON 态 glow ---------- */
-.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap !important; }
+/* ---------- D. 输入台：分组分隔 / 横向滚动（UI6 三层化后 ≤640 折行接管，此处不再 !important 钉死） / ON 态 glow ---------- */
+.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap; }
 .input-toolbar::-webkit-scrollbar { display: none; }
 .input-toolbar > * { flex-shrink: 0; }
 .native-agent-btn.native-on {
@@ -22589,8 +22660,8 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 [data-theme="light"] .welcome-suggestion { background: rgba(250,251,253,.9); border-color: rgba(90,110,150,.25); }
 .welcome-suggestion:hover { transform: translateY(-2px); border-color: rgba(91,140,255,.5); box-shadow: 0 6px 20px rgba(40,60,120,.25); }
-.welcome-suggestion--agent { border-color: rgba(74,222,128,.45); }
-.welcome-suggestion--agent:hover { border-color: rgba(74,222,128,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
+.welcome-suggestion--agent { border-color: rgba(63,214,143,.45); }
+.welcome-suggestion--agent:hover { border-color: rgba(63,214,143,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
 .welcome-suggestion-icon { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; }
 /* Agent 开关“引导脉冲”（一次性高亮 2 秒） */
 .native-agent-btn.native-on-pulse { animation: nativePulse 0.9s ease-out 2; }
@@ -22620,13 +22691,13 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 #wsSidebar .ws-tree-row .ws-caret { transition: transform .16s ease-out; }
 #wsSidebar .ws-tree-row .ws-caret.open { transform: rotate(90deg); }
-#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #6b7280); }
+#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #616c82); }
 #wsSidebar .ws-empty .lucide { width: 26px; height: 26px; opacity: .5; margin-bottom: 8px; }
 
 /* ---------- B. 空状态统一 ---------- */
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #6b7280); }
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #616c82); }
 .empty-state .lucide { width: 30px; height: 30px; opacity: .45; margin-bottom: 10px; }
-.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9ca3af); margin-bottom: 4px; }
+.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9aa3b8); margin-bottom: 4px; }
 .empty-state .empty-hint { font-size: 10px; }
 
 /* ---------- G. prefers-reduced-motion：关闭呼吸/脉冲/位移动画 ---------- */
@@ -22639,6 +22710,150 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 /* ---------- [批次修复 #20] 窄屏/触控：fixed 背景退化时防布局溢出（随内容滚动） ---------- */
 @media (max-width: 900px) {
   body, #app, .aurora-bg { background-attachment: scroll !important; }
+}
+
+/* ---------- [UI4] 顶栏窄屏适配（≤767px）：同步滚动文字隐藏（保留圆点/开关）、
+   会话名省略截断、分段控制器不压缩保持完整可点 ---------- */
+@media (max-width: 767px) {
+  /* UI4: 对比模式同步滚动文字隐藏（保留圆点与开关） */
+  #chat-compare .h-9 > div:last-child > span { display: none; }
+  #chat-compare .h-9 > div:last-child { gap: 6px; }
+  /* UI5: 主顶栏可换行两行布局——会话名（含 ellipsis）第一行，分段控制器独占第二行右对齐 */
+  #page-chat > header {
+    flex-wrap: wrap; height: auto; min-height: 56px;
+    align-content: center; row-gap: 4px;
+  }
+  #chatTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #page-chat > header > div:first-child { min-width: 0; flex: 1 1 auto; }
+  .mode-segment {
+    flex-basis: 100%; justify-content: flex-end; flex-shrink: 0;
+    order: 2; margin-left: 0; padding-left: 0;
+  }
+}
+@media (max-width: 900px) {
+  body, #app, .aurora-bg { background-attachment: scroll !important; }
+}
+/* ---------- [UI5] 窄屏会话栏抽屉兜底：<1024px 时会话栏脱离文档流（fixed），
+   顶栏获得完整宽度（骨架窄屏规则 computed 失效；!important 兜底，桌面不受影响） ---------- */
+@media (max-width: 1023px) {
+  body.narrow-screen aside:nth-of-type(2) {
+    position: fixed !important;
+    left: 0; top: 0; bottom: 0; z-index: 70;
+    transform: translateX(-100%);
+    transition: transform 200ms ease-in-out;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+  }
+  body.narrow-screen.drawer-open aside:nth-of-type(2) { transform: none; }
+}
+
+/* ---------- [UI6] 输入台三层结构（模型行 / 输入区 / 工具行） ---------- */
+/* 层1 模型选择行：独立首行，左侧小标签（不再与工具按钮同排） */
+#coreInputContainer > .input-toolbar-model {
+  max-width: none; width: fit-content;
+  margin: 3px 12px 0; padding: 2px 8px;
+}
+/* 层2 输入区：独占一行 */
+#coreInputContainer > .ui6-input-row { padding: 2px 12px 6px; }
+/* 层3 底部工具行：左=工具按钮 / 右=统计+发送；顶部分隔 */
+#coreInputContainer > .input-toolbar {
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--color-line-ghost, rgba(120,140,180,.16));
+  margin-top: 2px;
+}
+/* 统计（字/token）并入工具行右组 */
+#coreInputContainer > .input-toolbar .input-stats-left {
+  margin-left: auto; gap: 10px; font-size: 12px;
+  color: var(--color-text-tertiary, #9aa3b8);
+}
+#coreInputContainer > .input-toolbar .input-stats-left .value {
+  color: var(--color-text-secondary, #9aa3b8);
+}
+#coreInputContainer > .input-toolbar .input-stats-hint {
+  margin-left: 6px; font-size: 12px;
+  color: var(--color-text-tertiary, #9aa3b8); opacity: .72;
+}
+/* 代码模式徽章：激活时自然流显示于统计组左邻（原贴右规则在右组并入后改为 4px） */
+#coreInputContainer > .input-toolbar .code-mode-badge { margin-left: 4px; }
+/* 圆形发送按钮：36px，hover 提亮 + 钴蓝光晕 */
+#coreInputContainer > .input-toolbar .ui6-send { margin-left: 4px; flex-shrink: 0; }
+#coreInputContainer > .input-toolbar .ui6-send:hover {
+  background: var(--color-brand-cobalt-hover, #6f9dff);
+  box-shadow: 0 0 0 1px rgba(91,140,255,.55), 0 0 20px rgba(91,140,255,.45);
+  transform: translateY(-1px);
+}
+/* 统计原容器（内容已并入工具行）空壳隐藏 */
+#coreInputContainer > .input-stats { display: none; }
+/* 极窄屏：隐藏 Enter 快捷键提示；工具行允许折行——工具一行，统计+发送右对齐换行，
+   发送按钮始终保持在右下角完整可见可点（不裁剪） */
+@media (max-width: 640px) {
+  #coreInputContainer .input-stats-hint { display: none; }
+  #coreInputContainer > .input-toolbar { flex-wrap: wrap; row-gap: 6px; }
+}
+
+/* ==================== [UI7 通宵精修：视觉打磨（D1-D6，纯样式）] ==================== */
+
+/* D1 输入区：聚焦光核描边增强（代码模式激活态优先不被覆盖） */
+#coreInputContainer { transition: box-shadow .25s ease; }
+#coreInputContainer:not(.code-mode-active):focus-within {
+  box-shadow: 0 0 0 1px rgba(91,140,255,.45), 0 0 26px rgba(91,140,255,.20);
+}
+#coreInputContainer > .input-toolbar .ui6-send {
+  transition: background-color .15s ease, box-shadow .2s ease, transform .12s ease, filter .15s ease;
+}
+#coreInputContainer > .input-toolbar .ui6-send:active { transform: scale(.9); filter: brightness(1.18); }
+
+/* D2 消息气泡：AI 气泡叠极淡品牌蓝底（区分层级；色卡质感保留），代码块复制钮 hover 常显 */
+.msg-bubble__ai-box {
+  background-image: linear-gradient(0deg, rgba(91,140,255,.05), rgba(91,140,255,.05));
+}
+.code-block .code-copy-btn { opacity: .85; transition: opacity .15s ease, color .15s ease; }
+.code-block:hover .code-copy-btn { opacity: 1; }
+
+/* D3 侧栏：会话项过渡顺滑（200ms ease），选中态内描边轻提 */
+.session-item {
+  transition: background-color .18s ease, padding-left .18s ease, border-color .18s ease;
+}
+.session-item.active {
+  box-shadow: inset 0 0 0 1px rgba(91,140,255,.22);
+}
+
+/* D5 打字指示器：三点跳动改品牌钴蓝（动画 timing 沿用骨架 typingBounce） */
+.typing-dot { background: #5B8CFF; }
+
+/* D6 空状态：图标底圈衬底，更聚焦 */
+.empty-state .lucide {
+  padding: 8px; border-radius: 12px;
+  background: rgba(120,140,180,.07); box-sizing: content-box;
+}
+
+/* D8 360px 功能页响应式补漏（实测溢出：snippets/docs/automation/settings/cost/prompts 头部或卡片） */
+@media (max-width: 640px) {
+  /* 功能页顶栏允许两行（解除 h-14 定高挤压） */
+  #page-prompts > header, #page-snippets > header,
+  #page-docs > .h-14, #page-automation > .h-14, #page-cost > .h-14 {
+    height: auto; min-height: 56px; flex-wrap: wrap;
+    align-content: center; row-gap: 2px;
+  }
+  #page-prompts > header { padding: 4px 12px; }
+  #page-prompts > header > div:first-child { flex: 1 1 auto; min-width: 0; }
+  #page-prompts > header > div:last-child { margin-left: auto; }
+  /* snippets：搜索独占一行，语言选择与新增按钮第二行 */
+  #page-snippets > header { padding: 4px 12px; row-gap: 4px; }
+  #page-snippets > header > div:first-child { flex: 1 1 100%; flex-wrap: wrap; }
+  #page-snippets > header .w-56 { width: 100%; }
+  #page-snippets > header select { flex: 1 1 120px; max-width: 160px; }
+  #page-snippets > header > button { margin-left: auto; }
+  /* docs/cost/automation：右组收缩换行右对齐 */
+  #page-docs > .h-14 > div:last-child, #page-cost > .h-14 > div:last-child,
+  #page-automation > .h-14 > div:last-child {
+    margin-left: auto; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px;
+  }
+  #page-docs > .h-14 .w-56 { width: auto; min-width: 0; flex: 1 1 150px; }
+  /* automation 卡片单列（卡内操作按钮不再被裁） */
+  #page-automation .grid.grid-cols-2 { grid-template-columns: 1fr !important; }
+  /* settings 行折行（标签与控件分两行，select 不被挤出视口） */
+  #page-settings .glass-card .flex.items-center.justify-between,
+  #page-settings .glass-card .flex.items-center.gap-2 { flex-wrap: wrap; row-gap: 6px; }
 }
 `;
   document.head.appendChild(st);

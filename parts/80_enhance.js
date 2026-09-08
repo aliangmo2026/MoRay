@@ -675,7 +675,7 @@ function appendEnhanceSettings() {
           <div class="text-xs text-text-secondary">向量化后端</div>
           <div class="text-[10px] text-text-tertiary">auto=优先 Ollama；local=浏览器内 Transformers.js；hash=纯本地词频</div>
         </div>
-        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 10px;font-size:11px">
+        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
           <option value="auto" ${c.embeddingBackend === 'auto' ? 'selected' : ''}>auto</option>
           <option value="transformers" ${c.embeddingBackend === 'transformers' ? 'selected' : ''}>local (Transformers.js)</option>
           <option value="hash" ${c.embeddingBackend === 'hash' ? 'selected' : ''}>hash</option>

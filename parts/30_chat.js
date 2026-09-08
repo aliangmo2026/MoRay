@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    模块：任务三 对话系统（会话CRUD / 消息渲染 / 流式发送 / 导出）
    ============================================================ */
 
@@ -333,7 +333,7 @@ function installThinkModeBtn() {
   if (!document.getElementById('thinkModeBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'thinkModeBtnStyle';
-    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(91,140,255,.15);color:#5B8CFF;box-shadow:inset 0 0 0 1px rgba(91,140,255,.3)}.think-mode-btn.think-off{opacity:.4}';
+    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(91,140,255,.15);color:#5B8CFF;box-shadow:inset 0 0 0 1px rgba(91,140,255,.3)}.think-mode-btn.think-off{opacity:.4}';
     document.head.appendChild(st);
   }
   refreshIcons();
@@ -359,7 +359,7 @@ function installNativeAgentToggle() {
   if (!document.getElementById('nativeAgentBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'nativeAgentBtnStyle';
-    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:7px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
+    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
     document.head.appendChild(st);
   }
   syncNativeAgentBtn();
@@ -400,6 +400,8 @@ async function toggleNativeAgent() {
     return;
   }
   await MoraySettings.set('nativeToolsEnabled', next);
+  // [通宵回归 3.2 修复] 开启本机 Agent 时联动总开关：toolsEnabled 默认关会让请求体无 tools 而静默失效（开 native 的意图即是用工具）
+  if (next && MoraySettings.get('toolsEnabled') !== true) await MoraySettings.set('toolsEnabled', true);
   syncNativeAgentBtn();
   refreshNativeAgentBanner();
   if (next) {
@@ -925,7 +927,7 @@ function showWelcomeView() {
       </div>
       ${(typeof MoraySettings !== 'undefined' && MoraySettings.get('nativeToolsEnabled') === true && window.MorayBackend && window.MorayBackend.connected) ? `
       <div class="welcome-suggestion welcome-suggestion--agent" onclick="tryLocalAgentSuggestion()" title="载入示例工作区并演示本机 Agent">
-        <div class="welcome-suggestion-icon" style="background:rgba(74,222,128,0.12);color:#4ADE80;"><i data-lucide="bot" class="w-4 h-4"></i></div>
+        <div class="welcome-suggestion-icon" style="background:rgba(63,214,143,0.12);color:#3FD68F;"><i data-lucide="bot" class="w-4 h-4"></i></div>
         <div class="welcome-suggestion-text"><strong>试试本地 Agent</strong>演示查找→读取→汇总工作区文件</div>
       </div>` : ''}
     </div>`;
@@ -946,9 +948,10 @@ function removeWelcomeView() {
  * @returns {Promise<void>} */
 async function tryLocalAgentSuggestion() {
   try {
-    // 1) 本机工具开关：未开启则自动开启
+    // 1) 本机工具开关：未开启则自动开启（联动总开关，避免请求体无 tools 静默失效）
     if (MoraySettings.get('nativeToolsEnabled') !== true) {
       await MoraySettings.set('nativeToolsEnabled', true);
+      await MoraySettings.set('toolsEnabled', true);
       syncNativeAgentBtn();
       refreshNativeAgentBanner();
     }

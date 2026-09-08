@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    模块：自动化工作流引擎（任务七）/ 模型管理与监控（任务八）
    ============================================================ */
 
@@ -794,7 +794,7 @@ const WorkflowsApp = {
           <div class="flex items-center justify-between mb-2">
             <label class="form-label" style="margin:0">节点（按顺序执行）</label>
             <div class="flex gap-1">
-              <select id="weNodeType" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">
+              <select id="weNodeType" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">
                 <option value="input">输入节点</option><option value="ai">AI 处理</option><option value="code">代码执行</option>
                 <option value="condition">条件分支</option><option value="loop">循环</option><option value="output">输出</option>
               </select>
@@ -828,7 +828,7 @@ const WorkflowsApp = {
         nodeList().innerHTML = state.nodes.map((n, i) => `
           <div class="chunk-item flex items-center gap-2" data-node-idx="${i}">
             <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt flex-shrink-0">${n.type}</span>
-            <input type="text" class="form-input" style="flex:1;padding:4px 8px;font-size:11px" data-node-name="${i}" value="${escapeHtml(n.name)}">
+            <input type="text" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" data-node-name="${i}" value="${escapeHtml(n.name)}">
             <button class="tool-btn" data-node-op="cfg" title="配置"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i></button>
             <button class="tool-btn" data-node-op="up" title="上移"><i data-lucide="chevron-up" class="w-3.5 h-3.5"></i></button>
             <button class="tool-btn" data-node-op="down" title="下移"><i data-lucide="chevron-down" class="w-3.5 h-3.5"></i></button>

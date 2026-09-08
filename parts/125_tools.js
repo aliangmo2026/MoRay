@@ -700,7 +700,7 @@ async function appendToolsSettings() {
     '<p class="text-[10px] text-text-tertiary mb-3">内置工具闭环：模型可调用时间、计算器、知识库检索、片段保存、工作流与费用查询；仅 OpenAI 兼容后端生效，Ollama 自动跳过。</p>',
     '<div class="flex items-center gap-4 mb-3">',
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">启用工具调用</span><div class="toggle-track ' + (MoraySettings.get('toolsEnabled') ? 'active' : '') + '" id="setToolsEnabled"><div class="toggle-thumb"></div></div></div>',
-    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">最大工具轮数</span><input type="number" min="1" max="10" value="' + (MoraySettings.get('toolsMaxRounds') || 3) + '" id="setToolsMaxRounds" class="form-input" style="width:64px;padding:2px 6px;font-size:11px"></div>',
+    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">最大工具轮数</span><input type="number" min="1" max="10" value="' + (MoraySettings.get('toolsMaxRounds') || 3) + '" id="setToolsMaxRounds" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '</div>',
     '<div class="text-[10px] text-text-tertiary mb-1">工具开关（关闭总开关时请求体不携带 tools 字段）</div>',
     '<div id="toolsToolRows">' + toolRows + '</div>'
@@ -827,18 +827,18 @@ async function appendAgentSettings() {
     '<div class="flex items-center justify-between mb-2"><span class="text-xs text-text-secondary">工作区根</span>' +
     (cfg && cfg.fromEnv ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/20">环境变量 MORAY_WORKSPACE 锁定</span>' : '') + '</div>',
     '<div class="flex gap-2">',
-    '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:11px;padding:4px 8px">',
+    '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:12px;padding:4px 8px">',
     '<button id="agentWorkspaceSave" class="btn-ghost px-3 py-1.5 rounded-lg text-[10px] border border-line-ghost" ' + (cfg && cfg.fromEnv ? 'disabled' : '') + '>保存并校验</button>',
     '</div>',
     (cfg && cfg.fromEnv ? '<div class="text-[10px] text-text-tertiary mt-1.5">环境变量优先于此处设置；如需修改请调整 MORAY_WORKSPACE 后重启后端</div>' : '<div class="text-[10px] text-text-tertiary mt-1.5">修改后立即生效并写入后端（自动创建目录并校验可写；仅影响本机 Agent 工具）</div>'),
     '</div>',
     '<div class="space-y-2 text-xs">',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审批策略</span>' +
-    '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">' +
+    '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">' +
     '<option value="readonly_auto"' + (approval === 'readonly_auto' ? ' selected' : '') + '>只读自动执行（写文件/命令需审批）</option>' +
     '<option value="all"' + (approval === 'all' ? ' selected' : '') + '>全部工具需人工审批</option></select></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
-    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:11px"></div>',
+    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
     '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button></div>',
     // [阶段1 M1] 上次 Agent 自检结果

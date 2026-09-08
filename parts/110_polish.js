@@ -1062,9 +1062,9 @@ function openGroupManager() {
       ${groups.length ? groups.map(g => `
         <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-panel/60">
           <i data-lucide="folder" class="w-3.5 h-3.5 text-brand-cobalt flex-shrink-0"></i>
-          <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:11px"
+          <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:12px"
             onchange="renameSessionGroup('${g.id}', this.value)">
-          <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:11px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
+          <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:12px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
           </span>
         </div>`).join('') : '<div class="text-xs text-text-tertiary text-center py-4">还没有项目，输入名称创建一个</div>'}
@@ -1092,9 +1092,9 @@ function openGroupManager() {
     area.innerHTML = list.length ? list.map(g => `
       <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-panel/60">
         <i data-lucide="folder" class="w-3.5 h-3.5 text-brand-cobalt flex-shrink-0"></i>
-        <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:11px"
+        <input type="text" value="${escapeHtml(g.name)}" class="form-input" style="flex:1;padding:4px 8px;font-size:12px"
           onchange="renameSessionGroup('${g.id}', this.value)">
-        <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:11px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
+        <span class="icon-btn" style="cursor:pointer;color:var(--color-danger);font-size:12px" title="删除项目" onclick="deleteSessionGroup('${g.id}')">
           <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
         </span>
       </div>`).join('') : '<div class="text-xs text-text-tertiary text-center py-4">还没有项目，输入名称创建一个</div>';
@@ -1859,7 +1859,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.18.6';
+window.MORAY_BUILD = '3.19.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：

@@ -149,6 +149,71 @@ window.showNotification = function (title, message, type = 'info', duration) {
   });
 };
 
+
+/* ===================== [UI6] 输入台三层结构（模型行 / 输入区 / 工具行） ===================== */
+
+/** UI6: 输入台重排为豆包式三层——模型选择行（独立首行）→ 输入区 → 底部工具行
+ * （左=工具图标按钮，右=Token/字数统计 + 圆形发送按钮）。仅移动既有 DOM 节点
+ * （事件监听随节点走，id/绑定原样保留）与改写 placeholder 属性；不新增/删除功能元素。
+ * @returns {void} */
+function installUi6Layout() {
+  const core = document.getElementById('coreInputContainer');
+  if (!core || core.__ui6Layout) return;
+  const model = core.querySelector('.input-toolbar-model');
+  const stats = core.querySelector(':scope > .input-stats');
+  const toolbar = model && model.parentElement &&
+    model.parentElement.classList.contains('input-toolbar') ? model.parentElement : null;
+  const ta = document.getElementById('chatInputNormal');
+  // 输入行 = #chatInputNormal 向上回溯到 core 的直接子行
+  let inputRow = ta ? ta.parentElement : null;
+  while (inputRow && inputRow.parentElement !== core) inputRow = inputRow.parentElement;
+  if (!model || !stats || !toolbar || !ta || !inputRow || inputRow === core) return; // 结构不符放弃，保持原布局
+  // 1) 模型选择行 → 独立首行
+  core.insertBefore(model, core.firstChild);
+  // 2) 圆形发送按钮（onclick=createRipple+sendChatMessage）从输入行移入工具行
+  const send = inputRow.querySelector('button[onclick*="sendChatMessage"]');
+  if (send) toolbar.appendChild(send);
+  // 3) 统计（字/token）与 Enter 提示移入工具行右组（发送前）
+  const statsLeft = stats.querySelector('.input-stats-left');
+  const hint = stats.querySelector('.input-stats-hint');
+  if (statsLeft) toolbar.insertBefore(statsLeft, send || null);
+  if (hint) toolbar.insertBefore(hint, send || null);
+  // 4) 工具行整体置于输入行之后（第三层）
+  core.insertBefore(toolbar, stats);
+  // 5) placeholder 缩短（默认态；骨架原长文案不改动）
+  ta.setAttribute('placeholder', '输入消息，/ 呼出快捷指令');
+  // 6) 纯 CSS 挂钩类
+  inputRow.classList.add('ui6-input-row');
+  if (send) send.classList.add('ui6-send');
+  core.__ui6Layout = true;
+}
+
+/** 包装骨架 toggleCodeMode：关闭代码模式后把 placeholder 收回 UI6 短文案
+ * （骨架原实现退出时会恢复超长默认文案；包装不改动其功能逻辑） */
+(function ui6GuardCodeModePlaceholder() {
+  const orig = window.toggleCodeMode;
+  if (typeof orig !== 'function') return;
+  window.toggleCodeMode = function () {
+    const r = orig.apply(this, arguments);
+    if (!window.morayCodeMode) {
+      const ta = document.getElementById('chatInputNormal');
+      if (ta && ta.getAttribute('placeholder') !== '输入消息，/ 呼出快捷指令') {
+        ta.setAttribute('placeholder', '输入消息，/ 呼出快捷指令');
+      }
+    }
+    return r;
+  };
+})();
+
+/* 执行（最后分片，DOM 与骨架导出均已就绪；失败则下一个宏任务重试一次） */
+(function ui6Go() {
+  const core = document.getElementById('coreInputContainer');
+  if (core && !core.__ui6Layout) {
+    try { installUi6Layout(); } catch (e) { /* 结构未就绪 */ }
+    if (!core.__ui6Layout) setTimeout(installUi6Layout, 0);
+  }
+})();
+
 /* ===================== B/G/D/F/C. 全局精修样式（一次注入） ===================== */
 
 (function injectUiPolishCss() {
@@ -159,7 +224,7 @@ window.showNotification = function (title, message, type = 'info', duration) {
 /* ---------- [批次修复 #4] 附件“仅存本机”角标 ---------- */
 .local-only-badge {
   font-size: 9px; line-height: 1.2; padding: 1px 5px; border-radius: 8px;
-  color: var(--color-text-secondary, #9ca3af);
+  color: var(--color-text-secondary, #9aa3b8);
   border: 1px solid rgba(120,140,180,.3); background: rgba(120,140,180,.08);
   cursor: help; white-space: nowrap;
 }
@@ -171,7 +236,7 @@ window.showNotification = function (title, message, type = 'info', duration) {
   background: linear-gradient(180deg, rgba(16,19,29,.92), rgba(12,14,22,.95));
   -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
   border: 1px solid rgba(120,140,180,.28);
-  border-left: 3px solid var(--color-text-tertiary, #6b7280);
+  border-left: 3px solid var(--color-text-tertiary, #616c82);
   border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45);
   padding-right: 14px;
 }
@@ -179,16 +244,16 @@ window.showNotification = function (title, message, type = 'info', duration) {
   background: linear-gradient(180deg, rgba(250,251,253,.94), rgba(240,243,248,.96));
   border-color: rgba(90,110,150,.3); box-shadow: 0 10px 28px rgba(30,40,70,.18);
 }
-.notification--polished.type-success { border-left-color: var(--color-success, #4ade80); }
-.notification--polished.type-error   { border-left-color: var(--color-danger, #f87171); }
+.notification--polished.type-success { border-left-color: var(--color-success, #3fd68f); }
+.notification--polished.type-error   { border-left-color: var(--color-danger, #ff5c6c); }
 .notification--polished.type-warning { border-left-color: var(--color-warning, #fbbf24); }
 .notification--polished.type-info    { border-left-color: var(--color-brand-cobalt, #5b8cff); }
-.notification--polished .notification-icon.success { color: var(--color-success, #4ade80); }
-.notification--polished .notification-icon.error   { color: var(--color-danger, #f87171); }
+.notification--polished .notification-icon.success { color: var(--color-success, #3fd68f); }
+.notification--polished .notification-icon.error   { color: var(--color-danger, #ff5c6c); }
 .notification--polished .notification-icon.warning { color: var(--color-warning, #fbbf24); }
 .notification--polished .notification-icon.info    { color: var(--color-brand-cobalt, #5b8cff); }
 .notification--polished .notification-close {
-  background: transparent; border: 0; color: var(--color-text-tertiary, #6b7280);
+  background: transparent; border: 0; color: var(--color-text-tertiary, #616c82);
   cursor: pointer; padding: 4px; border-radius: 6px; line-height: 0;
 }
 .notification--polished .notification-close:hover { color: var(--color-text-primary, #e5e7eb); background: rgba(255,255,255,.08); }
@@ -225,6 +290,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 ::-webkit-scrollbar-thumb:hover { background: rgba(120,140,180,.55); }
 ::-webkit-scrollbar-track { background: transparent; }
 button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { transition: background-color .16s ease-out, border-color .16s ease-out, color .16s ease-out, box-shadow .16s ease-out, opacity .16s ease-out; }
+/* [UI3] 按下反馈：瞬时缩小+提亮（禁用不触发）；确认类按钮带 0.12s 过渡 */
+button:not(:disabled):active, .btn:not(:disabled):active, [role="button"]:not(:disabled):active { transform: scale(.97); filter: brightness(1.12); transition: transform .12s ease-out, filter .12s ease-out; }
+button:disabled, .btn:disabled, [role="button"][aria-disabled="true"] { opacity: .38; cursor: not-allowed; filter: grayscale(.35); }
 
 /* ---------- C. 网格页自适应 + 内容区居中 ---------- */
 #page-prompts .flex-1 > div, #page-snippets .flex-1 > div, #page-docs .flex-1 > div { max-width: 1560px; margin-left: auto; margin-right: auto; width: 100%; }
@@ -242,8 +310,8 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 #page-prompts .grid > *, #page-snippets .grid > * { min-width: 0; overflow: hidden; }
 
-/* ---------- D. 输入台：分组分隔 / 窄屏横向滚动 / ON 态 glow ---------- */
-.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap !important; }
+/* ---------- D. 输入台：分组分隔 / 横向滚动（UI6 三层化后 ≤640 折行接管，此处不再 !important 钉死） / ON 态 glow ---------- */
+.input-toolbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; flex-wrap: nowrap; }
 .input-toolbar::-webkit-scrollbar { display: none; }
 .input-toolbar > * { flex-shrink: 0; }
 .native-agent-btn.native-on {
@@ -267,8 +335,8 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 [data-theme="light"] .welcome-suggestion { background: rgba(250,251,253,.9); border-color: rgba(90,110,150,.25); }
 .welcome-suggestion:hover { transform: translateY(-2px); border-color: rgba(91,140,255,.5); box-shadow: 0 6px 20px rgba(40,60,120,.25); }
-.welcome-suggestion--agent { border-color: rgba(74,222,128,.45); }
-.welcome-suggestion--agent:hover { border-color: rgba(74,222,128,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
+.welcome-suggestion--agent { border-color: rgba(63,214,143,.45); }
+.welcome-suggestion--agent:hover { border-color: rgba(63,214,143,.8); box-shadow: 0 6px 20px rgba(40,120,60,.22); }
 .welcome-suggestion-icon { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; }
 /* Agent 开关“引导脉冲”（一次性高亮 2 秒） */
 .native-agent-btn.native-on-pulse { animation: nativePulse 0.9s ease-out 2; }
@@ -298,13 +366,13 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 }
 #wsSidebar .ws-tree-row .ws-caret { transition: transform .16s ease-out; }
 #wsSidebar .ws-tree-row .ws-caret.open { transform: rotate(90deg); }
-#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #6b7280); }
+#wsSidebar .ws-empty { text-align: center; padding: 26px 10px; color: var(--color-text-tertiary, #616c82); }
 #wsSidebar .ws-empty .lucide { width: 26px; height: 26px; opacity: .5; margin-bottom: 8px; }
 
 /* ---------- B. 空状态统一 ---------- */
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #6b7280); }
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: var(--color-text-tertiary, #616c82); }
 .empty-state .lucide { width: 30px; height: 30px; opacity: .45; margin-bottom: 10px; }
-.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9ca3af); margin-bottom: 4px; }
+.empty-state .empty-title { font-size: 12px; color: var(--color-text-secondary, #9aa3b8); margin-bottom: 4px; }
 .empty-state .empty-hint { font-size: 10px; }
 
 /* ---------- G. prefers-reduced-motion：关闭呼吸/脉冲/位移动画 ---------- */
@@ -317,6 +385,150 @@ button, .toggle-track, input, select, textarea, .btn-ghost, .btn-primary { trans
 /* ---------- [批次修复 #20] 窄屏/触控：fixed 背景退化时防布局溢出（随内容滚动） ---------- */
 @media (max-width: 900px) {
   body, #app, .aurora-bg { background-attachment: scroll !important; }
+}
+
+/* ---------- [UI4] 顶栏窄屏适配（≤767px）：同步滚动文字隐藏（保留圆点/开关）、
+   会话名省略截断、分段控制器不压缩保持完整可点 ---------- */
+@media (max-width: 767px) {
+  /* UI4: 对比模式同步滚动文字隐藏（保留圆点与开关） */
+  #chat-compare .h-9 > div:last-child > span { display: none; }
+  #chat-compare .h-9 > div:last-child { gap: 6px; }
+  /* UI5: 主顶栏可换行两行布局——会话名（含 ellipsis）第一行，分段控制器独占第二行右对齐 */
+  #page-chat > header {
+    flex-wrap: wrap; height: auto; min-height: 56px;
+    align-content: center; row-gap: 4px;
+  }
+  #chatTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #page-chat > header > div:first-child { min-width: 0; flex: 1 1 auto; }
+  .mode-segment {
+    flex-basis: 100%; justify-content: flex-end; flex-shrink: 0;
+    order: 2; margin-left: 0; padding-left: 0;
+  }
+}
+@media (max-width: 900px) {
+  body, #app, .aurora-bg { background-attachment: scroll !important; }
+}
+/* ---------- [UI5] 窄屏会话栏抽屉兜底：<1024px 时会话栏脱离文档流（fixed），
+   顶栏获得完整宽度（骨架窄屏规则 computed 失效；!important 兜底，桌面不受影响） ---------- */
+@media (max-width: 1023px) {
+  body.narrow-screen aside:nth-of-type(2) {
+    position: fixed !important;
+    left: 0; top: 0; bottom: 0; z-index: 70;
+    transform: translateX(-100%);
+    transition: transform 200ms ease-in-out;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+  }
+  body.narrow-screen.drawer-open aside:nth-of-type(2) { transform: none; }
+}
+
+/* ---------- [UI6] 输入台三层结构（模型行 / 输入区 / 工具行） ---------- */
+/* 层1 模型选择行：独立首行，左侧小标签（不再与工具按钮同排） */
+#coreInputContainer > .input-toolbar-model {
+  max-width: none; width: fit-content;
+  margin: 3px 12px 0; padding: 2px 8px;
+}
+/* 层2 输入区：独占一行 */
+#coreInputContainer > .ui6-input-row { padding: 2px 12px 6px; }
+/* 层3 底部工具行：左=工具按钮 / 右=统计+发送；顶部分隔 */
+#coreInputContainer > .input-toolbar {
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--color-line-ghost, rgba(120,140,180,.16));
+  margin-top: 2px;
+}
+/* 统计（字/token）并入工具行右组 */
+#coreInputContainer > .input-toolbar .input-stats-left {
+  margin-left: auto; gap: 10px; font-size: 12px;
+  color: var(--color-text-tertiary, #9aa3b8);
+}
+#coreInputContainer > .input-toolbar .input-stats-left .value {
+  color: var(--color-text-secondary, #9aa3b8);
+}
+#coreInputContainer > .input-toolbar .input-stats-hint {
+  margin-left: 6px; font-size: 12px;
+  color: var(--color-text-tertiary, #9aa3b8); opacity: .72;
+}
+/* 代码模式徽章：激活时自然流显示于统计组左邻（原贴右规则在右组并入后改为 4px） */
+#coreInputContainer > .input-toolbar .code-mode-badge { margin-left: 4px; }
+/* 圆形发送按钮：36px，hover 提亮 + 钴蓝光晕 */
+#coreInputContainer > .input-toolbar .ui6-send { margin-left: 4px; flex-shrink: 0; }
+#coreInputContainer > .input-toolbar .ui6-send:hover {
+  background: var(--color-brand-cobalt-hover, #6f9dff);
+  box-shadow: 0 0 0 1px rgba(91,140,255,.55), 0 0 20px rgba(91,140,255,.45);
+  transform: translateY(-1px);
+}
+/* 统计原容器（内容已并入工具行）空壳隐藏 */
+#coreInputContainer > .input-stats { display: none; }
+/* 极窄屏：隐藏 Enter 快捷键提示；工具行允许折行——工具一行，统计+发送右对齐换行，
+   发送按钮始终保持在右下角完整可见可点（不裁剪） */
+@media (max-width: 640px) {
+  #coreInputContainer .input-stats-hint { display: none; }
+  #coreInputContainer > .input-toolbar { flex-wrap: wrap; row-gap: 6px; }
+}
+
+/* ==================== [UI7 通宵精修：视觉打磨（D1-D6，纯样式）] ==================== */
+
+/* D1 输入区：聚焦光核描边增强（代码模式激活态优先不被覆盖） */
+#coreInputContainer { transition: box-shadow .25s ease; }
+#coreInputContainer:not(.code-mode-active):focus-within {
+  box-shadow: 0 0 0 1px rgba(91,140,255,.45), 0 0 26px rgba(91,140,255,.20);
+}
+#coreInputContainer > .input-toolbar .ui6-send {
+  transition: background-color .15s ease, box-shadow .2s ease, transform .12s ease, filter .15s ease;
+}
+#coreInputContainer > .input-toolbar .ui6-send:active { transform: scale(.9); filter: brightness(1.18); }
+
+/* D2 消息气泡：AI 气泡叠极淡品牌蓝底（区分层级；色卡质感保留），代码块复制钮 hover 常显 */
+.msg-bubble__ai-box {
+  background-image: linear-gradient(0deg, rgba(91,140,255,.05), rgba(91,140,255,.05));
+}
+.code-block .code-copy-btn { opacity: .85; transition: opacity .15s ease, color .15s ease; }
+.code-block:hover .code-copy-btn { opacity: 1; }
+
+/* D3 侧栏：会话项过渡顺滑（200ms ease），选中态内描边轻提 */
+.session-item {
+  transition: background-color .18s ease, padding-left .18s ease, border-color .18s ease;
+}
+.session-item.active {
+  box-shadow: inset 0 0 0 1px rgba(91,140,255,.22);
+}
+
+/* D5 打字指示器：三点跳动改品牌钴蓝（动画 timing 沿用骨架 typingBounce） */
+.typing-dot { background: #5B8CFF; }
+
+/* D6 空状态：图标底圈衬底，更聚焦 */
+.empty-state .lucide {
+  padding: 8px; border-radius: 12px;
+  background: rgba(120,140,180,.07); box-sizing: content-box;
+}
+
+/* D8 360px 功能页响应式补漏（实测溢出：snippets/docs/automation/settings/cost/prompts 头部或卡片） */
+@media (max-width: 640px) {
+  /* 功能页顶栏允许两行（解除 h-14 定高挤压） */
+  #page-prompts > header, #page-snippets > header,
+  #page-docs > .h-14, #page-automation > .h-14, #page-cost > .h-14 {
+    height: auto; min-height: 56px; flex-wrap: wrap;
+    align-content: center; row-gap: 2px;
+  }
+  #page-prompts > header { padding: 4px 12px; }
+  #page-prompts > header > div:first-child { flex: 1 1 auto; min-width: 0; }
+  #page-prompts > header > div:last-child { margin-left: auto; }
+  /* snippets：搜索独占一行，语言选择与新增按钮第二行 */
+  #page-snippets > header { padding: 4px 12px; row-gap: 4px; }
+  #page-snippets > header > div:first-child { flex: 1 1 100%; flex-wrap: wrap; }
+  #page-snippets > header .w-56 { width: 100%; }
+  #page-snippets > header select { flex: 1 1 120px; max-width: 160px; }
+  #page-snippets > header > button { margin-left: auto; }
+  /* docs/cost/automation：右组收缩换行右对齐 */
+  #page-docs > .h-14 > div:last-child, #page-cost > .h-14 > div:last-child,
+  #page-automation > .h-14 > div:last-child {
+    margin-left: auto; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px;
+  }
+  #page-docs > .h-14 .w-56 { width: auto; min-width: 0; flex: 1 1 150px; }
+  /* automation 卡片单列（卡内操作按钮不再被裁） */
+  #page-automation .grid.grid-cols-2 { grid-template-columns: 1fr !important; }
+  /* settings 行折行（标签与控件分两行，select 不被挤出视口） */
+  #page-settings .glass-card .flex.items-center.justify-between,
+  #page-settings .glass-card .flex.items-center.gap-2 { flex-wrap: wrap; row-gap: 6px; }
 }
 `;
   document.head.appendChild(st);

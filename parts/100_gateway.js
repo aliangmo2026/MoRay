@@ -1383,9 +1383,9 @@ async function appendGatewaySettings() {
   const rs = meta.routeStats || { byType: {}, byModel: {} };
   const models = AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('');
   const rc = c.routingConfig || {};
-  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:11px" data-route-${type}-${field}>
+  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route-${type}-${field}>
     <option value="">（未配置）</option>${models}</select>`.replace(`data-route-${type}-${field}>`, `data-route-${type}-${field}>`).replace('</select>', '</select>');
-  const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:11px" data-route="${type}.${field}">
+  const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route="${type}.${field}">
     <option value="">（未配置）</option>${AI.models.map(m => `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}</select>`;
 
   const maxDay = Math.max(1, ...Object.values(cacheStats.byDay || {}).map(d => Math.max(d.hits || 0, d.queries || 0)));
@@ -1424,11 +1424,11 @@ async function appendGatewaySettings() {
       </div>
       <div class="space-y-2 text-xs">
         <div class="flex items-center justify-between"><span class="text-text-secondary">缓存有效期</span>
-          <select class="form-select" style="width:auto;padding:4px 8px;font-size:11px" id="setCacheTTL">
+          <select class="form-select" style="width:auto;padding:4px 8px;font-size:12px" id="setCacheTTL">
             ${[[1, '1小时'], [6, '6小时'], [24, '24小时'], [168, '7天'], [0, '永久']].map(([v, n]) => `<option value="${v}" ${c.cacheTTL === v ? 'selected' : ''}>${n}</option>`).join('')}
           </select></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">缓存大小限制</span>
-          <select class="form-select" style="width:auto;padding:4px 8px;font-size:11px" id="setCacheMaxMB">
+          <select class="form-select" style="width:auto;padding:4px 8px;font-size:12px" id="setCacheMaxMB">
             ${[[50, '50MB'], [100, '100MB'], [500, '500MB'], [0, '无限制']].map(([v, n]) => `<option value="${v}" ${c.cacheMaxMB === v ? 'selected' : ''}>${n}</option>`).join('')}
           </select></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">语义缓存（相似请求命中）</span>
@@ -1462,7 +1462,7 @@ async function appendGatewaySettings() {
           </div>`).join('')}
         <div class="flex items-center justify-between pt-2">
           <span class="text-text-secondary">降级重试上限</span>
-          <input type="number" min="1" max="5" value="${MoraySettings.get('routingFallbacks') || 2}" id="setRoutingFallbacks" class="form-input" style="width:64px;padding:4px 8px;font-size:11px">
+          <input type="number" min="1" max="5" value="${MoraySettings.get('routingFallbacks') || 2}" id="setRoutingFallbacks" class="form-input" style="width:64px;padding:4px 8px;font-size:12px">
           <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="viewFallbackLogBtn">降级日志</button>
         </div>
         <div class="flex gap-4 pt-2 border-t border-line-ghost/50">
@@ -1480,7 +1480,7 @@ async function appendGatewaySettings() {
       </div>
       <div class="flex items-center justify-between">
         <span class="text-text-secondary">失败熔断冷却（秒，10-600）</span>
-        <input type="number" min="10" max="600" value="${parseInt(c.circuitBreakerCooldownSec || 90, 10)}" id="setCircuitBreakerCooldownSec" class="form-input" style="width:80px;padding:4px 8px;font-size:11px">
+        <input type="number" min="10" max="600" value="${parseInt(c.circuitBreakerCooldownSec || 90, 10)}" id="setCircuitBreakerCooldownSec" class="form-input" style="width:80px;padding:4px 8px;font-size:12px">
       </div>
       <div class="flex items-center justify-between">
         <span class="text-text-secondary">模型身份元问题前端直答</span>
@@ -1518,7 +1518,7 @@ async function appendGatewaySettings() {
             <button class="text-[10px] text-brand-cobalt hover:text-brand-cyan" id="gotoCostCardBtn">设置预算</button>
           </div></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">请求超时（秒）</span>
-          <input type="number" min="10" max="120" value="${c.requestTimeout || 30}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:11px"></div>
+          <input type="number" min="10" max="120" value="${c.requestTimeout || 30}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
         ${c.pauseAPI ? `<div class="flex items-center justify-between rounded-lg bg-danger/10 border border-danger/30 px-3 py-2">
           <span class="text-[11px] text-danger">云端 API 已暂停</span>
           <button class="text-[10px] text-text-secondary underline" id="resumeCloudBtn">恢复</button></div>` : ''}

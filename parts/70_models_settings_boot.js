@@ -408,7 +408,7 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">显示模型思考过程</span>
-                <select id="setThinkingDisplay" class="form-select" style="width:auto;font-size:11px;padding:4px 8px">
+                <select id="setThinkingDisplay" class="form-select" style="width:auto;font-size:12px;padding:4px 8px">
                   <option value="folded" ${c.thinkingDisplay !== 'hidden' && c.thinkingDisplay !== 'auto' ? 'selected' : ''}>折叠显示（一行）</option>
                   <option value="auto" ${c.thinkingDisplay === 'auto' ? 'selected' : ''}>自动展开</option>
                   <option value="hidden" ${c.thinkingDisplay === 'hidden' ? 'selected' : ''}>完全隐藏</option>
@@ -450,7 +450,7 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">正文字号</span>
-                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 10px;font-size:11px">
+                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
                   <option value="sm" ${c.fontSize === 'sm' ? 'selected' : ''}>小</option>
                   <option value="md" ${c.fontSize === 'md' ? 'selected' : ''}>标准</option>
                   <option value="lg" ${c.fontSize === 'lg' ? 'selected' : ''}>大</option>
@@ -496,7 +496,7 @@ const SettingsApp = {
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">AI 自动命名会话</span>
                 <div class="flex items-center gap-2">
-                  <select id="setNamingStyle" class="form-select" style="width:auto;padding:4px 8px;font-size:11px">
+                  <select id="setNamingStyle" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">
                     ${['简洁', '专业', '活泼'].map(s => `<option ${c.namingStyle === s ? 'selected' : ''}>${s}</option>`).join('')}
                   </select>
                   <input type="checkbox" id="setAutoNaming" ${c.autoNaming ? 'checked' : ''} class="accent-brand-cobalt w-4 h-4">
@@ -1095,7 +1095,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.18.6'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.19.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();

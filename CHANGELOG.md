@@ -1,5 +1,112 @@
 # MoRay 变更日志
 
+## 3.19.0（2026-09-08）通宵综合迭代：UI 精修 D1-D8 + 13 项核心功能全链路回归
+
+- **UI 精修（3.18.11，全部落在 135 注入段 / parts）**：
+  - D1 输入区：聚焦光核描边增强（:focus-within 提亮，代码模式激活态不被覆盖）、发送按钮 active 按压反馈与过渡；
+  - D2 消息气泡：AI 气泡叠极淡品牌蓝底（rgba(91,140,255,.05) 区分层级，色卡质感保留）、代码块复制钮 hover 常显；
+  - D3 侧栏：会话项过渡 200ms ease、选中态内描边轻提；
+  - D5 打字指示器：三点跳动改品牌钴蓝（沿用骨架 typingBounce 节奏）；
+  - D6 空状态：图标底圈衬底；
+  - D7 字号收敛：135 内 11px 清零（UI6 hint 12px）；text-[11px] 判定为既有小按钮/辅助体系保留（迁移有全局回归风险，如实记录）；
+  - D8 响应式补漏（360px 实测修复 5 页）：功能页顶栏允许两行（h-14 解除）、snippets 搜索独占行、docs 搜索框弹性、automation 卡片单列、settings 行折行——修复后 7 页 360px 溢出 0（前后 diff ≤0.8% 无回归）。
+- **回归发现并修复（3.18.12）**：本机 Agent 开关与 toolsEnabled 总开关不联动 → 用户开启 Agent 后请求体无 tools 静默失效；toggleNativeAgent / tryLocalAgentSuggestion 开启时联动置位总开关（关闭不影响普通工具用户），实测开→tools=true、关→tools 保持。
+- **13 项核心功能回归**（真机 qwen2.5:7b/qwen3.5:4b + 后端 8000 全栈 + CDP）：
+  3.1 对话全链路 ✓（新建/流式/停止/重试/清空/删除确认/项目分组）；3.2 本机 Agent 真机闭环 ✓（tools 注入/计划卡/只读自动执行/审批卡 diff 与信任勾选/同意落盘 hello.txt/拒绝 reject.txt 未创建/时间线/审计/指纹含内容 hash 防呆）；3.3 智能路由 ✓（本地优先决策+路由详情标注、手选模型不被路由覆盖）；3.4 成本中心 ✓（Gateway 按 usage 精确记账 2 请求 1591 tok、页面估算标注/明细/模型占比）；3.5 双存储 ✓（前端会话/消息实时同步后端 8→9 会话，清 IndexedDB 后降级可用）；3.6 多模型对比 ✓（双栏并发流式 qwen3.5:4b+9b、性能条、同步滚动开关）；3.7 提示词库/片段 ✓（新增/列表/搜索/插入输入框）；3.8 知识库 ✓（上传→本地解析分块 116B/1 块→索引状态）；3.9 自动化工作流 ✓（6 类节点创建/保存/运行日志/停止/删除确认）；3.10 壁纸主题 ✓（6 款切换/持久化/dark-light 无白块）；3.11 快捷键 ✓（⌘K 命令面板/Enter 发送/Shift+Enter 换行/`/` 菜单 12 项）；3.12 PWA ✓（manifest/SW moray-3.19.0/离线打开正常）；3.13 后端 API ✓（health/会话消息 upsert/批处理/删除级联/幽灵 404 宽松，17/17）。
+- 验证：19 分片 node --check 0 失败；py_compile 8/8；空库启动 /api/health build=3.19.0 db ok；agent_e2e_check **37 PASS / 0 FAIL**；assemble 幂等 ×2 hash 一致；前后对比截图存 work/shots/overnight/（pre_*/post_*/post_rwd_*/post_compare_dual.png）。
+- hash：根=release=`0da4fbca63efcc72…`，web 两份=`d74345dd0fd0c38e…`（横幅分组）；sw CACHE_NAME=moray-3.19.0；对外 MORAY_VERSION/PRODUCT_VERSION 保持 1.0.0 未动。
+
+## 3.18.12（2026-09-08）回归修复：本机 Agent 开关联动 toolsEnabled 总开关（见 3.19.0 汇总）
+
+## 3.18.11（2026-09-08）UI 精修 D1-D8（见 3.19.0 汇总）
+
+## 3.18.10（2026-09-08）UI6 输入台三层结构重排（豆包式：模型行 / 输入区 / 工具行，纯 135 注入段）
+
+- **#1 三层结构**（135_ui_polish.js 注入段净 +109 行）：最小 JS（installUi6Layout）移动既有
+  DOM 节点——`.input-toolbar-model` 独立为首行（左侧小标签，点击模型选择器原逻辑不变）；
+  `#chatInputNormal` 独占输入区行；底部工具行 = 左工具图标按钮（attach/图片/代码/语音原按钮
+  原 id 原位次）+ 右对齐 Token/字数统计（`.input-stats-left` 并入，text-xs text-text-tertiary）+
+  圆形发送按钮（原 `rounded-full bg-brand-cobalt` 36px 按钮移入行末，hover 提亮 + 钴蓝光晕）。
+  统计空壳 `.input-stats` 隐藏。id/onclick/事件监听随节点移动全部保留。
+- **#2 placeholder 缩短**：「输入消息，/ 呼出快捷指令」（JS setAttribute）；骨架 toggleCodeMode
+  退出会恢复长文案——135 内包装 window.toggleCodeMode，关闭代码模式后收回短文案
+  （功能逻辑零改动，仅 placeholder 文案修正）。
+- **#3 窄屏适配**：≤640px 工具行 flex-wrap 折行（工具一行、统计+发送右对齐换行，发送按钮
+  右下角完整可点不裁剪）；D 块 `flex-wrap: nowrap !important` 移除 !important 让位
+  （UI6 三层化后内容量已无需窄屏横滚兜底）。代码模式徽章 margin-left 改 4px 自然流。
+- 验证（Edge headless CDP 真机渲染）：完整版 + web 演示版 1440/360 两档：三层几何顺序正确
+  （model→输入区→工具行），360 下 wrap 两行、发送按钮 r≤视口（327≤360）完整可见可点、
+  scrollW 无溢出；1440 单行不变；placeholder 短文案；code 开→关后 placeholder 收回短文案；
+  发送 click 触发 sendChatMessage（临时替换验证）；attach/code/voice 按钮在工具栏内且点击
+  不抛错。截图像素复核：深色无白块（whitePct≤0.05）、light 无黑块、发送钴蓝块渲染
+  （sendBluePx≈960 两主题一致）。截图 work/shots/ui6_{360,1440}{,_light}.png 与 ui6_web_360.png。
+- 验证：19 分片 node --check 0 失败、agent_e2e_check 37 PASS / 0 FAIL（T0 后端 build=3.18.10）；
+  hash：根=release=`ce28e9bd8573cfac…`，web 两份=`553b6825809648e6…`（横幅分组）；
+  sw CACHE_NAME=moray-3.18.10；对外 MORAY_VERSION/PRODUCT_VERSION 保持 1.0.0 未动。
+
+## 3.18.9（2026-09-08）UI5 顶栏窄屏可换行两行布局 + 窄屏会话栏抽屉兜底（纯 CSS，135 注入段净 +18 行）
+
+- **#1 主顶栏 ≤767px 可换行两行布局**（135_ui_polish.js @media max-width:767px）：
+  `#page-chat > header` flex-wrap:wrap + height:auto + min-height:56px（会话名保留首行，
+  overflow:hidden + ellipsis + nowrap 不挤压）；首 div flex:1 1 auto；
+  `.mode-segment` flex-basis:100% 独占第二行 + justify-content:flex-end 右对齐 +
+  order:2 + flex-shrink:0（分段控制器完整宽度、两按钮保持完整可点）。
+- **#2 移除 UI3 视口级 `overflow-x:hidden` 兜底**（≤768px `main, [id^="page-"]` 规则删除，
+  不再掩盖真实溢出）。
+- **#3 窄屏会话栏抽屉兜底**（135 @media max-width:1023px）：骨架窄屏规则本应把
+  aside:nth-of-type(2) 置 fixed 脱离文档流，但运行期被 morayResizeStyle 注入的
+  inline `position:relative` 覆盖（computed 验证），导致 260px 会话栏仍占流内空间、
+  顶栏被压至 ~52px 宽；追加 `position:fixed !important` 等值兜底规则，
+  !important 可压过 inline 样式，会话栏彻底移出流（transform 抽屉行为不变，≥1024px 桌面不受影响）。
+- 验证（Edge headless CDP 实测，Tabbit CDP 通道故障期替代方案与 UI4 一致但为真机渲染）：
+  web 演示版 + 完整版双载体各五档 360/340/320/768/1440：窄档分段控制器 R≤iw
+  （340/320/300 ≤ 360/340/320）且两按钮完整可见可点（右缘余量 ≥20px）、scrollW==iw 无横向溢出；
+  768/1440 保持单行原样（wrap:nowrap h:56）；sidebar computed fixed（窄）/relative（1440）。
+  截图 work/shots/ui5_cdp_*.png（web 版）、ui5_full_*.png（完整版）各五档，像素级复核
+  （segment 行带内容范围与几何一致、选中态蓝块不越按钮框、顶栏右缘零贴边）。
+  另：CLI `--screenshot` 在此页面（含动画）存在捕获时序伪影，弃用，以 CDP captureScreenshot 为准。
+- 验证：19 分片 node --check 0 失败、agent_e2e_check 37 PASS / 0 FAIL（T0 后端 build=3.18.9）；
+  hash：根=release=`2b41b5a4d2e73a8e…`，web 两份=`20264e252770d771…`（横幅分组）；
+  sw CACHE_NAME=moray-3.18.9；对外 MORAY_VERSION/PRODUCT_VERSION 保持 1.0.0 未动。
+
+## 3.18.8（2026-09-08）UI4 顶栏窄屏适配 + 残留色值清零（纯 CSS）
+
+- **#1 顶栏窄屏适配**（135_ui_polish.js @media max-width:767px，约 10 行）：
+  同步滚动文字标签隐藏（保留状态圆点与开关，控制区 gap 收紧）；
+  #chatTitle overflow:hidden + ellipsis + nowrap（会话名不挤压）；
+  顶栏首 div min-width:0；.mode-segment flex-shrink:0（分段控制器保持完整宽度可点）。
+  产物结构与选择器匹配断言通过（同步滚动 span 位于 .h-9 控制 div 且与 toggle 相邻）。
+  ⚠️ 360px 实际截图因 Tabbit CDP 通道持续故障（Target.createTarget 分发失败）未执行，
+  以静态结构断言替代（同 UI3 限制）。
+- **#2 残留色值清零**：L273/L274 `.welcome-suggestion--agent` 两处
+  rgba(74,222,128,.45/.8) → rgba(63,214,143,.45/.8)；parts 与产物 grep 旧值 0 残留。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  hash：根=release=`551671eba8d8a327…`，web 两份=`e2282240bb4d665d…`（横幅分组）；
+  sw CACHE_NAME=moray-3.18.8；对外 MORAY_VERSION/PRODUCT_VERSION 保持 1.0.0。
+
+## 3.18.7（2026-09-07）UI 精细打磨（纯 CSS/class 层，零 JS 逻辑改动）
+
+- **#1 按钮按下反馈**（135_ui_polish.js）：`button:not(:disabled):active` 等瞬时
+  scale(.97)+brightness(1.12)，过渡 0.12s；禁用按钮不触发。
+- **#2 禁用态视觉**：`button:disabled/.btn:disabled` opacity .38 + not-allowed 光标 +
+  grayscale(.35)（不加 pointer-events:none，保留 hover title）。
+- **#3 fallback 色值与令牌对齐**：135 通知/组件 fallback 与 30_chat 欢迎卡共 12 处旧值
+  替换为令牌值（#3fd68f/#ff5c6c/#9aa3b8/#616c82 及 rgba(63,214,143,.12)）；
+  parts 内旧色值 0 残留（静态骨架区不可改除外）。
+- **#4 字号收敛**：全部 23 处 `font-size:11px` → 12px、2 处 `font-size:7px`（think/native
+  角标）→ 10px（10px 保留）；仅内联/注入样式，Tailwind 类字号不动。
+- **#5 骨架屏抽查**：知识库/工作流/成本三页列表均为同步渲染（内存/IndexedDB 快速）无异步
+  白屏窗口；文档库空态已备（empty-state）；未新增骨架（避免越界增行）。
+- **#6 响应式防御**：表格类容器 audit 全部已带 overflow 容器（0 缺口）；追加 ≤768px
+  视口级 `overflow-x:hidden` 防御规则（页内滚动容器自行横滚不被裁切）。
+  ⚠️ 三档×8 页无头截图验证因 Tabbit 自动化通道故障（CDP Target.createTarget 分发失败，
+  无其它可用浏览器）未能执行——以静态结构断言 + 防御规则落地替代，如实记录。
+- **#7 浅色主题**：代码审查确认 135 已覆盖 light 下 通知/模态/横幅/侧栏/欢迎卡等主要浮层；
+  ⚠️ light 截图抽查同样受上述通道故障限制未能执行（同 #6）。
+- 验证：19 分片 node --check 0 失败、py_compile 过、agent_e2e_check 37 PASS / 0 FAIL；
+  hash：根=release=`ff56d4fe8e28775e…`，web 两份=`58f92256c5c39ab3…`（横幅分组）；
+  sw CACHE_NAME=moray-3.18.7；对外 MORAY_VERSION/PRODUCT_VERSION 保持 1.0.0 未动。
+
 ## 3.18.6（2026-09-07）修复批次 6（残留收尾）：messages 宽松语义 / 对外版本自动校验 / 演示横幅极窄屏防折行
 
 - **#1 GET /messages 恢复宽松**（api.py）：会话不存在时不再 404，一律返回 200 + 空数组；
