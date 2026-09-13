@@ -85,6 +85,21 @@ const MoraySettings = {
   /** 内存缓存 @type {Object} */
   cache: null,
 
+  /** [3.20.1] 工具开关的 localStorage 镜像键。
+   *  背景：工具开关状态原本只存 IndexedDB；当浏览器 IndexedDB 不可用（隐私模式/站点数据被清）时
+   *  DB 会切到内存回退，设置刷新即丢失 —— 用户看到"打开过的开关刷新后又变回关"。
+   *  这里给"工具开关"这类开关额外写一份 localStorage 镜像（localStorage 在该场景下通常仍可用）。
+   *
+   *  为什么判定是"镜像存在即以其为准"，而不是"仅当 IndexedDB 缺该键才回填"：
+   *  启动流程里存在与开关无关的设置写入（如版本升级一次性清缓存标志），它会把**整份 settings**
+   *  落库一次，于是 IndexedDB 里很快就有了 `toolsEnabled = false`（其实是默认值，不是用户选择）。
+   *  只按"键是否存在"判断会被这个默认值挡住，镜像永远用不上。而镜像只在用户真正点击开关时写入，
+   *  因此它才是"用户最后一次显式选择"的可靠来源。
+   *  安全性：代码中没有任何路径会把这两个开关**程序化置 false**（只有联动开启方向），
+   *  所以"镜像存在即生效"不会误复活用户没选过的状态；两端都为空时保持默认关闭。
+   *  @type {Object<string,string>} 设置键 → localStorage 键 */
+  MIRROR_KEYS: { toolsEnabled: 'moray_tools_enabled', nativeToolsEnabled: 'moray_native_tools_enabled' },
+
   /** 初始化：从 IndexedDB 加载并应用
    * @returns {Promise<Object>} 生效配置 */
   async init() {
@@ -97,6 +112,16 @@ const MoraySettings = {
       if (legacy.temperature !== undefined && stored.temperature === undefined) this.cache.temperature = legacy.temperature;
       if (legacy.defaultModel && !stored.defaultModel) this.cache.defaultModel = legacy.defaultModel;
     } catch (e) { /* 忽略 */ }
+    // [3.20.1] 工具开关：镜像存在即回填为镜像值（= 用户最后一次显式选择），并尽力回写 IndexedDB（自愈）
+    let healed = false;
+    Object.keys(this.MIRROR_KEYS).forEach(k => {
+      let v = null;
+      try { v = localStorage.getItem(this.MIRROR_KEYS[k]); } catch (e) { v = null; }
+      if (v !== '1' && v !== '0') return; // 从未点过 → 保持默认（关闭）
+      const want = (v === '1');
+      if (this.cache[k] !== want) { this.cache[k] = want; healed = true; }
+    });
+    if (healed) { try { await DB.setSetting('app', this.cache); } catch (e) { /* 内存模式/写入失败不影响本次生效 */ } }
     this.apply();
     return this.cache;
   },
@@ -123,6 +148,11 @@ const MoraySettings = {
       this.cache.openaiAPIKeyStored = obj.openaiAPIKeyStored;
     }
     Object.assign(this.cache, obj);
+    // [3.20.1] 工具开关同步写 localStorage 镜像（IndexedDB 不可用时唯一能跨刷新保留的地方）
+    Object.keys(this.MIRROR_KEYS).forEach(k => {
+      if (!(k in obj)) return;
+      try { localStorage.setItem(this.MIRROR_KEYS[k], obj[k] ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    });
     try { await DB.setSetting('app', this.cache); } catch (e) { console.warn('[MoRay] settings save failed:', e); }
     this.apply();
   },

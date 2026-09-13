@@ -48,7 +48,7 @@ DANGEROUS_EXTS = frozenset(
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 # 副作用工具：approved !== true 绝不执行
-SIDE_EFFECT_TOOLS = frozenset({"write_file", "run_command", "edit_file"})
+SIDE_EFFECT_TOOLS = frozenset({"write_file", "create_file", "move_file", "run_command", "edit_file"})
 
 # 参数合法字符（纯 token：字母数字 + 少量安全标点；禁空格/引号/重定向/管道/百分号等元字符）
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._:@/\\+~-]+$")
@@ -198,6 +198,14 @@ def _summarize_args(name: str, args: dict) -> str:
             content = args.get("content")
             size = len(content) if isinstance(content, str) else (len(json.dumps(content, ensure_ascii=False)) if content is not None else 0)
             return f"path={path} bytes={size}"
+        if name == "create_file":
+            path = str(args.get("path") or "").strip()
+            content = args.get("content")
+            size = len(content) if isinstance(content, str) else 0
+            return f"create path={path} bytes={size}"
+        if name == "move_file":
+            return "move " + str(args.get("from") or args.get("src") or "").strip()[:80] + \
+                " -> " + str(args.get("to") or args.get("dst") or "").strip()[:80]
         if name == "run_command":
             cmd = str(args.get("command") or "").strip()
             a = args.get("args")
@@ -350,6 +358,227 @@ def _tool_write_file(args: dict):
     except OSError as e:  # noqa: BLE001
         raise ToolError(f"写入失败：{e}") from e
     return {"path": _rel(ws, target), "bytes": len(content.encode("utf-8")), "written": True}
+
+
+def _tool_create_file(args: dict):
+    """create_file(path, content?)：只新建、绝不覆盖（等价 write_file + overwrite=false 强制）"""
+    ws = _workspace_root()
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        raise ToolError("缺少 path 参数（相对工作区的新建文件路径）")
+    target = _safe_path(raw)
+    if target.suffix.lower() in DANGEROUS_EXTS:
+        raise SafeError(f"禁止创建危险/可执行后缀文件：{target.suffix}（{_rel(ws, target)}）")
+    if target.exists():
+        # 安全边界：本工具只负责"新建"，已存在一律拒绝（覆盖请显式用 write_file 并单独授权）
+        raise ToolError(f"文件已存在，create_file 不覆盖：{_rel(ws, target)}（如需覆盖请使用写文件工具）")
+    content = args.get("content")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        try:
+            content = json.dumps(content, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            content = str(content)
+    if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
+        raise ToolError(f"内容超过 {MAX_WRITE_BYTES // 1048576}MB 上限，已拒绝")
+    try:
+        if not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "x", encoding="utf-8", newline="") as f:  # 'x' = 独占创建，双保险不覆盖
+            f.write(content)
+    except FileExistsError:
+        raise ToolError(f"文件已存在，create_file 不覆盖：{_rel(ws, target)}") from None
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"创建失败：{e}") from e
+    return {"path": _rel(ws, target), "bytes": len(content.encode("utf-8")), "created": True}
+
+
+def _tool_move_file(args: dict):
+    """move_file(from, to)：移动/重命名（同一实现，前端两个工具名共用）。
+    安全边界：源必须存在且在工作区内；目标必须在工作区内、父目录自动创建、
+    目标已存在一律拒绝（不做静默覆盖），也不允许危险后缀落盘。"""
+    ws = _workspace_root()
+    raw_src = str(args.get("from") or args.get("src") or "").strip()
+    raw_dst = str(args.get("to") or args.get("dst") or "").strip()
+    if not raw_src or not raw_dst:
+        raise ToolError("缺少 from / to 参数（相对工作区的源路径与目标路径）")
+    src = _safe_path(raw_src, allow_missing=False)
+    dst = _safe_path(raw_dst)
+    if not src.is_file() and not src.is_dir():
+        raise ToolError(f"源路径不是文件或目录：{raw_src}")
+    if src == dst:
+        raise ToolError("源与目标是同一路径，无需移动")
+    if dst.suffix.lower() in DANGEROUS_EXTS:
+        raise SafeError(f"禁止移动为危险/可执行后缀：{dst.suffix}")
+    if dst.exists():
+        raise ToolError(f"目标已存在，拒绝覆盖：{_rel(ws, dst)}")
+    # 目录移动到自身子目录 → 会形成递归，必须拒绝
+    try:
+        if src.is_dir() and os.path.normcase(str(dst.resolve(strict=False))).startswith(
+                os.path.normcase(str(src)) + os.sep):
+            raise ToolError("不允许把目录移动到它自己的子目录内")
+    except OSError:
+        pass
+    try:
+        if not dst.parent.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+    except OSError as e:  # noqa: BLE001
+        raise ToolError(f"移动失败：{e}") from e
+    return {"from": _rel(ws, src), "to": _rel(ws, dst), "moved": True, "kind": "dir" if dst.is_dir() else "file"}
+
+
+def _proc_mem_mb_windows():
+    """Windows 进程内存（ctypes，无第三方依赖）：pid -> 工作集 MB；失败返回空表"""
+    out = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        # 枚举进程 pid（EnumProcesses），避免解析 tasklist 文本
+        arr = (wintypes.DWORD * 2048)()
+        need = wintypes.DWORD()
+        if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(need)):
+            return out
+        n = need.value // ctypes.sizeof(wintypes.DWORD)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        for i in range(min(n, 2048)):
+            pid = int(arr[i])
+            if pid <= 0:
+                continue
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            try:
+                pmc = PROCESS_MEMORY_COUNTERS()
+                pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+                if psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                    out[pid] = round(pmc.WorkingSetSize / 1048576.0, 1)
+            finally:
+                k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001 - 平台差异一律降级为空表
+        return {}
+    return out
+
+
+def _tool_list_processes(args: dict):
+    """list_processes(limit?, sort?)：只读进程列表（占内存前 N）。
+    无第三方依赖：Windows 走 psapi EnumProcesses+GetProcessMemoryInfo（ctypes），
+    Linux 走 /proc/<pid>/statm；两者都拿不到时返回可读的降级说明而不是报错。"""
+    limit = max(1, min(200, int(args.get("limit") or 30)))
+    sort_by = str(args.get("sort") or "memory").lower()
+    rows = []
+    mem = {}
+    names = {}
+    if os.name == "nt":
+        mem = _proc_mem_mb_windows()
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            for pid in list(mem.keys()):
+                h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if not h:
+                    continue
+                try:
+                    buf = ctypes.create_unicode_buffer(512)
+                    size = wintypes.DWORD(len(buf))
+                    if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        names[pid] = os.path.basename(buf.value)
+                finally:
+                    k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            names = {}
+    else:
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                try:
+                    with open(f"/proc/{pid}/statm", "r", encoding="utf-8") as f:
+                        pages = int(f.read().split()[1])
+                    mem[pid] = round(pages * os.sysconf("SC_PAGE_SIZE") / 1048576.0, 1)
+                    with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as f:
+                        names[pid] = f.read().strip()
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            mem, names = {}, {}
+    for pid, mb in mem.items():
+        rows.append({"pid": pid, "name": names.get(pid, ""), "memMB": mb})
+    if sort_by == "memory":
+        rows.sort(key=lambda r: r["memMB"], reverse=True)
+    else:
+        rows.sort(key=lambda r: r["pid"])
+    return {
+        "count": len(rows),
+        "limit": limit,
+        "sort": sort_by,
+        "items": rows[:limit],
+        "note": "" if rows else "当前平台无法读取进程内存信息（未安装 psutil 时降级为空列表，不影响其它工具）",
+    }
+
+
+def _tool_system_info(args: dict):
+    """system_info()：CPU / 内存 / 磁盘 / 运行时的只读概览（不采集任何用户隐私数据）"""
+    import platform
+
+    disk = {}
+    try:
+        usage = shutil.disk_usage(str(_workspace_root()))
+        disk = {"totalGB": round(usage.total / 1073741824.0, 1),
+                "usedGB": round(usage.used / 1073741824.0, 1),
+                "freeGB": round(usage.free / 1073741824.0, 1),
+                "percent": round(usage.used / usage.total * 100, 1) if usage.total else 0}
+    except OSError:
+        disk = {}
+    mem = {}
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            mem = {"totalGB": round(m.ullTotalPhys / 1073741824.0, 1),
+                   "availGB": round(m.ullAvailPhys / 1073741824.0, 1),
+                   "percent": int(m.dwMemoryLoad)}
+    except Exception:  # noqa: BLE001 - 非 Windows / 调用失败一律降级
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            psize = os.sysconf("SC_PAGE_SIZE")
+            mem = {"totalGB": round(pages * psize / 1073741824.0, 1)}
+        except (ValueError, OSError, AttributeError):
+            mem = {}
+    return {
+        "os": f"{platform.system()} {platform.release()}",
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+        "cpuCount": os.cpu_count(),
+        "cpuLoad1m": (lambda: (round(os.getloadavg()[0], 2) if hasattr(os, "getloadavg") else None))(),
+        "memory": mem,
+        "disk": disk,
+        "workspace": str(_workspace_root()),
+        "note": "只读概览：不含任何用户名/环境变量/文件内容",
+    }
 
 
 def _decode_output(data: bytes) -> str:
@@ -674,12 +903,33 @@ TOOL_IMPLS = {
     "find_files": _tool_find_files,
     "search_text": _tool_search_text,
     "edit_file": _tool_edit_file,
+    "create_file": _tool_create_file,
+    "move_file": _tool_move_file,
+    "list_processes": _tool_list_processes,
+    "system_info": _tool_system_info,
 }
 
 
 def _human_summary(name: str, args: dict) -> dict:
     """needsApproval 响应中的可读摘要（前端审批卡同样自渲染参数，此字段供 API 直调方/审计展示）"""
     ws = _workspace_root()
+    if name == "create_file":
+        path = str(args.get("path") or "").strip()
+        content = str(args.get("content") or "")
+        return {
+            "tool": name,
+            "title": f"新建文件 {path}",
+            "detail": f"将在工作区内新建文件 {path}（{len(content.encode('utf-8'))} 字节）；已存在则拒绝，不会覆盖任何现有文件",
+            "preview": content[:200] + ("…" if len(content) > 200 else ""),
+        }
+    if name == "move_file":
+        src = str(args.get("from") or args.get("src") or "").strip()
+        dst = str(args.get("to") or args.get("dst") or "").strip()
+        return {
+            "tool": name,
+            "title": f"移动/重命名 {src} → {dst}",
+            "detail": f"将工作区内 {src} 移动或重命名为 {dst}；目标已存在会拒绝，不做静默覆盖",
+        }
     if name == "write_file":
         path = str(args.get("path") or "").strip()
         content = str(args.get("content") or "")

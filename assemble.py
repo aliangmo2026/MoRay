@@ -5,7 +5,8 @@ import io, os, re
 
 PARTS = ['parts/10_db.js', 'parts/20_ai.js', 'parts/30_chat.js',
          'parts/40_compare_prompts.js', 'parts/50_snippets.js',
-         'parts/60_workflow.js', 'parts/65_automation_page.js', 'parts/70_models_settings_boot.js',
+         'parts/60_workflow.js', 'parts/65_automation_page.js', 'parts/68_task_dispatch.js',
+         'parts/70_models_settings_boot.js',
          'parts/80_enhance.js',
          'parts/85_robust.js', 'parts/90_perf.js', 'parts/95_features.js',
          'parts/100_gateway.js', 'parts/110_polish.js',

@@ -1,5 +1,121 @@
 # MoRay 变更日志
 
+## 3.20.1（2026-09-13）收尾修复：工具开关状态持久化 + RAG 来源标注去嵌套
+
+### 修复 1：工具开关状态未持久化（设置页「启用工具调用」刷新后回弹为关）
+- **现象**：设置页 `#setToolsEnabled`（启用工具调用）打开一次后，刷新/重开页面又变回关，用户误以为"工具没生效"。
+- **定位（真机复现，非猜测）**：开关本身**是**写 `MoraySettings`（IndexedDB）的，正常源下我实测「打开 → 刷新 → 仍为开」是通过的；
+  真正会丢的场景是 **IndexedDB 不可用/被清**（隐私模式、站点数据被清）→ `DB` 切内存回退（`enableMemoryMode()`），设置只活在内存里，刷新即丢。
+  用 `DB.enableMemoryMode()` + 真实点击开关可稳定复现「打开 → 刷新 → 回弹为关」。另一个加重因素：启动流程里与开关无关的设置写入
+  （如版本升级一次性清缓存标志）会把**整份 settings** 落库一次，于是 IndexedDB 里很快就有了 `toolsEnabled = false`（其实是默认值不是用户选择），
+  所以"仅当 IndexedDB 缺该键才回填"的写法会被这个默认值挡住。
+- **改动**（`parts/20_ai.js`）：
+  - 新增 `MoraySettings.MIRROR_KEYS = { toolsEnabled: 'moray_tools_enabled', nativeToolsEnabled: 'moray_native_tools_enabled' }`，
+    命名沿用项目既有 `moray_*` snake_case 习惯；
+  - `set()` 里对这两个键**额外写一份 localStorage 镜像**（只写这两个开关，不是整份设置）；
+  - `init()` 里**镜像存在即回填为镜像值**（镜像只在用户真正点击开关时写入，因此它是"用户最后一次显式选择"的可靠来源），
+    并尽力把回填结果回写 IndexedDB（自愈）；
+  - 两端都为空时保持默认关闭 —— **不改变"首次使用默认关"的保守默认**；
+  - 代码中没有任何路径会程序化把这两个开关置 false（只有联动开启方向），所以"镜像存在即生效"不会误复活用户没选过的状态。
+- **验证**（Edge headless + CDP 真机，8000 同源全栈）：
+  - 全新源：首次默认关 PASS；打开→刷新仍为开 PASS；关闭→刷新仍为关 PASS（5/5）；
+  - 内存回退场景（复现用例）：`DB.enableMemoryMode()` 后打开 → 刷新仍为开 **PASS**（修复前为 FAIL）；
+  - `nativeToolsEnabled` 走同一机制：写 '1'/'0' 镜像 **PASS**。
+
+### 修复 2：RAG 来源标注重复渲染（出现「来源：[来源：…]」嵌套）
+- **现象**：知识库问答回复底部渲染成 `来源：[来源：MoRay 快速开始指南.md·第1段]`，前缀与标注自身语义重复。
+- **原因**：`fillAssistantBody` 里行内标注行写成了 `来源：` + 各项 `[来源：文档名·第N段]`，两层"来源"叠加。
+- **改动**（`parts/30_chat.js`）：去掉前缀，行内标注直接就是 `[来源：文档名·第N段] [来源：文档名·第M段]`；
+  底部可点击引用 chips 区（标题「引用来源」）保留不变 —— 语义由 chips 区标题承担，行内不再重复。
+- **验证**：RAG 端到端（真机链路）**21 PASS / 0 FAIL**，其中新增两条断言：
+  `B6b 来源标注无「来源：[来源：…]」嵌套`（判定：含 `[来源：`、不以 `来源：` 开头、不含 `来源：[来源：`）、
+  `B6c 多来源按相关度降序且不重复`（3 条来源、doc+段号 无重复、score 降序 0.86/0.72/0.2654）。
+  截图 `work/shots/feat320/shots/s2_chat_citation.png`（已随本次复验重拍）。
+
+### 收尾
+- 版本：内部 **3.20.1** 三处同步（`110_polish.js` MORAY_BUILD / `70_models_settings_boot.js` APP_VERSION / `server/app/config.py` BUILD）；
+  对外 `MORAY_VERSION` = `PRODUCT_VERSION` = `VERSION` = **1.0.0** 未动。
+- 门禁：20 分片 `node --check` 0 失败；`assemble.py` 幂等 ×2；`--web web` + `build_release.py` 重出（zip 2026-09-13 14:57:29）；
+  `agent_e2e_check` **37 PASS / 0 FAIL**（T0 后端 build=3.20.1）；四份产物 hash 分组核对通过；sw CACHE_NAME=moray-3.20.1。
+- 最终 hash：根 = release `b93b779ae945604d…`，web 两份 `c531bd6ecbe3e360…`。
+- 验证脚本（本轮临时恢复后再次归档）：`work/feat320_verify_scripts/`；报告 `work/FIX_320_1_REPORT.md`。
+- 未做：git 提交/推送与线上同步（按约定由主控负责）。
+
+## 3.20.0（2026-09-13）功能补全三阶段：壁纸联动系统主题 / 知识库 RAG 端到端 / Agent 工具扩展 + 任务分派
+
+- **阶段1 壁纸联动系统主题**（`parts/110_polish.js`，+约 300 行，新增独立样式表 `wallpaperLinkStyle`）：
+  - 色相档体系：`#app[data-wall-tone]` 七个档位（cobalt/cyan/violet/magenta/green/warm/neutral），
+    由 JS 按当前壁纸写入；`--wall-glow-rgb / --wall-accent-rgb` 供光晕、边框、焦点环消费。
+  - 联动面：①输入台光晕色相（`.core-input` 环 + 动漫/自定义图的边框与环）；②三栏面板**着色压暗层**
+    （纯色/渐变类用更深的色相 scrim → 换壁纸改变整屏色相且正文对比度只升不降；图片类用浅版保住"不压暗人物"）；
+    ③卡片边框取主色（不动 background，避免整覆 `.welcome-suggestion` 自带渐变底）；④侧栏 1px 右边框取主色；
+    ⑤导航当前项 / `--shadow-glove*` 等光晕令牌随壁纸重定义；⑥面板/卡片透明度微调（`--wall-panel-alpha` / `--wall-card-alpha` 按壁纸）。
+  - 自定义上传图：Canvas 32×32 降采样 + 饱和度加权取主色 → 色相分档（失败回退冷蓝），结果按图指纹缓存
+    （`moray_custom_wall_tone`）；高亮度图自动加深遮罩（`data-wall-bright`，深色 0.52 / 浅色 0.42）。
+  - 验证（Edge headless + CDP 真机渲染 + PIL 像素复核，15 场景 = 6 内置 + 3 动漫 + 3 自定义 + 3 浅色主题）：
+    同页 on/off 差分（移除联动样式表 = 改造前基线）→ 输入台 p99 局部变化 29–121、侧栏 22–119、
+    面板均值 1.0–80；**联动色相判定 15/15 通过**；正文对比度（气泡 + 裸文本两处最坏情况）全部 ≥13.7:1 / ≥5.6:1，
+    均不低于改造前且远高于 WCAG AA 4.5；高亮自定义图场景裸文本 2.15→5.62（+161%）。
+    截图 `work/shots/feat320/shots/s1_*.png`（含自定义紫调/高亮/浅色主题）。
+  - 排查记录：首屏欢迎弹窗的 `.modal-overlay.active`(rgba(4,6,12,.55)) 会整页压暗，
+    早期像素测量被污染成 45% 强度 → 采集前必须先关弹窗；细线特征（1–2px 环/边框）不能用整区均值判可见性，
+    需按"峰值附近像素"取样。
+
+- **阶段2 知识库 RAG 端到端**（`parts/50_snippets.js` + `parts/125_tools.js` + `parts/30_chat.js`）：
+  - 检索模式探测：`DocsApp.probeRetrieval()` 读 Ollama `/api/tags` 找 embedding 模型（embed|bge|gte|m3e|text2vec|jina|e5-）
+    并真机调一次确认可用；无模型/不可用 → **自动降级关键词检索**（不报错，一次性温和提示 + 页头徽标显示当前模式）。
+  - 统一检索入口 `DocsApp.retrieve()`：embedding 模式走向量+关键词混合重排，关键词模式用
+    「词命中率 70% + 词频密度 30%」打分；**两种模式共用同一个 `query_knowledge_base` 工具**与同一返回结构。
+  - `embedDocument` 的 auto 档改为「有 embedding 模型才向量化，否则直接进入关键词模式」（不再无谓拉取 CDN 模型）。
+  - **问答来源标注（本次核心）**：工具返回 `{title, segment, section, score, snippet}` 并按相关度降序，
+    同时把来源登记到新增的 `RagSources` 收集器；对话层在回答完成后 drain → 写入消息 `citations`
+    → 渲染可点击来源 chip（标注「文档名 · 第N段」）+ 消息内 `来源：[来源：文档名·第N段]` 文本标注；
+    系统提示追加引用约定，模型也会写出行内来源。
+  - 文档管理：列表新增「字数 / 段数 / 导入时间」与「示例」标记，页头新增「清空」（二次确认）；
+    空状态文案改为引导导入 txt/md/json 并说明已内置示例。
+  - 分块 meta：`chunkText` 现在记录所属最近 Markdown 标题，来源标注可带上小节名。
+  - 内置示例文档《MoRay 快速开始指南》（通用使用说明，不含任何编造的专业数据），首次进入知识库且为空时自动导入一次。
+  - **顺带修复一个真实产品缺陷**：`parts/125_tools.js` 步骤卡 `const body = ''` 被反复赋值
+    → 每次渲染都抛 `Assignment to constant variable`，进而让 `emit()` 抛出、`Gateway.runWithTools`
+    中断并静默回退普通流式（浏览器里工具轮**从未真正生效**，此前只有协议层 e2e 覆盖不到）。改为 `let`。
+  - 验证：`scripts/rag_e2e_check.py` + `scripts/cdp_rag_e2e.mjs`（mock OpenAI 兼容模型 + mock Ollama embedding，
+    真机浏览器跑 DOM.setFileInputFiles → 真实分块入库 → 发问 → 工具执行 → 来源标注）**19 PASS / 0 FAIL**：
+    含「无 embedding → keyword」「有 embedding → embedding」「同一工具两模式可用」「来源按相关度降序」
+    「删除 / 清空」；截图 `work/shots/feat320/shots/s2_chat_citation.png`、`s2_docs_page.png`、`s2_docs_search.png`。
+
+- **阶段3 Agent 本地工具扩展 + 任务分派面板**：
+  - 新增 4 个本机工具（前端 `NATIVE_TOOLS` + 后端 `agent_tools.py` `TOOL_IMPLS`）：
+    `create_file`（只新建、已存在即拒绝，`open(..., 'x')` 双保险）、`rename_file` / `move_file`
+    （同一后端实现，拒绝覆盖目标、拒绝移动到自身子目录、父目录自动创建）、`list_processes`（只读，按内存倒序）、
+    `system_info`（只读：OS/CPU/内存/磁盘/工作区）。前三者进 `SIDE_EFFECT_TOOLS`（强制 `approved:true`），后两者只读免审批。
+  - 信任指纹扩展：`create_file` 目标文件状态、`move_file` 源内容与目标占用状态都参与指纹（状态变 → 重新授权）。
+  - 审批卡为本机工具新增可读参数卡（新建文件=路径+只新建提示+内容预览；移动/重命名=源→目标 + 不覆盖提示）；
+    设置页本机工具分区新增「需审批 / 只读免审批」徽标，让"本地/需审批"一眼可见。
+  - **明确不实现**（保持安全边界，报告中如实说明）：任意命令执行（`run_command` 白名单不变）、
+    删除文件、覆盖已存在文件、进程结束/系统修改。
+  - 任务分派面板（新增分片 `parts/68_task_dispatch.js`，已加入 `assemble.py` PARTS）：
+    新建任务（名称 / 目标 agent：ZCode、Codex、豆包、Claude Code、Cursor、自定义 / 项目路径 / 背景 / 要求 / 验收标准）
+    → 生成结构化指令（目标 Agent、项目路径、背景、要做的事、验收标准模板、交付要求）→ 一键复制到剪贴板
+    （Clipboard API + execCommand 回退）；任务列表支持状态流转（待办/进行中/已完成/失败）、备注、删除、清理已完成，
+    localStorage 持久化；**已配置 OpenAI 兼容云端 API 时**才渲染「直接执行」按钮（调远程模型跑该任务并回填结果），
+    未配置时该按钮根本不渲染。面板与导航按钮由 JS 运行时注入（不改骨架），自带与骨架一致的页面切换逻辑。
+  - **明确不做**：假装与外部 agent 实时通信（真实 A2A 需对方平台开放接口），报告中如实标注为"指令生成 + 状态管理"。
+  - 验证：`scripts/s3_check.py` + `scripts/cdp_feat320_s3.mjs`（8000 同源全栈真机）**47 PASS / 0 FAIL**：
+    含后端安全边界（不覆盖 / 越界拒绝 / 绝对路径拒绝 / 危险后缀拒绝 / 无删除类工具）、
+    审批同意落盘与拒绝不落盘、只读工具不弹审批、步骤卡五态渲染、任务面板建单-复制-状态-持久化-删除-云端执行。
+    截图 `work/shots/feat320/shots/s3_*.png`。
+
+- 收尾：内部版本三处同步 3.20.0（110 MORAY_BUILD / 70 APP_VERSION / config BUILD），对外 `MORAY_VERSION`=`PRODUCT_VERSION`=`VERSION`=1.0.0 未动；
+  `parts/` 现 20 个分片 `node --check` 0 失败；`assemble.py` 幂等 ×2 hash 一致 + `--web web` + `build_release.py` 全过；
+  agent_e2e_check **37 PASS / 0 FAIL**（T0 后端 build=3.20.0）；四份产物 hash 分组核对通过；
+  sw CACHE_NAME=moray-3.20.0。报告见 `work/FEAT_320_REPORT.md`。
+- 收尾补录（同日 12:49）：一次性脚本清理（`scripts/` 只留正式脚本，本轮 10 个验证脚本归档到 `work/feat320_verify_scripts/`，删除前确认无正式流程引用）；
+  闭环复验 6 项全过（20 分片语法 / assemble 幂等 / 发布包重建 zip 时间戳 2026-09-13 12:48:06 / 四份 hash 分组 / agent_e2e 37 PASS /
+  py_compile 8/8 + `MORAY_DB` 空库启动 db=ok）；清理前在最终代码态复跑 `rag_e2e_check` 19 PASS、`s3_check` 47 PASS。
+  最终 hash：根=release `0f49b17ab49758af…`，web×2 `e6fcb1584c9e8ac5…`，sw=`moray-3.20.0`。
+  完整工程归档 `backup/MoRay_完整工程_3.20.0_20260913_130402.zip`（73 MB / 713 条目，含 20 分片与 8 个正式脚本，不含 web/release/.venv/浏览器 profile）；
+  归档过程首次因暂存目录建在 work/ 内触发递归自复制，已终止进程、删除污染 zip 并重做（源码 hash 未变，已核对）。未做 git 与线上同步（不在本轮范围）。
+
 ## 3.19.0（2026-09-08）通宵综合迭代：UI 精修 D1-D8 + 13 项核心功能全链路回归
 
 - **UI 精修（3.18.11，全部落在 135 注入段 / parts）**：

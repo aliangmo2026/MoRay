@@ -836,8 +836,15 @@ function fillAssistantBody(el, msg, streaming) {
   if (showThinking && thinkingVisible()) html += thinkingPanelHtml(msg.reasoning, streaming && !msg.reasoning, msg.reasoningMs);
   html += `<div class="md-body ai-content">${renderMarkdown(msg.content || '')}${streaming ? '<span class="stream-cursor"></span>' : ''}</div>`;
   if (msg.citations && msg.citations.length) {
-    html += `<div class="mt-2 pt-2 border-t border-line-ghost/50"><div class="text-[10px] text-text-tertiary mb-1">引用来源</div>${msg.citations.map(c =>
-      `<span class="citation-chip" data-doc-id="${escapeHtml(c.docId)}" data-chunk-idx="${c.chunkIdx}"><i data-lucide="file-text" class="w-3 h-3"></i>${escapeHtml(c.docName)}${c.meta ? ' · ' + escapeHtml(c.meta) : ''}</span>`).join('')}</div>`;
+    // [3.20 阶段2 / 3.20.1 修复] 行内来源标注与底部可点击引用区并存，但**不得前缀"来源："**：
+    // 标注本身已是 [来源：文档名·第N段]，再加前缀会渲染成「来源：[来源：…]」的嵌套重复。
+    const ann = (c) => '[来源：' + escapeHtml(c.docName) + '·第' + ((typeof c.chunkIdx === 'number' ? c.chunkIdx : 0) + 1) + '段]';
+    const chips = msg.citations.map(c =>
+      `<span class="citation-chip" data-doc-id="${escapeHtml(c.docId)}" data-chunk-idx="${c.chunkIdx}" title="相关度 ${((c.score || 0) * 100).toFixed(1)}%${c.meta ? ' · ' + escapeHtml(c.meta) : ''}"><i data-lucide="file-text" class="w-3 h-3"></i>${escapeHtml(c.docName)} · 第${(typeof c.chunkIdx === 'number' ? c.chunkIdx : 0) + 1}段</span>`).join('');
+    html += `<div class="mt-2 pt-2 border-t border-line-ghost/50" data-rag-sources>`
+      + `<div class="text-[10px] text-text-tertiary mb-1">引用来源</div>${chips}`
+      + `<div class="rag-source-annot text-[11px] text-text-secondary mt-1.5" data-rag-annot>${msg.citations.map(ann).join(' ')}</div>`
+      + `</div>`;
   }
   // [V2] 缓存命中标签
   if (msg.cacheInfo) {
@@ -1155,7 +1162,13 @@ async function buildRequestMessages(conv, extraContext) {
     const agentPrompt = override || (typeof PlanTracker !== 'undefined' && PlanTracker.SYSTEM_PROMPT) || '';
     if (agentPrompt) sys = (sys ? sys + '\n\n' : '') + agentPrompt;
   }
-  if (sys) msgs.push({ role: 'system', content: sys });
+  // [3.20 阶段2] 知识库引用约定：本次请求携带 query_knowledge_base 时追加标注规范，
+  // 让模型在用到检索片段时写出行内来源（确定性兜底由消息底部「来源：」标注负责）
+  let kbCite = '';
+  if (typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().some(t => t.function.name === 'query_knowledge_base')) {
+    kbCite = '【知识库引用】使用 query_knowledge_base 的结果回答时，请在对应结论后标注来源，格式为 [来源：文档名·第N段]（N 用工具返回的 segment 字段）；未命中知识库时如实说明，不要编造文档内容。';
+  }
+  if (sys || kbCite) msgs.push({ role: 'system', content: kbCite ? (sys ? sys + '\n\n' + kbCite : kbCite) : sys });
   // [批次修复 #6] 短问候短路：新会话首条 ≤8 字符的纯问候（无引用/附件）→ 系统提示追加精简约束
   const _userMsgs = (AppState.messages || []).filter(m => m.conversationId === conv.id && m.role === 'user');
   const _lastUserText = _userMsgs.length ? String((_userMsgs[_userMsgs.length - 1] || {}).content || '').trim() : '';
@@ -1460,6 +1473,8 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   });
   AppState.generating = true;
   AppState.genController = controller;
+  // [3.20 阶段2] 清空知识库来源收集器：保证上一轮的来源不会串到本轮
+  if (typeof RagSources !== 'undefined') RagSources.clear();
 
   try {
     const result = await promise;
@@ -1490,6 +1505,22 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     }
     // [工具调用] 持久化工具步骤（旧消息无此字段 → 正常显示，向后兼容）
     if (result._toolSteps) assistantMsg.toolCalls = result._toolSteps;
+    // [3.20 阶段2] 知识库来源标注：把 query_knowledge_base 本轮登记的来源并入消息引用
+    // （按相关度降序、按 文档+段号 去重），随后 fillAssistantBody 会渲染「[来源：文档名·第N段]」
+    if (typeof RagSources !== 'undefined') {
+      const rag = RagSources.drain();
+      if (rag.length) {
+        const base = (assistantMsg.citations || []).slice();
+        const seen = new Set(base.map(c => String(c.docId) + '#' + c.chunkIdx));
+        rag.forEach(c => {
+          const k = String(c.docId) + '#' + c.chunkIdx;
+          if (seen.has(k)) return;
+          seen.add(k);
+          base.push(c);
+        });
+        assistantMsg.citations = base;
+      }
+    }
     typingEl.remove();
     // [V3 P3.6] AI 自动命名：标题还是自动截断时，后台静默生成更好的标题
     if (MoraySettings.get('autoNaming') && !conv.renamed && !conv.autoNamed && assistantMsg.content) {

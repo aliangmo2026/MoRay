@@ -1546,6 +1546,11 @@ window.__morayAudit = function () {
   --wall-scrim: rgba(6, 8, 14, 0.30);
   --wall-card-alpha: 0.45;
   --wall-floating-alpha: 0.90;
+  /* [3.20 阶段1] 联动光晕色（默认 = 品牌钴蓝/青），由 data-wall-tone 分档覆盖；
+     组件规则以 rgba(var(--wall-glow-rgb), α) 消费，未分档时回退本默认值 */
+  --wall-glow-rgb: 91, 140, 255;
+  --wall-accent-rgb: 58, 214, 232;
+  --wall-tint-color: rgb(91, 140, 255);
 }
 /* ---- 三栏骨架：唯一 backdrop-filter 层（内部卡片/气泡不再 blur，防嵌套掉帧） ---- */
 #app[data-wallpaper] aside.bg-surface-deep {
@@ -1753,16 +1758,16 @@ html[data-theme="light"] #app[data-wallpaper="custom"] .msg-bubble .md-body {
 #app[data-wallpaper="anime-window"] #coreInputContainer,
 #app[data-wallpaper="custom"] #coreInputContainer {
   background-color: rgba(12, 15, 25, 0.90);
-  border: 1px solid rgba(120, 150, 255, 0.22);
+  border: 1px solid rgba(var(--wall-glow-rgb, 120, 150, 255), 0.24);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
-/* 聚焦时边框过渡到品牌蓝，保留光核聚焦光晕 */
+/* 聚焦时边框过渡到壁纸主色光晕（原为品牌蓝；--wall-glow-rgb 未定义时回退同色） */
 #app[data-wallpaper="anime-starry"] #coreInputContainer:focus-within,
 #app[data-wallpaper="anime-aurora"] #coreInputContainer:focus-within,
 #app[data-wallpaper="anime-window"] #coreInputContainer:focus-within,
 #app[data-wallpaper="custom"] #coreInputContainer:focus-within {
-  border-color: var(--color-brand-cobalt);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.35), 0 0 28px rgba(91, 140, 255, 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
+  border-color: rgba(var(--wall-glow-rgb, 91, 140, 255), 0.90);
+  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.35), 0 0 28px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 /* 输入框：极轻衬底 + 圆角；正文保持主题色；placeholder 提亮 */
 #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -1798,7 +1803,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer
 html[data-theme="light"] #app[data-wallpaper="anime-window"] #coreInputContainer,
 html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
   background-color: rgba(255, 255, 255, 0.90);
-  border: 1px solid rgba(91, 140, 255, 0.30);
+  border: 1px solid rgba(var(--wall-glow-rgb, 91, 140, 255), 0.30);
   box-shadow: 0 10px 30px rgba(26, 34, 51, 0.18);
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -1859,7 +1864,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.19.0';
+window.MORAY_BUILD = '3.20.1';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -1973,4 +1978,371 @@ window.MORAY_BUILD = '3.19.0';
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', probeBackend);
   else probeBackend();
+})();
+
+/* ===================== [3.20 阶段1] 壁纸联动系统主题 =====================
+ * 目标：换壁纸不止换背景 —— 按壁纸主色联动整个 UI 的光晕/强调色相、面板与卡片叠色、
+ * 以及纯色/渐变类壁纸的面板透明度；自定义上传图用 Canvas 取主色自动分档。
+ *
+ * 实现边界（只加不改）：
+ *  - 只向 #app 写三个新属性：data-wall-tone（色相档）/ data-wall-tint（叠色开关）/
+ *    data-wall-bright（浅色图标记），不改任何现有类名、DOM 结构与函数签名；
+ *  - 光晕色相通过 110_polish 的壁纸规则里新增的 --wall-glow-rgb / --wall-accent-rgb /
+ *    --wall-tint-color 三个变量消费，未分档时回退品牌钴蓝（视觉零回归）；
+ *  - 样式表独立成 <style id="wallpaperLinkStyle">，位置在 wallpaperThroughStyle 之后，
+ *    同权重规则「后定义获胜」，因此无需改动既有壁纸规则即可叠加联动。
+ * 可读性红线：正文对比度不低于现状——浅色（高亮度）自定义图自动加深遮罩（data-wall-bright）。
+ */
+(function () {
+  /** 色相档 → 联动取值。
+   *  glow/accent：RGB 三元组，供 rgba(var(--x), α) 消费（光晕、边框、焦点环、当前项）；
+   *  scrim       ：按色相着色的压暗层（纯色/渐变类壁纸）——比默认 rgba(6,8,14,.30) 更深，
+   *                所以"面板色相随壁纸变"的同时正文对比度只会更高，不会更低（可读性红线）；
+   *  scrimImg    ：图片壁纸（动漫/自定义）用的浅版着色压暗层，只微微加深，保持"不压暗人物"；
+   *  scrimLight  ：浅色主题下的着色薄纱（亮度与既有白色薄纱相当，只带色相）。 */
+  const WALL_TONES = {
+    cobalt: {
+      glow: '91, 140, 255', accent: '157, 123, 255',
+      scrim: 'rgba(4, 9, 22, 0.36)', scrimImg: 'rgba(4, 10, 22, 0.12)', scrimLight: 'rgba(240, 244, 255, 0.24)'
+    },
+    cyan: {
+      glow: '58, 214, 232', accent: '91, 140, 255',
+      scrim: 'rgba(2, 12, 15, 0.38)', scrimImg: 'rgba(4, 12, 15, 0.12)', scrimLight: 'rgba(238, 252, 255, 0.24)'
+    },
+    violet: {
+      glow: '157, 123, 255', accent: '110, 140, 255',
+      scrim: 'rgba(11, 6, 22, 0.38)', scrimImg: 'rgba(10, 7, 22, 0.12)', scrimLight: 'rgba(246, 240, 255, 0.24)'
+    },
+    magenta: {
+      glow: '214, 108, 214', accent: '157, 123, 255',
+      scrim: 'rgba(16, 6, 15, 0.38)', scrimImg: 'rgba(14, 6, 15, 0.12)', scrimLight: 'rgba(255, 240, 252, 0.24)'
+    },
+    green: {
+      glow: '86, 214, 160', accent: '58, 214, 232',
+      scrim: 'rgba(2, 13, 9, 0.38)', scrimImg: 'rgba(3, 12, 9, 0.12)', scrimLight: 'rgba(238, 255, 246, 0.24)'
+    },
+    warm: {
+      glow: '232, 176, 92', accent: '232, 130, 110',
+      scrim: 'rgba(18, 11, 4, 0.38)', scrimImg: 'rgba(16, 11, 5, 0.12)', scrimLight: 'rgba(255, 248, 238, 0.24)'
+    },
+    neutral: {
+      glow: '138, 150, 172', accent: '110, 124, 150',
+      // 中性档（pure 等）：保持既有近乎不压暗的观感，不做着色
+      scrim: 'rgba(6, 8, 14, 0.02)', scrimImg: 'rgba(6, 8, 14, 0.08)', scrimLight: 'rgba(255, 255, 255, 0.22)'
+    }
+  };
+
+  /** 内置壁纸联动档案：tone = 光晕色相档；panel/card = 面板透明度微调（null = 保持既有值，
+   *  避免压暗动漫人物）。压暗层色相由 tone 决定，不在此处重复声明。 */
+  const WALL_PROFILE = {
+    aurora: { tone: 'cyan', panel: 0.60, card: 0.44 },
+    'deep-space': { tone: 'cobalt', panel: 0.66, card: 0.46 },
+    gradient: { tone: 'cobalt', panel: 0.62, card: 0.45 },
+    mountain: { tone: 'violet', panel: 0.58, card: 0.44 },
+    cyber: { tone: 'cyan', panel: 0.60, card: 0.44 },
+    pure: { tone: 'neutral', panel: 0.96, card: 0.94 },
+    'anime-starry': { tone: 'cyan', panel: null, card: null },
+    'anime-aurora': { tone: 'green', panel: null, card: null },
+    'anime-window': { tone: 'warm', panel: null, card: null }
+  };
+
+  /** 内置壁纸清单（与上方 __WALL_LIST 同序，用于判断是否为内置壁纸） */
+  const WALL_BUILTIN = ['aurora', 'deep-space', 'gradient', 'mountain', 'cyber', 'pure',
+    'anime-starry', 'anime-aurora', 'anime-window'];
+
+  const CUSTOM_TONE_KEY = 'moray_custom_wall_tone';
+
+  /** 当前 #app 元素（与壁纸属性同步逻辑同源） */
+  function wallShell() {
+    return document.getElementById('appShell') || document.getElementById('app');
+  }
+
+  /** 读取当前壁纸 id（权威来源与 __syncWallpaperAttr 一致：localStorage） */
+  function wallCurrentId() {
+    try {
+      const saved = localStorage.getItem('moray_wallpaper');
+      const custom = localStorage.getItem('moray_custom_wallpaper');
+      if (saved === 'custom' && custom) return 'custom';
+      if (saved && WALL_BUILTIN.includes(saved)) return saved;
+      if (!saved && custom) return 'custom';
+    } catch (e) { /* 忽略 */ }
+    return 'anime-starry';
+  }
+
+  /** 字符串指纹（用于自定义图取色缓存命中判断；改图即换键） */
+  function wallKeyOf(s) {
+    const t = s.length > 4096 ? (s.slice(0, 2048) + s.slice(-2048)) : s;
+    let h = 2166136261;
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(36) + ':' + s.length;
+  }
+
+  /** RGB → 色相档（饱和度/明度过低判为中性档） */
+  function wallToneFromRgb(r, g, b) {
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    const dlt = mx - mn;
+    const sat = mx === 0 ? 0 : dlt / mx;
+    if (sat < 0.12 || mx < 40) return 'neutral';
+    let h;
+    if (mx === r) h = 60 * (((g - b) / dlt) % 6);
+    else if (mx === g) h = 60 * ((b - r) / dlt + 2);
+    else h = 60 * ((r - g) / dlt + 4);
+    if (h < 0) h += 360;
+    if (h < 15 || h >= 320) return 'magenta';
+    if (h < 75) return 'warm';
+    if (h < 165) return 'green';
+    if (h < 205) return 'cyan';
+    if (h < 260) return 'cobalt';
+    return 'violet';
+  }
+
+  /** 自定义图取主色（Canvas 32×32 降采样 + 饱和度加权平均；跨域/解码失败 → null）
+   * @param {string} dataUrl 图片 dataURL
+   * @returns {Promise<{tone:string, bright:number, rgb:number[]}|null>} 分档结果 */
+  function wallExtractProfile(dataUrl) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      try {
+        const img = new Image();
+        const timer = setTimeout(() => finish(null), 4000);
+        img.onerror = () => { clearTimeout(timer); finish(null); };
+        img.onload = () => {
+          clearTimeout(timer);
+          try {
+            const N = 32;
+            const cv = document.createElement('canvas');
+            cv.width = N; cv.height = N;
+            const cx = cv.getContext('2d', { willReadFrequently: true });
+            if (!cx) { finish(null); return; }
+            cx.drawImage(img, 0, 0, img.width, img.height, 0, 0, N, N);
+            const d = cx.getImageData(0, 0, N, N).data;
+            let r = 0, g = 0, b = 0, w = 0, lum = 0, px = 0;
+            for (let i = 0; i < d.length; i += 4) {
+              const R = d[i], G = d[i + 1], B = d[i + 2];
+              if (d[i + 3] < 128) continue;
+              px++;
+              lum += (0.2126 * R + 0.7152 * G + 0.0722 * B) / 255;
+              const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+              const sat = mx === 0 ? 0 : (mx - mn) / mx;
+              const weight = Math.max(0.06, sat); // 饱和度加权：鲜艳像素主导"主色"
+              r += R * weight; g += G * weight; b += B * weight; w += weight;
+            }
+            const bright = px > 0 && (lum / px) > 0.6 ? 1 : 0;
+            if (w <= 0) { finish(null); return; }
+            const rr = Math.round(r / w), gg = Math.round(g / w), bb = Math.round(b / w);
+            finish({ tone: wallToneFromRgb(rr, gg, bb), bright, rgb: [rr, gg, bb] });
+          } catch (e) { finish(null); } // 画布污染（file:// 跨域图）等 → 回退默认冷蓝
+        };
+        img.src = dataUrl;
+      } catch (e) { finish(null); }
+    });
+  }
+
+  /** 读自定义图取色缓存（键 = 图指纹；换图自动失效） */
+  function wallCachedCustomTone(dataUrl) {
+    try {
+      const raw = localStorage.getItem(CUSTOM_TONE_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (o && o.key === wallKeyOf(dataUrl) && WALL_TONES[o.tone]) return o;
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 写自定义图取色缓存（容量异常时静默；仅缓存，失败不影响功能） */
+  function wallCacheCustomTone(dataUrl, prof) {
+    try {
+      localStorage.setItem(CUSTOM_TONE_KEY, JSON.stringify({
+        key: wallKeyOf(dataUrl), tone: prof.tone, bright: prof.bright
+      }));
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 把联动结果写到 #app 属性上（CSS 侧的 tonal 变量组据此生效） */
+  function wallPaint(tone, bright, isImg) {
+    const shell = wallShell();
+    if (!shell) return;
+    shell.setAttribute('data-wall-tone', WALL_TONES[tone] ? tone : 'cobalt');
+    if (isImg) shell.setAttribute('data-wall-img', '1');
+    else shell.removeAttribute('data-wall-img');
+    if (bright) shell.setAttribute('data-wall-bright', '1');
+    else shell.removeAttribute('data-wall-bright');
+  }
+
+  /** 主入口：按当前壁纸套用联动（内置同步分档；自定义走缓存/异步取色）
+   * @returns {void} */
+  function wallLinkApply() {
+    const id = wallCurrentId();
+    if (id === 'custom') {
+      let data = null;
+      try { data = localStorage.getItem('moray_custom_wallpaper'); } catch (e) { data = null; }
+      if (!data) { wallPaint('cobalt', 0, true); return; }
+      const cached = wallCachedCustomTone(data);
+      if (cached) { wallPaint(cached.tone, cached.bright, true); return; }
+      wallPaint('cobalt', 0, true); // 取色完成前先用默认冷蓝，避免空白期
+      wallExtractProfile(data).then((prof) => {
+        const p = prof || { tone: 'cobalt', bright: 0 };
+        wallCacheCustomTone(data, p);
+        if (wallCurrentId() === 'custom') wallPaint(p.tone, p.bright, true);
+      }).catch(() => { /* 已回退 */ });
+      return;
+    }
+    const prof = WALL_PROFILE[id];
+    if (!prof) { wallPaint('cobalt', 0, false); return; }
+    wallPaint(prof.tone, 0, id.indexOf('anime-') === 0);
+  }
+
+  /* ---------- 样式：色相变量组 + 组件联动（独立 style，位于壁纸规则之后） ---------- */
+  function injectWallLinkCss() {
+    if (document.getElementById('wallpaperLinkStyle')) return;
+    const st = document.createElement('style');
+    st.id = 'wallpaperLinkStyle';
+    let toneCss = '';
+    Object.keys(WALL_TONES).forEach((k) => {
+      const t = WALL_TONES[k];
+      // 1) 光晕/强调色相（供 rgba(var(--x), α) 消费）
+      toneCss += '#app[data-wall-tone="' + k + '"] { --wall-glow-rgb: ' + t.glow +
+        '; --wall-accent-rgb: ' + t.accent + '; }\n';
+      // 2) 面板压暗层按色相着色：纯色/渐变类用深版（更暗 → 对比度只升不降），
+      //    图片类用浅版（保住"不压暗人物"），浅色主题用同亮度薄纱只带色相。
+      //    :not([data-wall-img]) 保证图片壁纸不会套用深版（否则会压暗人物）。
+      toneCss += '#app[data-wall-tone="' + k + '"]:not([data-wall-img]) { --wall-scrim: ' + t.scrim + '; }\n';
+      toneCss += '#app[data-wall-tone="' + k + '"][data-wall-img] { --wall-scrim: ' + t.scrimImg + '; }\n';
+      toneCss += 'html[data-theme="light"] #app[data-wallpaper][data-wall-tone="' + k +
+        '"]:not([data-wall-img]) { --wall-scrim: ' + t.scrimLight + '; }\n';
+    });
+    let panelCss = '';
+    Object.keys(WALL_PROFILE).forEach((k) => {
+      const p = WALL_PROFILE[k];
+      if (p.panel == null && p.card == null) return;
+      let s = '#app[data-wallpaper="' + k + '"] {';
+      if (p.panel != null) s += ' --wall-panel-alpha: ' + p.panel + ';';
+      if (p.card != null) s += ' --wall-card-alpha: ' + p.card + ';';
+      panelCss += s + ' }\n';
+    });
+    st.textContent = `
+/* ========== [3.20 阶段1] 壁纸联动系统主题（独立样式表：同权重后定义获胜） ========== */
+/* ---- 1) 色相分档：决定光晕/强调/叠色（由 JS 写 #app[data-wall-tone]） ---- */
+${toneCss}/* 未分档（JS 尚未执行 / 未知壁纸）时回退品牌钴蓝，视觉零回归 */
+#app[data-wallpaper] {
+  --shadow-glove: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.25), 0 0 16px rgba(var(--wall-accent-rgb), 0.15);
+  --shadow-glove-focus: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.55), 0 0 28px rgba(var(--wall-accent-rgb), 0.30);
+  --shadow-glow-cobalt: 0 0 12px rgba(var(--wall-glow-rgb), 0.40);
+  --shadow-glow-cyan: 0 0 12px rgba(var(--wall-accent-rgb), 0.40);
+}
+/* ---- 2) 三栏面板与输入台的色相联动 = 压暗层着色（--wall-scrim 按色相档取深版/浅版）。
+        纯色/渐变类用的深版比原 rgba(6,8,14,.30) 更暗 → 换壁纸改变整屏色相，同时正文对比度
+        只升不降（可读性红线）；图片类用浅版，保住"不压暗人物" ---- */
+/* ---- 2b) 卡片：边框取壁纸主色（所有壁纸通用，含动漫/自定义图）。只改边框色，
+        不加外发光、不改 background —— 既不动卡片自带渐变底，也不抬高正文可读性基线 ---- */
+#app[data-wall-tone] main .glass-card,
+#app[data-wall-tone] main .bg-surface-card,
+#app[data-wall-tone] main .welcome-suggestion,
+#app[data-wall-tone] main .doc-card,
+#app[data-wall-tone] main .workflow-card,
+#app[data-wall-tone] main .timestamp-card,
+#app[data-wall-tone] main .model-detail-card,
+#app[data-wall-tone] main .error-card {
+  border-color: rgba(var(--wall-glow-rgb), 0.34);
+}
+/* ---- 2c) 侧栏右边框取壁纸主色：1px 精确色相提示，不动任何不透明度与亮度（可读性零影响），
+        图片类壁纸也适用 —— 让"侧栏随壁纸变色"在任何壁纸下都肉眼可辨 ---- */
+#app[data-wall-tone] aside.bg-surface-deep,
+#app[data-wall-tone] #middleSidebar {
+  border-right-color: rgba(var(--wall-glow-rgb), 0.35);
+}
+/* ---- 3) 输入台光晕 = 壁纸主色（非图片壁纸作用域；图片壁纸见第 6 节） ---- */
+#app[data-wallpaper] .core-input {
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.30), 0 0 20px rgba(var(--wall-accent-rgb), 0.20);
+}
+#app[data-wallpaper] .core-input:focus-within {
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.55), 0 0 32px rgba(var(--wall-accent-rgb), 0.32);
+}
+/* ---- 4) 侧栏导航当前项 = 壁纸主色（原为固定品牌蓝） ---- */
+#app[data-wallpaper] .nav-icon-btn.active {
+  background: rgba(var(--wall-glow-rgb), 0.16);
+  color: rgb(var(--wall-glow-rgb));
+}
+/* ---- 5) 面板透明度微调（仅纯色/渐变类；图片类保持"不压暗人物"既有值） ---- */
+${panelCss}/* ---- 6) 图片壁纸（动漫内置 + 自定义）：保留深色浮起结构，只换光晕/边框色相 ---- */
+#app[data-wallpaper="anime-starry"] #coreInputContainer,
+#app[data-wallpaper="anime-aurora"] #coreInputContainer,
+#app[data-wallpaper="anime-window"] #coreInputContainer,
+#app[data-wallpaper="custom"] #coreInputContainer {
+  border-color: rgba(var(--wall-glow-rgb), 0.28);
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.20), 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+#app[data-wallpaper="anime-starry"] #coreInputContainer:focus-within,
+#app[data-wallpaper="anime-aurora"] #coreInputContainer:focus-within,
+#app[data-wallpaper="anime-window"] #coreInputContainer:focus-within,
+#app[data-wallpaper="custom"] #coreInputContainer:focus-within {
+  border-color: rgba(var(--wall-glow-rgb), 0.90);
+  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.40), 0 0 30px rgba(var(--wall-accent-rgb), 0.18), 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+html[data-theme="light"] #app[data-wallpaper="anime-starry"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="anime-window"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
+  border-color: rgba(var(--wall-glow-rgb), 0.34);
+}
+/* ---- 7) 可读性红线：高亮度自定义图自动加深遮罩（正文对比度不低于现状）。
+        权重：[data-wall-tone] 后缀保证压过上面的按色相着色规则（同权重时后定义获胜） ---- */
+#app[data-wall-bright="1"][data-wall-tone] {
+  --wall-scrim: rgba(6, 8, 14, 0.52);
+}
+#app[data-wall-bright="1"][data-wall-tone] main .msg-bubble .md-body {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+}
+html[data-theme="light"] #app[data-wallpaper][data-wall-bright="1"][data-wall-tone] {
+  --wall-scrim: rgba(6, 8, 14, 0.42);
+}
+`;
+    document.head.appendChild(st);
+  }
+
+  injectWallLinkCss();
+  wallLinkApply();
+
+  // 属性兜底：data-wallpaper / 内联背景变化时重算联动（只读 data-wallpaper，不写回，无循环）
+  const shell = wallShell();
+  if (shell && typeof MutationObserver === 'function') {
+    new MutationObserver(() => { wallLinkApply(); })
+      .observe(shell, { attributes: true, attributeFilter: ['data-wallpaper', 'style'] });
+  }
+  // 主题切换（data-theme）后重算：浅色/深色遮罩取值不同
+  if (typeof MutationObserver === 'function') {
+    new MutationObserver(() => { wallLinkApply(); })
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  }
+  // 自定义上传完成后（静置 0.4s 等内联背景落盘）再取一次色
+  if (typeof window.handleCustomWallpaper === 'function') {
+    const origHandle = window.handleCustomWallpaper;
+    window.handleCustomWallpaper = function (input) {
+      const r = origHandle.apply(this, arguments);
+      setTimeout(() => {
+        try { localStorage.removeItem(CUSTOM_TONE_KEY); } catch (e) { /* 忽略 */ }
+        wallLinkApply();
+      }, 400);
+      return r;
+    };
+  }
+
+  /** 调试/自检出口：查当前联动状态（不改状态，只读） */
+  window.__wallLink = {
+    apply: wallLinkApply,
+    extract: wallExtractProfile,
+    toneOf: wallCurrentId,
+    profiles: WALL_PROFILE,
+    tones: WALL_TONES,
+    /** 当前 #app 上的联动属性快照 */
+    snapshot() {
+      const s = wallShell();
+      return s ? {
+        wallpaper: s.getAttribute('data-wallpaper'),
+        tone: s.getAttribute('data-wall-tone'),
+        bright: s.getAttribute('data-wall-bright')
+      } : null;
+    }
+  };
 })();

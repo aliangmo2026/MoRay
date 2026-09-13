@@ -402,31 +402,70 @@ function cosineSimilarity(a, b) {
  * @param {string} text - 全文
  * @param {number} chunkSize - 目标块大小（字符）
  * @param {number} overlap - 重叠字符数
- * @returns {Array<{text:string, meta:string}>} 分块列表 */
+ * @returns {Array<{text:string, meta:string}>} 分块列表（meta = 所属最近标题，用于来源标注） */
 function chunkText(text, chunkSize, overlap) {
   const chunks = [];
   const paras = String(text || '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-  let buf = '';
+  let buf = '', bufMeta = '', heading = '';
+  const collect = (t, m) => { chunks.push({ text: t, meta: m || '' }); };
   paras.forEach(p => {
-    // 标题行作为独立 meta
+    // 标题行（形如 "## 小节名"）作为该块及其后续块的 meta —— 让"第N段"还能带上小节名
+    const h = /^(#{1,6})\s+(\S.*)$/.exec(p);
+    if (h && p.split('\n').length <= 2) heading = h[2].trim().slice(0, 40);
     if (p.length > chunkSize) {
-      if (buf) { chunks.push({ text: buf, meta: '' }); buf = ''; }
+      if (buf) { collect(buf, bufMeta); buf = ''; bufMeta = ''; }
       // 滑窗切分长段落
       for (let i = 0; i < p.length; i += chunkSize - overlap) {
-        chunks.push({ text: p.slice(i, i + chunkSize), meta: '' });
+        collect(p.slice(i, i + chunkSize), heading);
       }
       return;
     }
     if ((buf + '\n\n' + p).length > chunkSize && buf) {
-      chunks.push({ text: buf, meta: '' });
-      buf = p;
+      collect(buf, bufMeta);
+      buf = p; bufMeta = heading;
     } else {
+      if (!buf) bufMeta = heading;
       buf = buf ? buf + '\n\n' + p : p;
     }
   });
-  if (buf) chunks.push({ text: buf, meta: '' });
+  if (buf) collect(buf, bufMeta);
   return chunks;
 }
+
+/** 内置示例文档正文：只写通用使用说明，不编造任何专业数据（首次进入知识库时自动导入，便于立刻跑通 RAG 闭环）
+ * @type {string} */
+const SAMPLE_KB_DOC_TEXT = `# MoRay 快速开始指南
+
+## 这是什么
+MoRay 是一个本地优先的 AI 开发者工作台：对话、多模型对比、提示词库、知识库问答与自动化工作流都在一个页面里完成。
+数据默认保存在浏览器本机（IndexedDB），启动本地后端后可与本机 SQLite 双向同步。
+
+## 第一次使用
+1. 左上角导航依次是：对话、提示词、片段、设置、文档库、自动化、成本中心。
+2. 对话页底部是输入台：直接输入问题回车发送；输入「/」可以呼出快捷指令。
+3. 想用本地模型，请在设置页填写 Ollama 地址（默认 http://localhost:11434），再在模型下拉里选择已下载的模型。
+4. 想用云端模型，请在设置页填入自己的 API Key（BYOK：Key 只保存在本机浏览器）。
+
+## 知识库怎么用
+- 进入「文档库」页，拖入或点击选择 .txt / .md / .json 等文本文件，MoRay 会自动解析、按段落分块并建立索引。
+- 开启「本机工具」开关后，可以直接问「知识库里关于 X 的内容」，模型会调用 query_knowledge_base 工具检索，并在回答下方标注来源。
+- 检索优先使用本地 Ollama 的 embedding 模型（如 nomic-embed-text）；没有检测到 embedding 模型时会自动降级为关键词检索，功能不受影响。
+- 文档列表支持预览、重新索引、单篇删除与清空；重新索引用于更换 embedding 模型后重建向量。
+
+## 多步 Agent 与本机工具
+- 打开输入台的「本机工具」开关后，模型可以读取和修改受控工作区内的文件，并先提交一份计划再逐步执行。
+- 涉及写文件、改文件、移动文件的步骤都需要你在审批卡上确认；只读操作（列出目录、读文件、找文件、搜文本、查看进程与系统信息）直接执行。
+- 每一步都会在时间线上留痕，可以在设置页查看审计日志。
+
+## 数据与隐私
+- 对话、提示词、片段、知识库文档都保存在本机；除你自己配置的模型服务外，不向任何第三方发送数据。
+- 设置页提供导出/导入备份，换机器时可以先导出再导入。
+
+## 常见问题
+- 找不到本地模型：确认 Ollama 已启动，且模型已下载（ollama pull <模型名>）。
+- 回答里没有来源标注：说明这次回答没有命中知识库内容，可以换更具体的问法，或先确认文档已完成索引。
+- 后端显示未启动：不影响本地对话与知识库，只是暂时不能多设备同步；双击「启动MoRay.bat」可启动本地后端。
+`;
 
 /** 文档库应用 */
 const DocsApp = {
@@ -446,14 +485,18 @@ const DocsApp = {
           <i data-lucide="book-open" class="w-4 h-4 text-brand-violet"></i>
           <span class="text-sm font-medium text-text-primary">文档知识库</span>
           <span class="tag-pill bg-brand-violet/15 text-brand-violet" id="docCountPill">0 篇文档</span>
+          <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="ragModePill" title="">检索模式：探测中</span>
         </div>
         <div class="flex items-center gap-2">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragClearAllBtn" title="删除全部文档与索引">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>清空
+          </button>
           <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragSettingsBtn">
             <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>知识库设置
           </button>
           <div class="relative w-56">
             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-tertiary"></i>
-            <input type="text" id="docSearchInput" placeholder="语义检索文档内容..." class="w-full h-8 pl-9 pr-3 rounded-lg bg-surface-card border border-line-ghost text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none">
+            <input type="text" id="docSearchInput" placeholder="语义/关键词检索文档内容..." class="w-full h-8 pl-9 pr-3 rounded-lg bg-surface-card border border-line-ghost text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none">
           </div>
         </div>
       </div>
@@ -505,15 +548,38 @@ const DocsApp = {
       search.value = '';
     });
     on(document.getElementById('ragSettingsBtn'), 'click', () => this.openSettings());
+    on(document.getElementById('ragClearAllBtn'), 'click', () => this.clearAll());
     refreshIcons();
+  },
+
+  /** 清空知识库（全部文档 + 分块 + 向量）
+   * @returns {Promise<void>} */
+  async clearAll() {
+    if (!this.cache.length) { showNotification('知识库为空', '当前没有可清空的文档', 'info', 1800); return; }
+    const n = this.cache.length;
+    showConfirm('清空知识库', `确定删除全部 ${n} 篇文档及其分块与向量？此操作不可恢复。`, async () => {
+      for (const d of this.cache.slice()) {
+        try { await DB.deleteDocument(d.id); } catch (e) { console.error(e); }
+      }
+      this.cache = [];
+      this.renderList(); this.renderDocSidebar();
+      showNotification('已清空', `${n} 篇文档已删除`, 'success', 1800);
+    }, { danger: true, okText: '全部删除' });
   },
 
   /** 加载并渲染
    * @returns {Promise<void>} */
   async reload() {
     try { this.cache = await DB.listDocuments(); } catch (e) { this.cache = []; console.error(e); }
+    let seeded = false;
+    try { seeded = await this.ensureSampleDoc(); } catch (e) { seeded = false; }
+    if (seeded) {
+      try { this.cache = await DB.listDocuments(); } catch (e) { /* 忽略 */ }
+    }
     this.renderList();
     this.renderDocSidebar();
+    // 空闲时后台探测检索模式（不阻塞页面渲染，也不打扰用户）
+    this.probeRetrieval(false).catch(() => { /* 忽略 */ });
   },
 
   /** 渲染文档列表
@@ -526,7 +592,9 @@ const DocsApp = {
     if (!this.cache.length) {
       // [V3 P2.5] 统一空状态
       list.innerHTML = renderEmptyState({
-        icon: 'book-open', title: '上传文档构建知识库', desc: 'PDF / Markdown / TXT / DOCX 自动解析、分块并向量化', actionText: '上传文档', dragHint: true
+        icon: 'book-open', title: '导入文档构建知识库',
+        desc: '支持 .txt / .md / .json 等文本文件（也支持 PDF / DOCX），自动分块并建立索引；已为你内置一篇《MoRay 快速开始指南》示例文档',
+        actionText: '导入文档', dragHint: true
       });
       bindEmptyAction(list, () => { const inp = document.getElementById('docFileInput'); if (inp) inp.click(); });
       refreshIcons();
@@ -538,6 +606,7 @@ const DocsApp = {
       const statusText = d.status === 'ready' ? '已索引' : d.status === 'error' ? '解析失败' : '处理中';
       const idx = (d.chunks || []).length;
       const embedded = (d.chunks || []).filter(c => c.embedding).length;
+      const chars = (d.chunks || []).reduce((s, c) => s + (c.text || '').length, 0);
       return `
       <div class="doc-card p-4" data-doc-id="${d.id}">
         <div class="flex items-center justify-between gap-3">
@@ -546,8 +615,8 @@ const DocsApp = {
               <i data-lucide="${d.type === 'pdf' ? 'file-text' : d.type === 'code' ? 'file-code' : 'file-text'}" class="w-4 h-4 text-brand-violet"></i>
             </div>
             <div class="min-w-0">
-              <div class="text-sm text-text-primary truncate">${escapeHtml(d.name)}</div>
-              <div class="text-[10px] text-text-tertiary">${formatBytes(d.size)} · ${idx} 块${d.status === 'ready' ? ' · 已向量化 ' + embedded + ' 块' : ''} · ${relTime(d.createdAt)}</div>
+              <div class="text-sm text-text-primary truncate flex items-center gap-1.5">${escapeHtml(d.name)}${d.sample ? '<span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt">示例</span>' : ''}</div>
+              <div class="text-[10px] text-text-tertiary">${formatBytes(d.size)} · ${chars} 字 · ${idx} 段${d.status === 'ready' ? ' · 已向量化 ' + embedded + ' 段' : ''} · 导入于 ${relTime(d.createdAt)}</div>
             </div>
           </div>
           <div class="flex items-center gap-2 flex-shrink-0">
@@ -718,23 +787,33 @@ const DocsApp = {
   },
 
   /**
-   * 向量化文档分块：优先 Ollama embedding，失败回退本地哈希向量
+   * 建索引：与检索模式保持一致 —— auto = Ollama embedding 可用则向量化，否则不做向量化
+   * （检索走关键词模式，无需向量；避免无意义地拉取 CDN 模型与算哈希向量）
    * @param {Object} doc - 文档对象
    * @returns {Promise<void>} */
   async embedDocument(doc) {
     doc.status = 'indexing';
     await DB.putDocument(doc);
     this.renderList();
-    // [阶段三] 后端链：auto=Ollama优先 -> Transformers.js -> Hash；显式指定则强制
     const backend = MoraySettings.get('embeddingBackend') || 'auto';
     let mode = 'hash';
     if (backend === 'transformers') {
       mode = (await TransformersEmbedder.load()) ? 'transformers' : 'hash';
-    } else if (backend === 'auto') {
-      if (AI.backend === 'ollama') {
-        try { await AI.embed(MoraySettings.get('embeddingModel'), 'test'); mode = 'ollama'; } catch (e) { /* 探测失败 */ }
-      }
-      if (mode === 'hash') mode = (await TransformersEmbedder.load()) ? 'transformers' : 'hash';
+    } else if (backend === 'hash') {
+      mode = 'hash';
+    } else if (backend === 'ollama') {
+      try { await AI.embed(MoraySettings.get('embeddingModel'), 'test'); mode = 'ollama'; } catch (e) { mode = 'hash'; }
+    } else {
+      // auto：探测到可用 embedding 模型才向量化，否则直接进入关键词检索模式（本次 3.20 阶段2 调整）
+      const probe = await this.probeRetrieval(true);
+      mode = probe.mode === 'embedding' ? 'ollama' : 'keyword';
+    }
+    if (mode === 'keyword') {
+      doc.status = 'ready';
+      await DB.putDocument(doc);
+      this.renderList();
+      this.renderDocSidebar();
+      return;
     }
     if (mode === 'hash') {
       // 哈希向量批量走 Web Worker（不阻塞 UI），不可用回退主线程
@@ -762,27 +841,13 @@ const DocsApp = {
   },
 
   /**
-   * 语义检索：查询向量化 -> 余弦 Top-K
+   * 语义/关键词检索（UI 入口）：检索 → 高亮渲染
    * @param {string} query - 查询文本
    * @returns {Promise<Array<{doc:Object, chunk:Object, score:number}>>} 结果 */
   async semanticSearch(query) {
     if (!query) return [];
-    let qvec = null;
-    if (AI.backend === 'ollama') {
-      try { qvec = await AI.embed(MoraySettings.get('embeddingModel'), query); } catch (e) { /* 回退 */ }
-    }
-    if (!qvec) qvec = localHashVector(query);
-    const results = [];
-    for (const doc of this.cache) {
-      (doc.chunks || []).forEach(chunk => {
-        if (!chunk.embedding) return;
-        const score = cosineSimilarity(qvec, chunk.embedding);
-        if (score > 0.01) results.push({ doc, chunk, score });
-      });
-    }
-    results.sort((a, b) => b.score - a.score);
-    const topK = MoraySettings.get('ragTopK') || 4;
-    const top = results.slice(0, topK);
+    const top = (await this.retrieve(query)).slice(0, MoraySettings.get('ragTopK') || 4);
+    if (!top.length) { this.renderSearchResults(query, top); return top; }
     this.renderSearchResults(query, top);
     return top;
   },
@@ -807,7 +872,7 @@ const DocsApp = {
       return `<div class="chunk-item" data-search-doc="${r.doc.id}" data-search-chunk="${r.chunk.idx}" style="cursor:pointer">
         <div class="flex items-center justify-between mb-1">
           <span class="text-brand-cyan">${escapeHtml(r.doc.name)}</span>
-          <span class="text-text-tertiary">相似度 ${(r.score * 100).toFixed(1)}%</span>
+          <span class="text-text-tertiary">${(this._retrieval && this._retrieval.mode === 'keyword') ? '相关度' : '相似度'} ${(r.score * 100).toFixed(1)}%</span>
         </div>
         <div>${text}…</div>
       </div>`;
@@ -832,16 +897,138 @@ const DocsApp = {
     return { text: ctx, citations };
   },
 
-  /** 原始检索（不渲染UI）
+  /** 原始检索（不渲染UI；工具 query_knowledge_base 与对话 RAG 都走这里）
    * @param {string} query - 查询
-   * @returns {Promise<Array>} 结果 */
+   * @returns {Promise<Array>} 结果（按相关度降序） */
   async semanticSearchRaw(query) {
-    if (!this.cache.length) return [];
-    let qvec = null;
-    if (AI.backend === 'ollama') {
-      try { qvec = await AI.embed(MoraySettings.get('embeddingModel'), query); } catch (e) { /* 回退 */ }
+    return this.retrieve(query);
+  },
+
+  /* ---------- [3.20 阶段2] 检索模式：优先 Ollama embedding，缺失自动降级关键词 ---------- */
+
+  /** 检索模式探测缓存 @type {?{mode:string, model:string, reason:string}} */
+  _retrieval: null,
+  /** 探测中的 Promise（并发去重） @type {?Promise} */
+  _retrievalPromise: null,
+  /** 关键词降级提示是否已弹（每会话一次，避免刷屏） @type {boolean} */
+  _keywordHinted: false,
+
+  /** 探测知识库检索模式：先看 Ollama /api/tags 里有没有可用的 embedding 模型，
+   * 有就真机调一次确认可用；没有则降级关键词检索（不报错，只给一次温和提示）。
+   * @param {boolean} [force] - 强制重新探测（设置变更/重新索引时用）
+   * @returns {Promise<{mode:'embedding'|'keyword', model:string, reason:string}>} 探测结果 */
+  async probeRetrieval(force) {
+    if (!force && this._retrieval) return this._retrieval;
+    if (!force && this._retrievalPromise) return this._retrievalPromise;
+    this._retrievalPromise = (async () => {
+      const want = MoraySettings.get('embeddingModel') || 'nomic-embed-text';
+      const out = { mode: 'keyword', model: want, reason: '' };
+      if (typeof AI === 'undefined') { out.reason = 'AI 模块未加载'; return out; }
+      if (AI.backend !== 'ollama') { out.reason = '当前模型后端不是本地 Ollama'; return out; }
+      let names = [];
+      try {
+        const res = await fetch(AI.ollamaURL + '/api/tags', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const j = await res.json();
+        names = (j.models || []).map(m => String(m.name || m.model || ''));
+      } catch (e) { out.reason = '无法读取 Ollama 模型列表'; return out; }
+      const isEmbed = (n) => /embed|bge|gte|m3e|text2vec|jina|e5-/i.test(n);
+      const base = want.split(':')[0];
+      const hit = names.find(n => isEmbed(n) && n.indexOf(base) === 0) || names.find(isEmbed);
+      if (!hit) { out.reason = '未检测到 embedding 模型（如 nomic-embed-text）'; return out; }
+      try {
+        await AI.embed(hit, 'probe'); // 真机验证：只列名不работ 的模型按不可用处理
+        out.mode = 'embedding';
+        out.model = hit;
+      } catch (e) { out.reason = 'embedding 调用失败：' + String((e && e.message) || e).slice(0, 60); }
+      return out;
+    })();
+    this._retrieval = await this._retrievalPromise;
+    this._retrievalPromise = null;
+    this.renderModePill();
+    return this._retrieval;
+  },
+
+  /** 确保模式已知（首次检索时探测），降级为关键词时给一次性提示
+   * @returns {Promise<{mode:string, model:string, reason:string}>} 探测结果 */
+  async ensureRetrieval() {
+    const r = await this.probeRetrieval(false);
+    if (r.mode === 'keyword' && !this._keywordHinted) {
+      this._keywordHinted = true;
+      showNotification('未检测到 embedding 模型，使用关键词检索',
+        (r.reason ? r.reason + '。' : '') + '可在「知识库设置」里指定本地 Ollama embedding 模型（如 nomic-embed-text）以获得语义检索',
+        'info', 5200);
     }
-    if (!qvec) qvec = localHashVector(query);
+    return r;
+  },
+
+  /** 刷新页头的检索模式徽标（真实反映当前模式，不是装饰） */
+  renderModePill() {
+    const pill = document.getElementById('ragModePill');
+    if (!pill) return;
+    const r = this._retrieval;
+    if (!r) { pill.textContent = '检索模式：探测中'; pill.title = ''; return; }
+    if (r.mode === 'embedding') {
+      pill.textContent = '语义检索 · ' + r.model;
+      pill.title = '使用 Ollama embedding 模型：' + r.model;
+      pill.className = 'tag-pill bg-brand-cyan/15 text-brand-cyan';
+    } else {
+      pill.textContent = '关键词检索';
+      pill.title = (r.reason || '') + '（降级为关键词检索，功能不受影响）';
+      pill.className = 'tag-pill bg-brand-cobalt/15 text-brand-cobalt';
+    }
+  },
+
+  /** 关键词检索打分（0~1）：词命中率 70% + 词频密度 30%
+   * @param {string} query - 查询
+   * @param {string} text - 片段
+   * @returns {number} 分值 */
+  keywordScore(query, text) {
+    const terms = String(query || '').toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, ' ').split(/\s+/).filter(t => t.length > 1);
+    if (!terms.length) return 0;
+    const lower = String(text || '').toLowerCase();
+    let hit = 0, freq = 0;
+    terms.forEach(t => {
+      if (lower.indexOf(t) < 0) return;
+      hit++;
+      let from = 0, c = 0;
+      while (c < 20) { const p = lower.indexOf(t, from); if (p < 0) break; c++; from = p + t.length; }
+      freq += c;
+    });
+    if (!hit) return 0;
+    const coverage = hit / terms.length;
+    const density = Math.min(1, freq / (lower.length / 120 + 1));
+    return coverage * 0.7 + density * 0.3;
+  },
+
+  /** 关键词检索（无 embedding 模型时的降级路径，与向量检索共用返回结构）
+   * @param {string} query - 查询
+   * @returns {Array<{doc:Object, chunk:Object, score:number}>} 结果 */
+  keywordRetrieve(query) {
+    const results = [];
+    for (const doc of this.cache) {
+      (doc.chunks || []).forEach(chunk => {
+        const s = this.keywordScore(query, chunk.text);
+        if (s > 0) results.push({ doc, chunk, score: s });
+      });
+    }
+    results.sort((a, b) => b.score - a.score);
+    return results;
+  },
+
+  /** 统一检索入口：按已探测的模式走向量检索或关键词检索（两模式共用同一返回结构，
+   * 因此 query_knowledge_base 工具与对话 RAG 都不需要关心当前是哪种模式）
+   * @param {string} query - 查询文本
+   * @returns {Promise<Array<{doc:Object, chunk:Object, score:number}>>} 结果（降序） */
+  async retrieve(query) {
+    if (!this.cache.length) return [];
+    const q = String(query || '').trim();
+    if (!q) return [];
+    const r = await this.ensureRetrieval();
+    if (r.mode !== 'embedding') return this.keywordRetrieve(q);
+    let qvec = null;
+    try { qvec = await AI.embed(r.model || MoraySettings.get('embeddingModel'), q); } catch (e) { qvec = null; }
+    if (!qvec) return this.keywordRetrieve(q); // embedding 运行期不可用 → 本次退关键词
     const results = [];
     for (const doc of this.cache) {
       (doc.chunks || []).forEach(chunk => {
@@ -850,12 +1037,36 @@ const DocsApp = {
       });
     }
     // [夜间优化4.4] 混合检索：向量相似度 70% + 关键词重合度 30%（轻量重排）
-    results.forEach(r => {
-      const kw = typeof keywordOverlap === 'function' ? keywordOverlap(query, r.chunk.text) : 0;
-      r.score = r.score * 0.7 + kw * 0.3;
+    results.forEach(rr => {
+      const kw = typeof keywordOverlap === 'function' ? keywordOverlap(q, rr.chunk.text) : 0;
+      rr.score = rr.score * 0.7 + kw * 0.3;
     });
     results.sort((a, b) => b.score - a.score);
     return results;
+  },
+
+  /** 首次进入知识库时导入内置示例文档「MoRay 快速开始指南」，
+   * 保证零文档状态下也能立刻跑通「提问 → 检索 → 来源标注」闭环。
+   * 只在从未导入过且当前一篇文档都没有时执行一次（localStorage 标记）。
+   * @returns {Promise<boolean>} 是否导入了示例文档 */
+  async ensureSampleDoc() {
+    try {
+      if (localStorage.getItem('moray_kb_seeded') === '1') return false;
+      if (this.cache.length) { localStorage.setItem('moray_kb_seeded', '1'); return false; }
+      const chunkSize = MoraySettings.get('chunkSize') || 600;
+      const overlap = MoraySettings.get('chunkOverlap') || 100;
+      const text = SAMPLE_KB_DOC_TEXT;
+      const chunks = chunkText(text, chunkSize, overlap)
+        .map((c, i) => ({ id: uid('chunk'), idx: i, text: c.text, meta: c.meta, embedding: null }));
+      const doc = {
+        id: uid('doc'), name: 'MoRay 快速开始指南.md', size: text.length, type: 'markdown',
+        status: 'ready', chunks, createdAt: Date.now(), tags: ['示例'], sample: true, error: ''
+      };
+      await DB.putDocument(doc);
+      this.cache.push(doc);
+      localStorage.setItem('moray_kb_seeded', '1');
+      return true;
+    } catch (e) { return false; } // 示例文档失败绝不影响知识库本身
   },
 
   /** 文档预览（分块浏览，可跳转到指定块）

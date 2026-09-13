@@ -115,6 +115,16 @@ const ToolRegistry = {
       if (name === 'find_files') return '查找「' + (a.pattern || '*') + '」' + (a.path ? '于 ' + a.path : '（全工作区）');
       if (name === 'search_text') return '搜索「' + String(a.query || '').slice(0, 40) + '」' + (a.regex ? '（正则）' : '') + (a.path ? '于 ' + a.path : '');
       if (name === 'edit_file') return '编辑 ' + (a.path || '') + '（' + String(a.old_str || '').length + '→' + String(a.new_str || '').length + ' 字符）';
+      if (name === 'query_knowledge_base') return '检索知识库「' + String(a.query || '').slice(0, 40) + '」' + (a.topK ? '（前 ' + a.topK + ' 条）' : '');
+      // [3.20 阶段3] 新增本机工具的可读摘要
+      if (name === 'create_file') {
+        const bytes = (typeof a.content === 'string') ? a.content.length : 0;
+        return '新建 ' + (a.path || '') + (bytes ? '（' + bytes + ' 字符）' : '（空文件）');
+      }
+      if (name === 'rename_file') return '重命名 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'move_file') return '移动 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'list_processes') return '查看进程' + (a.sort === 'pid' ? '（按 PID）' : '（占内存前 ' + (a.limit || 30) + ' 条）');
+      if (name === 'system_info') return '读取系统概览（只读）';
       const s = JSON.stringify(a);
       return s.length > 120 ? s.slice(0, 120) + '…' : s;
     } catch (e) {
@@ -133,7 +143,10 @@ const ToolRegistry = {
       // [阶段0 本机 Agent] 本机工具图标
       list_directory: 'folder', read_file: 'file-text', write_file: 'file-pen-line', run_command: 'terminal',
       // [阶段1 M2] 高价值三工具
-      find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen'
+      find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen',
+      // [3.20 阶段3] 新增本机工具
+      create_file: 'file-plus-2', rename_file: 'file-pen', move_file: 'folder-input',
+      list_processes: 'activity', system_info: 'cpu'
     };
     const icon = iconMap[evt.name] || 'wrench';
     const label = evt.label || evt.name;
@@ -149,7 +162,10 @@ const ToolRegistry = {
     // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
     // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
     const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
-    const body = '';
+    // [3.20 修复] 这里必须是 let：下面 4 个分支都要对 body 重新赋值，
+    // 原来是 const → 每次步骤卡渲染都抛 "Assignment to constant variable"，
+    // 进而让 emit() 抛出、Gateway.runWithTools 中断并回退普通流式（工具轮直接失效）
+    let body = '';
     if (evt.status === 'error') {
       body = '<div class="text-[10px] text-danger mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
     } else if (evt.status === 'denied') {
@@ -507,6 +523,35 @@ function safeCalc(expr) {
   return r;
 }
 
+/** [3.20 阶段2] 知识库来源收集器：query_knowledge_base 每次检索把来源登记到这里，
+ * 对话层在回答生成完成后取走（drain），写入消息的 citations 并在消息中渲染
+ * 「[来源：文档名·第N段]」标注。工具与对话层因此解耦，不需要改工具返回协议。 */
+const RagSources = {
+  /** 本次请求累计的来源 @type {Array<{docId:string, docName:string, chunkIdx:number, meta:string, score:number}>} */
+  items: [],
+  /** 登记一批来源（自动去重：同一文档同一段只留最高分）
+   * @param {Array} list - 来源数组
+   * @returns {void} */
+  add(list) {
+    (list || []).forEach(it => {
+      if (!it || !it.docId) return;
+      const key = it.docId + '#' + it.chunkIdx;
+      const old = this.items.find(x => x.docId + '#' + x.chunkIdx === key);
+      if (old) { if ((it.score || 0) > (old.score || 0)) old.score = it.score; return; }
+      this.items.push(it);
+    });
+  },
+  /** 取走全部来源（按相关度降序） @returns {Array} 来源列表 */
+  drain() {
+    const out = this.items.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
+    this.items = [];
+    return out;
+  },
+  /** 清空（每次新请求开始前调用，避免上一轮来源串到本轮） @returns {void} */
+  clear() { this.items = []; }
+};
+window.RagSources = RagSources;
+
 /** 内置工具清单（{name, label, description, parameters, enabledByDefault, run}） */
 const BUILTIN_TOOLS = [
   {
@@ -535,8 +580,10 @@ const BUILTIN_TOOLS = [
     }
   },
   {
-    name: 'query_knowledge_base', label: '查询知识库',
-    description: '在本地知识库（文档库）中按语义检索相关片段，返回文档标题与内容摘要。当用户询问"知识库里关于 X 的内容"时使用。',
+    name: 'query_knowledge_base', label: '查询知识库', timeoutMs: 30000,
+    description: '在本地知识库（文档库）中检索相关片段，返回文档标题、片段内容摘要与相关度。'
+      + '当用户询问"知识库里关于 X 的内容 / 文档里怎么写的"时使用。'
+      + '若你的回答用到了返回的片段，请在相应句子后标注来源，格式为 [来源：文档名·第N段]（N 为返回的 segment 字段）。',
     parameters: {
       type: 'object',
       properties: { query: { type: 'string', description: '检索关键词或问题' }, topK: { type: 'integer', description: '返回条数（默认 3）' } },
@@ -552,14 +599,26 @@ const BUILTIN_TOOLS = [
       const results = await DocsApp.semanticSearchRaw(q);
       // 关键 await 后复查：中止后不再继续（不组装结果、不写成功态）
       if (ctx && ctx.signal && ctx.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-      if (!results || !results.length) return { query: q, count: 0, items: [] };
-      return {
-        query: q, count: Math.min(results.length, topK),
-        items: results.slice(0, topK).map(r => ({
-          title: (r.doc && r.doc.name) ? r.doc.name : '(未命名文档)',
-          excerpt: String((r.chunk && r.chunk.text) || '').slice(0, 400)
-        }))
-      };
+      const mode = (DocsApp._retrieval && DocsApp._retrieval.mode) || 'keyword';
+      if (!results || !results.length) {
+        return { query: q, mode, count: 0, items: [], note: '知识库中没有命中内容（可能尚未导入文档，或问法与文档内容差异较大）' };
+      }
+      // 按相关度降序取前 topK，并把来源登记到 RagSources（供消息来源标注使用）
+      const top = results.slice(0, topK).map(r => ({
+        title: (r.doc && r.doc.name) ? r.doc.name : '(未命名文档)',
+        segment: (r.chunk && typeof r.chunk.idx === 'number') ? r.chunk.idx + 1 : 1,
+        section: (r.chunk && r.chunk.meta) || '',
+        score: Number((r.score || 0).toFixed(4)),
+        snippet: String((r.chunk && r.chunk.text) || '').slice(0, 400)
+      }));
+      RagSources.add(top.map((it, i) => ({
+        docId: (results[i].doc && results[i].doc.id) || '',
+        docName: it.title,
+        chunkIdx: it.segment - 1,
+        meta: it.section,
+        score: it.score
+      })));
+      return { query: q, mode, count: top.length, items: top };
     }
   },
   {
@@ -681,7 +740,11 @@ async function appendToolsSettings() {
       return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
         '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
         ' <span class="font-mono text-[10px] text-text-tertiary">' + t.name + '</span>' +
-        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span></div>' +
+        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span>' +
+        (t.sideEffect
+          ? '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/25">需审批</span>'
+          : '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-success/10 text-success border border-success/20">只读免审批</span>') +
+        '</div>' +
         '<div class="text-[10px] text-text-tertiary mt-0.5">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
         '<div class="text-[10px] text-text-tertiary shrink-0 ' + (nativeOn ? 'text-success' : '') + '">' + (nativeOn ? '已由输入台开启' : '由输入台「本机工具」开关控制') + '</div></div>';
     }
@@ -1037,6 +1100,31 @@ async function agentFingerprintForApproval(def, args) {
     } catch (e) {
       fp += '::missing';
     }
+  } else if (def.name === 'create_file') {
+    // [3.20 阶段3] 目标文件状态参与指纹：同名文件出现/消失都要重新授权（防呆）
+    const path = String((args && args.path) || '');
+    try {
+      const data = await wsFetchTool('read_file', { path, maxBytes: 4096 });
+      fp += '::exists' + (typeof fnvHash64 === 'function' ? fnvHash64(String(data && data.content || '')) : '');
+    } catch (e) {
+      fp += '::absent';
+    }
+  } else if (def.name === 'move_file' || def.name === 'rename_file') {
+    // 源文件内容变化 / 目标位置被占用 → 指纹变化，必须重新授权
+    const src = String((args && (args.from || args.src)) || '');
+    const dst = String((args && (args.to || args.dst)) || '');
+    try {
+      const d = await wsFetchTool('read_file', { path: src, maxBytes: 4096 });
+      fp += '::src' + (typeof fnvHash64 === 'function' ? fnvHash64(String(d && d.content || '')) : '');
+    } catch (e) {
+      fp += '::srcmissing';
+    }
+    try {
+      await wsFetchTool('read_file', { path: dst, maxBytes: 64 });
+      fp += '::dsttaken';
+    } catch (e) {
+      fp += '::dstfree';
+    }
   }
   return fp;
 }
@@ -1105,6 +1193,27 @@ function agentApproval(def, args, ctx) {
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
         (args.overwrite === false ? '<div class="text-[10px] text-warning mt-1">仅新建，不覆盖已有文件</div>' : '<div class="text-[10px] text-text-tertiary mt-1">已有同名文件将被覆盖</div>') +
         '</div>' + diffBlock;
+    } else if (def.name === 'create_file') {
+      // [3.20 阶段3] 新建文件：明确"只新建不覆盖"，并给出内容预览
+      const c = String(args.content || '');
+      argCards = '<div class="' + cell + '">' +
+        '<div class="text-[10px] text-text-tertiary mb-1.5">新建文件（工作区内，相对路径）</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
+        '<div class="text-[10px] text-success mt-1">只新建：若同名文件已存在会被拒绝，不会覆盖</div>' +
+        '</div>' +
+        '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">内容预览（前 300 字符）</div>' +
+        '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' +
+        (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空文件）</span>') +
+        '</div></div>';
+    } else if (def.name === 'rename_file' || def.name === 'move_file') {
+      // [3.20 阶段3] 移动/重命名：源 → 目标，并提示"目标存在即拒绝"
+      argCards = '<div class="' + cell + '">' +
+        '<div class="text-[10px] text-text-tertiary mb-1.5">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
+        '<div class="font-mono text-[11px] text-text-tertiary break-all">' + escapeHtml(String(args.from || '')) + '</div>' +
+        '<div class="text-[10px] text-text-tertiary my-0.5">↓</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.to || '')) + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mt-1.5">目标已存在会拒绝，不做静默覆盖；父目录不存在会自动创建</div>' +
+        '</div>';
     } else if (def.name === 'run_command') {
       const parts = [String(args.command || '')].concat(Array.isArray(args.args) ? args.args.map(String) : []);
       argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">将执行的只读白名单命令</div>' +
@@ -1336,6 +1445,66 @@ const NATIVE_TOOLS = [
     run(args, ctx) { return agentNativeRun(this, args, ctx); }
   },
   {
+    // [3.20 阶段3] 只新建不覆盖：语义上比 write_file 更安全，适合"创建新文件"场景
+    name: 'create_file', label: '新建文件', native: true, sideEffect: true, timeoutMs: 300000,
+    description: '在工作区内新建一个文本文件（需用户授权）。文件已存在时会被拒绝，绝不覆盖任何现有文件——需要覆盖已有文件请改用 write_file 并单独确认。父目录不存在会自动创建。当用户说"新建一个 X 文件 / 创建一个脚本文件"时使用它。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区根的新文件路径（必填，如 notes/todo.md）' },
+        content: { type: 'string', description: '文件内容（UTF-8 文本，可为空串创建空文件）' }
+      },
+      required: ['path']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'rename_file', label: '重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内重命名文件或目录（需用户授权，可理解为同一目录内的移动）。目标已存在时会被拒绝，不会覆盖。当用户说"把 a.txt 改名成 b.txt"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: '相对工作区根的原路径（必填，必须存在）' },
+        to: { type: 'string', description: '重命名后的相对路径（必填，通常与 from 同目录）' }
+      },
+      required: ['from', 'to']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'move_file', label: '移动文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内把文件或目录移动到另一个位置（需用户授权）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: '相对工作区根的源路径（必填，必须存在）' },
+        to: { type: 'string', description: '相对工作区根的目标路径（必填）' }
+      },
+      required: ['from', 'to']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [3.20 阶段3] 只读：进程列表（按内存倒序），无需审批
+    name: 'list_processes', label: '查看进程', native: true, sideEffect: false, timeoutMs: 15000,
+    description: '列出本机正在运行的进程（pid / 进程名 / 占用内存），默认按内存占用倒序取前 30 条。只读，不结束也不修改任何进程。当用户问"现在有哪些进程在占内存 / 电脑卡是不是某个程序"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', description: '返回条数（默认 30，上限 200）' },
+        sort: { type: 'string', description: 'memory（默认，按内存倒序）或 pid' }
+      }
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [3.20 阶段3] 只读：系统概览，无需审批
+    name: 'system_info', label: '系统信息', native: true, sideEffect: false, timeoutMs: 15000,
+    description: '读取本机系统只读概览：操作系统版本、CPU 核数与负载、内存总量与可用量、工作区所在磁盘容量。不含任何用户名/环境变量/文件内容。当用户问"这台机器配置怎么样 / 内存还剩多少 / 磁盘够不够"时使用。',
+    parameters: { type: 'object', properties: {} },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
     // [阶段1 M3] 计划编排：纯前端工具（不调后端），native 门控（随"本机工具"开关进入请求）
     name: 'submit_plan', label: '提交任务计划', native: true, sideEffect: false, timeoutMs: 5000,
     description: '把多步任务的执行计划提交给用户查看（每步含简短意图与预计使用的工具名）。规则：任务需要 2 个以上步骤时，在开始任何文件操作前先调用本工具登记计划；然后按计划顺序逐步执行；全部完成后用一段话总结。steps 最多 12 步。',
@@ -1375,10 +1544,10 @@ const PlanTracker = {
    * @type {string} */
   SYSTEM_PROMPT: [
     '# 本机 Agent 工作规范（受控工作区内操作）',
-    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
+    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；rename_file 重命名；move_file 移动；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
     '- 工作区边界：所有 path 都必须是相对工作区根的路径；你无法访问工作区以外的任何文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。',
     '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
-    '- 授权与拒绝：write_file / edit_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
+    '- 授权与拒绝：create_file / write_file / edit_file / rename_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
     '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
     '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。'
   ].join('\n'),

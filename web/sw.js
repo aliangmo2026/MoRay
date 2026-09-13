@@ -1,6 +1,6 @@
 /* MoRay Service Worker —— 静态资源缓存（离线可用，AI 请求除外）
    策略：HTML/导航请求 -> 网络优先（失败回退缓存）；CDN 与静态资源 -> 缓存优先（后台更新） */
-const CACHE_NAME = 'moray-3.19.0';
+const CACHE_NAME = 'moray-3.20.1';
 const SHELL_URLS = [
   './moray-workbench.html',
   './index.html',

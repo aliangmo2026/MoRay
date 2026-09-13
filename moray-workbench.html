@@ -6364,6 +6364,21 @@ const MoraySettings = {
   /** 内存缓存 @type {Object} */
   cache: null,
 
+  /** [3.20.1] 工具开关的 localStorage 镜像键。
+   *  背景：工具开关状态原本只存 IndexedDB；当浏览器 IndexedDB 不可用（隐私模式/站点数据被清）时
+   *  DB 会切到内存回退，设置刷新即丢失 —— 用户看到"打开过的开关刷新后又变回关"。
+   *  这里给"工具开关"这类开关额外写一份 localStorage 镜像（localStorage 在该场景下通常仍可用）。
+   *
+   *  为什么判定是"镜像存在即以其为准"，而不是"仅当 IndexedDB 缺该键才回填"：
+   *  启动流程里存在与开关无关的设置写入（如版本升级一次性清缓存标志），它会把**整份 settings**
+   *  落库一次，于是 IndexedDB 里很快就有了 `toolsEnabled = false`（其实是默认值，不是用户选择）。
+   *  只按"键是否存在"判断会被这个默认值挡住，镜像永远用不上。而镜像只在用户真正点击开关时写入，
+   *  因此它才是"用户最后一次显式选择"的可靠来源。
+   *  安全性：代码中没有任何路径会把这两个开关**程序化置 false**（只有联动开启方向），
+   *  所以"镜像存在即生效"不会误复活用户没选过的状态；两端都为空时保持默认关闭。
+   *  @type {Object<string,string>} 设置键 → localStorage 键 */
+  MIRROR_KEYS: { toolsEnabled: 'moray_tools_enabled', nativeToolsEnabled: 'moray_native_tools_enabled' },
+
   /** 初始化：从 IndexedDB 加载并应用
    * @returns {Promise<Object>} 生效配置 */
   async init() {
@@ -6376,6 +6391,16 @@ const MoraySettings = {
       if (legacy.temperature !== undefined && stored.temperature === undefined) this.cache.temperature = legacy.temperature;
       if (legacy.defaultModel && !stored.defaultModel) this.cache.defaultModel = legacy.defaultModel;
     } catch (e) { /* 忽略 */ }
+    // [3.20.1] 工具开关：镜像存在即回填为镜像值（= 用户最后一次显式选择），并尽力回写 IndexedDB（自愈）
+    let healed = false;
+    Object.keys(this.MIRROR_KEYS).forEach(k => {
+      let v = null;
+      try { v = localStorage.getItem(this.MIRROR_KEYS[k]); } catch (e) { v = null; }
+      if (v !== '1' && v !== '0') return; // 从未点过 → 保持默认（关闭）
+      const want = (v === '1');
+      if (this.cache[k] !== want) { this.cache[k] = want; healed = true; }
+    });
+    if (healed) { try { await DB.setSetting('app', this.cache); } catch (e) { /* 内存模式/写入失败不影响本次生效 */ } }
     this.apply();
     return this.cache;
   },
@@ -6402,6 +6427,11 @@ const MoraySettings = {
       this.cache.openaiAPIKeyStored = obj.openaiAPIKeyStored;
     }
     Object.assign(this.cache, obj);
+    // [3.20.1] 工具开关同步写 localStorage 镜像（IndexedDB 不可用时唯一能跨刷新保留的地方）
+    Object.keys(this.MIRROR_KEYS).forEach(k => {
+      if (!(k in obj)) return;
+      try { localStorage.setItem(this.MIRROR_KEYS[k], obj[k] ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    });
     try { await DB.setSetting('app', this.cache); } catch (e) { console.warn('[MoRay] settings save failed:', e); }
     this.apply();
   },
@@ -8105,8 +8135,15 @@ function fillAssistantBody(el, msg, streaming) {
   if (showThinking && thinkingVisible()) html += thinkingPanelHtml(msg.reasoning, streaming && !msg.reasoning, msg.reasoningMs);
   html += `<div class="md-body ai-content">${renderMarkdown(msg.content || '')}${streaming ? '<span class="stream-cursor"></span>' : ''}</div>`;
   if (msg.citations && msg.citations.length) {
-    html += `<div class="mt-2 pt-2 border-t border-line-ghost/50"><div class="text-[10px] text-text-tertiary mb-1">引用来源</div>${msg.citations.map(c =>
-      `<span class="citation-chip" data-doc-id="${escapeHtml(c.docId)}" data-chunk-idx="${c.chunkIdx}"><i data-lucide="file-text" class="w-3 h-3"></i>${escapeHtml(c.docName)}${c.meta ? ' · ' + escapeHtml(c.meta) : ''}</span>`).join('')}</div>`;
+    // [3.20 阶段2 / 3.20.1 修复] 行内来源标注与底部可点击引用区并存，但**不得前缀"来源："**：
+    // 标注本身已是 [来源：文档名·第N段]，再加前缀会渲染成「来源：[来源：…]」的嵌套重复。
+    const ann = (c) => '[来源：' + escapeHtml(c.docName) + '·第' + ((typeof c.chunkIdx === 'number' ? c.chunkIdx : 0) + 1) + '段]';
+    const chips = msg.citations.map(c =>
+      `<span class="citation-chip" data-doc-id="${escapeHtml(c.docId)}" data-chunk-idx="${c.chunkIdx}" title="相关度 ${((c.score || 0) * 100).toFixed(1)}%${c.meta ? ' · ' + escapeHtml(c.meta) : ''}"><i data-lucide="file-text" class="w-3 h-3"></i>${escapeHtml(c.docName)} · 第${(typeof c.chunkIdx === 'number' ? c.chunkIdx : 0) + 1}段</span>`).join('');
+    html += `<div class="mt-2 pt-2 border-t border-line-ghost/50" data-rag-sources>`
+      + `<div class="text-[10px] text-text-tertiary mb-1">引用来源</div>${chips}`
+      + `<div class="rag-source-annot text-[11px] text-text-secondary mt-1.5" data-rag-annot>${msg.citations.map(ann).join(' ')}</div>`
+      + `</div>`;
   }
   // [V2] 缓存命中标签
   if (msg.cacheInfo) {
@@ -8424,7 +8461,13 @@ async function buildRequestMessages(conv, extraContext) {
     const agentPrompt = override || (typeof PlanTracker !== 'undefined' && PlanTracker.SYSTEM_PROMPT) || '';
     if (agentPrompt) sys = (sys ? sys + '\n\n' : '') + agentPrompt;
   }
-  if (sys) msgs.push({ role: 'system', content: sys });
+  // [3.20 阶段2] 知识库引用约定：本次请求携带 query_knowledge_base 时追加标注规范，
+  // 让模型在用到检索片段时写出行内来源（确定性兜底由消息底部「来源：」标注负责）
+  let kbCite = '';
+  if (typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().some(t => t.function.name === 'query_knowledge_base')) {
+    kbCite = '【知识库引用】使用 query_knowledge_base 的结果回答时，请在对应结论后标注来源，格式为 [来源：文档名·第N段]（N 用工具返回的 segment 字段）；未命中知识库时如实说明，不要编造文档内容。';
+  }
+  if (sys || kbCite) msgs.push({ role: 'system', content: kbCite ? (sys ? sys + '\n\n' + kbCite : kbCite) : sys });
   // [批次修复 #6] 短问候短路：新会话首条 ≤8 字符的纯问候（无引用/附件）→ 系统提示追加精简约束
   const _userMsgs = (AppState.messages || []).filter(m => m.conversationId === conv.id && m.role === 'user');
   const _lastUserText = _userMsgs.length ? String((_userMsgs[_userMsgs.length - 1] || {}).content || '').trim() : '';
@@ -8729,6 +8772,8 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   });
   AppState.generating = true;
   AppState.genController = controller;
+  // [3.20 阶段2] 清空知识库来源收集器：保证上一轮的来源不会串到本轮
+  if (typeof RagSources !== 'undefined') RagSources.clear();
 
   try {
     const result = await promise;
@@ -8759,6 +8804,22 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     }
     // [工具调用] 持久化工具步骤（旧消息无此字段 → 正常显示，向后兼容）
     if (result._toolSteps) assistantMsg.toolCalls = result._toolSteps;
+    // [3.20 阶段2] 知识库来源标注：把 query_knowledge_base 本轮登记的来源并入消息引用
+    // （按相关度降序、按 文档+段号 去重），随后 fillAssistantBody 会渲染「[来源：文档名·第N段]」
+    if (typeof RagSources !== 'undefined') {
+      const rag = RagSources.drain();
+      if (rag.length) {
+        const base = (assistantMsg.citations || []).slice();
+        const seen = new Set(base.map(c => String(c.docId) + '#' + c.chunkIdx));
+        rag.forEach(c => {
+          const k = String(c.docId) + '#' + c.chunkIdx;
+          if (seen.has(k)) return;
+          seen.add(k);
+          base.push(c);
+        });
+        assistantMsg.citations = base;
+      }
+    }
     typingEl.remove();
     // [V3 P3.6] AI 自动命名：标题还是自动截断时，后台静默生成更好的标题
     if (MoraySettings.get('autoNaming') && !conv.renamed && !conv.autoNamed && assistantMsg.content) {
@@ -10760,31 +10821,70 @@ function cosineSimilarity(a, b) {
  * @param {string} text - 全文
  * @param {number} chunkSize - 目标块大小（字符）
  * @param {number} overlap - 重叠字符数
- * @returns {Array<{text:string, meta:string}>} 分块列表 */
+ * @returns {Array<{text:string, meta:string}>} 分块列表（meta = 所属最近标题，用于来源标注） */
 function chunkText(text, chunkSize, overlap) {
   const chunks = [];
   const paras = String(text || '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-  let buf = '';
+  let buf = '', bufMeta = '', heading = '';
+  const collect = (t, m) => { chunks.push({ text: t, meta: m || '' }); };
   paras.forEach(p => {
-    // 标题行作为独立 meta
+    // 标题行（形如 "## 小节名"）作为该块及其后续块的 meta —— 让"第N段"还能带上小节名
+    const h = /^(#{1,6})\s+(\S.*)$/.exec(p);
+    if (h && p.split('\n').length <= 2) heading = h[2].trim().slice(0, 40);
     if (p.length > chunkSize) {
-      if (buf) { chunks.push({ text: buf, meta: '' }); buf = ''; }
+      if (buf) { collect(buf, bufMeta); buf = ''; bufMeta = ''; }
       // 滑窗切分长段落
       for (let i = 0; i < p.length; i += chunkSize - overlap) {
-        chunks.push({ text: p.slice(i, i + chunkSize), meta: '' });
+        collect(p.slice(i, i + chunkSize), heading);
       }
       return;
     }
     if ((buf + '\n\n' + p).length > chunkSize && buf) {
-      chunks.push({ text: buf, meta: '' });
-      buf = p;
+      collect(buf, bufMeta);
+      buf = p; bufMeta = heading;
     } else {
+      if (!buf) bufMeta = heading;
       buf = buf ? buf + '\n\n' + p : p;
     }
   });
-  if (buf) chunks.push({ text: buf, meta: '' });
+  if (buf) collect(buf, bufMeta);
   return chunks;
 }
+
+/** 内置示例文档正文：只写通用使用说明，不编造任何专业数据（首次进入知识库时自动导入，便于立刻跑通 RAG 闭环）
+ * @type {string} */
+const SAMPLE_KB_DOC_TEXT = `# MoRay 快速开始指南
+
+## 这是什么
+MoRay 是一个本地优先的 AI 开发者工作台：对话、多模型对比、提示词库、知识库问答与自动化工作流都在一个页面里完成。
+数据默认保存在浏览器本机（IndexedDB），启动本地后端后可与本机 SQLite 双向同步。
+
+## 第一次使用
+1. 左上角导航依次是：对话、提示词、片段、设置、文档库、自动化、成本中心。
+2. 对话页底部是输入台：直接输入问题回车发送；输入「/」可以呼出快捷指令。
+3. 想用本地模型，请在设置页填写 Ollama 地址（默认 http://localhost:11434），再在模型下拉里选择已下载的模型。
+4. 想用云端模型，请在设置页填入自己的 API Key（BYOK：Key 只保存在本机浏览器）。
+
+## 知识库怎么用
+- 进入「文档库」页，拖入或点击选择 .txt / .md / .json 等文本文件，MoRay 会自动解析、按段落分块并建立索引。
+- 开启「本机工具」开关后，可以直接问「知识库里关于 X 的内容」，模型会调用 query_knowledge_base 工具检索，并在回答下方标注来源。
+- 检索优先使用本地 Ollama 的 embedding 模型（如 nomic-embed-text）；没有检测到 embedding 模型时会自动降级为关键词检索，功能不受影响。
+- 文档列表支持预览、重新索引、单篇删除与清空；重新索引用于更换 embedding 模型后重建向量。
+
+## 多步 Agent 与本机工具
+- 打开输入台的「本机工具」开关后，模型可以读取和修改受控工作区内的文件，并先提交一份计划再逐步执行。
+- 涉及写文件、改文件、移动文件的步骤都需要你在审批卡上确认；只读操作（列出目录、读文件、找文件、搜文本、查看进程与系统信息）直接执行。
+- 每一步都会在时间线上留痕，可以在设置页查看审计日志。
+
+## 数据与隐私
+- 对话、提示词、片段、知识库文档都保存在本机；除你自己配置的模型服务外，不向任何第三方发送数据。
+- 设置页提供导出/导入备份，换机器时可以先导出再导入。
+
+## 常见问题
+- 找不到本地模型：确认 Ollama 已启动，且模型已下载（ollama pull <模型名>）。
+- 回答里没有来源标注：说明这次回答没有命中知识库内容，可以换更具体的问法，或先确认文档已完成索引。
+- 后端显示未启动：不影响本地对话与知识库，只是暂时不能多设备同步；双击「启动MoRay.bat」可启动本地后端。
+`;
 
 /** 文档库应用 */
 const DocsApp = {
@@ -10804,14 +10904,18 @@ const DocsApp = {
           <i data-lucide="book-open" class="w-4 h-4 text-brand-violet"></i>
           <span class="text-sm font-medium text-text-primary">文档知识库</span>
           <span class="tag-pill bg-brand-violet/15 text-brand-violet" id="docCountPill">0 篇文档</span>
+          <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="ragModePill" title="">检索模式：探测中</span>
         </div>
         <div class="flex items-center gap-2">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragClearAllBtn" title="删除全部文档与索引">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>清空
+          </button>
           <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragSettingsBtn">
             <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>知识库设置
           </button>
           <div class="relative w-56">
             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-tertiary"></i>
-            <input type="text" id="docSearchInput" placeholder="语义检索文档内容..." class="w-full h-8 pl-9 pr-3 rounded-lg bg-surface-card border border-line-ghost text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none">
+            <input type="text" id="docSearchInput" placeholder="语义/关键词检索文档内容..." class="w-full h-8 pl-9 pr-3 rounded-lg bg-surface-card border border-line-ghost text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none">
           </div>
         </div>
       </div>
@@ -10863,15 +10967,38 @@ const DocsApp = {
       search.value = '';
     });
     on(document.getElementById('ragSettingsBtn'), 'click', () => this.openSettings());
+    on(document.getElementById('ragClearAllBtn'), 'click', () => this.clearAll());
     refreshIcons();
+  },
+
+  /** 清空知识库（全部文档 + 分块 + 向量）
+   * @returns {Promise<void>} */
+  async clearAll() {
+    if (!this.cache.length) { showNotification('知识库为空', '当前没有可清空的文档', 'info', 1800); return; }
+    const n = this.cache.length;
+    showConfirm('清空知识库', `确定删除全部 ${n} 篇文档及其分块与向量？此操作不可恢复。`, async () => {
+      for (const d of this.cache.slice()) {
+        try { await DB.deleteDocument(d.id); } catch (e) { console.error(e); }
+      }
+      this.cache = [];
+      this.renderList(); this.renderDocSidebar();
+      showNotification('已清空', `${n} 篇文档已删除`, 'success', 1800);
+    }, { danger: true, okText: '全部删除' });
   },
 
   /** 加载并渲染
    * @returns {Promise<void>} */
   async reload() {
     try { this.cache = await DB.listDocuments(); } catch (e) { this.cache = []; console.error(e); }
+    let seeded = false;
+    try { seeded = await this.ensureSampleDoc(); } catch (e) { seeded = false; }
+    if (seeded) {
+      try { this.cache = await DB.listDocuments(); } catch (e) { /* 忽略 */ }
+    }
     this.renderList();
     this.renderDocSidebar();
+    // 空闲时后台探测检索模式（不阻塞页面渲染，也不打扰用户）
+    this.probeRetrieval(false).catch(() => { /* 忽略 */ });
   },
 
   /** 渲染文档列表
@@ -10884,7 +11011,9 @@ const DocsApp = {
     if (!this.cache.length) {
       // [V3 P2.5] 统一空状态
       list.innerHTML = renderEmptyState({
-        icon: 'book-open', title: '上传文档构建知识库', desc: 'PDF / Markdown / TXT / DOCX 自动解析、分块并向量化', actionText: '上传文档', dragHint: true
+        icon: 'book-open', title: '导入文档构建知识库',
+        desc: '支持 .txt / .md / .json 等文本文件（也支持 PDF / DOCX），自动分块并建立索引；已为你内置一篇《MoRay 快速开始指南》示例文档',
+        actionText: '导入文档', dragHint: true
       });
       bindEmptyAction(list, () => { const inp = document.getElementById('docFileInput'); if (inp) inp.click(); });
       refreshIcons();
@@ -10896,6 +11025,7 @@ const DocsApp = {
       const statusText = d.status === 'ready' ? '已索引' : d.status === 'error' ? '解析失败' : '处理中';
       const idx = (d.chunks || []).length;
       const embedded = (d.chunks || []).filter(c => c.embedding).length;
+      const chars = (d.chunks || []).reduce((s, c) => s + (c.text || '').length, 0);
       return `
       <div class="doc-card p-4" data-doc-id="${d.id}">
         <div class="flex items-center justify-between gap-3">
@@ -10904,8 +11034,8 @@ const DocsApp = {
               <i data-lucide="${d.type === 'pdf' ? 'file-text' : d.type === 'code' ? 'file-code' : 'file-text'}" class="w-4 h-4 text-brand-violet"></i>
             </div>
             <div class="min-w-0">
-              <div class="text-sm text-text-primary truncate">${escapeHtml(d.name)}</div>
-              <div class="text-[10px] text-text-tertiary">${formatBytes(d.size)} · ${idx} 块${d.status === 'ready' ? ' · 已向量化 ' + embedded + ' 块' : ''} · ${relTime(d.createdAt)}</div>
+              <div class="text-sm text-text-primary truncate flex items-center gap-1.5">${escapeHtml(d.name)}${d.sample ? '<span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt">示例</span>' : ''}</div>
+              <div class="text-[10px] text-text-tertiary">${formatBytes(d.size)} · ${chars} 字 · ${idx} 段${d.status === 'ready' ? ' · 已向量化 ' + embedded + ' 段' : ''} · 导入于 ${relTime(d.createdAt)}</div>
             </div>
           </div>
           <div class="flex items-center gap-2 flex-shrink-0">
@@ -11076,23 +11206,33 @@ const DocsApp = {
   },
 
   /**
-   * 向量化文档分块：优先 Ollama embedding，失败回退本地哈希向量
+   * 建索引：与检索模式保持一致 —— auto = Ollama embedding 可用则向量化，否则不做向量化
+   * （检索走关键词模式，无需向量；避免无意义地拉取 CDN 模型与算哈希向量）
    * @param {Object} doc - 文档对象
    * @returns {Promise<void>} */
   async embedDocument(doc) {
     doc.status = 'indexing';
     await DB.putDocument(doc);
     this.renderList();
-    // [阶段三] 后端链：auto=Ollama优先 -> Transformers.js -> Hash；显式指定则强制
     const backend = MoraySettings.get('embeddingBackend') || 'auto';
     let mode = 'hash';
     if (backend === 'transformers') {
       mode = (await TransformersEmbedder.load()) ? 'transformers' : 'hash';
-    } else if (backend === 'auto') {
-      if (AI.backend === 'ollama') {
-        try { await AI.embed(MoraySettings.get('embeddingModel'), 'test'); mode = 'ollama'; } catch (e) { /* 探测失败 */ }
-      }
-      if (mode === 'hash') mode = (await TransformersEmbedder.load()) ? 'transformers' : 'hash';
+    } else if (backend === 'hash') {
+      mode = 'hash';
+    } else if (backend === 'ollama') {
+      try { await AI.embed(MoraySettings.get('embeddingModel'), 'test'); mode = 'ollama'; } catch (e) { mode = 'hash'; }
+    } else {
+      // auto：探测到可用 embedding 模型才向量化，否则直接进入关键词检索模式（本次 3.20 阶段2 调整）
+      const probe = await this.probeRetrieval(true);
+      mode = probe.mode === 'embedding' ? 'ollama' : 'keyword';
+    }
+    if (mode === 'keyword') {
+      doc.status = 'ready';
+      await DB.putDocument(doc);
+      this.renderList();
+      this.renderDocSidebar();
+      return;
     }
     if (mode === 'hash') {
       // 哈希向量批量走 Web Worker（不阻塞 UI），不可用回退主线程
@@ -11120,27 +11260,13 @@ const DocsApp = {
   },
 
   /**
-   * 语义检索：查询向量化 -> 余弦 Top-K
+   * 语义/关键词检索（UI 入口）：检索 → 高亮渲染
    * @param {string} query - 查询文本
    * @returns {Promise<Array<{doc:Object, chunk:Object, score:number}>>} 结果 */
   async semanticSearch(query) {
     if (!query) return [];
-    let qvec = null;
-    if (AI.backend === 'ollama') {
-      try { qvec = await AI.embed(MoraySettings.get('embeddingModel'), query); } catch (e) { /* 回退 */ }
-    }
-    if (!qvec) qvec = localHashVector(query);
-    const results = [];
-    for (const doc of this.cache) {
-      (doc.chunks || []).forEach(chunk => {
-        if (!chunk.embedding) return;
-        const score = cosineSimilarity(qvec, chunk.embedding);
-        if (score > 0.01) results.push({ doc, chunk, score });
-      });
-    }
-    results.sort((a, b) => b.score - a.score);
-    const topK = MoraySettings.get('ragTopK') || 4;
-    const top = results.slice(0, topK);
+    const top = (await this.retrieve(query)).slice(0, MoraySettings.get('ragTopK') || 4);
+    if (!top.length) { this.renderSearchResults(query, top); return top; }
     this.renderSearchResults(query, top);
     return top;
   },
@@ -11165,7 +11291,7 @@ const DocsApp = {
       return `<div class="chunk-item" data-search-doc="${r.doc.id}" data-search-chunk="${r.chunk.idx}" style="cursor:pointer">
         <div class="flex items-center justify-between mb-1">
           <span class="text-brand-cyan">${escapeHtml(r.doc.name)}</span>
-          <span class="text-text-tertiary">相似度 ${(r.score * 100).toFixed(1)}%</span>
+          <span class="text-text-tertiary">${(this._retrieval && this._retrieval.mode === 'keyword') ? '相关度' : '相似度'} ${(r.score * 100).toFixed(1)}%</span>
         </div>
         <div>${text}…</div>
       </div>`;
@@ -11190,16 +11316,138 @@ const DocsApp = {
     return { text: ctx, citations };
   },
 
-  /** 原始检索（不渲染UI）
+  /** 原始检索（不渲染UI；工具 query_knowledge_base 与对话 RAG 都走这里）
    * @param {string} query - 查询
-   * @returns {Promise<Array>} 结果 */
+   * @returns {Promise<Array>} 结果（按相关度降序） */
   async semanticSearchRaw(query) {
-    if (!this.cache.length) return [];
-    let qvec = null;
-    if (AI.backend === 'ollama') {
-      try { qvec = await AI.embed(MoraySettings.get('embeddingModel'), query); } catch (e) { /* 回退 */ }
+    return this.retrieve(query);
+  },
+
+  /* ---------- [3.20 阶段2] 检索模式：优先 Ollama embedding，缺失自动降级关键词 ---------- */
+
+  /** 检索模式探测缓存 @type {?{mode:string, model:string, reason:string}} */
+  _retrieval: null,
+  /** 探测中的 Promise（并发去重） @type {?Promise} */
+  _retrievalPromise: null,
+  /** 关键词降级提示是否已弹（每会话一次，避免刷屏） @type {boolean} */
+  _keywordHinted: false,
+
+  /** 探测知识库检索模式：先看 Ollama /api/tags 里有没有可用的 embedding 模型，
+   * 有就真机调一次确认可用；没有则降级关键词检索（不报错，只给一次温和提示）。
+   * @param {boolean} [force] - 强制重新探测（设置变更/重新索引时用）
+   * @returns {Promise<{mode:'embedding'|'keyword', model:string, reason:string}>} 探测结果 */
+  async probeRetrieval(force) {
+    if (!force && this._retrieval) return this._retrieval;
+    if (!force && this._retrievalPromise) return this._retrievalPromise;
+    this._retrievalPromise = (async () => {
+      const want = MoraySettings.get('embeddingModel') || 'nomic-embed-text';
+      const out = { mode: 'keyword', model: want, reason: '' };
+      if (typeof AI === 'undefined') { out.reason = 'AI 模块未加载'; return out; }
+      if (AI.backend !== 'ollama') { out.reason = '当前模型后端不是本地 Ollama'; return out; }
+      let names = [];
+      try {
+        const res = await fetch(AI.ollamaURL + '/api/tags', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const j = await res.json();
+        names = (j.models || []).map(m => String(m.name || m.model || ''));
+      } catch (e) { out.reason = '无法读取 Ollama 模型列表'; return out; }
+      const isEmbed = (n) => /embed|bge|gte|m3e|text2vec|jina|e5-/i.test(n);
+      const base = want.split(':')[0];
+      const hit = names.find(n => isEmbed(n) && n.indexOf(base) === 0) || names.find(isEmbed);
+      if (!hit) { out.reason = '未检测到 embedding 模型（如 nomic-embed-text）'; return out; }
+      try {
+        await AI.embed(hit, 'probe'); // 真机验证：只列名不работ 的模型按不可用处理
+        out.mode = 'embedding';
+        out.model = hit;
+      } catch (e) { out.reason = 'embedding 调用失败：' + String((e && e.message) || e).slice(0, 60); }
+      return out;
+    })();
+    this._retrieval = await this._retrievalPromise;
+    this._retrievalPromise = null;
+    this.renderModePill();
+    return this._retrieval;
+  },
+
+  /** 确保模式已知（首次检索时探测），降级为关键词时给一次性提示
+   * @returns {Promise<{mode:string, model:string, reason:string}>} 探测结果 */
+  async ensureRetrieval() {
+    const r = await this.probeRetrieval(false);
+    if (r.mode === 'keyword' && !this._keywordHinted) {
+      this._keywordHinted = true;
+      showNotification('未检测到 embedding 模型，使用关键词检索',
+        (r.reason ? r.reason + '。' : '') + '可在「知识库设置」里指定本地 Ollama embedding 模型（如 nomic-embed-text）以获得语义检索',
+        'info', 5200);
     }
-    if (!qvec) qvec = localHashVector(query);
+    return r;
+  },
+
+  /** 刷新页头的检索模式徽标（真实反映当前模式，不是装饰） */
+  renderModePill() {
+    const pill = document.getElementById('ragModePill');
+    if (!pill) return;
+    const r = this._retrieval;
+    if (!r) { pill.textContent = '检索模式：探测中'; pill.title = ''; return; }
+    if (r.mode === 'embedding') {
+      pill.textContent = '语义检索 · ' + r.model;
+      pill.title = '使用 Ollama embedding 模型：' + r.model;
+      pill.className = 'tag-pill bg-brand-cyan/15 text-brand-cyan';
+    } else {
+      pill.textContent = '关键词检索';
+      pill.title = (r.reason || '') + '（降级为关键词检索，功能不受影响）';
+      pill.className = 'tag-pill bg-brand-cobalt/15 text-brand-cobalt';
+    }
+  },
+
+  /** 关键词检索打分（0~1）：词命中率 70% + 词频密度 30%
+   * @param {string} query - 查询
+   * @param {string} text - 片段
+   * @returns {number} 分值 */
+  keywordScore(query, text) {
+    const terms = String(query || '').toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, ' ').split(/\s+/).filter(t => t.length > 1);
+    if (!terms.length) return 0;
+    const lower = String(text || '').toLowerCase();
+    let hit = 0, freq = 0;
+    terms.forEach(t => {
+      if (lower.indexOf(t) < 0) return;
+      hit++;
+      let from = 0, c = 0;
+      while (c < 20) { const p = lower.indexOf(t, from); if (p < 0) break; c++; from = p + t.length; }
+      freq += c;
+    });
+    if (!hit) return 0;
+    const coverage = hit / terms.length;
+    const density = Math.min(1, freq / (lower.length / 120 + 1));
+    return coverage * 0.7 + density * 0.3;
+  },
+
+  /** 关键词检索（无 embedding 模型时的降级路径，与向量检索共用返回结构）
+   * @param {string} query - 查询
+   * @returns {Array<{doc:Object, chunk:Object, score:number}>} 结果 */
+  keywordRetrieve(query) {
+    const results = [];
+    for (const doc of this.cache) {
+      (doc.chunks || []).forEach(chunk => {
+        const s = this.keywordScore(query, chunk.text);
+        if (s > 0) results.push({ doc, chunk, score: s });
+      });
+    }
+    results.sort((a, b) => b.score - a.score);
+    return results;
+  },
+
+  /** 统一检索入口：按已探测的模式走向量检索或关键词检索（两模式共用同一返回结构，
+   * 因此 query_knowledge_base 工具与对话 RAG 都不需要关心当前是哪种模式）
+   * @param {string} query - 查询文本
+   * @returns {Promise<Array<{doc:Object, chunk:Object, score:number}>>} 结果（降序） */
+  async retrieve(query) {
+    if (!this.cache.length) return [];
+    const q = String(query || '').trim();
+    if (!q) return [];
+    const r = await this.ensureRetrieval();
+    if (r.mode !== 'embedding') return this.keywordRetrieve(q);
+    let qvec = null;
+    try { qvec = await AI.embed(r.model || MoraySettings.get('embeddingModel'), q); } catch (e) { qvec = null; }
+    if (!qvec) return this.keywordRetrieve(q); // embedding 运行期不可用 → 本次退关键词
     const results = [];
     for (const doc of this.cache) {
       (doc.chunks || []).forEach(chunk => {
@@ -11208,12 +11456,36 @@ const DocsApp = {
       });
     }
     // [夜间优化4.4] 混合检索：向量相似度 70% + 关键词重合度 30%（轻量重排）
-    results.forEach(r => {
-      const kw = typeof keywordOverlap === 'function' ? keywordOverlap(query, r.chunk.text) : 0;
-      r.score = r.score * 0.7 + kw * 0.3;
+    results.forEach(rr => {
+      const kw = typeof keywordOverlap === 'function' ? keywordOverlap(q, rr.chunk.text) : 0;
+      rr.score = rr.score * 0.7 + kw * 0.3;
     });
     results.sort((a, b) => b.score - a.score);
     return results;
+  },
+
+  /** 首次进入知识库时导入内置示例文档「MoRay 快速开始指南」，
+   * 保证零文档状态下也能立刻跑通「提问 → 检索 → 来源标注」闭环。
+   * 只在从未导入过且当前一篇文档都没有时执行一次（localStorage 标记）。
+   * @returns {Promise<boolean>} 是否导入了示例文档 */
+  async ensureSampleDoc() {
+    try {
+      if (localStorage.getItem('moray_kb_seeded') === '1') return false;
+      if (this.cache.length) { localStorage.setItem('moray_kb_seeded', '1'); return false; }
+      const chunkSize = MoraySettings.get('chunkSize') || 600;
+      const overlap = MoraySettings.get('chunkOverlap') || 100;
+      const text = SAMPLE_KB_DOC_TEXT;
+      const chunks = chunkText(text, chunkSize, overlap)
+        .map((c, i) => ({ id: uid('chunk'), idx: i, text: c.text, meta: c.meta, embedding: null }));
+      const doc = {
+        id: uid('doc'), name: 'MoRay 快速开始指南.md', size: text.length, type: 'markdown',
+        status: 'ready', chunks, createdAt: Date.now(), tags: ['示例'], sample: true, error: ''
+      };
+      await DB.putDocument(doc);
+      this.cache.push(doc);
+      localStorage.setItem('moray_kb_seeded', '1');
+      return true;
+    } catch (e) { return false; } // 示例文档失败绝不影响知识库本身
   },
 
   /** 文档预览（分块浏览，可跳转到指定块）
@@ -12375,6 +12647,498 @@ const AutomationPage = {
   }
 };
 
+/* ===================== [3.20 阶段3.2] 任务分派面板（A2A 子集） =====================
+ * 能力边界（诚实说明，不做"假装"功能）：
+ *  - 本面板**不与外部 agent 建立实时通信通道**。真实的 A2A（agent 之间互相调用/回传）
+ *    需要对方平台开放接口与鉴权，MoRay 目前不具备，所以这里只做能真正工作的两件事：
+ *    ① 结构化任务指令生成（项目路径/背景/要求/验收标准模板）+ 一键复制到剪贴板；
+ *    ② 任务状态管理（待办/进行中/已完成/失败）+ 备注 + 删除，localStorage 持久化。
+ *  - 若设置里已配置 OpenAI 兼容云端 API，"直接执行"按钮才出现（未配置时**不渲染**，
+ *    而不是渲染一个点不动的灰按钮）；点击后用该 API 跑这条任务并把结果回填到任务备注。
+ *
+ * 实现约束：不动 moray-workbench.html 骨架 —— 导航按钮与页面容器均由本分片在运行时注入，
+ * 并自带与骨架一致的页面切换逻辑（骨架的切换脚本在解析期只绑定已存在的按钮）。
+ */
+(function () {
+  const LS_KEY = 'moray_task_dispatch_v1';
+  const PAGE = 'tasks';
+
+  /** 目标 agent 预设（自定义项由用户填写名称） */
+  const AGENTS = [
+    { id: 'zcode', name: 'ZCode' },
+    { id: 'codex', name: 'Codex' },
+    { id: 'doubao', name: '豆包' },
+    { id: 'claude-code', name: 'Claude Code' },
+    { id: 'cursor', name: 'Cursor' },
+    { id: 'custom', name: '自定义…' }
+  ];
+  const STATUS = [
+    { id: 'todo', name: '待办', cls: 'bg-text-tertiary/15 text-text-tertiary' },
+    { id: 'doing', name: '进行中', cls: 'bg-brand-cyan/15 text-brand-cyan' },
+    { id: 'done', name: '已完成', cls: 'bg-success/15 text-success' },
+    { id: 'failed', name: '失败', cls: 'bg-danger/15 text-danger' }
+  ];
+  const DEFAULT_ACCEPT = '1. 功能真实可用（没有假按钮 / 假数据 / 假状态）\n2. 通过项目现有测试或自测命令\n3. 给出改动文件清单与关键实现说明';
+
+  /** 本地状态（localStorage 持久化；结构损坏时安全回退为空） */
+  let state = { tasks: [], seq: 1, projectPath: '', customAgent: '', lastForm: null };
+  /** 当前是否有任务正在执行（防重复点击） */
+  let running = false;
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const o = JSON.parse(raw);
+      if (o && Array.isArray(o.tasks)) {
+        state = {
+          tasks: o.tasks.filter(t => t && t.id),
+          seq: parseInt(o.seq, 10) || (o.tasks.length + 1),
+          projectPath: typeof o.projectPath === 'string' ? o.projectPath : '',
+          customAgent: typeof o.customAgent === 'string' ? o.customAgent : '',
+          lastForm: o.lastForm || null
+        };
+      }
+    } catch (e) { /* 损坏数据不阻塞面板 */ }
+  }
+
+  function save() {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(state)); return true; }
+    catch (e) { return false; }
+  }
+
+  function uid() { return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+  function esc(s) {
+    if (typeof escapeHtml === 'function') return escapeHtml(String(s == null ? '' : s));
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function agentName(id) {
+    if (id === 'custom') return state.customAgent || '自定义 Agent';
+    const a = AGENTS.find(x => x.id === id);
+    return a ? a.name : id;
+  }
+
+  function statusMeta(id) { return STATUS.find(s => s.id === id) || STATUS[0]; }
+
+  /** 生成结构化任务指令（含项目路径/背景/要求/验收标准模板）
+   * @param {Object} t - 任务对象
+   * @returns {string} 指令全文（纯文本，便于直接粘贴到任何 agent 的输入框） */
+  function buildInstruction(t) {
+    const lines = [];
+    lines.push('# 任务：' + (t.name || '（未命名任务）'));
+    lines.push('');
+    lines.push('## 目标 Agent');
+    lines.push(agentName(t.agent));
+    lines.push('');
+    lines.push('## 项目路径');
+    lines.push(t.projectPath ? t.projectPath : '（未填写：请在目标 agent 中打开对应工程目录后执行）');
+    lines.push('');
+    lines.push('## 背景');
+    lines.push(t.background ? t.background : '（未填写）');
+    lines.push('');
+    lines.push('## 需要完成的事情');
+    lines.push(t.requirements ? t.requirements : '（未填写）');
+    lines.push('');
+    lines.push('## 验收标准');
+    lines.push(t.acceptance ? t.acceptance : DEFAULT_ACCEPT);
+    lines.push('');
+    lines.push('## 交付要求');
+    lines.push('- 完成后给出改动文件清单与关键实现说明（文件路径 + 行号）。');
+    lines.push('- 给出可复现的运行/自测命令与结果；测试不通过要如实说明。');
+    lines.push('- 做不到的部分要诚实写进结论，不要假装完成。');
+    return lines.join('\n');
+  }
+
+  /** 复制到剪贴板：优先 Clipboard API，非安全上下文回退 textarea + execCommand
+   * @param {string} text - 待复制文本
+   * @returns {Promise<boolean>} 是否复制成功 */
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { /* 继续回退 */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', 'readonly');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch (e) { return false; }
+  }
+
+  /* ---------------- 注入：导航按钮 + 页面容器 ---------------- */
+
+  function ensureNavButton() {
+    if (document.querySelector('.nav-icon-btn[data-page="' + PAGE + '"]')) return;
+    const nav = document.querySelector('.nav-icon-btn[data-page="cost"]') ?
+      document.querySelector('.nav-icon-btn[data-page="cost"]').parentElement : null;
+    if (!nav) return;
+    const btn = document.createElement('button');
+    btn.className = 'nav-icon-btn';
+    btn.setAttribute('data-page', PAGE);
+    btn.setAttribute('data-tooltip', '任务分派');
+    btn.innerHTML = '<i data-lucide="send" class="w-[18px] h-[18px]"></i>';
+    nav.appendChild(btn);
+    // 骨架的页面切换脚本在解析期就绑定了当时存在的按钮，这里补一个等价的切换逻辑
+    btn.addEventListener('click', () => {
+      switchTo(PAGE);
+      const page = document.getElementById('page-' + PAGE);
+      const formCard = page && page.querySelector('#taskFormCard');
+      const formOpen = formCard && formCard.style.display !== 'none';
+      if (page && !formOpen) buildPage(); // 重新计算「直接执行」入口是否可用（设置里可能刚配好云端 API）
+    });
+  }
+
+  function ensurePage() {
+    if (document.getElementById('page-' + PAGE)) return;
+    const ref = document.getElementById('page-cost');
+    if (!ref || !ref.parentElement) return;
+    const div = document.createElement('div');
+    div.id = 'page-' + PAGE;
+    div.className = 'page-panel hidden flex-1 flex flex-col min-h-0';
+    ref.parentElement.insertBefore(div, ref.nextSibling);
+  }
+
+  /** 与骨架一致的页面切换（本页无独立侧栏，故只切 page-panel 与导航激活态） */
+  function switchTo(page) {
+    document.querySelectorAll('.nav-icon-btn[data-page]').forEach(b => {
+      b.classList.toggle('active', b.dataset.page === page);
+    });
+    document.querySelectorAll('.page-panel').forEach(p => {
+      p.classList.add('hidden');
+      p.classList.remove('flex');
+    });
+    const target = document.getElementById('page-' + page);
+    if (target) {
+      target.classList.remove('hidden');
+      target.classList.add('flex');
+      void target.offsetWidth;
+    }
+    document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
+    const sb = document.getElementById('sidebar-' + page);
+    if (sb) { sb.classList.remove('hidden'); sb.classList.add('flex'); }
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /* ---------------- 渲染 ---------------- */
+
+  function buildPage() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const cloudReady = !!(typeof MoraySettings !== 'undefined' && MoraySettings.get('openaiEnabled') &&
+      MoraySettings.get('openaiBaseURL'));
+    page.innerHTML = `
+      <div class="h-14 px-5 flex items-center justify-between border-b border-line-ghost/50 flex-shrink-0">
+        <div class="flex items-center gap-2">
+          <i data-lucide="send" class="w-4 h-4 text-brand-cobalt"></i>
+          <span class="text-sm font-medium text-text-primary">任务分派</span>
+          <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="taskCountPill">0 个任务</span>
+          <span class="text-[11px] text-text-tertiary" title="真实 A2A 需要对方平台开放接口；本面板负责指令生成与状态管理">指令生成 + 状态管理（非实时通信）</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="taskClearDoneBtn" title="删除全部已完成任务">
+            <i data-lucide="eraser" class="w-3.5 h-3.5"></i>清理已完成
+          </button>
+          <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5" id="taskNewBtn">
+            <i data-lucide="plus" class="w-3.5 h-3.5"></i>新建任务
+          </button>
+        </div>
+      </div>
+      <div class="flex-1 overflow-y-auto p-5">
+        <div class="max-w-4xl mx-auto space-y-4">
+          <div class="glass-card rounded-xl p-4 space-y-3" id="taskFormCard" style="display:none">
+            <div class="text-xs font-medium text-text-secondary">新建任务</div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div class="form-row"><label class="form-label">任务名称</label>
+                <input type="text" id="taskName" class="form-input" placeholder="例如：给 MoRay 增加壁纸联动主题"></div>
+              <div class="form-row"><label class="form-label">目标 Agent</label>
+                <select id="taskAgent" class="form-input">${AGENTS.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
+              <div class="form-row" id="taskCustomAgentRow" style="display:none"><label class="form-label">自定义 Agent 名称</label>
+                <input type="text" id="taskCustomAgent" class="form-input" placeholder="例如：某公司内部 Agent"></div>
+              <div class="form-row"><label class="form-label">项目路径</label>
+                <input type="text" id="taskProjectPath" class="form-input" placeholder="例如：D:\\ai工具台"></div>
+            </div>
+            <div class="form-row"><label class="form-label">背景</label>
+              <textarea id="taskBackground" class="form-input" rows="2" placeholder="这个任务的来龙去脉、当前状态、相关约束"></textarea></div>
+            <div class="form-row"><label class="form-label">需要完成的事情</label>
+              <textarea id="taskRequirements" class="form-input" rows="3" placeholder="一条一条写清楚要做的事"></textarea></div>
+            <div class="form-row"><label class="form-label">验收标准</label>
+              <textarea id="taskAcceptance" class="form-input" rows="3" placeholder="留空则使用默认三条（真实可用 / 通过测试 / 改动清单）"></textarea></div>
+            <div class="flex items-center gap-2">
+              <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5" id="taskSaveBtn">
+                <i data-lucide="check" class="w-3.5 h-3.5"></i>保存并生成指令</button>
+              <button class="btn-ghost px-3 h-8 rounded-lg text-xs border border-line-ghost" id="taskCancelBtn">取消</button>
+            </div>
+          </div>
+          <div class="glass-card rounded-xl p-4 space-y-2" id="taskPreviewCard" style="display:none">
+            <div class="flex items-center justify-between">
+              <div class="text-xs font-medium text-text-secondary">生成的指令</div>
+              <button class="btn-ghost px-2.5 h-7 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="taskCopyBtn">
+                <i data-lucide="copy" class="w-3 h-3"></i>复制到剪贴板</button>
+            </div>
+            <textarea id="taskPreview" class="form-input font-mono text-[11px]" rows="12" readonly></textarea>
+            <div class="text-[10px] text-text-tertiary">把这段指令整段粘贴到目标 agent 的会话里即可；它包含项目路径、背景、要做的事与验收标准。</div>
+          </div>
+          <div>
+            <h3 class="text-xs font-medium text-text-secondary mb-3">任务列表</h3>
+            <div class="space-y-2" id="taskList"></div>
+          </div>
+        </div>
+      </div>`;
+    bindForm(cloudReady);
+    renderList(cloudReady);
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  function bindForm(cloudReady) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const on = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+    on(page.querySelector('#taskNewBtn'), 'click', () => {
+      const card = page.querySelector('#taskFormCard');
+      card.style.display = '';
+      const f = state.lastForm || {};
+      page.querySelector('#taskName').value = '';
+      page.querySelector('#taskAgent').value = f.agent || 'zcode';
+      page.querySelector('#taskCustomAgent').value = state.customAgent || '';
+      page.querySelector('#taskProjectPath').value = f.projectPath || state.projectPath || '';
+      page.querySelector('#taskBackground').value = '';
+      page.querySelector('#taskRequirements').value = '';
+      page.querySelector('#taskAcceptance').value = '';
+      syncCustomAgentRow();
+    });
+    on(page.querySelector('#taskCancelBtn'), 'click', () => { page.querySelector('#taskFormCard').style.display = 'none'; });
+    on(page.querySelector('#taskAgent'), 'change', syncCustomAgentRow);
+    on(page.querySelector('#taskSaveBtn'), 'click', () => {
+      const name = page.querySelector('#taskName').value.trim();
+      if (!name) { if (typeof showNotification === 'function') showNotification('缺少任务名称', '请先填写任务名称', 'warning', 2500); return; }
+      const agent = page.querySelector('#taskAgent').value;
+      const custom = page.querySelector('#taskCustomAgent').value.trim();
+      const projectPath = page.querySelector('#taskProjectPath').value.trim();
+      if (agent === 'custom' && !custom) {
+        if (typeof showNotification === 'function') showNotification('缺少自定义 Agent 名称', '请填写自定义 Agent 名称', 'warning', 2500);
+        return;
+      }
+      state.customAgent = custom;
+      state.projectPath = projectPath;
+      const t = {
+        id: uid(), name, agent, projectPath,
+        background: page.querySelector('#taskBackground').value.trim(),
+        requirements: page.querySelector('#taskRequirements').value.trim(),
+        acceptance: page.querySelector('#taskAcceptance').value.trim(),
+        status: 'todo', note: '', result: '', createdAt: Date.now(), updatedAt: Date.now()
+      };
+      state.tasks.unshift(t);
+      state.seq += 1;
+      state.lastForm = { agent, projectPath };
+      const persisted = save();
+      page.querySelector('#taskFormCard').style.display = 'none';
+      renderList(cloudReady);
+      showPreview(t);
+      if (typeof showNotification === 'function') {
+        showNotification('任务已创建', persisted ? '指令已生成，可一键复制' : '本地存储写入失败（可能空间不足），本次任务仅在当前页面有效', persisted ? 'success' : 'warning', 2600);
+      }
+    });
+    on(page.querySelector('#taskCopyBtn'), 'click', async () => {
+      const txt = page.querySelector('#taskPreview').value;
+      const ok = await copyText(txt);
+      if (typeof showNotification === 'function') {
+        showNotification(ok ? '已复制' : '复制失败', ok ? '指令已复制到剪贴板，去粘贴给目标 agent 即可' : '当前环境不允许自动复制，请手动全选文本框内容', ok ? 'success' : 'warning', 2600);
+      }
+    });
+    on(page.querySelector('#taskClearDoneBtn'), 'click', () => {
+      const done = state.tasks.filter(t => t.status === 'done');
+      if (!done.length) { if (typeof showNotification === 'function') showNotification('没有已完成任务', '先把任务状态标记为「已完成」再清理', 'info', 2200); return; }
+      const doClear = () => {
+        state.tasks = state.tasks.filter(t => t.status !== 'done');
+        save(); renderList(cloudReady);
+        if (typeof showNotification === 'function') showNotification('已清理', `删除 ${done.length} 个已完成任务`, 'success', 1800);
+      };
+      if (typeof showConfirm === 'function') showConfirm('清理已完成任务', `确定删除 ${done.length} 个已完成任务？`, doClear, { okText: '删除' });
+      else doClear();
+    });
+  }
+
+  function syncCustomAgentRow() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const row = page.querySelector('#taskCustomAgentRow');
+    const sel = page.querySelector('#taskAgent');
+    if (row && sel) row.style.display = (sel.value === 'custom') ? '' : 'none';
+  }
+
+  function showPreview(t) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    page.querySelector('#taskPreviewCard').style.display = '';
+    page.querySelector('#taskPreview').value = buildInstruction(t);
+    page.querySelector('#taskPreview').dataset.taskId = t.id;
+  }
+
+  function renderList(cloudReady) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const list = page.querySelector('#taskList');
+    const pill = page.querySelector('#taskCountPill');
+    if (pill) pill.textContent = state.tasks.length + ' 个任务';
+    if (!state.tasks.length) {
+      list.innerHTML = `<div class="glass-card rounded-xl p-6 text-center">
+        <i data-lucide="clipboard-list" class="w-7 h-7 mx-auto mb-2 text-text-tertiary"></i>
+        <div class="text-sm text-text-primary mb-1">还没有任务</div>
+        <div class="text-[11px] text-text-tertiary">点右上角「新建任务」：填好名称、目标 agent 与要求，MoRay 会生成一份可直接粘贴的结构化指令。</div>
+      </div>`;
+      if (typeof refreshIcons === 'function') refreshIcons();
+      return;
+    }
+    list.innerHTML = state.tasks.map(t => {
+      const sm = statusMeta(t.status);
+      return `<div class="doc-card p-4" data-task-id="${esc(t.id)}">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0 flex-1">
+            <div class="text-sm text-text-primary flex items-center gap-2 flex-wrap">
+              <span class="truncate">${esc(t.name)}</span>
+              <span class="tag-pill ${sm.cls}">${esc(sm.name)}</span>
+              <span class="tag-pill bg-brand-violet/15 text-brand-violet">${esc(agentName(t.agent))}</span>
+            </div>
+            <div class="text-[10px] text-text-tertiary mt-0.5">创建于 ${new Date(t.createdAt).toLocaleString('zh-CN')}${t.projectPath ? ' · ' + esc(t.projectPath) : ''}</div>
+            ${t.note ? `<div class="text-[11px] text-text-secondary mt-1 whitespace-pre-wrap">${esc(t.note).slice(0, 300)}</div>` : ''}
+            ${t.result ? `<div class="text-[11px] text-brand-cyan mt-1 whitespace-pre-wrap max-h-24 overflow-auto">执行结果：${esc(t.result).slice(0, 500)}</div>` : ''}
+          </div>
+          <div class="flex items-center gap-1.5 flex-shrink-0">
+            <select class="h-7 rounded-lg bg-surface-card border border-line-ghost text-[11px] text-text-primary px-1" data-task-op="status">
+              ${STATUS.map(s => `<option value="${s.id}" ${s.id === t.status ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
+            </select>
+            <button class="tool-btn" data-task-op="copy" title="复制指令"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+            <button class="tool-btn" data-task-op="note" title="备注"><i data-lucide="pencil-line" class="w-3.5 h-3.5"></i></button>
+            ${cloudReady ? '<button class="tool-btn" data-task-op="run" title="用已配置的云端 API 直接执行"><i data-lucide="play" class="w-3.5 h-3.5 text-brand-cyan"></i></button>' : ''}
+            <button class="tool-btn" data-task-op="delete" title="删除"><i data-lucide="trash-2" class="w-3.5 h-3.5 text-danger"></i></button>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('[data-task-id]').forEach(card => {
+      const id = card.dataset.taskId;
+      const t = state.tasks.find(x => x.id === id);
+      if (!t) return;
+      const sel = card.querySelector('[data-task-op="status"]');
+      if (sel) sel.addEventListener('change', () => {
+        t.status = sel.value;
+        t.updatedAt = Date.now();
+        save(); renderList(cloudReady);
+      });
+      card.querySelectorAll('[data-task-op]').forEach(btn => {
+        const op = btn.dataset.taskOp;
+        if (op === 'status') return;
+        btn.addEventListener('click', () => {
+          if (op === 'copy') copyText(buildInstruction(t)).then(ok => {
+            if (typeof showNotification === 'function') showNotification(ok ? '已复制' : '复制失败', ok ? '指令已复制到剪贴板' : '请手动打开预览后复制', ok ? 'success' : 'warning', 2200);
+          });
+          if (op === 'note') editNote(t, cloudReady);
+          if (op === 'run') runTask(t, cloudReady);
+          if (op === 'delete') {
+            const del = () => {
+              state.tasks = state.tasks.filter(x => x.id !== id);
+              save(); renderList(cloudReady);
+              if (typeof showNotification === 'function') showNotification('已删除', t.name, 'success', 1600);
+            };
+            if (typeof showConfirm === 'function') showConfirm('删除任务', `确定删除「${t.name}」？`, del, { danger: true, okText: '删除' });
+            else del();
+          }
+        });
+      });
+    });
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  function editNote(t, cloudReady) {
+    if (typeof showModal !== 'function') return;
+    const box = showModal(`
+      <div class="form-row"><label class="form-label">备注 / 执行记录</label>
+        <textarea id="taskNoteInput" class="form-input" rows="6" placeholder="记录这个任务的进展、阻塞、对方 agent 的回报等">${esc(t.note || '')}</textarea></div>`,
+      { title: '任务备注 · ' + t.name, icon: 'pencil-line',
+        footer: '<button class="btn-ghost px-4 py-2 rounded-lg text-sm border border-line-ghost" data-note-cancel>取消</button>' +
+                '<button class="btn-primary px-4 py-2 rounded-lg text-sm" id="taskNoteSave">保存</button>' });
+    const close = typeof closeModal === 'function' ? closeModal : () => {};
+    box.querySelector('[data-note-cancel]').addEventListener('click', close);
+    box.querySelector('#taskNoteSave').addEventListener('click', () => {
+      t.note = box.querySelector('#taskNoteInput').value;
+      t.updatedAt = Date.now();
+      save(); close(); renderList(cloudReady);
+    });
+  }
+
+  /** 用已配置的 OpenAI 兼容 API 直接执行该任务（未配置时不渲染入口）
+   * @param {Object} t - 任务
+   * @param {boolean} cloudReady - 云端 API 是否就绪
+   * @returns {Promise<void>} */
+  async function runTask(t, cloudReady) {
+    if (!cloudReady || running) return;
+    if (typeof AI === 'undefined') return;
+    running = true;
+    if (typeof showNotification === 'function') showNotification('开始执行', '正在调用你配置的云端模型…', 'info', 2200);
+    try {
+      if (AI.backend !== 'openai') {
+        try { await AI.detectBackend(); } catch (e) { /* 忽略 */ }
+      }
+      if (AI.backend !== 'openai') {
+        if (typeof showNotification === 'function') showNotification('云端 API 不可用', '设置里的 OpenAI 兼容接口未连通，请先在设置页测试连接', 'warning', 3200);
+        return;
+      }
+      const model = MoraySettings.get('openaiModel') || (AI.models && AI.models[0] && AI.models[0].name) || '';
+      const prompt = buildInstruction(t) + '\n\n## 你的输出\n请直接给出这个任务的完整可执行方案与关键实现要点（若超出单次回答能力，请给出分步计划）。';
+      const r = await AI.chat({ model, messages: [{ role: 'user', content: prompt }], temperature: 0.2 });
+      t.result = String((r && r.content) || '').slice(0, 4000);
+      t.status = t.status === 'todo' ? 'doing' : t.status;
+      t.updatedAt = Date.now();
+      save(); renderList(cloudReady);
+      if (typeof showNotification === 'function') showNotification('执行完成', '结果已回填到任务卡片', 'success', 2600);
+    } catch (e) {
+      if (typeof showNotification === 'function') showNotification('执行失败', String((e && e.message) || e).slice(0, 160), 'error', 3600);
+    } finally {
+      running = false;
+    }
+  }
+
+  /* ---------------- 安装 ---------------- */
+  function install() {
+    load();
+    ensureNavButton();
+    ensurePage();
+    buildPage();
+    // 设置页改了云端 API 后，"直接执行"入口需要跟着出现/消失（不刷新页面也生效）
+    window.addEventListener('moray-settings-changed', () => {
+      const page = document.getElementById('page-' + PAGE);
+      if (page) buildPage();
+    });
+  }
+
+  // 延迟到本脚本（含全部 parts）执行完毕再安装：安装时要用到 escapeHtml / refreshIcons /
+  // showNotification 等由后续分片定义的绑定，脚本内同步调用会踩到 TDZ。
+  function bootInstall() { try { install(); } catch (e) { console.warn('[MoRay] 任务分派面板安装失败:', e); } }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootInstall);
+  else setTimeout(bootInstall, 0);
+
+  /** 调试/自检出口（只读状态，便于自动化验证） */
+  window.__taskDispatch = {
+    page: PAGE,
+    state() { return JSON.parse(JSON.stringify(state)); },
+    buildInstruction,
+    switchTo,
+    /** 面板是否已注入到 DOM（导航按钮 + 页面容器都存在） */
+    installed() {
+      return !!(document.querySelector('.nav-icon-btn[data-page="' + PAGE + '"]') && document.getElementById('page-' + PAGE));
+    }
+  };
+})();
+
 /* ============================================================
    模块：模型管理与监控（任务八）/ 设置页（任务九）/ 启动器
    ============================================================ */
@@ -13472,7 +14236,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.19.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.20.1'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -18620,6 +19384,11 @@ window.__morayAudit = function () {
   --wall-scrim: rgba(6, 8, 14, 0.30);
   --wall-card-alpha: 0.45;
   --wall-floating-alpha: 0.90;
+  /* [3.20 阶段1] 联动光晕色（默认 = 品牌钴蓝/青），由 data-wall-tone 分档覆盖；
+     组件规则以 rgba(var(--wall-glow-rgb), α) 消费，未分档时回退本默认值 */
+  --wall-glow-rgb: 91, 140, 255;
+  --wall-accent-rgb: 58, 214, 232;
+  --wall-tint-color: rgb(91, 140, 255);
 }
 /* ---- 三栏骨架：唯一 backdrop-filter 层（内部卡片/气泡不再 blur，防嵌套掉帧） ---- */
 #app[data-wallpaper] aside.bg-surface-deep {
@@ -18827,16 +19596,16 @@ html[data-theme="light"] #app[data-wallpaper="custom"] .msg-bubble .md-body {
 #app[data-wallpaper="anime-window"] #coreInputContainer,
 #app[data-wallpaper="custom"] #coreInputContainer {
   background-color: rgba(12, 15, 25, 0.90);
-  border: 1px solid rgba(120, 150, 255, 0.22);
+  border: 1px solid rgba(var(--wall-glow-rgb, 120, 150, 255), 0.24);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
-/* 聚焦时边框过渡到品牌蓝，保留光核聚焦光晕 */
+/* 聚焦时边框过渡到壁纸主色光晕（原为品牌蓝；--wall-glow-rgb 未定义时回退同色） */
 #app[data-wallpaper="anime-starry"] #coreInputContainer:focus-within,
 #app[data-wallpaper="anime-aurora"] #coreInputContainer:focus-within,
 #app[data-wallpaper="anime-window"] #coreInputContainer:focus-within,
 #app[data-wallpaper="custom"] #coreInputContainer:focus-within {
-  border-color: var(--color-brand-cobalt);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.35), 0 0 28px rgba(91, 140, 255, 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
+  border-color: rgba(var(--wall-glow-rgb, 91, 140, 255), 0.90);
+  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.35), 0 0 28px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 /* 输入框：极轻衬底 + 圆角；正文保持主题色；placeholder 提亮 */
 #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -18872,7 +19641,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer
 html[data-theme="light"] #app[data-wallpaper="anime-window"] #coreInputContainer,
 html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
   background-color: rgba(255, 255, 255, 0.90);
-  border: 1px solid rgba(91, 140, 255, 0.30);
+  border: 1px solid rgba(var(--wall-glow-rgb, 91, 140, 255), 0.30);
   box-shadow: 0 10px 30px rgba(26, 34, 51, 0.18);
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -18933,7 +19702,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.19.0';
+window.MORAY_BUILD = '3.20.1';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -19047,6 +19816,373 @@ window.MORAY_BUILD = '3.19.0';
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', probeBackend);
   else probeBackend();
+})();
+
+/* ===================== [3.20 阶段1] 壁纸联动系统主题 =====================
+ * 目标：换壁纸不止换背景 —— 按壁纸主色联动整个 UI 的光晕/强调色相、面板与卡片叠色、
+ * 以及纯色/渐变类壁纸的面板透明度；自定义上传图用 Canvas 取主色自动分档。
+ *
+ * 实现边界（只加不改）：
+ *  - 只向 #app 写三个新属性：data-wall-tone（色相档）/ data-wall-tint（叠色开关）/
+ *    data-wall-bright（浅色图标记），不改任何现有类名、DOM 结构与函数签名；
+ *  - 光晕色相通过 110_polish 的壁纸规则里新增的 --wall-glow-rgb / --wall-accent-rgb /
+ *    --wall-tint-color 三个变量消费，未分档时回退品牌钴蓝（视觉零回归）；
+ *  - 样式表独立成 <style id="wallpaperLinkStyle">，位置在 wallpaperThroughStyle 之后，
+ *    同权重规则「后定义获胜」，因此无需改动既有壁纸规则即可叠加联动。
+ * 可读性红线：正文对比度不低于现状——浅色（高亮度）自定义图自动加深遮罩（data-wall-bright）。
+ */
+(function () {
+  /** 色相档 → 联动取值。
+   *  glow/accent：RGB 三元组，供 rgba(var(--x), α) 消费（光晕、边框、焦点环、当前项）；
+   *  scrim       ：按色相着色的压暗层（纯色/渐变类壁纸）——比默认 rgba(6,8,14,.30) 更深，
+   *                所以"面板色相随壁纸变"的同时正文对比度只会更高，不会更低（可读性红线）；
+   *  scrimImg    ：图片壁纸（动漫/自定义）用的浅版着色压暗层，只微微加深，保持"不压暗人物"；
+   *  scrimLight  ：浅色主题下的着色薄纱（亮度与既有白色薄纱相当，只带色相）。 */
+  const WALL_TONES = {
+    cobalt: {
+      glow: '91, 140, 255', accent: '157, 123, 255',
+      scrim: 'rgba(4, 9, 22, 0.36)', scrimImg: 'rgba(4, 10, 22, 0.12)', scrimLight: 'rgba(240, 244, 255, 0.24)'
+    },
+    cyan: {
+      glow: '58, 214, 232', accent: '91, 140, 255',
+      scrim: 'rgba(2, 12, 15, 0.38)', scrimImg: 'rgba(4, 12, 15, 0.12)', scrimLight: 'rgba(238, 252, 255, 0.24)'
+    },
+    violet: {
+      glow: '157, 123, 255', accent: '110, 140, 255',
+      scrim: 'rgba(11, 6, 22, 0.38)', scrimImg: 'rgba(10, 7, 22, 0.12)', scrimLight: 'rgba(246, 240, 255, 0.24)'
+    },
+    magenta: {
+      glow: '214, 108, 214', accent: '157, 123, 255',
+      scrim: 'rgba(16, 6, 15, 0.38)', scrimImg: 'rgba(14, 6, 15, 0.12)', scrimLight: 'rgba(255, 240, 252, 0.24)'
+    },
+    green: {
+      glow: '86, 214, 160', accent: '58, 214, 232',
+      scrim: 'rgba(2, 13, 9, 0.38)', scrimImg: 'rgba(3, 12, 9, 0.12)', scrimLight: 'rgba(238, 255, 246, 0.24)'
+    },
+    warm: {
+      glow: '232, 176, 92', accent: '232, 130, 110',
+      scrim: 'rgba(18, 11, 4, 0.38)', scrimImg: 'rgba(16, 11, 5, 0.12)', scrimLight: 'rgba(255, 248, 238, 0.24)'
+    },
+    neutral: {
+      glow: '138, 150, 172', accent: '110, 124, 150',
+      // 中性档（pure 等）：保持既有近乎不压暗的观感，不做着色
+      scrim: 'rgba(6, 8, 14, 0.02)', scrimImg: 'rgba(6, 8, 14, 0.08)', scrimLight: 'rgba(255, 255, 255, 0.22)'
+    }
+  };
+
+  /** 内置壁纸联动档案：tone = 光晕色相档；panel/card = 面板透明度微调（null = 保持既有值，
+   *  避免压暗动漫人物）。压暗层色相由 tone 决定，不在此处重复声明。 */
+  const WALL_PROFILE = {
+    aurora: { tone: 'cyan', panel: 0.60, card: 0.44 },
+    'deep-space': { tone: 'cobalt', panel: 0.66, card: 0.46 },
+    gradient: { tone: 'cobalt', panel: 0.62, card: 0.45 },
+    mountain: { tone: 'violet', panel: 0.58, card: 0.44 },
+    cyber: { tone: 'cyan', panel: 0.60, card: 0.44 },
+    pure: { tone: 'neutral', panel: 0.96, card: 0.94 },
+    'anime-starry': { tone: 'cyan', panel: null, card: null },
+    'anime-aurora': { tone: 'green', panel: null, card: null },
+    'anime-window': { tone: 'warm', panel: null, card: null }
+  };
+
+  /** 内置壁纸清单（与上方 __WALL_LIST 同序，用于判断是否为内置壁纸） */
+  const WALL_BUILTIN = ['aurora', 'deep-space', 'gradient', 'mountain', 'cyber', 'pure',
+    'anime-starry', 'anime-aurora', 'anime-window'];
+
+  const CUSTOM_TONE_KEY = 'moray_custom_wall_tone';
+
+  /** 当前 #app 元素（与壁纸属性同步逻辑同源） */
+  function wallShell() {
+    return document.getElementById('appShell') || document.getElementById('app');
+  }
+
+  /** 读取当前壁纸 id（权威来源与 __syncWallpaperAttr 一致：localStorage） */
+  function wallCurrentId() {
+    try {
+      const saved = localStorage.getItem('moray_wallpaper');
+      const custom = localStorage.getItem('moray_custom_wallpaper');
+      if (saved === 'custom' && custom) return 'custom';
+      if (saved && WALL_BUILTIN.includes(saved)) return saved;
+      if (!saved && custom) return 'custom';
+    } catch (e) { /* 忽略 */ }
+    return 'anime-starry';
+  }
+
+  /** 字符串指纹（用于自定义图取色缓存命中判断；改图即换键） */
+  function wallKeyOf(s) {
+    const t = s.length > 4096 ? (s.slice(0, 2048) + s.slice(-2048)) : s;
+    let h = 2166136261;
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(36) + ':' + s.length;
+  }
+
+  /** RGB → 色相档（饱和度/明度过低判为中性档） */
+  function wallToneFromRgb(r, g, b) {
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    const dlt = mx - mn;
+    const sat = mx === 0 ? 0 : dlt / mx;
+    if (sat < 0.12 || mx < 40) return 'neutral';
+    let h;
+    if (mx === r) h = 60 * (((g - b) / dlt) % 6);
+    else if (mx === g) h = 60 * ((b - r) / dlt + 2);
+    else h = 60 * ((r - g) / dlt + 4);
+    if (h < 0) h += 360;
+    if (h < 15 || h >= 320) return 'magenta';
+    if (h < 75) return 'warm';
+    if (h < 165) return 'green';
+    if (h < 205) return 'cyan';
+    if (h < 260) return 'cobalt';
+    return 'violet';
+  }
+
+  /** 自定义图取主色（Canvas 32×32 降采样 + 饱和度加权平均；跨域/解码失败 → null）
+   * @param {string} dataUrl 图片 dataURL
+   * @returns {Promise<{tone:string, bright:number, rgb:number[]}|null>} 分档结果 */
+  function wallExtractProfile(dataUrl) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      try {
+        const img = new Image();
+        const timer = setTimeout(() => finish(null), 4000);
+        img.onerror = () => { clearTimeout(timer); finish(null); };
+        img.onload = () => {
+          clearTimeout(timer);
+          try {
+            const N = 32;
+            const cv = document.createElement('canvas');
+            cv.width = N; cv.height = N;
+            const cx = cv.getContext('2d', { willReadFrequently: true });
+            if (!cx) { finish(null); return; }
+            cx.drawImage(img, 0, 0, img.width, img.height, 0, 0, N, N);
+            const d = cx.getImageData(0, 0, N, N).data;
+            let r = 0, g = 0, b = 0, w = 0, lum = 0, px = 0;
+            for (let i = 0; i < d.length; i += 4) {
+              const R = d[i], G = d[i + 1], B = d[i + 2];
+              if (d[i + 3] < 128) continue;
+              px++;
+              lum += (0.2126 * R + 0.7152 * G + 0.0722 * B) / 255;
+              const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+              const sat = mx === 0 ? 0 : (mx - mn) / mx;
+              const weight = Math.max(0.06, sat); // 饱和度加权：鲜艳像素主导"主色"
+              r += R * weight; g += G * weight; b += B * weight; w += weight;
+            }
+            const bright = px > 0 && (lum / px) > 0.6 ? 1 : 0;
+            if (w <= 0) { finish(null); return; }
+            const rr = Math.round(r / w), gg = Math.round(g / w), bb = Math.round(b / w);
+            finish({ tone: wallToneFromRgb(rr, gg, bb), bright, rgb: [rr, gg, bb] });
+          } catch (e) { finish(null); } // 画布污染（file:// 跨域图）等 → 回退默认冷蓝
+        };
+        img.src = dataUrl;
+      } catch (e) { finish(null); }
+    });
+  }
+
+  /** 读自定义图取色缓存（键 = 图指纹；换图自动失效） */
+  function wallCachedCustomTone(dataUrl) {
+    try {
+      const raw = localStorage.getItem(CUSTOM_TONE_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (o && o.key === wallKeyOf(dataUrl) && WALL_TONES[o.tone]) return o;
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 写自定义图取色缓存（容量异常时静默；仅缓存，失败不影响功能） */
+  function wallCacheCustomTone(dataUrl, prof) {
+    try {
+      localStorage.setItem(CUSTOM_TONE_KEY, JSON.stringify({
+        key: wallKeyOf(dataUrl), tone: prof.tone, bright: prof.bright
+      }));
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 把联动结果写到 #app 属性上（CSS 侧的 tonal 变量组据此生效） */
+  function wallPaint(tone, bright, isImg) {
+    const shell = wallShell();
+    if (!shell) return;
+    shell.setAttribute('data-wall-tone', WALL_TONES[tone] ? tone : 'cobalt');
+    if (isImg) shell.setAttribute('data-wall-img', '1');
+    else shell.removeAttribute('data-wall-img');
+    if (bright) shell.setAttribute('data-wall-bright', '1');
+    else shell.removeAttribute('data-wall-bright');
+  }
+
+  /** 主入口：按当前壁纸套用联动（内置同步分档；自定义走缓存/异步取色）
+   * @returns {void} */
+  function wallLinkApply() {
+    const id = wallCurrentId();
+    if (id === 'custom') {
+      let data = null;
+      try { data = localStorage.getItem('moray_custom_wallpaper'); } catch (e) { data = null; }
+      if (!data) { wallPaint('cobalt', 0, true); return; }
+      const cached = wallCachedCustomTone(data);
+      if (cached) { wallPaint(cached.tone, cached.bright, true); return; }
+      wallPaint('cobalt', 0, true); // 取色完成前先用默认冷蓝，避免空白期
+      wallExtractProfile(data).then((prof) => {
+        const p = prof || { tone: 'cobalt', bright: 0 };
+        wallCacheCustomTone(data, p);
+        if (wallCurrentId() === 'custom') wallPaint(p.tone, p.bright, true);
+      }).catch(() => { /* 已回退 */ });
+      return;
+    }
+    const prof = WALL_PROFILE[id];
+    if (!prof) { wallPaint('cobalt', 0, false); return; }
+    wallPaint(prof.tone, 0, id.indexOf('anime-') === 0);
+  }
+
+  /* ---------- 样式：色相变量组 + 组件联动（独立 style，位于壁纸规则之后） ---------- */
+  function injectWallLinkCss() {
+    if (document.getElementById('wallpaperLinkStyle')) return;
+    const st = document.createElement('style');
+    st.id = 'wallpaperLinkStyle';
+    let toneCss = '';
+    Object.keys(WALL_TONES).forEach((k) => {
+      const t = WALL_TONES[k];
+      // 1) 光晕/强调色相（供 rgba(var(--x), α) 消费）
+      toneCss += '#app[data-wall-tone="' + k + '"] { --wall-glow-rgb: ' + t.glow +
+        '; --wall-accent-rgb: ' + t.accent + '; }\n';
+      // 2) 面板压暗层按色相着色：纯色/渐变类用深版（更暗 → 对比度只升不降），
+      //    图片类用浅版（保住"不压暗人物"），浅色主题用同亮度薄纱只带色相。
+      //    :not([data-wall-img]) 保证图片壁纸不会套用深版（否则会压暗人物）。
+      toneCss += '#app[data-wall-tone="' + k + '"]:not([data-wall-img]) { --wall-scrim: ' + t.scrim + '; }\n';
+      toneCss += '#app[data-wall-tone="' + k + '"][data-wall-img] { --wall-scrim: ' + t.scrimImg + '; }\n';
+      toneCss += 'html[data-theme="light"] #app[data-wallpaper][data-wall-tone="' + k +
+        '"]:not([data-wall-img]) { --wall-scrim: ' + t.scrimLight + '; }\n';
+    });
+    let panelCss = '';
+    Object.keys(WALL_PROFILE).forEach((k) => {
+      const p = WALL_PROFILE[k];
+      if (p.panel == null && p.card == null) return;
+      let s = '#app[data-wallpaper="' + k + '"] {';
+      if (p.panel != null) s += ' --wall-panel-alpha: ' + p.panel + ';';
+      if (p.card != null) s += ' --wall-card-alpha: ' + p.card + ';';
+      panelCss += s + ' }\n';
+    });
+    st.textContent = `
+/* ========== [3.20 阶段1] 壁纸联动系统主题（独立样式表：同权重后定义获胜） ========== */
+/* ---- 1) 色相分档：决定光晕/强调/叠色（由 JS 写 #app[data-wall-tone]） ---- */
+${toneCss}/* 未分档（JS 尚未执行 / 未知壁纸）时回退品牌钴蓝，视觉零回归 */
+#app[data-wallpaper] {
+  --shadow-glove: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.25), 0 0 16px rgba(var(--wall-accent-rgb), 0.15);
+  --shadow-glove-focus: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.55), 0 0 28px rgba(var(--wall-accent-rgb), 0.30);
+  --shadow-glow-cobalt: 0 0 12px rgba(var(--wall-glow-rgb), 0.40);
+  --shadow-glow-cyan: 0 0 12px rgba(var(--wall-accent-rgb), 0.40);
+}
+/* ---- 2) 三栏面板与输入台的色相联动 = 压暗层着色（--wall-scrim 按色相档取深版/浅版）。
+        纯色/渐变类用的深版比原 rgba(6,8,14,.30) 更暗 → 换壁纸改变整屏色相，同时正文对比度
+        只升不降（可读性红线）；图片类用浅版，保住"不压暗人物" ---- */
+/* ---- 2b) 卡片：边框取壁纸主色（所有壁纸通用，含动漫/自定义图）。只改边框色，
+        不加外发光、不改 background —— 既不动卡片自带渐变底，也不抬高正文可读性基线 ---- */
+#app[data-wall-tone] main .glass-card,
+#app[data-wall-tone] main .bg-surface-card,
+#app[data-wall-tone] main .welcome-suggestion,
+#app[data-wall-tone] main .doc-card,
+#app[data-wall-tone] main .workflow-card,
+#app[data-wall-tone] main .timestamp-card,
+#app[data-wall-tone] main .model-detail-card,
+#app[data-wall-tone] main .error-card {
+  border-color: rgba(var(--wall-glow-rgb), 0.34);
+}
+/* ---- 2c) 侧栏右边框取壁纸主色：1px 精确色相提示，不动任何不透明度与亮度（可读性零影响），
+        图片类壁纸也适用 —— 让"侧栏随壁纸变色"在任何壁纸下都肉眼可辨 ---- */
+#app[data-wall-tone] aside.bg-surface-deep,
+#app[data-wall-tone] #middleSidebar {
+  border-right-color: rgba(var(--wall-glow-rgb), 0.35);
+}
+/* ---- 3) 输入台光晕 = 壁纸主色（非图片壁纸作用域；图片壁纸见第 6 节） ---- */
+#app[data-wallpaper] .core-input {
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.30), 0 0 20px rgba(var(--wall-accent-rgb), 0.20);
+}
+#app[data-wallpaper] .core-input:focus-within {
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.55), 0 0 32px rgba(var(--wall-accent-rgb), 0.32);
+}
+/* ---- 4) 侧栏导航当前项 = 壁纸主色（原为固定品牌蓝） ---- */
+#app[data-wallpaper] .nav-icon-btn.active {
+  background: rgba(var(--wall-glow-rgb), 0.16);
+  color: rgb(var(--wall-glow-rgb));
+}
+/* ---- 5) 面板透明度微调（仅纯色/渐变类；图片类保持"不压暗人物"既有值） ---- */
+${panelCss}/* ---- 6) 图片壁纸（动漫内置 + 自定义）：保留深色浮起结构，只换光晕/边框色相 ---- */
+#app[data-wallpaper="anime-starry"] #coreInputContainer,
+#app[data-wallpaper="anime-aurora"] #coreInputContainer,
+#app[data-wallpaper="anime-window"] #coreInputContainer,
+#app[data-wallpaper="custom"] #coreInputContainer {
+  border-color: rgba(var(--wall-glow-rgb), 0.28);
+  box-shadow: 0 0 0 2px rgba(var(--wall-glow-rgb), 0.20), 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+#app[data-wallpaper="anime-starry"] #coreInputContainer:focus-within,
+#app[data-wallpaper="anime-aurora"] #coreInputContainer:focus-within,
+#app[data-wallpaper="anime-window"] #coreInputContainer:focus-within,
+#app[data-wallpaper="custom"] #coreInputContainer:focus-within {
+  border-color: rgba(var(--wall-glow-rgb), 0.90);
+  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.40), 0 0 30px rgba(var(--wall-accent-rgb), 0.18), 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+html[data-theme="light"] #app[data-wallpaper="anime-starry"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="anime-window"] #coreInputContainer,
+html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
+  border-color: rgba(var(--wall-glow-rgb), 0.34);
+}
+/* ---- 7) 可读性红线：高亮度自定义图自动加深遮罩（正文对比度不低于现状）。
+        权重：[data-wall-tone] 后缀保证压过上面的按色相着色规则（同权重时后定义获胜） ---- */
+#app[data-wall-bright="1"][data-wall-tone] {
+  --wall-scrim: rgba(6, 8, 14, 0.52);
+}
+#app[data-wall-bright="1"][data-wall-tone] main .msg-bubble .md-body {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+}
+html[data-theme="light"] #app[data-wallpaper][data-wall-bright="1"][data-wall-tone] {
+  --wall-scrim: rgba(6, 8, 14, 0.42);
+}
+`;
+    document.head.appendChild(st);
+  }
+
+  injectWallLinkCss();
+  wallLinkApply();
+
+  // 属性兜底：data-wallpaper / 内联背景变化时重算联动（只读 data-wallpaper，不写回，无循环）
+  const shell = wallShell();
+  if (shell && typeof MutationObserver === 'function') {
+    new MutationObserver(() => { wallLinkApply(); })
+      .observe(shell, { attributes: true, attributeFilter: ['data-wallpaper', 'style'] });
+  }
+  // 主题切换（data-theme）后重算：浅色/深色遮罩取值不同
+  if (typeof MutationObserver === 'function') {
+    new MutationObserver(() => { wallLinkApply(); })
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  }
+  // 自定义上传完成后（静置 0.4s 等内联背景落盘）再取一次色
+  if (typeof window.handleCustomWallpaper === 'function') {
+    const origHandle = window.handleCustomWallpaper;
+    window.handleCustomWallpaper = function (input) {
+      const r = origHandle.apply(this, arguments);
+      setTimeout(() => {
+        try { localStorage.removeItem(CUSTOM_TONE_KEY); } catch (e) { /* 忽略 */ }
+        wallLinkApply();
+      }, 400);
+      return r;
+    };
+  }
+
+  /** 调试/自检出口：查当前联动状态（不改状态，只读） */
+  window.__wallLink = {
+    apply: wallLinkApply,
+    extract: wallExtractProfile,
+    toneOf: wallCurrentId,
+    profiles: WALL_PROFILE,
+    tones: WALL_TONES,
+    /** 当前 #app 上的联动属性快照 */
+    snapshot() {
+      const s = wallShell();
+      return s ? {
+        wallpaper: s.getAttribute('data-wallpaper'),
+        tone: s.getAttribute('data-wall-tone'),
+        bright: s.getAttribute('data-wall-bright')
+      } : null;
+    }
+  };
 })();
 
 /* ============================================================
@@ -20109,6 +21245,16 @@ const ToolRegistry = {
       if (name === 'find_files') return '查找「' + (a.pattern || '*') + '」' + (a.path ? '于 ' + a.path : '（全工作区）');
       if (name === 'search_text') return '搜索「' + String(a.query || '').slice(0, 40) + '」' + (a.regex ? '（正则）' : '') + (a.path ? '于 ' + a.path : '');
       if (name === 'edit_file') return '编辑 ' + (a.path || '') + '（' + String(a.old_str || '').length + '→' + String(a.new_str || '').length + ' 字符）';
+      if (name === 'query_knowledge_base') return '检索知识库「' + String(a.query || '').slice(0, 40) + '」' + (a.topK ? '（前 ' + a.topK + ' 条）' : '');
+      // [3.20 阶段3] 新增本机工具的可读摘要
+      if (name === 'create_file') {
+        const bytes = (typeof a.content === 'string') ? a.content.length : 0;
+        return '新建 ' + (a.path || '') + (bytes ? '（' + bytes + ' 字符）' : '（空文件）');
+      }
+      if (name === 'rename_file') return '重命名 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'move_file') return '移动 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'list_processes') return '查看进程' + (a.sort === 'pid' ? '（按 PID）' : '（占内存前 ' + (a.limit || 30) + ' 条）');
+      if (name === 'system_info') return '读取系统概览（只读）';
       const s = JSON.stringify(a);
       return s.length > 120 ? s.slice(0, 120) + '…' : s;
     } catch (e) {
@@ -20127,7 +21273,10 @@ const ToolRegistry = {
       // [阶段0 本机 Agent] 本机工具图标
       list_directory: 'folder', read_file: 'file-text', write_file: 'file-pen-line', run_command: 'terminal',
       // [阶段1 M2] 高价值三工具
-      find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen'
+      find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen',
+      // [3.20 阶段3] 新增本机工具
+      create_file: 'file-plus-2', rename_file: 'file-pen', move_file: 'folder-input',
+      list_processes: 'activity', system_info: 'cpu'
     };
     const icon = iconMap[evt.name] || 'wrench';
     const label = evt.label || evt.name;
@@ -20143,7 +21292,10 @@ const ToolRegistry = {
     // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
     // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
     const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
-    const body = '';
+    // [3.20 修复] 这里必须是 let：下面 4 个分支都要对 body 重新赋值，
+    // 原来是 const → 每次步骤卡渲染都抛 "Assignment to constant variable"，
+    // 进而让 emit() 抛出、Gateway.runWithTools 中断并回退普通流式（工具轮直接失效）
+    let body = '';
     if (evt.status === 'error') {
       body = '<div class="text-[10px] text-danger mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
     } else if (evt.status === 'denied') {
@@ -20501,6 +21653,35 @@ function safeCalc(expr) {
   return r;
 }
 
+/** [3.20 阶段2] 知识库来源收集器：query_knowledge_base 每次检索把来源登记到这里，
+ * 对话层在回答生成完成后取走（drain），写入消息的 citations 并在消息中渲染
+ * 「[来源：文档名·第N段]」标注。工具与对话层因此解耦，不需要改工具返回协议。 */
+const RagSources = {
+  /** 本次请求累计的来源 @type {Array<{docId:string, docName:string, chunkIdx:number, meta:string, score:number}>} */
+  items: [],
+  /** 登记一批来源（自动去重：同一文档同一段只留最高分）
+   * @param {Array} list - 来源数组
+   * @returns {void} */
+  add(list) {
+    (list || []).forEach(it => {
+      if (!it || !it.docId) return;
+      const key = it.docId + '#' + it.chunkIdx;
+      const old = this.items.find(x => x.docId + '#' + x.chunkIdx === key);
+      if (old) { if ((it.score || 0) > (old.score || 0)) old.score = it.score; return; }
+      this.items.push(it);
+    });
+  },
+  /** 取走全部来源（按相关度降序） @returns {Array} 来源列表 */
+  drain() {
+    const out = this.items.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
+    this.items = [];
+    return out;
+  },
+  /** 清空（每次新请求开始前调用，避免上一轮来源串到本轮） @returns {void} */
+  clear() { this.items = []; }
+};
+window.RagSources = RagSources;
+
 /** 内置工具清单（{name, label, description, parameters, enabledByDefault, run}） */
 const BUILTIN_TOOLS = [
   {
@@ -20529,8 +21710,10 @@ const BUILTIN_TOOLS = [
     }
   },
   {
-    name: 'query_knowledge_base', label: '查询知识库',
-    description: '在本地知识库（文档库）中按语义检索相关片段，返回文档标题与内容摘要。当用户询问"知识库里关于 X 的内容"时使用。',
+    name: 'query_knowledge_base', label: '查询知识库', timeoutMs: 30000,
+    description: '在本地知识库（文档库）中检索相关片段，返回文档标题、片段内容摘要与相关度。'
+      + '当用户询问"知识库里关于 X 的内容 / 文档里怎么写的"时使用。'
+      + '若你的回答用到了返回的片段，请在相应句子后标注来源，格式为 [来源：文档名·第N段]（N 为返回的 segment 字段）。',
     parameters: {
       type: 'object',
       properties: { query: { type: 'string', description: '检索关键词或问题' }, topK: { type: 'integer', description: '返回条数（默认 3）' } },
@@ -20546,14 +21729,26 @@ const BUILTIN_TOOLS = [
       const results = await DocsApp.semanticSearchRaw(q);
       // 关键 await 后复查：中止后不再继续（不组装结果、不写成功态）
       if (ctx && ctx.signal && ctx.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-      if (!results || !results.length) return { query: q, count: 0, items: [] };
-      return {
-        query: q, count: Math.min(results.length, topK),
-        items: results.slice(0, topK).map(r => ({
-          title: (r.doc && r.doc.name) ? r.doc.name : '(未命名文档)',
-          excerpt: String((r.chunk && r.chunk.text) || '').slice(0, 400)
-        }))
-      };
+      const mode = (DocsApp._retrieval && DocsApp._retrieval.mode) || 'keyword';
+      if (!results || !results.length) {
+        return { query: q, mode, count: 0, items: [], note: '知识库中没有命中内容（可能尚未导入文档，或问法与文档内容差异较大）' };
+      }
+      // 按相关度降序取前 topK，并把来源登记到 RagSources（供消息来源标注使用）
+      const top = results.slice(0, topK).map(r => ({
+        title: (r.doc && r.doc.name) ? r.doc.name : '(未命名文档)',
+        segment: (r.chunk && typeof r.chunk.idx === 'number') ? r.chunk.idx + 1 : 1,
+        section: (r.chunk && r.chunk.meta) || '',
+        score: Number((r.score || 0).toFixed(4)),
+        snippet: String((r.chunk && r.chunk.text) || '').slice(0, 400)
+      }));
+      RagSources.add(top.map((it, i) => ({
+        docId: (results[i].doc && results[i].doc.id) || '',
+        docName: it.title,
+        chunkIdx: it.segment - 1,
+        meta: it.section,
+        score: it.score
+      })));
+      return { query: q, mode, count: top.length, items: top };
     }
   },
   {
@@ -20675,7 +21870,11 @@ async function appendToolsSettings() {
       return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
         '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
         ' <span class="font-mono text-[10px] text-text-tertiary">' + t.name + '</span>' +
-        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span></div>' +
+        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span>' +
+        (t.sideEffect
+          ? '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/25">需审批</span>'
+          : '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-success/10 text-success border border-success/20">只读免审批</span>') +
+        '</div>' +
         '<div class="text-[10px] text-text-tertiary mt-0.5">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
         '<div class="text-[10px] text-text-tertiary shrink-0 ' + (nativeOn ? 'text-success' : '') + '">' + (nativeOn ? '已由输入台开启' : '由输入台「本机工具」开关控制') + '</div></div>';
     }
@@ -21031,6 +22230,31 @@ async function agentFingerprintForApproval(def, args) {
     } catch (e) {
       fp += '::missing';
     }
+  } else if (def.name === 'create_file') {
+    // [3.20 阶段3] 目标文件状态参与指纹：同名文件出现/消失都要重新授权（防呆）
+    const path = String((args && args.path) || '');
+    try {
+      const data = await wsFetchTool('read_file', { path, maxBytes: 4096 });
+      fp += '::exists' + (typeof fnvHash64 === 'function' ? fnvHash64(String(data && data.content || '')) : '');
+    } catch (e) {
+      fp += '::absent';
+    }
+  } else if (def.name === 'move_file' || def.name === 'rename_file') {
+    // 源文件内容变化 / 目标位置被占用 → 指纹变化，必须重新授权
+    const src = String((args && (args.from || args.src)) || '');
+    const dst = String((args && (args.to || args.dst)) || '');
+    try {
+      const d = await wsFetchTool('read_file', { path: src, maxBytes: 4096 });
+      fp += '::src' + (typeof fnvHash64 === 'function' ? fnvHash64(String(d && d.content || '')) : '');
+    } catch (e) {
+      fp += '::srcmissing';
+    }
+    try {
+      await wsFetchTool('read_file', { path: dst, maxBytes: 64 });
+      fp += '::dsttaken';
+    } catch (e) {
+      fp += '::dstfree';
+    }
   }
   return fp;
 }
@@ -21099,6 +22323,27 @@ function agentApproval(def, args, ctx) {
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
         (args.overwrite === false ? '<div class="text-[10px] text-warning mt-1">仅新建，不覆盖已有文件</div>' : '<div class="text-[10px] text-text-tertiary mt-1">已有同名文件将被覆盖</div>') +
         '</div>' + diffBlock;
+    } else if (def.name === 'create_file') {
+      // [3.20 阶段3] 新建文件：明确"只新建不覆盖"，并给出内容预览
+      const c = String(args.content || '');
+      argCards = '<div class="' + cell + '">' +
+        '<div class="text-[10px] text-text-tertiary mb-1.5">新建文件（工作区内，相对路径）</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
+        '<div class="text-[10px] text-success mt-1">只新建：若同名文件已存在会被拒绝，不会覆盖</div>' +
+        '</div>' +
+        '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">内容预览（前 300 字符）</div>' +
+        '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' +
+        (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空文件）</span>') +
+        '</div></div>';
+    } else if (def.name === 'rename_file' || def.name === 'move_file') {
+      // [3.20 阶段3] 移动/重命名：源 → 目标，并提示"目标存在即拒绝"
+      argCards = '<div class="' + cell + '">' +
+        '<div class="text-[10px] text-text-tertiary mb-1.5">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
+        '<div class="font-mono text-[11px] text-text-tertiary break-all">' + escapeHtml(String(args.from || '')) + '</div>' +
+        '<div class="text-[10px] text-text-tertiary my-0.5">↓</div>' +
+        '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.to || '')) + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mt-1.5">目标已存在会拒绝，不做静默覆盖；父目录不存在会自动创建</div>' +
+        '</div>';
     } else if (def.name === 'run_command') {
       const parts = [String(args.command || '')].concat(Array.isArray(args.args) ? args.args.map(String) : []);
       argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">将执行的只读白名单命令</div>' +
@@ -21330,6 +22575,66 @@ const NATIVE_TOOLS = [
     run(args, ctx) { return agentNativeRun(this, args, ctx); }
   },
   {
+    // [3.20 阶段3] 只新建不覆盖：语义上比 write_file 更安全，适合"创建新文件"场景
+    name: 'create_file', label: '新建文件', native: true, sideEffect: true, timeoutMs: 300000,
+    description: '在工作区内新建一个文本文件（需用户授权）。文件已存在时会被拒绝，绝不覆盖任何现有文件——需要覆盖已有文件请改用 write_file 并单独确认。父目录不存在会自动创建。当用户说"新建一个 X 文件 / 创建一个脚本文件"时使用它。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区根的新文件路径（必填，如 notes/todo.md）' },
+        content: { type: 'string', description: '文件内容（UTF-8 文本，可为空串创建空文件）' }
+      },
+      required: ['path']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'rename_file', label: '重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内重命名文件或目录（需用户授权，可理解为同一目录内的移动）。目标已存在时会被拒绝，不会覆盖。当用户说"把 a.txt 改名成 b.txt"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: '相对工作区根的原路径（必填，必须存在）' },
+        to: { type: 'string', description: '重命名后的相对路径（必填，通常与 from 同目录）' }
+      },
+      required: ['from', 'to']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    name: 'move_file', label: '移动文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内把文件或目录移动到另一个位置（需用户授权）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: '相对工作区根的源路径（必填，必须存在）' },
+        to: { type: 'string', description: '相对工作区根的目标路径（必填）' }
+      },
+      required: ['from', 'to']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [3.20 阶段3] 只读：进程列表（按内存倒序），无需审批
+    name: 'list_processes', label: '查看进程', native: true, sideEffect: false, timeoutMs: 15000,
+    description: '列出本机正在运行的进程（pid / 进程名 / 占用内存），默认按内存占用倒序取前 30 条。只读，不结束也不修改任何进程。当用户问"现在有哪些进程在占内存 / 电脑卡是不是某个程序"时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', description: '返回条数（默认 30，上限 200）' },
+        sort: { type: 'string', description: 'memory（默认，按内存倒序）或 pid' }
+      }
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [3.20 阶段3] 只读：系统概览，无需审批
+    name: 'system_info', label: '系统信息', native: true, sideEffect: false, timeoutMs: 15000,
+    description: '读取本机系统只读概览：操作系统版本、CPU 核数与负载、内存总量与可用量、工作区所在磁盘容量。不含任何用户名/环境变量/文件内容。当用户问"这台机器配置怎么样 / 内存还剩多少 / 磁盘够不够"时使用。',
+    parameters: { type: 'object', properties: {} },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
     // [阶段1 M3] 计划编排：纯前端工具（不调后端），native 门控（随"本机工具"开关进入请求）
     name: 'submit_plan', label: '提交任务计划', native: true, sideEffect: false, timeoutMs: 5000,
     description: '把多步任务的执行计划提交给用户查看（每步含简短意图与预计使用的工具名）。规则：任务需要 2 个以上步骤时，在开始任何文件操作前先调用本工具登记计划；然后按计划顺序逐步执行；全部完成后用一段话总结。steps 最多 12 步。',
@@ -21369,10 +22674,10 @@ const PlanTracker = {
    * @type {string} */
   SYSTEM_PROMPT: [
     '# 本机 Agent 工作规范（受控工作区内操作）',
-    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
+    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；rename_file 重命名；move_file 移动；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
     '- 工作区边界：所有 path 都必须是相对工作区根的路径；你无法访问工作区以外的任何文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。',
     '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
-    '- 授权与拒绝：write_file / edit_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
+    '- 授权与拒绝：create_file / write_file / edit_file / rename_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
     '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
     '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。'
   ].join('\n'),
