@@ -12650,9 +12650,11 @@ const AutomationPage = {
 /* ===================== [3.20 阶段3.2] 任务分派面板（A2A 子集） =====================
  * 能力边界（诚实说明，不做"假装"功能）：
  *  - 本面板**不与外部 agent 建立实时通信通道**。真实的 A2A（agent 之间互相调用/回传）
- *    需要对方平台开放接口与鉴权，MoRay 目前不具备，所以这里只做能真正工作的两件事：
+ *    需要对方平台开放接口与鉴权，MoRay 目前不具备，所以这里只做能真正工作的三件事：
  *    ① 结构化任务指令生成（项目路径/背景/要求/验收标准模板）+ 一键复制到剪贴板；
- *    ② 任务状态管理（待办/进行中/已完成/失败）+ 备注 + 删除，localStorage 持久化。
+ *    ② 任务状态管理（待办/进行中/已完成/失败/已超时/已取消）+ 备注 + 删除，localStorage 持久化；
+ *    ③ [v3.21.0] **一键自动指挥 Codex**：本地后端用 `codex exec` 在任务的项目目录里真正干活，
+ *       日志流式回传、状态按真实退出码流转、token usage 折算成本（拿不到就写"未能获取"，不编造）。
  *  - 若设置里已配置 OpenAI 兼容云端 API，"直接执行"按钮才出现（未配置时**不渲染**，
  *    而不是渲染一个点不动的灰按钮）；点击后用该 API 跑这条任务并把结果回填到任务备注。
  *
@@ -12676,14 +12678,33 @@ const AutomationPage = {
     { id: 'todo', name: '待办', cls: 'bg-text-tertiary/15 text-text-tertiary' },
     { id: 'doing', name: '进行中', cls: 'bg-brand-cyan/15 text-brand-cyan' },
     { id: 'done', name: '已完成', cls: 'bg-success/15 text-success' },
-    { id: 'failed', name: '失败', cls: 'bg-danger/15 text-danger' }
+    { id: 'failed', name: '失败', cls: 'bg-danger/15 text-danger' },
+    // [v3.21.0 自动执行] 新增两种终态：超时（强杀）与取消（用户停止）
+    { id: 'timeout', name: '已超时', cls: 'bg-warning/15 text-warning' },
+    { id: 'canceled', name: '已取消', cls: 'bg-text-tertiary/15 text-text-tertiary' }
   ];
   const DEFAULT_ACCEPT = '1. 功能真实可用（没有假按钮 / 假数据 / 假状态）\n2. 通过项目现有测试或自测命令\n3. 给出改动文件清单与关键实现说明';
 
+  /** [v3.21.0] 自动执行相关常量 */
+  const DEFAULT_CODEX_CMD = 'codex.cmd';         // 默认 codex CLI（cmd 包装器，规避 PowerShell 执行策略）
+  const DEFAULT_WORKDIR = 'D:\\ai工具台';          // 默认工作目录（本机工作台工程目录；设置页可改）
+  const DEFAULT_TIMEOUT = 600;                    // 默认任务超时（秒）
+  const LOG_KEEP = 400;                           // 本地保留日志行数（防止 localStorage 膨胀）
+  const LOG_TAIL_RECORD = 200;                    // 执行记录里保留的日志尾行数
+  const PATH_TTL = 20000;                         // 项目路径存在性校验缓存（ms）
+
   /** 本地状态（localStorage 持久化；结构损坏时安全回退为空） */
-  let state = { tasks: [], seq: 1, projectPath: '', customAgent: '', lastForm: null };
-  /** 当前是否有任务正在执行（防重复点击） */
+  let state = { tasks: [], seq: 1, projectPath: '', customAgent: '', lastForm: null, records: [] };
+  /** 当前是否有任务正在执行（云端直接执行用；自动执行以后端为准） */
   let running = false;
+  /** 自动执行中的任务 → 轮询定时器 @type {Object<string, number>} */
+  const pollers = {};
+  /** 每个任务已消费到的日志全局行号 @type {Object<string, number>} */
+  const offsets = {};
+  /** 项目路径校验缓存 path → {ok, note, at} @type {Object<string, Object>} */
+  const pathCache = {};
+  /** 自动执行是否可用（本地后端在线） */
+  let backendOnline = false;
 
   function load() {
     try {
@@ -12696,10 +12717,25 @@ const AutomationPage = {
           seq: parseInt(o.seq, 10) || (o.tasks.length + 1),
           projectPath: typeof o.projectPath === 'string' ? o.projectPath : '',
           customAgent: typeof o.customAgent === 'string' ? o.customAgent : '',
-          lastForm: o.lastForm || null
+          lastForm: o.lastForm || null,
+          records: Array.isArray(o.records) ? o.records.filter(r => r && r.taskId).slice(0, 50) : []
         };
       }
     } catch (e) { /* 损坏数据不阻塞面板 */ }
+    // [v3.21.0] 上次关页面时还在"运行中"的任务：先按"与后端失联"兜底（install 后再按后端记录校正）
+    state.tasks.forEach(t => {
+      if (t.status !== 'doing') return;
+      const r = t.run || {};
+      if (r.status && r.status !== 'running') return;
+      const run = Object.assign({}, r, {
+        status: 'failed',
+        error: '应用重启导致中断（页面关闭/后端重启时任务尚未结束）',
+        endedAt: r.endedAt || Date.now()
+      });
+      t.run = run;
+      t.status = 'failed';
+      t.log = appendLog(t.log, '—— 页面重载：该任务此前处于运行中，且未查到后端仍有对应的运行记录，标注为「应用重启导致中断」');
+    });
   }
 
   function save() {
@@ -12708,6 +12744,13 @@ const AutomationPage = {
   }
 
   function uid() { return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+  /** 追加日志行（按上限裁剪，防止 localStorage 写爆） */
+  function appendLog(arr, line) {
+    const out = Array.isArray(arr) ? arr.slice() : [];
+    String(line == null ? '' : line).split('\n').forEach(l => { if (l !== '') out.push(l); });
+    return out.length > LOG_KEEP ? out.slice(out.length - LOG_KEEP) : out;
+  }
 
   function esc(s) {
     if (typeof escapeHtml === 'function') return escapeHtml(String(s == null ? '' : s));
@@ -12721,6 +12764,155 @@ const AutomationPage = {
   }
 
   function statusMeta(id) { return STATUS.find(s => s.id === id) || STATUS[0]; }
+
+  /* ---------------- [v3.21.0] 自动执行：配置读取 / 后端调用 / 展示辅助 ---------------- */
+
+  /** 读设置（未配置时回落到内置默认；默认值不写库，符合"设置项无默认值不写库"） */
+  function cfgStr(key, fallback) {
+    try {
+      if (typeof MoraySettings === 'undefined') return fallback;
+      const v = MoraySettings.get(key);
+      return (typeof v === 'string' && v.trim()) ? v.trim() : fallback;
+    } catch (e) { return fallback; }
+  }
+  function cfgNum(key, fallback) {
+    try {
+      if (typeof MoraySettings === 'undefined') return fallback;
+      const n = parseInt(MoraySettings.get(key), 10);
+      return (isFinite(n) && n > 0) ? n : fallback;
+    } catch (e) { return fallback; }
+  }
+  function cfgCodexPath() { return cfgStr('agentRunCodexPath', DEFAULT_CODEX_CMD); }
+  function cfgWorkdir() { return cfgStr('agentRunWorkdir', DEFAULT_WORKDIR); }
+  function cfgTimeout() { return Math.max(10, Math.min(3600, cfgNum('agentRunTimeoutSec', DEFAULT_TIMEOUT))); }
+
+  /** 后端 origin（复用全局唯一事实源，file:// 直开回退默认端口） */
+  function apiBase() {
+    if (typeof agentBackendBase === 'function') {
+      try { return agentBackendBase(); } catch (e) { /* 继续回退 */ }
+    }
+    try {
+      if (window.MorayBackend && window.MorayBackend.origin) return window.MorayBackend.origin;
+      if (typeof window.resolveBackendOrigin === 'function') return window.resolveBackendOrigin();
+    } catch (e) { /* 忽略 */ }
+    return 'http://127.0.0.1:8000';
+  }
+
+  /** 后端是否在线（自动执行的前置条件；纯静态打开时按钮禁用并说明原因） */
+  function isBackendOnline() {
+    try {
+      if (typeof agentBackendBase === 'function' && window.MorayBackend) {
+        return !!window.MorayBackend.connected;
+      }
+      return !!(window.MorayBackend && window.MorayBackend.connected);
+    } catch (e) { return false; }
+  }
+
+  /** 前端 → 后端统一请求；后端离线/超时/非 JSON 都给出可读错误
+   * @param {string} method - HTTP 方法
+   * @param {string} path - 以 /api 开头的路径
+   * @param {Object} [body] - JSON body
+   * @param {number} [timeoutMs] - 超时
+   * @returns {Promise<{ok:boolean, status:number, data?:Object, code?:string, message?:string}>} */
+  async function apiCall(method, path, body, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 8000);
+    try {
+      // [v3.21.0] 时间戳破坏缓存：SW 对固定 URL 的 GET 曾有"缓存优先"行为（见 sw_template.js 的 /api 例外），
+      // cache:'no-store' 挡不住 SW —— 双保险，保证轮询/对齐读到的都是后端当下状态
+      const url = apiBase() + path + (path.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+      const opt = { method, signal: ctrl.signal, cache: 'no-store', headers: {} };
+      if (body !== undefined) {
+        opt.headers['Content-Type'] = 'application/json';
+        opt.body = JSON.stringify(body);
+      }
+      const res = await fetch(url, opt);
+      let j = null;
+      try { j = await res.json(); } catch (e) { j = null; }
+      if (!res.ok) {
+        return {
+          ok: false, status: res.status,
+          code: (j && j.code) || 'http_' + res.status,
+          message: (j && (j.message || j.error)) || ('本地后端返回 ' + res.status)
+        };
+      }
+      if (!j || j.ok !== true) {
+        return { ok: false, status: res.status, code: (j && j.code) || 'bad_response', message: (j && (j.message || j.error)) || '后端返回格式异常' };
+      }
+      return { ok: true, status: res.status, data: j.data };
+    } catch (e) {
+      const aborted = e && e.name === 'AbortError';
+      return {
+        ok: false, status: 0, code: aborted ? 'timeout' : 'offline',
+        message: aborted ? '请求本地后端超时' : '连不上本地后端（需要启动 MoRay 后端）'
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 项目路径校验（带 20s 缓存）：决定「自动执行」按钮是否可用及其 tooltip */
+  async function checkPath(path) {
+    const p = String(path || '').trim();
+    if (!p) return { ok: false, note: '未填写项目路径' };
+    const hit = pathCache[p];
+    if (hit && Date.now() - hit.at < PATH_TTL) return hit;
+    const r = await apiCall('GET', '/api/agent/run/preflight?project_path=' + encodeURIComponent(p) +
+      '&command=' + encodeURIComponent(cfgCodexPath()));
+    const out = r.ok
+      ? { ok: !!(r.data.path_ok && r.data.command_ok), note: !r.data.command_ok ? r.data.command_note : (r.data.path_note || ''), at: Date.now() }
+      : { ok: false, note: r.message, at: Date.now() };
+    pathCache[p] = out;
+    return out;
+  }
+
+  /** 运行状态 → 中文标签与配色（与 STATUS 的 id 对齐） */
+  const RUN_LABEL = {
+    running: ['运行中', 'text-brand-cyan'],
+    completed: ['已完成', 'text-success'],
+    failed: ['失败', 'text-danger'],
+    timeout: ['已超时', 'text-warning'],
+    canceled: ['已取消', 'text-text-tertiary']
+  };
+
+  /** 运行状态 → 任务状态 id */
+  function runStatusToTaskStatus(s) {
+    return { running: 'doing', completed: 'done', failed: 'failed', timeout: 'timeout', canceled: 'canceled' }[s] || 'todo';
+  }
+
+  function fmtDuration(sec) {
+    const v = Number(sec);
+    if (!isFinite(v) || v <= 0) return '';
+    if (v < 60) return v.toFixed(1) + 's';
+    return Math.floor(v / 60) + 'm' + Math.round(v % 60) + 's';
+  }
+
+  function fmtWhen(ts) {
+    try { return ts ? new Date(ts).toLocaleString('zh-CN') : ''; } catch (e) { return ''; }
+  }
+
+  /** 本次运行的估算成本（真实 usage + 成本中心既有单价；拿不到 usage 就返回 null，绝不编造）
+   * @param {Object} run - 运行对象
+   * @returns {Object|null} {cny, text, title} */
+  function runCost(run) {
+    const u = run && run.usage;
+    if (!u || typeof u.input_tokens !== 'number') return null;
+    if (typeof CostEngine === 'undefined') return null;
+    const model = (run && run.model) || '';
+    const prompt = Number(u.input_tokens) || 0;
+    const cache = Number(u.cached_input_tokens) || 0;
+    const out = Number(u.output_tokens) || 0;
+    const price = CostEngine.resolvePrice(model);
+    const cny = CostEngine.estimateCost(model, prompt, out, cache);
+    return {
+      cny,
+      text: '本次估算成本 ' + CostEngine.formatMoney(cny),
+      title: '按成本中心价格表估算（非厂商账单）：' + (model || '模型未知') + ' · 单价 ' + price.note +
+        ' · 输入 ¥' + price.input + ' / 输出 ¥' + price.output + ' / 缓存命中 ¥' + price.cacheHit + ' 每百万 token' +
+        ' · 实际用量：输入 ' + prompt + '（含缓存 ' + cache + '）· 输出 ' + out +
+        (u.reasoning_output_tokens ? '（含推理 ' + u.reasoning_output_tokens + '）' : '')
+    };
+  }
 
   /** 生成结构化任务指令（含项目路径/背景/要求/验收标准模板）
    * @param {Object} t - 任务对象
@@ -12841,9 +13033,12 @@ const AutomationPage = {
           <i data-lucide="send" class="w-4 h-4 text-brand-cobalt"></i>
           <span class="text-sm font-medium text-text-primary">任务分派</span>
           <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="taskCountPill">0 个任务</span>
-          <span class="text-[11px] text-text-tertiary" title="真实 A2A 需要对方平台开放接口；本面板负责指令生成与状态管理">指令生成 + 状态管理（非实时通信）</span>
+          <span class="text-[11px] text-text-tertiary" title="真实 A2A 需要对方平台开放接口；本面板负责指令生成、状态管理与「一键自动指挥 Codex（本机 codex CLI）」">指令生成 + 状态管理 + Codex 自动执行</span>
         </div>
         <div class="flex items-center gap-2">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="taskOrchBtn" title="编排工头：把一个大任务拆成子任务，按类型分给 codex / 本地 Ollama 串行执行，最后汇总成本">
+            <i data-lucide="network" class="w-3.5 h-3.5"></i>编排计划
+          </button>
           <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="taskClearDoneBtn" title="删除全部已完成任务">
             <i data-lucide="eraser" class="w-3.5 h-3.5"></i>清理已完成
           </button>
@@ -12854,6 +13049,8 @@ const AutomationPage = {
       </div>
       <div class="flex-1 overflow-y-auto p-5">
         <div class="max-w-4xl mx-auto space-y-4">
+          <div class="rounded-lg border border-line-ghost/60 px-3 py-2 text-[11px] flex items-start gap-2" id="taskBackendHint"></div>
+
           <div class="glass-card rounded-xl p-4 space-y-3" id="taskFormCard" style="display:none">
             <div class="text-xs font-medium text-text-secondary">新建任务</div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -12895,6 +13092,28 @@ const AutomationPage = {
       </div>`;
     bindForm(cloudReady);
     renderList(cloudReady);
+    renderBackendHint();
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /** 顶部后端提示：自动执行必须由本地后端执行（纯静态打开时禁用入口并说明原因） */
+  function renderBackendHint() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const el = page.querySelector('#taskBackendHint');
+    if (!el) return;
+    backendOnline = isBackendOnline();
+    if (backendOnline) {
+      el.className = 'rounded-lg border border-line-ghost/60 px-3 py-2 text-[11px] flex items-start gap-2';
+      el.innerHTML = '<i data-lucide="terminal" class="w-3.5 h-3.5 text-success flex-shrink-0 mt-0.5"></i>' +
+        '<span class="text-text-secondary">自动执行已就绪：本地后端在线，MoRay 会在任务的项目目录里拉起 <code class="font-mono">' + esc(cfgCodexPath()) +
+        '</code>。命令路径 / 默认工作目录 / 超时秒数在 <b>设置 → Agent 编排</b> 里改。</span>';
+    } else {
+      el.className = 'rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] flex items-start gap-2';
+      el.innerHTML = '<i data-lucide="plug-zap" class="w-3.5 h-3.5 text-warning flex-shrink-0 mt-0.5"></i>' +
+        '<span class="text-text-secondary"><b>自动执行需要本地后端</b>：当前后端未连接（纯静态打开或后端没启动）。' +
+        '用「启动MoRay.bat」启动后自动可用；其它功能（指令生成 / 复制 / 状态管理）不受影响。</span>';
+    }
     if (typeof refreshIcons === 'function') refreshIcons();
   }
 
@@ -12902,6 +13121,14 @@ const AutomationPage = {
     const page = document.getElementById('page-' + PAGE);
     if (!page) return;
     const on = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+    // [v3.22.0] 编排工头入口（面板由 69_orchestrator.js 注入；未安装时给出明确提示而不是静默失效）
+    on(page.querySelector('#taskOrchBtn'), 'click', () => {
+      if (window.__taskOrchestrator && typeof window.__taskOrchestrator.open === 'function') {
+        window.__taskOrchestrator.open();
+      } else if (typeof showNotification === 'function') {
+        showNotification('编排面板未就绪', '编排工头分片未安装（请确认构建产物完整：python assemble.py）', 'warning', 3200);
+      }
+    });
     on(page.querySelector('#taskNewBtn'), 'click', () => {
       const card = page.querySelector('#taskFormCard');
       card.style.display = '';
@@ -12909,7 +13136,7 @@ const AutomationPage = {
       page.querySelector('#taskName').value = '';
       page.querySelector('#taskAgent').value = f.agent || 'zcode';
       page.querySelector('#taskCustomAgent').value = state.customAgent || '';
-      page.querySelector('#taskProjectPath').value = f.projectPath || state.projectPath || '';
+      page.querySelector('#taskProjectPath').value = f.projectPath || state.projectPath || cfgWorkdir();
       page.querySelector('#taskBackground').value = '';
       page.querySelector('#taskRequirements').value = '';
       page.querySelector('#taskAcceptance').value = '';
@@ -13000,6 +13227,14 @@ const AutomationPage = {
     }
     list.innerHTML = state.tasks.map(t => {
       const sm = statusMeta(t.status);
+      const run = t.run || {};
+      const isRunning = run.status === 'running';
+      const canPath = !!(t.projectPath && t.projectPath.trim());
+      // 自动执行按钮：唯一不满足条件的原因写进 tooltip（不渲染"点不动的假按钮"给用户猜）
+      const autoDisabled = isRunning ? false : (!backendOnline || !canPath);
+      const autoTip = !backendOnline ? '需要本地后端：用「启动MoRay.bat」启动后可用'
+        : !canPath ? '该任务没填项目路径：本功能只在该目录下干活，先在设置里补上或编辑任务'
+        : 'MoRay 会在「' + t.projectPath + '」目录下拉起 ' + cfgCodexPath() + ' exec 干这个任务，日志实时回传';
       return `<div class="doc-card p-4" data-task-id="${esc(t.id)}">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
@@ -13019,9 +13254,13 @@ const AutomationPage = {
             <button class="tool-btn" data-task-op="copy" title="复制指令"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
             <button class="tool-btn" data-task-op="note" title="备注"><i data-lucide="pencil-line" class="w-3.5 h-3.5"></i></button>
             ${cloudReady ? '<button class="tool-btn" data-task-op="run" title="用已配置的云端 API 直接执行"><i data-lucide="play" class="w-3.5 h-3.5 text-brand-cyan"></i></button>' : ''}
+            ${isRunning
+              ? '<button class="tool-btn" data-task-op="stop" title="停止：杀掉整棵 codex 进程树"><i data-lucide="square" class="w-3.5 h-3.5 text-danger"></i></button>'
+              : `<button class="tool-btn" data-task-op="auto" title="${esc(autoTip)}" ${autoDisabled ? 'disabled style="opacity:.4;cursor:not-allowed"' : ''}><i data-lucide="rocket" class="w-3.5 h-3.5 ${autoDisabled ? '' : 'text-brand-cyan'}"></i></button>`}
             <button class="tool-btn" data-task-op="delete" title="删除"><i data-lucide="trash-2" class="w-3.5 h-3.5 text-danger"></i></button>
           </div>
         </div>
+        ${runPanelHtml(t)}
       </div>`;
     }).join('');
     list.querySelectorAll('[data-task-id]').forEach(card => {
@@ -13043,8 +13282,11 @@ const AutomationPage = {
           });
           if (op === 'note') editNote(t, cloudReady);
           if (op === 'run') runTask(t, cloudReady);
+          if (op === 'auto') startAutoRun(t, cloudReady);
+          if (op === 'stop') stopAutoRun(t, cloudReady);
           if (op === 'delete') {
             const del = () => {
+              stopPoll(t.id);
               state.tasks = state.tasks.filter(x => x.id !== id);
               save(); renderList(cloudReady);
               if (typeof showNotification === 'function') showNotification('已删除', t.name, 'success', 1600);
@@ -13055,8 +13297,317 @@ const AutomationPage = {
         });
       });
     });
+    bindRunPanels();
+    // 路径/命令存在性校验：异步补一次，只更新对应那张卡的按钮态（不整体重绘，避免打散正在滚动的日志）
+    if (backendOnline) state.tasks.forEach(t => {
+      if (!t.projectPath || (t.run && t.run.status === 'running')) return;
+      const card = page.querySelector('#taskList [data-task-id="' + t.id + '"]');
+      const btn = card ? card.querySelector('[data-task-op="auto"]') : null;
+      if (!btn) return;
+      checkPath(t.projectPath).then(r => {
+        if (r.ok) return;
+        btn.disabled = true;
+        btn.style.opacity = '.4';
+        btn.style.cursor = 'not-allowed';
+        btn.title = '项目路径/命令不可用：' + r.note;
+      });
+    });
     if (typeof refreshIcons === 'function') refreshIcons();
   }
+
+  /* ---------------- [v3.21.0] 自动执行：日志面板 ---------------- */
+
+  /** 展开中的日志面板（按任务 id 记录，重绘后保持展开态） @type {Object<string, boolean>} */
+  const expanded = {};
+  /** 轮询活动标记 + 连续失败计数 @type {Object<string, number>} */
+  const fails = {};
+
+  function stopPoll(taskId) {
+    if (pollers[taskId]) { clearTimeout(pollers[taskId]); }
+    delete pollers[taskId];
+    delete fails[taskId];
+  }
+
+  /** 运行日志面板的 HTML（无运行记录时返回空串，不占位） */
+  function runPanelHtml(t) {
+    const run = t.run || {};
+    if (!run.status) return '';
+    const open = !!expanded[t.id] || run.status === 'running';
+    const cost = runCost(run);
+    const bits = [];
+    const lm = RUN_LABEL[run.status] || [run.status, 'text-text-secondary'];
+    bits.push('<span class="' + lm[1] + '">' + esc(lm[0]) + '</span>');
+    if (run.startedAt) bits.push('<span>开始 ' + esc(fmtWhen(run.startedAt)) + '</span>');
+    if (run.durationSec) bits.push('<span>耗时 ' + esc(fmtDuration(run.durationSec)) + '</span>');
+    if (run.exitCode !== undefined && run.exitCode !== null) bits.push('<span>退出码 ' + esc(run.exitCode) + '</span>');
+    if (cost) bits.push('<span class="text-brand-cyan" title="' + esc(cost.title) + '">' + esc(cost.text) + '</span>');
+    else bits.push('<span title="模型侧没有返回 usage 事件，MoRay 不编造数字">成本：未能获取（模型侧未返回 usage）</span>');
+    if (run.logPath) bits.push('<span class="font-mono truncate max-w-[220px]" title="' + esc(run.logPath) + '">日志 ' + esc(run.logPath) + '</span>');
+    return `<div class="mt-3 rounded-lg border border-line-ghost/60 bg-surface-panel/40" data-run-panel>
+      <div class="flex items-center justify-between gap-2 px-3 py-2 flex-wrap">
+        <div class="text-[10px] text-text-tertiary flex items-center gap-2 flex-wrap" data-run-bits>${bits.join('<span class="opacity-40">·</span>')}</div>
+        <div class="flex items-center gap-1.5">
+          <button class="btn-ghost px-2 py-1 rounded-lg text-[10px] border border-line-ghost" data-run-op="toggle">${open ? '收起日志 ▴' : '展开日志 ▾'}</button>
+          <button class="btn-ghost px-2 py-1 rounded-lg text-[10px] border border-line-ghost" data-run-op="copylog">复制日志</button>
+        </div>
+      </div>
+      ${run.error ? `<div class="px-3 pb-1 text-[10px] text-danger">${esc(run.error)}</div>` : ''}
+      ${(run.warnings && run.warnings.length) ? `<div class="px-3 pb-1 text-[10px] text-warning">⚠ ${esc(run.warnings.join('；'))}</div>` : ''}
+      <pre data-run-log class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap px-3 pb-3 text-text-secondary overflow-auto${open ? '' : ' hidden'}" style="max-height:288px;word-break:break-all">${esc((t.log || []).join('\n'))}</pre>
+    </div>`;
+  }
+
+  /** 局部更新（运行中轮询用）：只改这一张卡的徽标与日志，保住滚动位置与展开状态 */
+  function updateRunPanel(t) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const card = page.querySelector('#taskList [data-task-id="' + t.id + '"]');
+    const panel = card ? card.querySelector('[data-run-panel]') : null;
+    if (!panel) { renderList(cloudReadyNow()); return; }   // 面板还不存在（例如刚启动）→ 整体重绘一次
+    const pre = panel.querySelector('[data-run-log]');
+    if (pre) {
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+      pre.textContent = (t.log || []).join('\n');
+      if (atBottom) pre.scrollTop = pre.scrollHeight;   // 自动滚到底（用户往上翻时不打断）
+    }
+    const bits = panel.querySelector('[data-run-bits]');
+    if (bits) {
+      const run = t.run || {};
+      const cost = runCost(run);
+      const lm = RUN_LABEL[run.status] || [run.status, 'text-text-secondary'];
+      const out = ['<span class="' + lm[1] + '">' + esc(lm[0]) + '</span>'];
+      if (run.startedAt) out.push('<span>开始 ' + esc(fmtWhen(run.startedAt)) + '</span>');
+      if (run.durationSec) out.push('<span>耗时 ' + esc(fmtDuration(run.durationSec)) + '</span>');
+      if (run.exitCode !== undefined && run.exitCode !== null) out.push('<span>退出码 ' + esc(run.exitCode) + '</span>');
+      out.push(cost ? '<span class="text-brand-cyan">' + esc(cost.text) + '</span>'
+        : '<span>成本：未能获取（模型侧未返回 usage）</span>');
+      bits.innerHTML = out.join('<span class="opacity-40">·</span>');
+    }
+  }
+
+  /** 绑定日志面板的展开/复制（整体重绘后重新绑） */
+  function bindRunPanels() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    page.querySelectorAll('#taskList [data-task-id]').forEach(card => {
+      const t = state.tasks.find(x => x.id === card.dataset.taskId);
+      if (!t) return;
+      const panel = card.querySelector('[data-run-panel]');
+      if (!panel) return;
+      const toggle = panel.querySelector('[data-run-op="toggle"]');
+      const pre = panel.querySelector('[data-run-log]');
+      if (toggle && pre) toggle.addEventListener('click', () => {
+        const willOpen = pre.classList.contains('hidden');
+        pre.classList.toggle('hidden', !willOpen);
+        expanded[t.id] = willOpen;
+        toggle.textContent = willOpen ? '收起日志 ▴' : '展开日志 ▾';
+        if (willOpen) pre.scrollTop = pre.scrollHeight;
+      });
+      const copyBtn = panel.querySelector('[data-run-op="copylog"]');
+      if (copyBtn) copyBtn.addEventListener('click', async () => {
+        const head = '任务：' + t.name + '\n运行状态：' + ((t.run || {}).status || '') +
+          '\n退出码：' + (((t.run || {}).exitCode === undefined || (t.run || {}).exitCode === null) ? '-' : (t.run || {}).exitCode) +
+          '\n耗时：' + (fmtDuration((t.run || {}).durationSec) || '-') + '\n\n';
+        const ok = await copyText(head + (t.log || []).join('\n'));
+        if (typeof showNotification === 'function') showNotification(ok ? '日志已复制' : '复制失败', ok ? '含状态、退出码、耗时与全部日志行' : '当前环境不允许自动复制', ok ? 'success' : 'warning', 2200);
+      });
+    });
+  }
+
+  /* ---------------- [v3.21.0] 自动执行：启动 / 停止 / 轮询 ---------------- */
+
+  /** 自动执行提示词 = 生成的指令 + 执行上下文说明（手动"复制指令"的文本保持原样不变） */
+  function autoPrompt(t) {
+    return buildInstruction(t) + '\n\n## 执行方式（MoRay 自动执行）\n' +
+      '你正被 MoRay 以非交互方式（codex exec）拉起，工作根就是上面的项目路径。请直接动手完成要求：' +
+      '该改文件就改，能跑自测就跑；最后用一段话说明改了什么、结果如何；做不到的部分如实说明，不要假装完成。';
+  }
+
+  /** 启动自动执行（唯一入口：用户点击任务卡的 🚀 按钮） */
+  async function startAutoRun(t, cloudReady) {
+    if (!isBackendOnline()) {
+      if (typeof showNotification === 'function') showNotification('需要本地后端', '自动执行由本地后端拉起 codex：请用「启动MoRay.bat」启动后重试', 'warning', 3600);
+      return;
+    }
+    if (!t.projectPath || !t.projectPath.trim()) {
+      if (typeof showNotification === 'function') showNotification('缺少项目路径', '本功能只在指定目录下干活：请编辑任务或到设置里填默认工作目录', 'warning', 3600);
+      return;
+    }
+    if (t.id in pollers) return;
+    const other = state.tasks.find(x => x.id !== t.id && x.run && x.run.status === 'running');
+    if (other) {
+      if (typeof showNotification === 'function') showNotification('已有任务在执行', '本产品单机串行：先停止「' + other.name + '」再启动本条', 'warning', 3600);
+      return;
+    }
+    const pathOk = await checkPath(t.projectPath);
+    if (!pathOk.ok) {
+      if (typeof showNotification === 'function') showNotification('项目路径不可用', pathOk.note || '路径校验未通过', 'warning', 4000);
+      return;
+    }
+    if (typeof showNotification === 'function') showNotification('已提交自动执行', '本地后端正在拉起 ' + cfgCodexPath() + ' …', 'info', 2400);
+    const r = await apiCall('POST', '/api/agent/run', {
+      task_id: t.id,
+      prompt: autoPrompt(t),
+      project_path: t.projectPath,
+      timeout_sec: cfgTimeout(),
+      command: cfgCodexPath()
+    }, 20000);
+    if (!r.ok) {
+      const msg = r.code === 'busy' ? '后端已有任务在执行（单机串行）：请先停止它' : r.message;
+      if (typeof showNotification === 'function') showNotification('启动失败', msg, 'error', 4200);
+      return;
+    }
+    const d = r.data || {};
+    t.run = {
+      runId: d.run_id, status: 'running', startedAt: (d.started_at || 0) * 1000,
+      endedAt: null, durationSec: null, exitCode: null, usage: null,
+      model: d.model || '', logPath: d.log_path || '', timeoutSec: d.timeout_sec || cfgTimeout(), error: null, warnings: []
+    };
+    t.log = (d.lines || []).slice(-LOG_KEEP);
+    offsets[t.id] = d.total_lines || t.log.length;
+    t.status = 'doing';
+    t.updatedAt = Date.now();
+    expanded[t.id] = true;
+    save(); renderList(cloudReady);
+    schedulePoll(t.id, cloudReady);
+  }
+
+  /** 停止：后端杀整棵进程树 → 状态 canceled */
+  async function stopAutoRun(t, cloudReady) {
+    const r = await apiCall('POST', '/api/agent/tasks/' + encodeURIComponent(t.id) + '/stop', {}, 10000);
+    if (!r.ok) {
+      if (typeof showNotification === 'function') showNotification('停止失败', r.message, 'error', 3600);
+      return;
+    }
+    if (typeof showNotification === 'function') showNotification('已发送停止', '正在终止 codex 进程树', 'info', 2400);
+    schedulePoll(t.id, cloudReady);   // 兜底：确认状态落地
+  }
+
+  /** 轮询增量日志（800ms；连续失败 5 次判定与后端失联，如实标注） */
+  function schedulePoll(taskId, cloudReady) {
+    if (taskId in pollers) return;
+    pollers[taskId] = 1;
+    fails[taskId] = 0;
+    const tick = async () => {
+      if (!(taskId in pollers)) return;
+      const t = state.tasks.find(x => x.id === taskId);
+      if (!t) { stopPoll(taskId); return; }
+      const off = offsets[taskId] || 0;
+      const r = await apiCall('GET', '/api/agent/tasks/' + encodeURIComponent(taskId) + '?offset=' + off, undefined, 8000);
+      if (!(taskId in pollers)) return;
+      if (!r.ok) {
+        fails[taskId] = (fails[taskId] || 0) + 1;
+        if (fails[taskId] >= 5) {
+          t.log = appendLog(t.log, '—— 连续 5 次拉取失败：' + r.message + '（按失联处理，标注为失败）');
+          t.run = Object.assign({}, t.run, { status: 'failed', error: '与本地后端失去联系：' + r.message, endedAt: Date.now() });
+          finishRun(t, cloudReady, '与本地后端失去联系');
+          return;
+        }
+      } else {
+        fails[taskId] = 0;
+        const d = r.data || {};
+        if (d.lines && d.lines.length) {
+          t.log = appendLog(t.log, d.lines.join('\n'));
+          offsets[taskId] = d.total_lines || (off + d.lines.length);
+        }
+        t.run = Object.assign({}, t.run, {
+          runId: d.run_id, status: d.status,
+          startedAt: (d.started_at || 0) * 1000,
+          endedAt: d.ended_at ? d.ended_at * 1000 : null,
+          durationSec: d.duration_sec, exitCode: d.exit_code,
+          usage: d.usage || null, model: d.model || (t.run || {}).model || '',
+          warnings: d.warnings || [], logPath: d.log_path || (t.run || {}).logPath || '',
+          error: d.error || null, timeoutSec: d.timeout_sec
+        });
+        if (d.status !== 'running') { finishRun(t, cloudReady); return; }
+        t.status = 'doing';
+        t.updatedAt = Date.now();
+        save();
+        updateRunPanel(t);
+      }
+      pollers[taskId] = setTimeout(tick, 800);
+    };
+    pollers[taskId] = setTimeout(tick, 400);
+  }
+
+  /** 收尾：状态流转 + 落执行记录 + 重绘（成本/耗时都来自真实回传） */
+  function finishRun(t, cloudReady, why) {
+    stopPoll(t.id);
+    const run = t.run || {};
+    t.status = runStatusToTaskStatus(run.status);
+    t.updatedAt = Date.now();
+    const cost = runCost(run);
+    state.records.unshift({
+      taskId: t.id, taskName: t.name, runId: run.runId, status: run.status,
+      startedAt: run.startedAt, endedAt: run.endedAt, durationSec: run.durationSec,
+      exitCode: (run.exitCode === undefined ? null : run.exitCode),
+      usage: run.usage || null, model: run.model || '',
+      costCNY: cost ? cost.cny : null,
+      costNote: cost ? cost.title : '模型侧未返回 usage，未能估算成本（MoRay 不编造数字）',
+      logTail: (t.log || []).slice(-LOG_TAIL_RECORD)
+    });
+    state.records = state.records.slice(0, 50);
+    save(); renderList(cloudReady);
+    const lm = RUN_LABEL[run.status] || [run.status];
+    const costText = cost ? ('估算成本 ' + cost.text.replace('本次估算成本 ', '')) : '成本未能获取（无 usage）';
+    if (typeof showNotification === 'function') {
+      const type = run.status === 'completed' ? 'success' : (run.status === 'failed' ? 'error' : 'warning');
+      showNotification(why ? why : ('自动执行' + lm[0]),
+        '「' + t.name + '」' + lm[0] + ' · 耗时 ' + (fmtDuration(run.durationSec) || '-') +
+        (run.exitCode === null || run.exitCode === undefined ? '' : ' · 退出码 ' + run.exitCode) + ' · ' + costText,
+        type, 4600);
+    }
+  }
+
+  /** 页面刷新后与后端对齐：
+   *  ① 后端仍在跑 → 重新接上日志流（不谎报"中断"）；
+   *  ② 后端有更新的真实结果 → 以它为准修正状态；
+   *  ③ 后端没有记录 → 保持 load() 里标注的「应用重启导致中断」。 */
+  async function reattachRuns(cloudReady) {
+    if (!isBackendOnline()) return;
+    const r = await apiCall('GET', '/api/agent/runs?limit=50', undefined, 8000);
+    if (!r.ok) return;
+    const runs = (r.data && r.data.runs) || [];
+    let touched = false;
+    for (const d of runs) {
+      const t = state.tasks.find(x => x.id === d.task_id);
+      if (!t) continue;
+      const local = t.run || {};
+      const backendNewer = !local.startedAt || (d.started_at * 1000) >= local.startedAt - 1000;
+      if (d.status === 'running') {
+        if (t.id in pollers) continue;
+        t.run = Object.assign({}, local, {
+          runId: d.run_id, status: 'running', startedAt: (d.started_at || 0) * 1000,
+          endedAt: null, durationSec: null, exitCode: null, usage: null,
+          model: d.model || '', logPath: d.log_path || '', timeoutSec: d.timeout_sec, error: null, warnings: []
+        });
+        t.status = 'doing';
+        expanded[t.id] = true;
+        offsets[t.id] = 0;
+        const detail = await apiCall('GET', '/api/agent/tasks/' + encodeURIComponent(t.id) + '?offset=0', undefined, 8000);
+        if (detail.ok) {
+          const dd = detail.data || {};
+          t.log = (dd.lines || []).slice(-LOG_KEEP);
+          offsets[t.id] = dd.total_lines || t.log.length;
+        }
+        schedulePoll(t.id, cloudReady);
+        touched = true;
+      } else if (backendNewer && (local.status === 'running' || /应用重启导致中断/.test(local.error || ''))) {
+        t.run = Object.assign({}, local, {
+          runId: d.run_id, status: d.status, startedAt: (d.started_at || 0) * 1000,
+          endedAt: d.ended_at ? d.ended_at * 1000 : null, durationSec: d.duration_sec,
+          exitCode: d.exit_code, usage: d.usage || null, model: d.model || '',
+          logPath: d.log_path || '', error: d.error || null, warnings: d.warnings || []
+        });
+        t.status = runStatusToTaskStatus(d.status);
+        const detail = await apiCall('GET', '/api/agent/tasks/' + encodeURIComponent(t.id) + '?offset=0', undefined, 8000);
+        if (detail.ok && detail.data && detail.data.lines) t.log = detail.data.lines.slice(-LOG_KEEP);
+        touched = true;
+      }
+    }
+    if (touched) { save(); renderList(cloudReady); }
+  }
+
 
   function editNote(t, cloudReady) {
     if (typeof showModal !== 'function') return;
@@ -13107,17 +13658,124 @@ const AutomationPage = {
     }
   }
 
+  /* ---------------- [v3.21.0] 设置页：Agent 编排 配置组 ---------------- */
+
+  /** 云端"直接执行"入口是否可用（与 buildPage 中原逻辑一致，抽出来给运行流程复用） */
+  function cloudReadyNow() {
+    try {
+      return !!(typeof MoraySettings !== 'undefined' && MoraySettings.get('openaiEnabled') && MoraySettings.get('openaiBaseURL'));
+    } catch (e) { return false; }
+  }
+
+  /** 最近用过的项目路径（设置页下拉候选：任务里出现过的 + 上次新建表单填的） */
+  function recentPaths() {
+    const out = [];
+    const push = (p) => {
+      const v = String(p || '').trim();
+      if (v && out.indexOf(v) === -1) out.push(v);
+    };
+    state.tasks.forEach(t => push(t.projectPath));
+    push(state.projectPath);
+    return out.slice(0, 12);
+  }
+
+  /** 设置页「Agent 编排」卡（幂等：已存在则先移除再插，保证数值最新） */
+  function appendRunSettingsCard() {
+    const container = document.querySelector('#page-settings .max-w-2xl');
+    if (!container) return;
+    const old = container.querySelector('#agentRunSettingsCard');
+    if (old) old.remove();
+    const codexPath = cfgCodexPath();
+    const workdir = cfgWorkdir();
+    const timeout = cfgTimeout();
+    const online = isBackendOnline();
+    const listId = 'agentRunWorkdirList';
+    const card = document.createElement('div');
+    card.id = 'agentRunSettingsCard';
+    card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
+    card.innerHTML = [
+      '<h3 class="text-sm font-semibold text-text-primary mb-1 flex items-center gap-2"><i data-lucide="rocket" class="w-4 h-4 text-brand-cyan"></i>Agent 编排（一键自动指挥 Codex）</h3>',
+      '<p class="text-[10px] text-text-tertiary mb-3">任务分派面板点 🚀 后，由<b>本地后端</b>在该任务的项目目录里拉起 codex CLI 干活：日志实时回传、状态按真实退出码流转、token usage 折算成本。' +
+      '参数固定为 <code class="font-mono">exec --json --skip-git-repo-check -s workspace-write -C &lt;项目目录&gt;</code>，指令走 stdin（规避 cmd 转义）；超时/停止会通过 <code class="font-mono">taskkill /T /F</code> 杀掉整棵进程树。</p>',
+      online
+        ? '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-success"><span class="beacon-dot success"></span>本地后端已连接：自动执行可用</div>'
+        : '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-warning"><span class="beacon-dot warn-dot"></span>本地后端离线：自动执行不可用（纯静态打开时按钮置灰）</div>',
+      '<div class="space-y-3">',
+      '<div><label class="form-label">Codex 命令路径</label>' +
+      '<input type="text" id="setAgentRunCodexPath" class="form-input font-mono" style="font-size:12px" value="' + esc(codexPath) + '" placeholder="' + esc(DEFAULT_CODEX_CMD) + ' 或绝对路径">' +
+      '<div class="form-hint">默认 <code class="font-mono">codex.cmd</code>（从 PATH 找；也可填绝对路径，例如 C:\\Users\\你\\AppData\\Roaming\\npm\\codex.cmd）</div></div>',
+      '<div><label class="form-label">默认工作目录</label>' +
+      '<input type="text" id="setAgentRunWorkdir" class="form-input font-mono" style="font-size:12px" list="' + listId + '" value="' + esc(workdir) + '" placeholder="' + esc(DEFAULT_WORKDIR) + '">' +
+      '<datalist id="' + listId + '">' + recentPaths().map(p => '<option value="' + esc(p) + '"></option>').join('') + '</datalist>' +
+      '<div class="form-hint">新建任务时「项目路径」的默认值（也是「测试命令与路径」的校验目录）；下拉可选最近用过的项目</div></div>',
+      '<div class="flex items-center justify-between"><span class="text-xs text-text-secondary">任务超时（秒，10-3600）</span>' +
+      '<input type="number" min="10" max="3600" step="10" value="' + timeout + '" id="setAgentRunTimeout" class="form-input" style="width:96px;padding:2px 6px;font-size:12px"></div>',
+      '<div class="flex items-center justify-between"><span class="text-xs text-text-secondary">最大并发</span>' +
+      '<span class="text-[11px] text-text-tertiary">1（固定 · 单机串行；同时只跑一个任务，第二个请求会被后端拒绝并提示）</span></div>',
+      '<div class="flex items-center gap-2 pt-1 border-t border-line-ghost/40">' +
+      '<button id="agentRunTestBtn" class="btn-ghost px-3 py-1.5 rounded-lg text-[11px] border border-line-ghost">测试命令与路径</button>' +
+      '<span class="text-[10px] text-text-tertiary" id="agentRunTestResult"></span></div>',
+      '</div>'
+    ].join('');
+    container.insertBefore(card, container.querySelector('#agentSettingsCard') || container.lastElementChild);
+    if (typeof refreshIcons === 'function') refreshIcons();
+
+    const on = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+    const codexInput = card.querySelector('#setAgentRunCodexPath');
+    const workdirInput = card.querySelector('#setAgentRunWorkdir');
+    const timeoutInput = card.querySelector('#setAgentRunTimeout');
+    on(codexInput, 'change', async () => {
+      await MoraySettings.set('agentRunCodexPath', codexInput.value.trim());
+      Object.keys(pathCache).forEach(k => delete pathCache[k]);
+      if (typeof showNotification === 'function') showNotification('已保存', 'Codex 命令路径已更新', 'success', 1600);
+    });
+    on(workdirInput, 'change', async () => {
+      await MoraySettings.set('agentRunWorkdir', workdirInput.value.trim());
+      if (typeof showNotification === 'function') showNotification('已保存', '默认工作目录已更新', 'success', 1600);
+    });
+    on(timeoutInput, 'change', async () => {
+      const v = Math.max(10, Math.min(3600, parseInt(timeoutInput.value, 10) || DEFAULT_TIMEOUT));
+      timeoutInput.value = v;
+      await MoraySettings.set('agentRunTimeoutSec', v);
+      if (typeof showNotification === 'function') showNotification('已保存', '任务超时 ' + v + ' 秒', 'success', 1600);
+    });
+    on(card.querySelector('#agentRunTestBtn'), 'click', async () => {
+      const out = card.querySelector('#agentRunTestResult');
+      out.textContent = '校验中…';
+      const cmd = (codexInput.value || '').trim() || DEFAULT_CODEX_CMD;
+      const dir = (workdirInput.value || '').trim() || DEFAULT_WORKDIR;
+      const r = await apiCall('GET', '/api/agent/run/preflight?project_path=' + encodeURIComponent(dir) +
+        '&command=' + encodeURIComponent(cmd), undefined, 8000);
+      if (!r.ok) { out.textContent = '✘ ' + r.message; return; }
+      const d = r.data;
+      out.textContent = (d.command_ok ? '✓ 命令 ' + d.command_path : '✘ ' + d.command_note) +
+        ' · ' + (d.path_ok ? '✓ 目录可用' : '✘ ' + d.path_note) +
+        ' · 模型（成本口径）' + (d.model || '未知') + (d.busy ? ' · 当前有任务在执行' : '');
+    });
+  }
+
   /* ---------------- 安装 ---------------- */
   function install() {
     load();
     ensureNavButton();
     ensurePage();
     buildPage();
+    appendRunSettingsCard();
     // 设置页改了云端 API 后，"直接执行"入口需要跟着出现/消失（不刷新页面也生效）
     window.addEventListener('moray-settings-changed', () => {
       const page = document.getElementById('page-' + PAGE);
       if (page) buildPage();
+      appendRunSettingsCard();
     });
+    // 后端探测完成后：刷新"自动执行"可用性，并把页面上的运行态与后端真实记录对齐
+    window.addEventListener('moray-backend-probed', () => {
+      backendOnline = isBackendOnline();
+      const page = document.getElementById('page-' + PAGE);
+      if (page) buildPage();
+      reattachRuns(cloudReadyNow());
+    });
+    // 首屏若后端已在线，直接对齐一次（覆盖"运行中刷新页面"的场景）
+    if (isBackendOnline()) setTimeout(() => reattachRuns(cloudReadyNow()), 600);
   }
 
   // 延迟到本脚本（含全部 parts）执行完毕再安装：安装时要用到 escapeHtml / refreshIcons /
@@ -13135,6 +13793,1361 @@ const AutomationPage = {
     /** 面板是否已注入到 DOM（导航按钮 + 页面容器都存在） */
     installed() {
       return !!(document.querySelector('.nav-icon-btn[data-page="' + PAGE + '"]') && document.getElementById('page-' + PAGE));
+    },
+    // [v3.21.0] 自动执行：自检出口（自动化验证用；仓库外的调用方也能检查配置与成本口径）
+    cfg: () => ({ codexPath: cfgCodexPath(), workdir: cfgWorkdir(), timeoutSec: cfgTimeout(), backendOnline: isBackendOnline() }),
+    recentPaths,
+    appendRunSettingsCard,
+    costOf: (taskId) => {
+      const t = state.tasks.find(x => x.id === taskId);
+      return t ? runCost(t.run) : null;
+    },
+    logOf: (taskId) => {
+      const t = state.tasks.find(x => x.id === taskId);
+      return t ? (t.log || []).join('\n') : '';
+    },
+    records: () => JSON.parse(JSON.stringify(state.records || []))
+  };
+})();
+
+/* ===================== [3.22.0] 编排工头（大任务 → 子任务 → 分工 → 串行队列 → 成本汇总） =====================
+ * 能力边界（诚实说明，不做"假装"功能）：
+ *  - 本面板是**真实编排**：子任务由后端用**真模型**（本地 Ollama，免费）拆解出来，用户可逐条
+ *    增删改；点「开始执行」后由本地后端**串行**跑队列（codex 工人 = 真 codex exec 子进程；
+ *    ollama 工人 = 真调本地 Ollama /api/chat），进度/日志/状态全部来自后端真实回传。
+ *  - 成本口径与 v3.21 一致：codex 子任务用**真实 usage** × 成本中心 PRICE_TABLE 单价；
+ *    ollama 子任务成本恒为 ¥0（本地推理，真实的 0）；拿不到 usage 就写"未能获取"，**不编数字**。
+ *  - 无后端（纯静态打开）时整块面板禁用并说明原因；不做并行 / 子任务依赖 / 定时自动执行。
+ *
+ * 实现约束：不动 moray-workbench.html 骨架 —— 导航按钮与页面容器由本分片运行时注入，
+ * 并自带与骨架一致的页面切换逻辑（与 68 分片同一做法）。分片排在 68 之后（见 assemble.py PARTS）。
+ */
+(function () {
+  const LS_KEY = 'moray_orchestrator_v1';
+  const PAGE = 'orchestrator';
+  const POLL_MS = 1500;              // 运行时轮询间隔（题目约定）
+  const IDLE_POLL_MS = 8000;         // 没有运行中的计划时的低频兜底轮询
+  const PATH_TTL = 20000;            // 路径/命令校验缓存
+  const LOG_KEEP = 400;              // 本地保留日志行数（防 localStorage 膨胀）
+  const PLAN_KEEP = 30;              // 本地保留计划条数
+  const OUT_KEEP = 3000;             // 本地快照里保留的输出字符数
+
+  const DEFAULT_CODEX_CMD = 'codex.cmd';
+  const DEFAULT_WORKDIR = 'D:\\ai工具台';
+  const DEFAULT_TIMEOUT = 600;
+  const MAX_SUBTASKS = 12;
+
+  const POOLS = [
+    { id: 'both', name: '两者都要（auto 按规则推荐）' },
+    { id: 'codex', name: '只用 Codex（会改文件/跑命令，付费）' },
+    { id: 'ollama', name: '只用本地 Ollama（免费，只出文字）' }
+  ];
+
+  const PLAN_LABEL = {
+    pending: ['待执行', 'bg-text-tertiary/15 text-text-tertiary'],
+    running: ['执行中', 'bg-brand-cyan/15 text-brand-cyan'],
+    completed: ['已完成', 'bg-success/15 text-success'],
+    canceled: ['已取消', 'bg-text-tertiary/15 text-text-tertiary'],
+    interrupted: ['应用重启导致中断', 'bg-warning/15 text-warning']
+  };
+  const SUB_LABEL = {
+    pending: ['待执行', 'bg-text-tertiary/15 text-text-tertiary'],
+    running: ['执行中', 'bg-brand-cyan/15 text-brand-cyan'],
+    completed: ['已完成', 'bg-success/15 text-success'],
+    failed: ['失败', 'bg-danger/15 text-danger'],
+    timeout: ['已超时', 'bg-warning/15 text-warning'],
+    canceled: ['已取消', 'bg-text-tertiary/15 text-text-tertiary']
+  };
+  const WORKER_LABEL = {
+    codex: ['Codex', 'bg-brand-violet/15 text-brand-violet', '真 codex exec 子进程（DeepSeek，按真实 usage 计费）'],
+    ollama: ['本地', 'bg-brand-cyan/15 text-brand-cyan', '本地 Ollama /api/chat（免费，只做文字工作）']
+  };
+
+  /** 本地状态（localStorage 持久化；后端在线时以后端为准） */
+  let state = { plans: [], expanded: null, draft: null, form: null };
+  /** 日志缓冲（只放内存，不进 localStorage —— 避免把 localStorage 写爆） @type {Object<string,string[]>} */
+  let logBufs = {};
+  /** 展开中的子任务输出（plan:idx → bool） @type {Object<string,boolean>} */
+  const openOutputs = {};
+  /** 后端可用性/工人状态缓存 */
+  let pf = { online: false, data: null, at: 0 };
+  /** 轮询定时器（同一时刻只轮询一个计划） */
+  let pollTimer = null;
+  let pollPlanId = null;
+  /** 日志游标：index = 想读哪个子任务的日志（null = 计划级），offset = 已消费到的总行号 */
+  let offsets = { index: null, offset: 0 };
+  /** 计划结束时置位：下一轮按 offset=0 把当前子任务的日志**完整**重拉一次（防止中途切换索引漏掉开头几行） */
+  let refillPending = false;
+  let busyLocal = false;              // 本页面正在发起「启动/停止/创建」请求（防重复点击）
+
+  function uid() { return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+  function esc(s) {
+    if (typeof escapeHtml === 'function') return escapeHtml(String(s == null ? '' : s));
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function planMeta(id) { return PLAN_LABEL[id] || [id, 'bg-text-tertiary/15 text-text-tertiary']; }
+  function subMeta(id) { return SUB_LABEL[id] || [id, 'bg-text-tertiary/15 text-text-tertiary']; }
+
+  /* ---------------- 持久化 ---------------- */
+
+  function trimPlan(p) {
+    const o = JSON.parse(JSON.stringify(p || {}));
+    (o.subtasks || []).forEach(s => { if (typeof s.output === 'string') s.output = s.output.slice(0, OUT_KEEP); });
+    return o;
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const o = JSON.parse(raw);
+      if (o && Array.isArray(o.plans)) {
+        state = {
+          plans: o.plans.filter(p => p && p.id).slice(0, PLAN_KEEP),
+          expanded: typeof o.expanded === 'string' ? o.expanded : null,
+          draft: (o.draft && Array.isArray(o.draft.subtasks)) ? o.draft : null,
+          form: o.form || null
+        };
+      }
+    } catch (e) { /* 损坏数据不阻塞面板 */ }
+    logBufs = {};
+    // [诚实标注] 上次关页面时还在"执行中"的计划：先按"与后端失联"兜底，install 后再按后端真实记录校正
+    state.plans.forEach(p => {
+      if (p.status !== 'running') return;
+      p.status = 'interrupted';
+      p.note = ((p.note || '') + ' 应用重启导致中断（页面关闭时该计划尚未结束，正在与后端核对）').trim();
+    });
+  }
+
+  function save() {
+    try {
+      state.plans = state.plans.slice(0, PLAN_KEEP).map(trimPlan);
+      localStorage.setItem(LS_KEY, JSON.stringify(state));   // logBufs 刻意不入库
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* ---------------- 后端调用（与 68 分片同一套约定） ---------------- */
+
+  function apiBase() {
+    if (typeof agentBackendBase === 'function') {
+      try { return agentBackendBase(); } catch (e) { /* 继续回退 */ }
+    }
+    try {
+      if (window.MorayBackend && window.MorayBackend.origin) return window.MorayBackend.origin;
+    } catch (e) { /* 忽略 */ }
+    return 'http://127.0.0.1:8000';
+  }
+
+  function isBackendOnline() {
+    try { return !!(window.MorayBackend && window.MorayBackend.connected); } catch (e) { return false; }
+  }
+
+  async function apiCall(method, path, body, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 8000);
+    try {
+      const url = apiBase() + path + (path.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+      const opt = { method, signal: ctrl.signal, cache: 'no-store', headers: {} };
+      if (body !== undefined) {
+        opt.headers['Content-Type'] = 'application/json';
+        opt.body = JSON.stringify(body);
+      }
+      const res = await fetch(url, opt);
+      let j = null;
+      try { j = await res.json(); } catch (e) { j = null; }
+      if (!res.ok) {
+        return {
+          ok: false, status: res.status,
+          code: (j && j.code) || 'http_' + res.status,
+          message: (j && (j.message || j.error)) || ('本地后端返回 ' + res.status),
+          data: j || null
+        };
+      }
+      if (!j || j.ok !== true) {
+        return { ok: false, status: res.status, code: (j && j.code) || 'bad_response',
+                 message: (j && (j.message || j.error)) || '后端返回格式异常', data: j || null };
+      }
+      return { ok: true, status: res.status, data: j.data };
+    } catch (e) {
+      const aborted = e && e.name === 'AbortError';
+      return { ok: false, status: 0, code: aborted ? 'timeout' : 'offline',
+               message: aborted ? '请求本地后端超时' : '连不上本地后端（需要启动 MoRay 后端）' };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function cfgStr(key, fallback) {
+    try {
+      if (typeof MoraySettings === 'undefined') return fallback;
+      const v = MoraySettings.get(key);
+      return (typeof v === 'string' && v.trim()) ? v.trim() : fallback;
+    } catch (e) { return fallback; }
+  }
+  function cfgNum(key, fallback) {
+    try {
+      if (typeof MoraySettings === 'undefined') return fallback;
+      const n = parseInt(MoraySettings.get(key), 10);
+      return (isFinite(n) && n > 0) ? n : fallback;
+    } catch (e) { return fallback; }
+  }
+  function cfgCodexPath() { return cfgStr('agentRunCodexPath', DEFAULT_CODEX_CMD); }
+  function cfgWorkdir() { return cfgStr('agentRunWorkdir', DEFAULT_WORKDIR); }
+  function cfgTimeout() { return Math.max(10, Math.min(3600, cfgNum('agentRunTimeoutSec', DEFAULT_TIMEOUT))); }
+
+  /** 工人可用性（20s 缓存；force=true 强制刷新） */
+  async function preflight(force) {
+    if (!isBackendOnline()) { pf = { online: false, data: null, at: Date.now() }; return pf; }
+    if (!force && pf.data && Date.now() - pf.at < PATH_TTL) return pf;
+    const r = await apiCall('GET', '/api/orchestrator/preflight?command=' + encodeURIComponent(cfgCodexPath()), undefined, 8000);
+    pf = r.ok ? { online: true, data: r.data, at: Date.now() }
+      : { online: false, data: null, at: Date.now(), error: r.message };
+    return pf;
+  }
+
+  /* ---------------- 成本（真实来源；拿不到就明说） ---------------- */
+
+  /** 子任务成本：ollama 恒为 ¥0；codex 用真实 usage × 成本中心单价 */
+  function subCost(sub, plan) {
+    if (sub.effective_worker === 'ollama') {
+      return { cny: 0, text: '¥0', local: true, title: '本地 Ollama 推理：不产生 API 费用（成本恒为 ¥0）' };
+    }
+    const u = sub.usage;
+    if (!u || typeof u.input_tokens !== 'number') return null;
+    if (typeof CostEngine === 'undefined') return null;
+    const model = sub.model || (plan && plan.codex_model) || '';
+    const prompt = Number(u.input_tokens) || 0;
+    const cache = Number(u.cached_input_tokens) || 0;
+    const out = Number(u.output_tokens) || 0;
+    const price = CostEngine.resolvePrice(model);
+    const cny = CostEngine.estimateCost(model, prompt, out, cache);
+    return {
+      cny,
+      text: CostEngine.formatMoney(cny),
+      title: '按成本中心价格表估算（非厂商账单）：' + (model || '模型未知') + ' · 单价 ' + price.note +
+        ' · 输入 ¥' + price.input + ' / 输出 ¥' + price.output + ' / 缓存命中 ¥' + price.cacheHit + ' 每百万 token' +
+        ' · 实际用量：输入 ' + prompt + '（含缓存 ' + cache + '）· 输出 ' + out
+    };
+  }
+
+  /** 计划汇总成本：各子任务之和；有取不到 usage 的 codex 子任务时如实标注未计入 */
+  function planCost(plan) {
+    let total = 0, unknown = 0, codexCny = 0;
+    (plan.subtasks || []).forEach(s => {
+      const c = subCost(s, plan);
+      if (!c) { if (s.status === 'completed' || s.status === 'failed' || s.status === 'timeout') unknown += 1; return; }
+      total += c.cny;
+      if (s.effective_worker !== 'ollama') codexCny += c.cny;
+    });
+    return { total, unknown, codexCny, ollamaCny: 0 };
+  }
+
+  function fmtDuration(sec) {
+    const v = Number(sec);
+    if (!isFinite(v) || v <= 0) return '';
+    if (v < 60) return v.toFixed(1) + 's';
+    return Math.floor(v / 60) + 'm' + Math.round(v % 60) + 's';
+  }
+
+  function fmtWhen(ts) {
+    try { return ts ? new Date(ts).toLocaleString('zh-CN') : ''; } catch (e) { return ''; }
+  }
+
+  /* ---------------- 注入：导航按钮 + 页面容器 ---------------- */
+
+  function ensureNavButton() {
+    if (document.querySelector('.nav-icon-btn[data-page="' + PAGE + '"]')) return;
+    const taskBtn = document.querySelector('.nav-icon-btn[data-page="tasks"]');
+    const nav = taskBtn ? taskBtn.parentElement
+      : (document.querySelector('.nav-icon-btn[data-page="cost"]') ?
+         document.querySelector('.nav-icon-btn[data-page="cost"]').parentElement : null);
+    if (!nav) return;
+    const btn = document.createElement('button');
+    btn.className = 'nav-icon-btn';
+    btn.setAttribute('data-page', PAGE);
+    btn.setAttribute('data-tooltip', '编排工头');
+    btn.innerHTML = '<i data-lucide="network" class="w-[18px] h-[18px]"></i>';
+    nav.appendChild(btn);
+    btn.addEventListener('click', () => { switchTo(PAGE); onEnterPage(); });
+  }
+
+  function ensurePage() {
+    if (document.getElementById('page-' + PAGE)) return;
+    const ref = document.getElementById('page-tasks') || document.getElementById('page-cost');
+    if (!ref || !ref.parentElement) return;
+    const div = document.createElement('div');
+    div.id = 'page-' + PAGE;
+    div.className = 'page-panel hidden flex-1 flex flex-col min-h-0';
+    ref.parentElement.insertBefore(div, ref.nextSibling);
+  }
+
+  function switchTo(page) {
+    document.querySelectorAll('.nav-icon-btn[data-page]').forEach(b => {
+      b.classList.toggle('active', b.dataset.page === page);
+    });
+    document.querySelectorAll('.page-panel').forEach(p => {
+      p.classList.add('hidden');
+      p.classList.remove('flex');
+    });
+    const target = document.getElementById('page-' + page);
+    if (target) {
+      target.classList.remove('hidden');
+      target.classList.add('flex');
+      void target.offsetWidth;
+    }
+    document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
+    const sb = document.getElementById('sidebar-' + page);
+    if (sb) { sb.classList.remove('hidden'); sb.classList.add('flex'); }
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /* ---------------- 页面骨架 ---------------- */
+
+  function buildPage() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    page.innerHTML = `
+      <div class="h-14 px-5 flex items-center justify-between border-b border-line-ghost/50 flex-shrink-0">
+        <div class="flex items-center gap-2 min-w-0">
+          <i data-lucide="network" class="w-4 h-4 text-brand-cyan flex-shrink-0"></i>
+          <span class="text-sm font-medium text-text-primary">编排工头</span>
+          <span class="tag-pill bg-brand-cyan/15 text-brand-cyan" id="orchPlanPill">0 个计划</span>
+          <span class="text-[11px] text-text-tertiary truncate" title="后端用真模型把大任务拆成子任务 → 按类型分配给 codex / 本地 Ollama → 串行执行 → 汇总成本">大任务拆解 · 分工 · 串行队列 · 成本汇总</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="orchRefreshBtn" title="重新从后端拉取计划列表与工人状态">
+            <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>刷新
+          </button>
+          <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5" id="orchNewBtn">
+            <i data-lucide="plus" class="w-3.5 h-3.5"></i>新建大任务
+          </button>
+        </div>
+      </div>
+      <div class="flex-1 overflow-y-auto p-5">
+        <div class="max-w-4xl mx-auto space-y-4">
+          <div class="rounded-lg border border-line-ghost/60 px-3 py-2 text-[11px] flex items-start gap-2" id="orchBackendHint"></div>
+
+          <div class="glass-card rounded-xl p-4 space-y-3" id="orchFormCard" style="display:none">
+            <div class="text-xs font-medium text-text-secondary">新建编排计划</div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div class="form-row"><label class="form-label">大任务名称</label>
+                <input type="text" id="orchTitle" class="form-input" placeholder="例如：整理 MoRay 工程的 Python 代码"></div>
+              <div class="form-row"><label class="form-label">项目路径</label>
+                <input type="text" id="orchProjectPath" class="form-input font-mono" style="font-size:12px"
+                  list="orchPathList" placeholder="例如：D:\\ai工具台">
+                <datalist id="orchPathList"></datalist></div>
+            </div>
+            <div class="form-row"><label class="form-label">目标描述（拆解的输入）</label>
+              <textarea id="orchGoal" class="form-input" rows="4" placeholder="例如：整理 MoRay 项目里所有 python 文件并总结每个文件的职责，最后给出一份工程结构说明。"></textarea></div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div class="form-row"><label class="form-label">工人池</label>
+                <select id="orchPool" class="form-input">${POOLS.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+              <div class="form-row"><label class="form-label">失败策略</label>
+                <select id="orchFailFast" class="form-input">
+                  <option value="0">失败继续跑下一个</option>
+                  <option value="1">失败即停（剩余取消）</option>
+                </select></div>
+              <div class="form-row"><label class="form-label">每个子任务超时（秒）</label>
+                <input type="number" min="10" max="3600" step="10" id="orchTimeout" class="form-input"></div>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5" id="orchDecomposeBtn">
+                <i data-lucide="split" class="w-3.5 h-3.5"></i>拆解为子任务</button>
+              <span class="text-[10px] text-text-tertiary" id="orchDecomposeHint"></span>
+              <button class="btn-ghost px-3 h-8 rounded-lg text-xs border border-line-ghost ml-auto" id="orchFormCancelBtn">取消</button>
+            </div>
+          </div>
+
+          <div class="glass-card rounded-xl p-4 space-y-3" id="orchDraftCard" style="display:none">
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <div class="text-xs font-medium text-text-secondary" id="orchDraftTitle">拆解结果（可编辑）</div>
+              <div class="text-[10px] text-text-tertiary" id="orchDraftMeta"></div>
+            </div>
+            <div class="space-y-2" id="orchDraftList"></div>
+            <div class="rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-[11px] text-danger" id="orchDecomposeError" style="display:none"></div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <button class="btn-ghost px-3 h-8 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="orchAddSubBtn">
+                <i data-lucide="plus" class="w-3.5 h-3.5"></i>添加子任务</button>
+              <span class="text-[10px] text-text-tertiary" id="orchDraftCount"></span>
+              <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 ml-auto" id="orchCreateRunBtn">
+                <i data-lucide="rocket" class="w-3.5 h-3.5"></i>创建并开始执行</button>
+              <button class="btn-ghost px-3 h-8 rounded-lg text-xs border border-line-ghost" id="orchCreateBtn">仅创建计划</button>
+              <button class="btn-ghost px-3 h-8 rounded-lg text-xs border border-line-ghost" id="orchDraftCancelBtn">放弃</button>
+            </div>
+          </div>
+
+          <div>
+            <h3 class="text-xs font-medium text-text-secondary mb-3">编排计划</h3>
+            <div class="space-y-2" id="orchPlanList"></div>
+          </div>
+        </div>
+      </div>`;
+    bindPage();
+    renderAll();
+  }
+
+  function onEnterPage() {
+    if (isBackendOnline()) { preflight(true).then(() => { renderAll(); }); }
+    refreshFromBackend();
+  }
+
+  /* ---------------- 渲染：后端提示 ---------------- */
+
+  function renderBackendHint() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const el = page.querySelector('#orchBackendHint');
+    if (!el) return;
+    const d = pf.data;
+    if (!isBackendOnline() || !d) {
+      el.className = 'rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] flex items-start gap-2';
+      el.innerHTML = '<i data-lucide="plug-zap" class="w-3.5 h-3.5 text-warning flex-shrink-0 mt-0.5"></i>' +
+        '<span class="text-text-secondary"><b>编排需要本地后端</b>：当前后端未连接（纯静态打开或后端没启动）。' +
+        '用「启动MoRay.bat」启动后端后本面板自动可用；编排的每一环都在本机执行，不会把任务发到云端之外。</span>';
+      if (typeof refreshIcons === 'function') refreshIcons();
+      return;
+    }
+    const codex = d.codex || {}, ollama = d.ollama || {};
+    const bits = [];
+    bits.push(codex.ok
+      ? '<span class="text-success">✓ Codex 工人就绪</span><span class="text-text-tertiary font-mono">' + esc(codex.path || '') + '</span>'
+      : '<span class="text-danger">✘ Codex 工人不可用：' + esc(codex.note || '') + '</span>');
+    bits.push(ollama.ok
+      ? '<span class="text-success">✓ 本地 Ollama 就绪（' + (ollama.models || []).length + ' 个模型）</span>'
+      : '<span class="text-danger">✘ 本地 Ollama 不可用：' + esc(ollama.note || '') + '</span>');
+    if (d.busy) {
+      bits.push('<span class="text-warning">⚠ 本机已有' + (d.active_plan_id ? '计划' : '任务') + '在执行（单机串行）：' +
+        esc(d.active_plan_title || d.active_task_id || '') + '</span>');
+    }
+    el.className = 'rounded-lg border border-line-ghost/60 px-3 py-2 text-[11px] flex flex-wrap items-center gap-x-3 gap-y-1';
+    el.innerHTML = '<i data-lucide="terminal" class="w-3.5 h-3.5 text-success flex-shrink-0"></i>' +
+      '<span class="text-text-tertiary">工人状态：</span>' + bits.join('<span class="opacity-40">·</span>') +
+      '<span class="text-text-tertiary ml-auto">拆解用本地模型：' + esc((ollama.decompose_models || []).join(' → ') || 'qwen3.5:9b') + '</span>';
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /* ---------------- 渲染：表单 / 拆解草稿 ---------------- */
+
+  function renderForm() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const f = state.form || {};
+    const el = (id) => page.querySelector(id);
+    if (el('#orchTimeout') && !el('#orchTimeout').value) el('#orchTimeout').value = f.timeoutSec || cfgTimeout();
+    if (el('#orchPool') && f.pool) el('#orchPool').value = f.pool;
+    if (el('#orchFailFast') && f.failFast !== undefined) el('#orchFailFast').value = f.failFast ? '1' : '0';
+    const dl = el('#orchPathList');
+    if (dl) dl.innerHTML = recentPaths().map(p => '<option value="' + esc(p) + '"></option>').join('');
+  }
+
+  function recentPaths() {
+    const out = [];
+    const push = (p) => {
+      const v = String(p || '').trim();
+      if (v && out.indexOf(v) === -1) out.push(v);
+    };
+    state.plans.forEach(p => push(p.project_path));
+    push((state.form || {}).projectPath);
+    push(cfgWorkdir());
+    return out.slice(0, 12);
+  }
+
+  function renderDraft() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const card = page.querySelector('#orchDraftCard');
+    if (!card) return;
+    const d = state.draft;
+    if (!d || !Array.isArray(d.subtasks) || !d.subtasks.length) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    page.querySelector('#orchDraftTitle').textContent = '拆解结果（可编辑）：' + (d.title || '未命名大任务');
+    page.querySelector('#orchDraftMeta').textContent =
+      '拆解模型 ' + (d.model || '-') + ' · 耗时 ' + (fmtDuration(d.elapsed_sec) || '-') +
+      (d.model_note ? ' · ' + d.model_note : '');
+    page.querySelector('#orchDraftCount').textContent = d.subtasks.length + ' 个子任务（最多 ' + MAX_SUBTASKS + ' 个）';
+    const list = page.querySelector('#orchDraftList');
+    list.innerHTML = d.subtasks.map((s, i) => {
+      const pool = d.pool || 'both';
+      const locked = pool !== 'both';
+      const eff = locked ? pool : (s.worker === 'auto' ? 'auto' : s.worker);
+      const effText = locked ? ('工人池已锁定：' + eff)
+        : (s.worker === 'auto' ? ('auto → 将用于 ' + recommendHint(s.title, s.detail)) : ('指定 ' + s.worker));
+      return `<div class="rounded-lg border border-line-ghost/60 p-3 space-y-2" data-draft-idx="${i}">
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] text-text-tertiary w-4 flex-shrink-0">${i + 1}</span>
+          <input type="text" class="form-input flex-1" style="font-size:12px" data-draft-field="title"
+            value="${esc(s.title)}" placeholder="子任务标题（<=20 字）">
+          <select class="h-7 rounded-lg bg-surface-card border border-line-ghost text-[11px] text-text-primary px-1"
+            data-draft-field="worker" ${locked ? 'disabled style="opacity:.5"' : ''}>
+            <option value="auto" ${s.worker === 'auto' ? 'selected' : ''}>auto（推荐）</option>
+            <option value="codex" ${s.worker === 'codex' ? 'selected' : ''}>codex</option>
+            <option value="ollama" ${s.worker === 'ollama' ? 'selected' : ''}>ollama</option>
+          </select>
+          <button class="tool-btn" data-draft-op="up" title="上移" ${i === 0 ? 'disabled style="opacity:.3"' : ''}><i data-lucide="arrow-up" class="w-3.5 h-3.5"></i></button>
+          <button class="tool-btn" data-draft-op="down" title="下移" ${i === d.subtasks.length - 1 ? 'disabled style="opacity:.3"' : ''}><i data-lucide="arrow-down" class="w-3.5 h-3.5"></i></button>
+          <button class="tool-btn" data-draft-op="del" title="删除这个子任务"><i data-lucide="trash-2" class="w-3.5 h-3.5 text-danger"></i></button>
+        </div>
+        <textarea class="form-input" rows="2" style="font-size:12px" data-draft-field="detail"
+          placeholder="具体做什么（1-3 句）">${esc(s.detail)}</textarea>
+        <div class="text-[10px] text-text-tertiary" data-draft-eff>${esc(effText)}</div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('[data-draft-idx]').forEach(row => {
+      const i = parseInt(row.dataset.draftIdx, 10);
+      row.querySelectorAll('[data-draft-field]').forEach(el => {
+        const field = el.dataset.draftField;
+        const ev = el.tagName === 'SELECT' ? 'change' : 'input';
+        el.addEventListener(ev, () => {
+          state.draft.subtasks[i][field] = el.value;
+          save();
+          if (field !== 'worker') return;
+          const hint = row.querySelector('[data-draft-eff]');
+          if (hint) {
+            hint.textContent = el.value === 'auto'
+              ? ('auto → 将用于 ' + recommendHint(state.draft.subtasks[i].title, state.draft.subtasks[i].detail))
+              : ('指定 ' + el.value);
+          }
+        });
+      });
+      row.querySelectorAll('[data-draft-op]').forEach(btn => {
+        const op = btn.dataset.draftOp;
+        if (btn.disabled) return;
+        btn.addEventListener('click', () => {
+          const arr = state.draft.subtasks;
+          if (op === 'del') arr.splice(i, 1);
+          if (op === 'up' && i > 0) { const t = arr[i - 1]; arr[i - 1] = arr[i]; arr[i] = t; }
+          if (op === 'down' && i < arr.length - 1) { const t = arr[i + 1]; arr[i + 1] = arr[i]; arr[i] = t; }
+          save(); renderDraft();
+        });
+      });
+    });
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /** 前端展示用的推荐提示（与后端 agent_orchestrator.recommend_worker 同一套规则） */
+  const CODE_WORDS = ['代码', '文件', '命令', '修复', '实现', '重构', '测试', '脚本', '配置', '部署', '编译', '调试',
+    '修改', '编写', '新增', '创建', '生成', '目录', '工程', '接口', '函数', '数据库', '安装', '运行', '打包', '构建',
+    '迁移', '清理', '排查', 'bug', 'python', 'js', 'sql', 'json', 'api'];
+  const TEXT_WORDS = ['总结', '解释', '改写', '问答', '翻译', '说明', '概括', '归纳', '描述', '回答', '建议', '评估',
+    '分析', '对比', '梳理', '罗列', '整理', '阅读', '讲解', '提炼'];
+  function recommendHint(title, detail) {
+    const t = (String(title || '') + ' ' + String(detail || '')).toLowerCase();
+    if (CODE_WORDS.some(w => t.indexOf(w) >= 0)) return 'codex';
+    if (TEXT_WORDS.some(w => t.indexOf(w) >= 0)) return 'ollama';
+    return 'codex（无法判断，保守走 codex）';
+  }
+
+  /* ---------------- 渲染：计划列表 ---------------- */
+
+  function renderAll() {
+    renderBackendHint();
+    renderForm();
+    renderDraft();
+    renderPlans();
+  }
+
+  function renderPlans() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const list = page.querySelector('#orchPlanList');
+    const pill = page.querySelector('#orchPlanPill');
+    if (pill) pill.textContent = state.plans.length + ' 个计划';
+    if (!state.plans.length) {
+      list.innerHTML = `<div class="glass-card rounded-xl p-6 text-center">
+        <i data-lucide="network" class="w-7 h-7 mx-auto mb-2 text-text-tertiary"></i>
+        <div class="text-sm text-text-primary mb-1">还没有编排计划</div>
+        <div class="text-[11px] text-text-tertiary">点右上角「新建大任务」：写下目标 → MoRay 用本地模型拆成子任务（可逐条改）→ 分配给 codex / 本地 Ollama → 串行执行并汇总成本。</div>
+      </div>`;
+      if (typeof refreshIcons === 'function') refreshIcons();
+      return;
+    }
+    list.innerHTML = state.plans.map(p => planCardHtml(p)).join('');
+    bindPlanCards();
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  function planCardHtml(p) {
+    const pm = planMeta(p.status);
+    const cost = planCost(p);
+    const total = p.subtask_count || (p.subtasks || []).length;
+    const done = p.done_count !== undefined ? p.done_count : (p.subtasks || []).filter(s => s.status === 'completed').length;
+    const running = p.status === 'running';
+    const d = pf.data || {};
+    const codexOk = !!(d.codex && d.codex.ok);
+    // 「开始执行」不可用的唯一原因写进 tooltip（不渲染"点不动的假按钮"让用户猜）
+    let runTip = '串行执行全部子任务：codex 子任务会拉起真 codex 进程，本地子任务调用 Ollama';
+    let runDisabled = false;
+    if (busyLocal) { runDisabled = true; runTip = '正在提交请求…'; }
+    else if (!isBackendOnline()) { runDisabled = true; runTip = '需要本地后端：用「启动MoRay.bat」启动后可用'; }
+    else if (running) { runDisabled = true; runTip = '该计划正在执行中'; }
+    else if (p.status === 'completed' || p.status === 'interrupted') {
+      runDisabled = true;
+      runTip = p.status === 'completed' ? '该计划已执行完成；要重跑请新建计划（避免重复执行同一子任务）'
+        : '该计划在后端重启时中断，不能续跑；请新建计划';
+    } else if (d.busy && d.active_plan_id !== p.id) {
+      runDisabled = true;
+      runTip = '本机已有' + (d.active_plan_id ? '计划' : '任务') + '在执行（单机串行）：请先停止它';
+    } else if (!codexOk && needsCodex(p)) {
+      runDisabled = true;
+      runTip = 'Codex 工人不可用：' + ((d.codex && d.codex.note) || '未找到 codex 命令') + '（可改工人池或修好 codex）';
+    }
+    const runnable = ['pending', 'canceled'].indexOf(p.status) >= 0;
+    const expanded = state.expanded === p.id;
+    return `<div class="doc-card p-4" data-plan-id="${esc(p.id)}">
+      <div class="flex items-start justify-between gap-3">
+        <div class="min-w-0 flex-1">
+          <div class="text-sm text-text-primary flex items-center gap-2 flex-wrap">
+            <span class="truncate">${esc(p.title)}</span>
+            <span class="tag-pill ${pm[1]}">${esc(pm[0])}</span>
+            <span class="tag-pill bg-brand-violet/15 text-brand-violet">进度 ${done}/${total}</span>
+            <span class="tag-pill bg-text-tertiary/15 text-text-tertiary">${esc(poolName(p.worker_pool))}</span>
+            ${p.fail_fast ? '<span class="tag-pill bg-warning/15 text-warning">失败即停</span>' : ''}
+          </div>
+          <div class="text-[10px] text-text-tertiary mt-0.5 truncate">
+            创建于 ${esc(fmtWhen((p.created_at || 0) * 1000))}${p.project_path ? ' · ' + esc(p.project_path) : ''}
+            ${p.started_at ? ' · 开始 ' + esc(fmtWhen(p.started_at * 1000)) : ''}
+            ${p.duration_sec ? ' · 总耗时 ' + esc(fmtDuration(p.duration_sec)) : ''}
+            · 总成本 ${costHtml(p)}
+          </div>
+          ${p.note ? `<div class="text-[11px] text-text-secondary mt-1 whitespace-pre-wrap">${esc(p.note)}</div>` : ''}
+        </div>
+        <div class="flex items-center gap-1.5 flex-shrink-0">
+          <button class="tool-btn" data-plan-op="toggle" title="${expanded ? '收起子任务与日志' : '展开子任务与日志'}">
+            <i data-lucide="${expanded ? 'chevron-up' : 'chevron-down'}" class="w-3.5 h-3.5"></i></button>
+          <button class="tool-btn" data-plan-op="copy" title="复制这个计划的汇总（含子任务清单与成本）"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+          ${running
+            ? '<button class="tool-btn" data-plan-op="stop" title="停止：杀掉当前子任务进程树，未开始的子任务标记取消"><i data-lucide="square" class="w-3.5 h-3.5 text-danger"></i></button>'
+            : `<button class="tool-btn" data-plan-op="run" title="${esc(runTip)}" ${(runDisabled || !runnable) ? 'disabled style="opacity:.4;cursor:not-allowed"' : ''}><i data-lucide="rocket" class="w-3.5 h-3.5 ${(runDisabled || !runnable) ? '' : 'text-brand-cyan'}"></i></button>`}
+          <button class="tool-btn" data-plan-op="forget" title="从本页面移除这条记录（不动后端数据）"><i data-lucide="trash-2" class="w-3.5 h-3.5 text-danger"></i></button>
+        </div>
+      </div>
+      ${expanded ? planDetailHtml(p) : ''}
+    </div>`;
+  }
+
+  function needsCodex(p) {
+    return (p.subtasks || []).some(s => (s.effective_worker || s.worker) === 'codex');
+  }
+
+  function poolName(id) {
+    return ({ both: '工人池：自动', codex: '工人池：仅 Codex', ollama: '工人池：仅本地' })[id] || ('工人池：' + id);
+  }
+
+  function costHtml(p) {
+    const c = planCost(p);
+    if (!c.total && !c.unknown) return '¥0';
+    const parts = [CostEngineText(c.total)];
+    if (c.unknown) parts.push('<span class="text-warning">' + c.unknown + ' 个子任务成本未能获取</span>');
+    return parts.join(' ');
+  }
+
+  function CostEngineText(cny) {
+    if (typeof CostEngine !== 'undefined') return CostEngine.formatMoney(cny);
+    return '¥' + Number(cny || 0).toFixed(4);
+  }
+
+  function planDetailHtml(p) {
+    const subs = p.subtasks || [];
+    const c = planCost(p);
+    const rows = subs.map(s => {
+      const sm = subMeta(s.status);
+      const w = WORKER_LABEL[s.effective_worker] || WORKER_LABEL.codex;
+      const sc = subCost(s, p);
+      const out = String(s.output || '');
+      const openKey = (state.expanded === p.id) && openOutputs[p.id + ':' + s.idx];
+      return `<div class="rounded-lg border border-line-ghost/60 p-3" data-sub-idx="${s.idx}">
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0 flex-1">
+            <div class="text-[12px] text-text-primary flex items-center gap-2 flex-wrap">
+              <span class="text-text-tertiary text-[10px]">#${s.idx + 1}</span>
+              <span>${esc(s.title)}</span>
+              <span class="tag-pill ${w[1]}" title="${esc(w[2])}">${esc(w[0])}</span>
+              <span class="tag-pill ${sm[1]}">${esc(sm[0])}</span>
+              ${s.elapsed_sec ? '<span class="text-[10px] text-text-tertiary">耗时 ' + esc(fmtDuration(s.elapsed_sec)) + '</span>' : ''}
+              ${sc ? '<span class="text-[10px] text-brand-cyan" title="' + esc(sc.title) + '">' + esc(sc.text) + '</span>'
+                   : '<span class="text-[10px] text-warning" title="模型侧没有返回 usage 事件，MoRay 不编造数字">成本未能获取</span>'}
+            </div>
+            ${s.detail ? `<div class="text-[10px] text-text-tertiary mt-0.5 whitespace-pre-wrap">${esc(String(s.detail).slice(0, 400))}</div>` : ''}
+            ${s.error ? `<div class="text-[10px] text-danger mt-0.5">${esc(s.error)}</div>` : ''}
+            ${(s.changed_files && s.changed_files.length) ? `<div class="text-[10px] text-text-secondary mt-0.5">改动文件：${esc(s.changed_files.map(f => f.path).join('、'))}</div>` : ''}
+            ${s.local_tokens ? `<div class="text-[10px] text-text-tertiary mt-0.5">本地模型真实用量（不计费）：输入 ${esc(s.local_tokens.prompt_eval_count)} / 输出 ${esc(s.local_tokens.eval_count)} tokens</div>` : ''}
+          </div>
+          <div class="flex items-center gap-1.5 flex-shrink-0">
+            ${out ? `<button class="btn-ghost px-2 py-1 rounded-lg text-[10px] border border-line-ghost" data-sub-op="out">${openKey ? '收起输出 ▴' : '查看输出 ▾'}</button>` : ''}
+            ${s.log_path ? `<button class="btn-ghost px-2 py-1 rounded-lg text-[10px] border border-line-ghost" data-sub-op="logpath" title="${esc(s.log_path)}">日志路径</button>` : ''}
+          </div>
+        </div>
+        ${openKey ? `<pre class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap mt-2 text-text-secondary overflow-auto" style="max-height:260px;word-break:break-all">${esc(out)}</pre>` : ''}
+      </div>`;
+    }).join('');
+    const logIdx = currentLogIndex(p);
+    const logLines = logBufs[p.id] || [];
+    return `<div class="mt-3 space-y-2">
+      <div class="rounded-lg border border-line-ghost/60 p-3 space-y-2">
+        <div class="text-[11px] text-text-secondary font-medium">子任务（按执行顺序串行）</div>
+        ${rows || '<div class="text-[11px] text-text-tertiary">没有子任务</div>'}
+      </div>
+      <div class="rounded-lg border border-brand-cyan/25 bg-brand-cyan/5 p-3">
+        <div class="text-[11px] text-text-secondary font-medium mb-1">汇总</div>
+        <div class="text-[11px] text-text-secondary flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span>总耗时 <b>${esc(fmtDuration(p.duration_sec) || '-')}</b></span>
+          <span>总成本 <b class="text-brand-cyan">${CostEngineText(c.total)}</b></span>
+          <span>Codex 子任务 ${CostEngineText(c.codexCny)}</span>
+          <span>本地 Ollama ¥0（本地推理）</span>
+          <span>完成 ${p.done_count || 0}/${p.subtask_count || 0}</span>
+          <span class="${(p.failed_count || 0) ? 'text-danger' : ''}">失败 ${p.failed_count || 0}</span>
+          <span>取消 ${p.canceled_count || 0}</span>
+        </div>
+        ${c.unknown ? '<div class="text-[10px] text-warning mt-1">有 ' + c.unknown + ' 个 codex 子任务没拿到 usage，未计入总成本（MoRay 不编造金额）。</div>' : ''}
+        ${p.fail_fast_tripped ? '<div class="text-[10px] text-warning mt-1">失败即停已生效：剩余子任务未执行。</div>' : ''}
+      </div>
+      <div class="rounded-lg border border-line-ghost/60 bg-surface-panel/40">
+        <div class="flex items-center justify-between gap-2 px-3 py-2 flex-wrap">
+          <div class="text-[10px] text-text-tertiary">
+            ${logIdx === null ? '执行日志（计划级）' : '执行日志 · 子任务 #' + (logIdx + 1)}
+            ${p.status === 'running' ? ' · 运行中实时刷新（1.5s）' : ' · 已结束'}
+          </div>
+          <button class="btn-ghost px-2 py-1 rounded-lg text-[10px] border border-line-ghost" data-plan-op="copylog">复制日志</button>
+        </div>
+        <pre data-plan-log class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap px-3 pb-3 text-text-secondary overflow-auto" style="max-height:288px;word-break:break-all">${esc(logLines.join('\n'))}</pre>
+      </div>
+    </div>`;
+  }
+
+  /** 日志区显示哪个子任务：运行中跟随 current_index，否则留在最后跑过的那个 */
+  function currentLogIndex(p) {
+    if (p.current_index !== null && p.current_index !== undefined) return p.current_index;
+    const subs = p.subtasks || [];
+    for (let i = subs.length - 1; i >= 0; i--) {
+      if (subs[i].status && subs[i].status !== 'pending') return subs[i].idx;
+    }
+    return null;
+  }
+
+  /** 结构指纹：状态/进度/耗时没变时不要整体重绘（保住日志滚动位置与展开态） */
+  function planSig(p) {
+    return (p.subtasks || []).map(s => s.status).join(',') + '|' + p.status + '|' +
+      (p.duration_sec || 0) + '|' + (p.total_cost_marker || '');
+  }
+
+  /** 原地更新日志（不重绘整页）：用户没往上翻时自动滚到底 */
+  function updateLogInPlace(planId) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return false;
+    const pre = page.querySelector('#orchPlanList [data-plan-id="' + planId + '"] [data-plan-log]');
+    if (!pre) return false;
+    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+    pre.textContent = (logBufs[planId] || []).join('\n');
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+    return true;
+  }
+
+  /* ---------------- 绑定 ---------------- */
+
+  function bindPage() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const on = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+    on(page.querySelector('#orchNewBtn'), 'click', () => openForm());
+    on(page.querySelector('#orchFormCancelBtn'), 'click', () => {
+      page.querySelector('#orchFormCard').style.display = 'none';
+    });
+    on(page.querySelector('#orchRefreshBtn'), 'click', async () => {
+      await preflight(true);
+      await refreshFromBackend(true);
+      if (typeof showNotification === 'function') showNotification('已刷新', '计划列表与工人状态已与后端对齐', 'success', 1800);
+    });
+    on(page.querySelector('#orchDecomposeBtn'), 'click', doDecompose);
+    on(page.querySelector('#orchAddSubBtn'), 'click', () => {
+      if (!state.draft) return;
+      if (state.draft.subtasks.length >= MAX_SUBTASKS) {
+        if (typeof showNotification === 'function') showNotification('数量已达上限', '最多 ' + MAX_SUBTASKS + ' 个子任务', 'warning', 2600);
+        return;
+      }
+      state.draft.subtasks.push({ title: '', detail: '', worker: 'auto' });
+      save(); renderDraft();
+    });
+    on(page.querySelector('#orchCreateBtn'), 'click', () => createPlan(false));
+    on(page.querySelector('#orchCreateRunBtn'), 'click', () => createPlan(true));
+    on(page.querySelector('#orchDraftCancelBtn'), 'click', () => {
+      state.draft = null; save(); renderDraft();
+    });
+  }
+
+  function openForm() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const card = page.querySelector('#orchFormCard');
+    card.style.display = '';
+    const f = state.form || {};
+    page.querySelector('#orchTitle').value = f.title || '';
+    page.querySelector('#orchGoal').value = f.goal || '';
+    page.querySelector('#orchProjectPath').value = f.projectPath || cfgWorkdir();
+    page.querySelector('#orchPool').value = f.pool || 'both';
+    page.querySelector('#orchFailFast').value = f.failFast ? '1' : '0';
+    page.querySelector('#orchTimeout').value = f.timeoutSec || cfgTimeout();
+    renderForm();
+    if (!isBackendOnline()) {
+      if (typeof showNotification === 'function') showNotification('需要本地后端', '拆解与执行都由本地后端完成：请先启动 MoRay 后端', 'warning', 3600);
+    } else {
+      preflight(false).then(() => renderAll());
+    }
+    card.scrollIntoView({ block: 'nearest' });
+  }
+
+  /* ---------------- 拆解 ---------------- */
+
+  async function doDecompose() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const title = page.querySelector('#orchTitle').value.trim();
+    const goal = page.querySelector('#orchGoal').value.trim();
+    const projectPath = page.querySelector('#orchProjectPath').value.trim();
+    const pool = page.querySelector('#orchPool').value;
+    const failFast = page.querySelector('#orchFailFast').value === '1';
+    const timeoutSec = Math.max(10, Math.min(3600, parseInt(page.querySelector('#orchTimeout').value, 10) || cfgTimeout()));
+    if (!isBackendOnline()) {
+      notify2('需要本地后端', '拆解由本地后端调用本机 Ollama 完成：请先启动 MoRay 后端', 'warning', 4000);
+      return;
+    }
+    if (!goal) {
+      notify2('缺少目标描述', '先在「目标描述」里写清楚这个大任务要做什么，MoRay 才能拆解', 'warning', 3600);
+      return;
+    }
+    const d = pf.data || {};
+    if (d.ollama && !d.ollama.ok) {
+      notify2('本地 Ollama 不可用', '拆解必须由本地模型完成（' + (d.ollama.note || '连接失败') + '）：请先启动 Ollama 后重试', 'error', 5000);
+      return;
+    }
+    state.form = { title, goal, projectPath, pool, failFast, timeoutSec };
+    save();
+    const btn = page.querySelector('#orchDecomposeBtn');
+    const hint = page.querySelector('#orchDecomposeHint');
+    btn.disabled = true; btn.style.opacity = '.5';
+    hint.textContent = '正在用本地模型拆解（首次加载模型可能较慢，最多等 180s）…';
+    hideDecomposeError();
+    let r = null;
+    try {
+      r = await apiCall('POST', '/api/orchestrator/decompose', {
+        goal, project_path: projectPath, ollama_url: (pf.data && pf.data.ollama && pf.data.ollama.url) || ''
+      }, 190000);
+    } finally {
+      btn.disabled = false; btn.style.opacity = '';
+      hint.textContent = '';
+    }
+    if (!r.ok) {
+      showDecomposeError('拆解失败：' + r.message, r.data);
+      notify2('拆解失败', r.code === 'ollama_unavailable' ? '本地 Ollama 连不上，拆解未开始（没有静默降级）' : '详见页面上的错误详情', 'error', 5200);
+      return;
+    }
+    const dd = r.data || {};
+    state.draft = {
+      title: title || (goal.slice(0, 30)),
+      goal, projectPath, pool, failFast, timeoutSec,
+      model: dd.model || '', model_note: dd.model_note || '', elapsed_sec: dd.elapsed_sec || 0,
+      raw: dd.raw || '', installed: dd.installed_models || [],
+      subtasks: (dd.subtasks || []).map(s => ({ title: s.title, detail: s.detail, worker: s.worker }))
+    };
+    save();
+    renderDraft();
+    notify2('拆解完成', '本地模型 ' + (dd.model || '') + ' 拆出 ' + state.draft.subtasks.length + ' 个子任务（可逐条修改后再执行）', 'success', 3600);
+  }
+
+  function showDecomposeError(msg, data) {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const card = page.querySelector('#orchDraftCard');
+    const box = page.querySelector('#orchDecomposeError');
+    card.style.display = '';
+    box.style.display = '';
+    const attempts = (data && data.attempts) || [];
+    const details = attempts.map(a => '模型 ' + a.model + '：' + a.error +
+      (a.raw ? '\n原始输出：' + String(a.raw).slice(0, 800) : '')).join('\n\n');
+    box.innerHTML = '<div class="font-medium mb-1">' + esc(msg) + '</div>' +
+      (details ? '<pre class="font-mono text-[10px] whitespace-pre-wrap max-h-40 overflow-auto">' + esc(details) + '</pre>'
+        : '<div class="text-[10px]">后端没有返回可展示的原始输出。</div>');
+  }
+
+  function hideDecomposeError() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    const box = page.querySelector('#orchDecomposeError');
+    if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+  }
+
+  /* ---------------- 创建 / 执行 / 停止 ---------------- */
+
+  async function createPlan(autoRun) {
+    if (busyLocal) return;
+    const d = state.draft;
+    if (!d) return;
+    const subs = (d.subtasks || []).filter(s => String(s.title || '').trim() || String(s.detail || '').trim());
+    if (!subs.length) {
+      notify2('没有子任务', '至少保留一个子任务才能创建计划', 'warning', 3000);
+      return;
+    }
+    if (!isBackendOnline()) {
+      notify2('需要本地后端', '计划必须由本地后端创建与执行', 'warning', 3600);
+      return;
+    }
+    let created = null;
+    busyLocal = true;
+    try {
+      const r = await apiCall('POST', '/api/orchestrator/plans', {
+        title: d.title || d.goal.slice(0, 30),
+        goal: d.goal,
+        project_path: d.projectPath || '',
+        worker_pool: d.pool || 'both',
+        fail_fast: !!d.failFast,
+        timeout_sec: d.timeoutSec || cfgTimeout(),
+        command: cfgCodexPath(),
+        decompose_model: d.model || '',
+        subtasks: subs.map(s => ({ title: s.title, detail: s.detail, worker: s.worker }))
+      }, 20000);
+      if (!r.ok) {
+        notify2('创建计划失败', r.message, 'error', 5000);
+        return;
+      }
+      created = r.data;
+      state.plans = [trimPlan(created)].concat(state.plans.filter(x => x.id !== created.id));
+      state.expanded = created.id;
+      state.draft = null;
+      const page = document.getElementById('page-' + PAGE);
+      if (page) { page.querySelector('#orchFormCard').style.display = 'none'; hideDecomposeError(); }
+      save(); renderAll();
+      notify2('计划已创建', '「' + created.title + '」共 ' + created.subtask_count + ' 个子任务', 'success', 2600);
+      await preflight(true);
+    } finally {
+      busyLocal = false;
+    }
+    // 注意：必须在放开 busyLocal 之后再启动队列（runPlan 有同一把防重入闸）
+    if (autoRun && created) await runPlan(created.id);
+  }
+
+  async function runPlan(planId) {
+    if (busyLocal) return;
+    const plan = state.plans.find(p => p.id === planId);
+    if (!plan) return;
+    busyLocal = true;
+    try {
+      const r = await apiCall('POST', '/api/orchestrator/plans/' + encodeURIComponent(planId) + '/run', {}, 20000);
+      if (!r.ok) {
+        notify2('启动失败', r.code === 'busy' ? '本机已有任务/计划在执行（单机串行）：请先停止它' : r.message, 'error', 5000);
+        return;
+      }
+      mergePlan(r.data);
+      state.expanded = planId;
+      save(); renderAll();
+      notify2('开始执行', '串行队列已启动：一个子任务跑完（无论成败）→ 下一个', 'info', 3200);
+      await preflight(true);
+      startPoll(planId);
+    } finally {
+      busyLocal = false;
+    }
+  }
+
+  async function stopPlan(planId) {
+    const plan = state.plans.find(p => p.id === planId);
+    const doStop = async () => {
+      const r = await apiCall('POST', '/api/orchestrator/plans/' + encodeURIComponent(planId) + '/stop', {}, 15000);
+      if (!r.ok) { notify2('停止失败', r.message, 'error', 4000); return; }
+      mergePlan(r.data);
+      save(); renderAll();
+      notify2('已发送停止', '当前子任务进程树正在被终止，未开始的子任务标记为取消', 'info', 3200);
+      // 停止会往当前子任务的日志里追加若干行（用户点击停止 / taskkill / 收尾），
+      // 增量游标在这种"中途插入"的场景下容易错位 → 强制按 offset=0 完整重拉一次，保证日志不漏行
+      logBufs[planId] = [];
+      offsets = { index: offsets.index, offset: 0 };
+      refillPending = true;
+      startPoll(planId);
+    };
+    if (typeof showConfirm === 'function') {
+      showConfirm('停止编排计划', '确定停止「' + ((plan && plan.title) || '') + '」？\n当前子任务会被终止（codex 走 taskkill 进程树），未开始的子任务标记为已取消。', doStop, { danger: true, okText: '停止' });
+    } else { await doStop(); }
+  }
+
+  function mergePlan(p) {
+    if (!p || !p.id) return;
+    const i = state.plans.findIndex(x => x.id === p.id);
+    const merged = trimPlan(p);
+    if (i >= 0) state.plans[i] = merged; else state.plans.unshift(merged);
+  }
+
+  /* ---------------- 轮询 ---------------- */
+
+  function startPoll(planId, immediate) {
+    if (pollPlanId !== planId) {
+      offsets = { index: null, offset: 0 };
+      logBufs[planId] = [];
+      refillPending = false;
+    }
+    pollPlanId = planId;
+    if (pollTimer) return;
+    const tick = async () => {
+      pollTimer = null;
+      const id = pollPlanId;
+      if (!id) return;
+      const before = state.plans.find(p => p.id === id);
+      const sigBefore = before ? planSig(before) : '';
+      const asked = offsets.index;                       // 本次要读的日志索引（null = 计划级）
+      const reqOffset = offsets.offset || 0;             // 本次请求实际用的偏移（复用前要判断它是否还适用）
+      const url = '/api/orchestrator/plans/' + encodeURIComponent(id) +
+        '?offset=' + reqOffset + '&log_index=' + (asked === null ? -1 : asked);
+      const r = await apiCall('GET', url, undefined, 8000);
+      if (!r.ok || !r.data) {
+        // 拉取失败不谎报状态：等下一轮再试（连续失败交给上层提示）
+        if (pollPlanId === id) pollTimer = setTimeout(tick, POLL_MS);
+        return;
+      }
+      const d = r.data;
+      const lg = d.log || {};
+      const got = (lg.subtask_index === undefined) ? null : lg.subtask_index;
+      if (got !== asked) {
+        if (got === null && asked !== null) {
+          // 计划刚结束：后端 current_index 已清空 → 继续钉在原索引上读（后端会按 log_index 回放）
+        } else {
+          offsets = { index: got, offset: 0 };           // 换子任务 → 日志重新从头拉
+          logBufs[id] = [];
+          if (reqOffset !== 0) {
+            // 这份响应是用**旧游标**取回的，不能拿来填新索引的缓冲（否则开头几行永久丢失，
+            // 而游标随后会被推进到 total，再也补不回来）→ 丢弃并立刻按新游标重拉一次
+            pollTimer = setTimeout(tick, 250);
+            return;
+          }
+        }
+      }
+      if (lg.lines && lg.lines.length) {
+        const buf = (logBufs[id] || []).concat(lg.lines);
+        logBufs[id] = buf.length > LOG_KEEP ? buf.slice(buf.length - LOG_KEEP) : buf;
+        offsets.offset = lg.total_lines || (reqOffset + lg.lines.length);
+      }
+      const snapshot = trimPlan(d);
+      delete snapshot.log;
+      mergePlan(snapshot);
+      save();
+      if (state.expanded === id && sigBefore === planSig(d)) updateLogInPlace(id);
+      else renderPlans();
+      const finishedNow = before && before.status === 'running' && d.status !== 'running';
+      if (finishedNow) {
+        onPlanFinished(d);
+        preflight(true).then(() => renderAll());
+        // 收尾：把当前正在看的子任务日志按 offset=0 完整重拉一次（保证用户看到的是完整日志）
+        logBufs[id] = [];
+        offsets = { index: offsets.index, offset: 0 };
+        refillPending = true;
+      }
+      if (!pollPlanId) return;
+      if (refillPending) {
+        refillPending = false;
+        pollTimer = setTimeout(tick, 250);
+        return;
+      }
+      const stillRunning = d.status === 'running';
+      if (!stillRunning && state.expanded !== id && !state.plans.some(p => p.status === 'running')) {
+        pollPlanId = null;
+        return;
+      }
+      pollTimer = setTimeout(tick, stillRunning ? POLL_MS : IDLE_POLL_MS);
+    };
+    pollTimer = setTimeout(tick, immediate === false ? POLL_MS : 200);
+  }
+
+  function onPlanFinished(d) {
+    const cost = planCost(d);
+    const failed = d.failed_count || 0;
+    const done = d.done_count || 0;
+    notify2(failed ? '编排结束（有失败）' : '编排完成',
+      '「' + d.title + '」完成 ' + done + '/' + (d.subtask_count || 0) + ' 个子任务' +
+      (failed ? '（' + failed + ' 个失败）' : '') +
+      ' · 总耗时 ' + (fmtDuration(d.duration_sec) || '-') + ' · 总成本 ' + CostEngineText(cost.total) +
+      (cost.unknown ? '（' + cost.unknown + ' 个子任务成本未能获取）' : ''),
+      failed ? 'warning' : 'success', 6000);
+  }
+
+  /** 刷新后与后端对齐：列表以后端为准；后端仍在跑 → 重新接上日志流（不谎报中断） */
+  async function refreshFromBackend(force) {
+    if (!isBackendOnline()) { renderAll(); return; }
+    const r = await apiCall('GET', '/api/orchestrator/plans?limit=30', undefined, 8000);
+    if (!r.ok) { renderAll(); return; }
+    const plans = (r.data && r.data.plans) || [];
+    const localById = {};
+    state.plans.forEach(p => { localById[p.id] = p; });
+    state.plans = plans.map(p => {
+      const local = localById[p.id];
+      const merged = trimPlan(p);
+      if (local && local.status === 'running' && p.status !== 'running') {
+        // 后端给了终态：以后端为准（避免页面停留在"运行中"）
+        merged.note = p.note || '';
+      }
+      return merged;
+    });
+    const activeId = (r.data && r.data.active_plan_id) || null;
+    if (activeId) {
+      const active = state.plans.find(p => p.id === activeId);
+      if (active && active.status === 'running') { state.expanded = activeId; startPoll(activeId); }
+    }
+    save(); renderAll();
+  }
+
+  /* ---------------- 事件委托（计划卡 / 子任务） ---------------- */
+
+  function bindPlanCards() {
+    const page = document.getElementById('page-' + PAGE);
+    if (!page) return;
+    page.querySelectorAll('#orchPlanList [data-plan-id]').forEach(card => {
+      const id = card.dataset.planId;
+      const p = state.plans.find(x => x.id === id);
+      if (!p) return;
+      card.querySelectorAll('[data-plan-op]').forEach(btn => {
+        const op = btn.dataset.planOp;
+        if (btn.disabled && op !== 'toggle' && op !== 'copy' && op !== 'forget') return;
+        btn.addEventListener('click', () => {
+          if (op === 'toggle') {
+            state.expanded = state.expanded === id ? null : id;
+            save(); renderPlans();
+            if (state.expanded === id && p.status === 'running') startPoll(id);
+            else if (state.expanded === id) loadLogOnce(id);
+          }
+          if (op === 'run') runPlan(id);
+          if (op === 'stop') stopPlan(id);
+          if (op === 'copy') copyPlanSummary(p);
+          if (op === 'copylog') {
+            copyText((logBufs[id] || []).join('\n') || '（暂无日志）').then(ok => {
+              notify2(ok ? '日志已复制' : '复制失败', ok ? '共 ' + (logBufs[id] || []).length + ' 行' : '当前环境不允许自动复制', ok ? 'success' : 'warning', 2200);
+            });
+          }
+          if (op === 'forget') {
+            const del = () => {
+              state.plans = state.plans.filter(x => x.id !== id);
+              delete logBufs[id];
+              if (state.expanded === id) state.expanded = null;
+              save(); renderPlans();
+              notify2('已从本页移除', '后端数据库里的计划与执行记录没有被删除（仍可通过 /api/orchestrator/plans 查到）', 'info', 3600);
+            };
+            if (typeof showConfirm === 'function') {
+              showConfirm('移除记录', '只从本页面列表移除「' + p.title + '」，不会删除后端数据；数据库里的计划与执行记录保持不变。', del, { okText: '移除' });
+            } else { del(); }
+          }
+        });
+      });
+      card.querySelectorAll('[data-sub-idx]').forEach(row => {
+        const idx = parseInt(row.dataset.subIdx, 10);
+        row.querySelectorAll('[data-sub-op]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const op = btn.dataset.subOp;
+            if (op === 'out') {
+              const key = id + ':' + idx;
+              openOutputs[key] = !openOutputs[key];
+              renderPlans();
+            }
+            if (op === 'logpath') {
+              const s = (p.subtasks || []).find(x => x.idx === idx);
+              copyText((s && s.log_path) || '').then(ok => notify2(ok ? '已复制日志路径' : '复制失败', (s && s.log_path) || '', ok ? 'success' : 'warning', 3000));
+            }
+          });
+        });
+      });
+    });
+  }
+
+  async function loadLogOnce(planId) {
+    // 重新展开一个已结束的计划：让后端挑"日志最多的那个子任务"（frontend 无法凭状态判断谁有日志，
+    // 之前取"最后一个非 pending 子任务"会在它恰好没日志时把已经拉到手的日志清空 —— 真实缺陷，已修）
+    const r = await apiCall('GET', '/api/orchestrator/plans/' + encodeURIComponent(planId) +
+      '?offset=0&log_index=-2', undefined, 8000);
+    if (!r.ok || !r.data) return;
+    const d = r.data || {};
+    const lg = d.log || {};
+    const lines = lg.lines || [];
+    const got = (lg.subtask_index === undefined) ? null : lg.subtask_index;
+    // 只有"确实拿到内容"或"当前缓冲本来就是空的"才替换，绝不拿空结果覆盖已有日志
+    if (lines.length || !(logBufs[planId] || []).length) {
+      logBufs[planId] = lines;
+      offsets = { index: got, offset: lg.total_lines || 0 };
+    }
+    renderPlans();
+  }
+
+  async function copyPlanSummary(p) {
+    const c = planCost(p);
+    const lines = [];
+    lines.push('# 编排计划：' + p.title);
+    lines.push('状态：' + planMeta(p.status)[0] + ' · 进度 ' + (p.done_count || 0) + '/' + (p.subtask_count || 0) +
+      ' · 总耗时 ' + (fmtDuration(p.duration_sec) || '-') + ' · 总成本 ' + CostEngineText(c.total));
+    if (p.project_path) lines.push('项目路径：' + p.project_path);
+    if (p.goal) lines.push('目标：' + p.goal);
+    lines.push('');
+    (p.subtasks || []).forEach(s => {
+      const sc = subCost(s, p);
+      lines.push('[' + (s.status) + '] #' + (s.idx + 1) + ' ' + s.title + '（' + (s.effective_worker || s.worker) + '，' +
+        (fmtDuration(s.elapsed_sec) || '-') + '，' + (sc ? sc.text : '成本未能获取') + '）');
+      if (s.error) lines.push('    错误：' + s.error);
+      if (s.output) lines.push('    输出摘要：' + String(s.output).replace(/\s+/g, ' ').slice(0, 200));
+    });
+    lines.push('');
+    lines.push('成本口径：codex 子任务 = 真实 usage × 成本中心单价；本地 Ollama 子任务恒为 ¥0（本地推理）。');
+    const ok = await copyText(lines.join('\n'));
+    notify2(ok ? '已复制计划汇总' : '复制失败', ok ? '含每个子任务的状态/工人/耗时/成本' : '当前环境不允许自动复制', ok ? 'success' : 'warning', 2600);
+  }
+
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { /* 继续回退 */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', 'readonly');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch (e) { return false; }
+  }
+
+  function notify2(title, msg, type, ms) {
+    if (typeof showNotification === 'function') showNotification(title, msg, type, ms);
+  }
+
+  /* ---------------- 设置页：编排参数（工人池说明 + 本地模型名） ---------------- */
+
+  function appendOrchSettingsCard() {
+    const container = document.querySelector('#page-settings .max-w-2xl');
+    if (!container) return;
+    const old = container.querySelector('#orchSettingsCard');
+    if (old) old.remove();
+    const card = document.createElement('div');
+    card.id = 'orchSettingsCard';
+    card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
+    const d = pf.data || {};
+    const ollama = d.ollama || {};
+    card.innerHTML = [
+      '<h3 class="text-sm font-semibold text-text-primary mb-1 flex items-center gap-2"><i data-lucide="network" class="w-4 h-4 text-brand-cyan"></i>编排工头（大任务拆解与多工人串行）</h3>',
+      '<p class="text-[10px] text-text-tertiary mb-3">「编排工头」页把一个大任务交给<b>本地模型拆解</b>成子任务，再按类型分给两个工人串行执行：' +
+      '<b>codex 工人</b>（真 codex exec 子进程，按真实 usage 计费）与 <b>本地 Ollama 工人</b>（真调 /api/chat，成本恒为 ¥0）。' +
+      '单机同时只允许 1 个计划在跑（与单任务自动执行共用一把闸门）。</p>',
+      '<div class="space-y-2 text-[11px] text-text-secondary">',
+      '<div>拆解模型（本地，免费）：<code class="font-mono">' + esc((ollama.decompose_models || ['qwen3.5:9b', 'qwen2.5:7b']).join(' → ')) + '</code>' +
+      '（失败自动降级；都失败会返回明确错误，不会假装成功）</div>',
+      '<div>Ollama 地址：<code class="font-mono">' + esc(ollama.url || 'http://127.0.0.1:11434') + '</code>' +
+      (ollama.ok ? ' · 已连接，可用模型 ' + esc((ollama.models || []).join('、')) : ' · 未连接：' + esc(ollama.note || '')) + '</div>',
+      '<div>codex 工人命令：<code class="font-mono">' + esc((d.codex && d.codex.path) || cfgCodexPath()) + '</code>' +
+      '（在「Agent 编排」里改；成本口径读 ~/.codex/config.toml 的 model）</div>',
+      '<div>每个子任务超时：默认 ' + esc(cfgTimeout()) + ' 秒（与单任务一致，计划创建时可单独设置）</div>',
+      '</div>'
+    ].join('');
+    container.appendChild(card);
+    if (typeof refreshIcons === 'function') refreshIcons();
+  }
+
+  /* ---------------- 安装 ---------------- */
+
+  function install() {
+    load();
+    ensureNavButton();
+    ensurePage();
+    buildPage();
+    appendOrchSettingsCard();
+    window.addEventListener('moray-settings-changed', () => {
+      const page = document.getElementById('page-' + PAGE);
+      if (page) buildPage();
+      appendOrchSettingsCard();
+    });
+    window.addEventListener('moray-backend-probed', () => {
+      preflight(true).then(() => { renderAll(); appendOrchSettingsCard(); });
+      refreshFromBackend();
+    });
+    if (isBackendOnline()) {
+      setTimeout(() => {
+        preflight(true).then(() => { renderAll(); appendOrchSettingsCard(); });
+        refreshFromBackend();
+      }, 700);
+    }
+  }
+
+  function bootInstall() {
+    try { install(); } catch (e) { console.warn('[MoRay] 编排工头面板安装失败:', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootInstall);
+  else setTimeout(bootInstall, 0);
+
+  /** 被任务分派面板的「编排计划」入口按钮调用 */
+  function openFromTaskPanel() {
+    switchTo(PAGE);
+    onEnterPage();
+  }
+
+  /** 调试/自检出口（只读状态，便于自动化验证） */
+  window.__taskOrchestrator = {
+    page: PAGE,
+    open: openFromTaskPanel,
+    switchTo,
+    installed() {
+      return !!(document.querySelector('.nav-icon-btn[data-page="' + PAGE + '"]') && document.getElementById('page-' + PAGE));
+    },
+    state: () => JSON.parse(JSON.stringify({ plans: state.plans, expanded: state.expanded, draft: state.draft })),
+    preflight: () => JSON.parse(JSON.stringify(pf)),
+    refreshPreflight: () => preflight(true),
+    refresh: (force) => refreshFromBackend(force),
+    /** 自动化用：填表 → 拆解（真实调用本地模型） */
+    setForm: (o) => {
+      const page = document.getElementById('page-' + PAGE);
+      if (!page) return false;
+      page.querySelector('#orchFormCard').style.display = '';
+      if (o.title !== undefined) page.querySelector('#orchTitle').value = o.title;
+      if (o.goal !== undefined) page.querySelector('#orchGoal').value = o.goal;
+      if (o.projectPath !== undefined) page.querySelector('#orchProjectPath').value = o.projectPath;
+      if (o.pool !== undefined) page.querySelector('#orchPool').value = o.pool;
+      if (o.failFast !== undefined) page.querySelector('#orchFailFast').value = o.failFast ? '1' : '0';
+      if (o.timeoutSec !== undefined) page.querySelector('#orchTimeout').value = o.timeoutSec;
+      return true;
+    },
+    draft: () => JSON.parse(JSON.stringify(state.draft)),
+    /** 自动化用：直接注入一份"人工确认后的子任务列表"（走的是与拆解结果完全相同的渲染/提交路径） */
+    injectDraft: (d) => {
+      if (!d || !Array.isArray(d.subtasks)) return false;
+      state.draft = Object.assign({
+        title: '', goal: '', projectPath: '', pool: 'both', failFast: false,
+        timeoutSec: cfgTimeout(), model: '', model_note: '', elapsed_sec: 0, subtasks: []
+      }, d);
+      state.draft.subtasks = state.draft.subtasks.map(s => ({
+        title: s.title || '', detail: s.detail || '', worker: s.worker || 'auto'
+      }));
+      save(); renderDraft();
+      return true;
+    },
+    setDraftSubtasks: (arr) => {
+      if (!state.draft) return false;
+      state.draft.subtasks = arr.map(s => ({ title: s.title || '', detail: s.detail || '', worker: s.worker || 'auto' }));
+      save(); renderDraft();
+      return true;
+    },
+    createPlan: (autoRun) => createPlan(!!autoRun),
+    run: (planId) => runPlan(planId),
+    stop: (planId) => stopPlan(planId),
+    logs: (planId) => (logBufs[planId] || []).join('\n'),
+    /** 自检：轮询游标与日志缓冲状态（排查增量拉取时用） */
+    debug: (planId) => ({
+      pollPlanId, offsets, expanded: state.expanded,
+      logLen: (logBufs[planId] || []).length,
+      logAll: (logBufs[planId] || []),
+      pollTimer: !!pollTimer
+    }),
+    costOf: (planId) => {
+      const p = state.plans.find(x => x.id === planId);
+      return p ? planCost(p) : null;
+    },
+    planOf: (planId) => {
+      const p = state.plans.find(x => x.id === planId);
+      return p ? JSON.parse(JSON.stringify(p)) : null;
     }
   };
 })();
@@ -13725,6 +15738,10 @@ const SettingsApp = {
         </div>
       </div>`;
     this.bind();
+    // [v3.21.0] 设置页重建后重新挂上「Agent 编排」卡（由任务分派分片提供，幂等）
+    if (window.__taskDispatch && typeof window.__taskDispatch.appendRunSettingsCard === 'function') {
+      try { window.__taskDispatch.appendRunSettingsCard(); } catch (e) { /* 卡挂失败不影响设置页 */ }
+    }
     refreshIcons();
   },
 
@@ -14236,7 +16253,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.20.1'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.22.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -19702,7 +21719,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.20.1';
+window.MORAY_BUILD = '3.22.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -22033,7 +24050,12 @@ async function appendAgentSettings() {
     '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
     '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
-    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button></div>',
+    '<div class="flex items-center gap-1.5">' +
+    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button>' +
+    // [Kernel 阶段1] 飞行记录仪（时间轴）：与审计表格同一数据源（GET /api/agent/log），改视图不改数据
+    '<button id="agentTimelineBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost flex items-center gap-1" title="按天分组的时间轴视图：状态/工具筛选、展开详情、自动刷新">' +
+    '<i data-lucide="activity" class="w-3 h-3"></i>飞行记录仪</button>' +
+    '</div></div>',
     // [阶段1 M1] 上次 Agent 自检结果
     (() => {
       const sc = MoraySettings.get('agentSelfCheck');
@@ -22076,6 +24098,11 @@ async function appendAgentSettings() {
     showNotification('已保存', '最大工具轮数 = ' + v, 'success', 1500);
   });
   on(card.querySelector('#agentAuditViewBtn'), 'click', () => showAgentAuditLog());
+  // [Kernel 阶段1] 飞行记录仪入口（时间轴视图在 138_timeline.js；此处只转发，不改审计表格功能）
+  on(card.querySelector('#agentTimelineBtn'), 'click', () => {
+    if (typeof TimelineViewer !== 'undefined' && TimelineViewer.open) TimelineViewer.open();
+    else showNotification('时间轴未就绪', '前端分片未加载完成，请刷新页面后重试', 'warning', 2600);
+  });
   // [阶段0.5 E] 清除本会话已信任操作（相同工具+参数将重新询问）
   const trustedClear = card.querySelector('#agentTrustedClear');
   if (trustedClear) on(trustedClear, 'click', () => {
@@ -24163,6 +26190,1165 @@ button:disabled, .btn:disabled, [role="button"][aria-disabled="true"] { opacity:
 `;
   document.head.appendChild(st);
 })();
+
+/* ============================================================
+   [飞行记录仪] TimelineViewer —— 工具调用审计时间轴可视化
+   - 数据来源：GET /api/agent/log（现有接口，不可修改）
+   - 功能：时间轴可视化 / 状态筛选 / 工具筛选 / 点击展开详情 /
+           自动刷新 / 滚动加载更多 / 空状态 / 错误重试 /
+           修改并重放（Kernel 第二阶段：Event Sourcing 确定性回放）
+   - 零新增依赖：仅用已有 lucide 图标 + Tailwind 样式
+   - 加载顺序：135_ui_polish 之后（所有依赖已就绪）
+   - 入口：左侧导航栏「飞行记录仪」按钮 + 设置页「本机 Agent」卡内按钮
+   ============================================================ */
+
+/** 工具调用审计的右侧滑出时间轴面板。
+ * 纯前端视图层：只读 GET /api/agent/log；不触碰审批/安全/审计写入逻辑。
+ * @namespace TimelineViewer */
+const TimelineViewer = {
+  /** 每页条数（与后端 limit 上限 500 兼容） */
+  PAGE_SIZE: 50,
+  /** 自动刷新间隔（毫秒） */
+  AUTO_REFRESH_MS: 10000,
+
+  /** 视图状态（关闭面板保留：筛选条件 + 自动刷新开关 + 已加载数据；
+   * 重置：展开项、滚动位置） */
+  state: {
+    rows: [],           // 已加载的所有记录
+    total: 0,           // 后端总条数
+    offset: 0,          // 当前分页偏移
+    loading: false,     // 是否正在加载
+    expandedId: null,   // 当前展开的记录 id
+    filterStatus: 'all',// 状态筛选
+    filterTool: 'all',  // 工具筛选
+    autoRefresh: false, // 自动刷新开关
+    refreshTimer: null, // 自动刷新定时器
+    open: false,        // 面板是否打开
+    error: null,        // { title, hint, detail } 或 null
+    updatedAt: null,    // 最近一次成功加载的时刻
+    replayRow: null     // 当前重放对话框对应的记录
+  },
+
+  /** 工具名 → 中文标签映射（与 125_tools.js 的工具 label 完全一致，另有历史/后端专用工具） */
+  TOOL_LABELS: {
+    list_directory: '列出目录',
+    read_file: '读取文件',
+    write_file: '写文件',
+    create_file: '新建文件',
+    edit_file: '编辑文件',
+    move_file: '移动文件',
+    rename_file: '重命名文件',
+    run_command: '运行只读命令',
+    find_files: '查找文件',
+    search_text: '全文搜索',
+    list_processes: '查看进程',
+    system_info: '系统信息',
+    submit_plan: '提交任务计划',
+    get_current_time: '获取当前时间',
+    calculator: '计算器',
+    query_knowledge_base: '查询知识库',
+    save_snippet: '保存代码片段',
+    run_workflow: '运行自动化工作流',
+    get_cost_usage: '查询费用用量',
+    config_set_workspace: '修改工作区根',
+    config_clear_audit: '清空审计日志'
+  },
+
+  /** 工具名 → lucide 图标名（节点图标；未知工具回退 circle-dot） */
+  TOOL_ICONS: {
+    write_file: 'file-plus',
+    create_file: 'file-plus',
+    read_file: 'file-text',
+    list_directory: 'folder',
+    run_command: 'terminal',
+    edit_file: 'file-edit',
+    move_file: 'folder-input',
+    rename_file: 'folder-input',
+    find_files: 'search',
+    search_text: 'text-search',
+    list_processes: 'cpu',
+    system_info: 'info',
+    submit_plan: 'list-filter',
+    query_knowledge_base: 'book-open',
+    save_snippet: 'save',
+    run_workflow: 'workflow',
+    get_cost_usage: 'piggy-bank',
+    config_set_workspace: 'folder-cog',
+    config_clear_audit: 'trash-2'
+  },
+
+  /** 状态 → 中文标签 + 节点配色 + 徽章配色（统一使用项目设计令牌） */
+  STATUS_MAP: {
+    ok: { label: '成功', node: 'text-success border-success/30', badge: 'bg-success/10 text-success border-success/20' },
+    error: { label: '失败', node: 'text-danger border-danger/30', badge: 'bg-danger/10 text-danger border-danger/20' },
+    timeout: { label: '超时', node: 'text-warning border-warning/30', badge: 'bg-warning/10 text-warning border-warning/20' },
+    rejected: { label: '安全拒绝', node: 'text-warning border-warning/30', badge: 'bg-warning/10 text-warning border-warning/20' },
+    needs_approval: { label: '待审批', node: 'text-danger border-danger/30', badge: 'bg-danger/10 text-danger border-danger/20' },
+    denied: { label: '已拒绝', node: 'text-text-tertiary border-line-ghost', badge: 'bg-surface-panel text-text-tertiary border-line-ghost' }
+  },
+
+  /** 状态筛选下拉框的项目（顺序固定；动态出现的未知状态会追加） */
+  STATUS_FILTERS: [
+    { value: 'all', label: '全部状态' },
+    { value: 'ok', label: '成功' },
+    { value: 'error', label: '失败' },
+    { value: 'timeout', label: '超时' },
+    { value: 'rejected', label: '安全拒绝' },
+    { value: 'needs_approval', label: '待审批' },
+    { value: 'denied', label: '已拒绝' }
+  ],
+
+  /* ===================== 初始化 / 入口 ===================== */
+
+  /** 初始化：安装导航入口、全局按键与可见性监听（幂等，可重复调用）
+   * @returns {void} */
+  init() {
+    if (!this.installNavButton()) {
+      setTimeout(() => { try { this.installNavButton(); } catch (e) { /* 静默 */ } }, 0);
+    }
+    if (this._inited) return;
+    this._inited = true;
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (this._replayDialogOpen()) { this.closeReplayDialog(); return; }
+        if (this.state.open) { this.close(); }
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && this.state.open && this.state.autoRefresh) this.load(false);
+    });
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tl-replay]');
+      if (btn) {
+        e.stopPropagation();
+        const id = Number(btn.dataset.tlReplay);
+        const row = this.state.rows.filter(r => Number(r.id) === id)[0];
+        if (row) this.openReplayDialog(row);
+      }
+    });
+  },
+
+  /** 左侧导航栏入口按钮（不设 data-page —— 本面板是右侧浮层，不参与页面切换）
+   * @returns {boolean} 是否已就绪 */
+  installNavButton() {
+    if (document.getElementById('navTimelineBtn')) return true;
+    const cost = document.querySelector('.nav-icon-btn[data-page="cost"]');
+    const nav = cost ? cost.parentElement : document.querySelector('aside nav');
+    if (!nav) return false;
+    const btn = document.createElement('button');
+    btn.id = 'navTimelineBtn';
+    btn.className = 'nav-icon-btn';
+    btn.setAttribute('data-tooltip', '飞行记录仪（工具调用时间轴）');
+    btn.setAttribute('aria-label', '飞行记录仪（工具调用时间轴）');
+    btn.innerHTML = '<i data-lucide="activity" class="w-[18px] h-[18px]"></i>';
+    if (cost) cost.insertAdjacentElement('afterend', btn); else nav.appendChild(btn);
+    btn.addEventListener('click', () => this.toggle());
+    refreshIcons();
+    return true;
+  },
+
+  /** 开关切换（导航按钮用）
+   * @returns {void} */
+  toggle() { this.state.open ? this.close() : this.open(); },
+
+  /** 打开时间轴面板（首次调用创建 DOM；重复调用只做滑入）
+   * @returns {void} */
+  open() {
+    const panel = this._ensurePanel();
+    if (!panel) return;
+    this.state.open = true;
+    this.state.expandedId = null;
+    panel.classList.remove('hidden');
+    panel.classList.add('flex');
+    const ov = document.getElementById('timelineOverlay');
+    if (ov) ov.classList.remove('hidden');
+    void panel.offsetWidth;
+    if (ov) ov.classList.remove('opacity-0');
+    panel.classList.remove('translate-x-full');
+    const body = panel.querySelector('#timelineBody');
+    if (body) body.scrollTop = 0;
+    this.render();
+    this.load(false);
+    if (this.state.autoRefresh) this.startAutoRefresh();
+  },
+
+  /** 关闭面板（滑出后隐藏；已加载数据/筛选条件保留，展开项与滚动位置重置）
+   * @returns {void} */
+  close() {
+    if (!this.state.open) return;
+    this.state.open = false;
+    this.stopAutoRefresh();
+    this.state.expandedId = null;
+    const panel = document.getElementById('timelinePanel');
+    const ov = document.getElementById('timelineOverlay');
+    void (panel ? panel.offsetWidth : 0);
+    if (ov) ov.classList.add('opacity-0');
+    if (panel) panel.classList.add('translate-x-full');
+    setTimeout(() => {
+      if (this.state.open) return;
+      if (ov) ov.classList.add('hidden');
+      if (panel) { panel.classList.add('hidden'); panel.classList.remove('flex'); }
+    }, 320);
+  },
+
+  /* ===================== DOM 构建 ===================== */
+
+  /** 懒创建遮罩 + 滑出面板（幂等）
+   * @returns {HTMLElement|null} 面板元素
+   * @private */
+  _ensurePanel() {
+    let panel = document.getElementById('timelinePanel');
+    if (panel) return panel;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'timelineOverlay';
+    overlay.className = 'fixed inset-0 z-[9500] hidden bg-black/50 backdrop-blur-sm opacity-0 transition-opacity duration-300';
+    overlay.addEventListener('click', () => this.close());
+    document.body.appendChild(overlay);
+
+    panel = document.createElement('aside');
+    panel.id = 'timelinePanel';
+    panel.className = 'fixed inset-y-0 right-0 z-[9501] hidden w-[480px] max-w-[90vw] flex-col bg-surface-deep border-l border-line-ghost translate-x-full transition-transform duration-300 ease-out shadow-2xl';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', '飞行记录仪：工具调用审计时间轴');
+    panel.innerHTML = '' +
+      '<div class="flex items-start gap-2 px-4 py-3 border-b border-line-ghost/60 flex-shrink-0">' +
+        '<div class="flex items-center gap-2 min-w-0 flex-1">' +
+          '<i data-lucide="activity" class="w-4 h-4 text-brand-cyan flex-shrink-0"></i>' +
+          '<div class="min-w-0">' +
+            '<div class="text-sm font-medium text-text-primary">飞行记录仪</div>' +
+            '<div class="text-[10px] text-text-tertiary">工具调用审计 · 后端 SQLite 持久化</div>' +
+          '</div>' +
+        '</div>' +
+        '<button id="timelineCloseBtn" class="btn-ghost p-1.5 rounded-lg border border-line-ghost" aria-label="关闭面板" title="关闭（Esc）">' +
+          '<i data-lucide="x" class="w-4 h-4"></i>' +
+        '</button>' +
+      '</div>' +
+      '<div class="flex items-center gap-2 px-4 py-2 border-b border-line-ghost/50 flex-shrink-0 flex-wrap">' +
+        '<select id="timelineStatusSel" class="form-select" style="width:auto;padding:3px 8px;font-size:11px" aria-label="状态筛选"></select>' +
+        '<select id="timelineToolSel" class="form-select" style="width:auto;max-width:150px;padding:3px 8px;font-size:11px" aria-label="工具筛选"></select>' +
+        '<button id="timelineRefreshBtn" class="btn-ghost px-2.5 h-7 rounded-lg text-[10px] flex items-center gap-1.5 border border-line-ghost" title="重新从后端拉取最新记录">' +
+          '<i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>刷新' +
+        '</button>' +
+        '<div class="ml-auto flex items-center gap-1.5 text-[10px] text-text-secondary" title="开启后每 10 秒自动刷新（页面隐藏时暂停）">自动刷新' +
+          '<div class="toggle-track" id="timelineAutoToggle" role="switch" aria-checked="false" aria-label="自动刷新" tabindex="0"><div class="toggle-thumb"></div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="flex items-center gap-2 px-4 py-1.5 text-[10px] text-text-tertiary border-b border-line-ghost/40 flex-shrink-0">' +
+        '<span id="timelineStats">显示 0 / 共 0 条</span>' +
+        '<span id="timelineUpdated" class="ml-auto font-mono"></span>' +
+      '</div>' +
+      '<div id="timelineError" class="hidden mx-4 mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 flex-shrink-0">' +
+        '<div class="flex items-start gap-2">' +
+          '<i data-lucide="alert-triangle" class="w-4 h-4 text-danger flex-shrink-0 mt-0.5"></i>' +
+          '<div class="flex-1 min-w-0">' +
+            '<div id="timelineErrorMsg" class="text-[11px] text-danger">无法连接后端</div>' +
+            '<div id="timelineErrorHint" class="text-[10px] text-text-tertiary mt-1">请确认 MoRay 后端已启动（双击 启动MoRay.bat）</div>' +
+          '</div>' +
+          '<button id="timelineRetryBtn" class="btn-ghost px-2 py-0.5 rounded-md text-[10px] border border-danger/40 text-danger flex-shrink-0">重试</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="timelineBody" class="flex-1 overflow-y-auto p-4 min-h-0">' +
+        '<div id="timelineList" class="space-y-5"></div>' +
+        '<div id="timelineFooter" class="py-3 text-center text-[10px] text-text-tertiary"></div>' +
+      '</div>';
+
+    document.body.appendChild(panel);
+
+    const closeBtn = panel.querySelector('#timelineCloseBtn');
+    if (closeBtn) closeBtn.addEventListener('click', () => this.close());
+
+    const statusSel = panel.querySelector('#timelineStatusSel');
+    if (statusSel) statusSel.addEventListener('change', () => {
+      this.state.filterStatus = statusSel.value;
+      this.render();
+    });
+    const toolSel = panel.querySelector('#timelineToolSel');
+    if (toolSel) toolSel.addEventListener('change', () => {
+      this.state.filterTool = toolSel.value;
+      this.render();
+    });
+    const refreshBtn = panel.querySelector('#timelineRefreshBtn');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => this.load(false));
+    const retryBtn = panel.querySelector('#timelineRetryBtn');
+    if (retryBtn) retryBtn.addEventListener('click', () => this.load(false));
+
+    const autoTog = panel.querySelector('#timelineAutoToggle');
+    if (autoTog) {
+      const flip = () => {
+        this.state.autoRefresh = !this.state.autoRefresh;
+        autoTog.classList.toggle('active', this.state.autoRefresh);
+        autoTog.setAttribute('aria-checked', this.state.autoRefresh ? 'true' : 'false');
+        if (this.state.autoRefresh) {
+          this.startAutoRefresh();
+          showNotification('自动刷新已开启', '每 10 秒自动拉取最新审计记录（页面隐藏时暂停）', 'info', 2200);
+        } else {
+          this.stopAutoRefresh();
+        }
+      };
+      autoTog.addEventListener('click', flip);
+      autoTog.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); flip(); }
+      });
+    }
+
+    const list = panel.querySelector('#timelineList');
+    if (list) {
+      list.addEventListener('click', (e) => {
+        if (e.target.closest('[data-tl-detail]')) return;
+        const card = e.target.closest('[data-tl-id]');
+        if (card) this.toggleExpand(card.dataset.tlId);
+      });
+      list.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        if (e.target.closest('[data-tl-detail]')) return;
+        const card = e.target.closest('[data-tl-id]');
+        if (card) { e.preventDefault(); this.toggleExpand(card.dataset.tlId); }
+      });
+    }
+    const body = panel.querySelector('#timelineBody');
+    if (body) {
+      body.addEventListener('scroll', () => {
+        if (!this.state.open || this.state.loading) return;
+        if (this.state.rows.length >= this.state.total) return;
+        if (body.scrollTop + body.clientHeight >= body.scrollHeight - 200) this.load(true);
+      });
+    }
+    const footer = panel.querySelector('#timelineFooter');
+    if (footer) footer.addEventListener('click', (e) => {
+      if (e.target.closest('#timelineMoreBtn')) this.load(true);
+    });
+
+    refreshIcons();
+    return panel;
+  },
+
+  /* ===================== 数据加载 ===================== */
+
+  /** 从后端加载审计记录
+   * @param {boolean} [append] - true=追加下一页；false=从头刷新
+   * @returns {Promise<void>} */
+  async load(append = false) {
+    if (this.state.loading) return;
+    const panel = this._ensurePanel();
+    if (!panel) return;
+    this.state.loading = true;
+    const offset = append ? this.state.rows.length : 0;
+    this._setRefreshing(true);
+    this._updateFooter();
+    if (!append && !this.state.rows.length) {
+      const list = panel.querySelector('#timelineList');
+      if (list) list.innerHTML = this._loadingHtml();
+      refreshIcons();
+    }
+    let ok = false;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      let res;
+      try {
+        res = await fetch(agentBackendBase() + '/api/agent/log?limit=' + this.PAGE_SIZE + '&offset=' + offset,
+          { signal: ctrl.signal, cache: 'no-store' });
+      } finally {
+        clearTimeout(timer);
+      }
+      const j = await res.json().catch(() => null);
+      if (!res.ok || !j || !j.ok) throw new Error((j && (j.message || j.error)) || ('后端返回 HTTP ' + res.status));
+      const rows = (j.data && j.data.rows) || [];
+      const total = Number((j.data && j.data.total) || 0);
+      this.state.total = total;
+      this.state.rows = append ? this.state.rows.concat(rows) : rows;
+      this.state.offset = this.state.rows.length;
+      this.state.error = null;
+      this.state.updatedAt = new Date();
+      ok = true;
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      this.state.error = {
+        title: /Failed to fetch|NetworkError|aborted|AbortError|Load failed/i.test(msg)
+          ? '无法连接后端，请确认 MoRay 后端已启动（双击 启动MoRay.bat）'
+          : '读取审计记录失败',
+        hint: '若后端未启动：双击工程根目录的「启动MoRay.bat」；已启动请确认端口与页面一致（默认 127.0.0.1:8000）。',
+        detail: msg
+      };
+      if (!append) {
+        if (!this.state.rows.length) { this.state.total = 0; }
+      }
+    } finally {
+      this.state.loading = false;
+      this._setRefreshing(false);
+      this.render();
+    }
+    if (!ok && append) showNotification('加载更多失败', String(this.state.error && this.state.error.detail || '').slice(0, 120), 'error', 3000);
+  },
+
+  /** 渲染整条时间轴（分组 + 卡片 + 统计 + 筛选项目；保持展开项）
+   * @returns {void} */
+  render() {
+    const panel = this._ensurePanel();
+    if (!panel) return;
+    const list = panel.querySelector('#timelineList');
+    if (!list) return;
+    this._renderError();
+    this._updateFilterOptions();
+    const rows = this.getFilteredRows();
+    if (!this.state.rows.length) {
+      list.innerHTML = this.state.error ? this._offlineHtml() : this._emptyHtml();
+    } else if (!rows.length) {
+      list.innerHTML = '<div class="flex flex-col items-center justify-center py-14 text-text-tertiary">' +
+        '<i data-lucide="list-filter" class="w-8 h-8 opacity-40 mb-2"></i>' +
+        '<div class="text-[11px] text-text-secondary mb-1">当前筛选条件下无记录</div>' +
+        '<div class="text-[10px]">已加载 ' + this.state.rows.length + ' 条，可切换筛选或刷新</div></div>';
+    } else {
+      const groups = [];
+      const index = {};
+      rows.forEach(r => {
+        const d = this._parseTs(r.ts);
+        const key = d ? this._dayKey(d) : 'unknown';
+        if (index[key] == null) { index[key] = groups.length; groups.push({ key: key, ts: r.ts, rows: [] }); }
+        groups[index[key]].rows.push(r);
+      });
+      list.innerHTML = groups.map(g => this._renderDayGroup(g)).join('');
+    }
+    this._updateStats(rows.length);
+    this._updateFooter();
+    refreshIcons();
+    if (this.state.expandedId != null) {
+      const stillThere = rows.some(r => Number(r.id) === Number(this.state.expandedId));
+      if (stillThere) this._expand(this.state.expandedId, true);
+      else this.state.expandedId = null;
+    }
+    this._syncCards();
+  },
+
+  /** 渲染一天的组（日期标签 + 竖线 + 该天卡片）
+   * @param {{key:string, ts:string, rows:Array}} group - 分组数据
+   * @returns {string} HTML
+   * @private */
+  _renderDayGroup(group) {
+    const label = this.formatDateGroup(group.ts);
+    return '' +
+      '<section class="tl-day">' +
+        '<div class="sticky top-0 z-[1] -mx-1 px-1 py-1 mb-1 flex items-center gap-2 bg-surface-deep/95 backdrop-blur-sm rounded">' +
+          '<span class="w-1.5 h-1.5 rounded-full bg-brand-cyan/80 flex-shrink-0"></span>' +
+          '<span class="text-[11px] font-medium text-text-secondary">' + escapeHtml(label) + '</span>' +
+          '<span class="text-[10px] text-text-tertiary">· ' + group.rows.length + ' 条</span>' +
+          '<span class="flex-1 h-px bg-line-ghost/40"></span>' +
+        '</div>' +
+        '<div class="relative pl-7">' +
+          '<span class="absolute left-[11px] top-3 bottom-3 w-px bg-brand-cobalt/30" aria-hidden="true"></span>' +
+          '<div class="space-y-2">' + group.rows.map(r => this.renderEventCard(r)).join('') + '</div>' +
+        '</div>' +
+      '</section>';
+  },
+
+  /** 渲染单条事件卡片（折叠态 + 空详情容器）
+   * @param {Object} row - 审计记录
+   * @returns {string} HTML
+   */
+  renderEventCard(row) {
+    const st = this.statusInfo(row.status);
+    const isOpen = Number(this.state.expandedId) === Number(row.id);
+    const summary = this._truncate(String(row.args_summary || ''), 120);
+    const approved = Number(row.approved) === 1;
+    return '' +
+      '<div class="relative">' +
+        '<span class="absolute -left-7 top-3 w-6 h-6 rounded-full border bg-surface-panel flex items-center justify-center ' + st.node + '">' +
+          '<i data-lucide="' + this.toolIcon(row.tool) + '" class="w-3 h-3"></i>' +
+        '</span>' +
+        '<div class="tl-card rounded-lg border bg-surface-card/50 hover:border-brand-cobalt/40 transition-colors cursor-pointer ' +
+          (isOpen ? 'border-brand-cobalt/50' : 'border-line-ghost/50') + '"' +
+          ' data-tl-id="' + Number(row.id) + '" tabindex="0" role="button" aria-expanded="' + (isOpen ? 'true' : 'false') + '">' +
+          '<div class="px-3 py-2.5">' +
+            '<div class="flex items-center gap-2 mb-1">' +
+              '<span class="text-xs font-medium text-text-primary">' + escapeHtml(this.toolLabel(row.tool)) + '</span>' +
+              '<span class="text-[9px] px-1.5 py-0.5 rounded border ' + st.badge + '">' + escapeHtml(st.label) + '</span>' +
+              '<span class="ml-auto font-mono text-[10px] text-text-tertiary">' + escapeHtml(this._timeOnly(row.ts)) + '</span>' +
+              '<i data-lucide="chevron-down" class="tl-caret w-3 h-3 text-text-tertiary transition-transform' + (isOpen ? ' rotate-180' : '') + '"></i>' +
+            '</div>' +
+            '<div class="font-mono text-[10px] text-text-tertiary break-all leading-relaxed">' + escapeHtml(summary || '（无参数摘要）') + '</div>' +
+            '<div class="flex items-center gap-3 mt-1.5 text-[10px]">' +
+              '<span class="text-text-tertiary">耗时 <span class="font-mono">' + escapeHtml(this.formatMs(row.ms)) + '</span></span>' +
+              (approved
+                ? '<span class="text-success">已审批</span>'
+                : '<span class="text-text-tertiary">未审批/自动</span>') +
+              '<span class="ml-auto font-mono text-[9px] opacity-70">#' + Number(row.id) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="overflow-hidden" data-tl-detail="' + Number(row.id) + '" style="max-height:0"></div>' +
+        '</div>' +
+      '</div>';
+  },
+
+  /** 渲染详情展开区（完整参数摘要 / before-after diff / detail / 时间戳 / 记录 ID / 修改并重放按钮）
+   * @param {Object} row - 审计记录
+   * @returns {string} HTML
+   */
+  renderDetail(row) {
+    const st = this.statusInfo(row.status);
+    const detailText = String(row.detail || '');
+    const diffHtml = this._diffHtml(row, detailText);
+    // 可重放的状态：失败/超时/安全拒绝/待审批（成功和已拒绝不提供重放）
+    const replayable = ['error', 'timeout', 'rejected', 'needs_approval'].indexOf(String(row.status)) >= 0;
+    const hasSnapshot = row.snapshot_id != null && Number(row.snapshot_id) > 0;
+    return '' +
+      '<div class="border-t border-line-ghost/40 bg-surface-panel/40 px-3 py-2.5 space-y-2">' +
+        '<div>' +
+          '<div class="text-[10px] text-text-tertiary mb-1">参数摘要（完整）</div>' +
+          '<div class="font-mono text-xs text-text-secondary bg-surface-deep rounded-lg border border-line-ghost/50 p-2 break-all whitespace-pre-wrap">' +
+            escapeHtml(row.args_summary || '（无）') + '</div>' +
+        '</div>' +
+        (diffHtml
+          ? '<div><div class="text-[10px] text-text-tertiary mb-1">变更内容（before → after）</div>' + diffHtml + '</div>'
+          : '') +
+        '<div>' +
+          '<div class="text-[10px] text-text-tertiary mb-1">执行详情</div>' +
+          '<div class="font-mono text-xs ' + (String(row.status) === 'error' ? 'text-danger' : 'text-text-secondary') +
+            ' bg-surface-deep rounded-lg border border-line-ghost/50 p-2 break-all whitespace-pre-wrap">' +
+            (detailText ? escapeHtml(detailText) : '<span class="text-text-tertiary">（无附加信息）</span>') + '</div>' +
+        '</div>' +
+        '<div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-text-tertiary">' +
+          '<span>工具 <span class="font-mono text-text-secondary">' + escapeHtml(String(row.tool || '')) + '</span></span>' +
+          '<span>耗时 <span class="font-mono text-text-secondary">' + escapeHtml(this.formatMs(row.ms)) + '</span></span>' +
+          '<span>时间 <span class="font-mono text-text-secondary">' + escapeHtml(String(row.ts || '')) + '</span></span>' +
+          '<span>状态 <span class="' + st.node.split(' ')[0] + '">' + escapeHtml(st.label) + '</span></span>' +
+          '<span>记录 <span class="font-mono text-text-secondary">#' + Number(row.id) + '</span></span>' +
+        '</div>' +
+        (replayable && hasSnapshot
+          ? '<div class="pt-1 border-t border-line-ghost/30">' +
+              '<button data-tl-replay="' + Number(row.id) + '"' +
+                ' class="btn-primary px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 w-full justify-center">' +
+                '<i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>' +
+                '修改并重放此步骤' +
+              '</button>' +
+              '<div class="text-[9px] text-text-tertiary text-center mt-1">重放将经过完整安全校验（路径防护 + 副作用审批）</div>' +
+            '</div>'
+          : '') +
+        (replayable && !hasSnapshot
+          ? '<div class="pt-1 border-t border-line-ghost/30">' +
+              '<div class="flex items-center justify-center gap-1.5 text-[10px] text-text-tertiary py-1.5">' +
+                '<i data-lucide="info" class="w-3 h-3"></i>' +
+                '该记录无事件快照，暂不支持重放（新产生的记录将自动支持）' +
+              '</div>' +
+            '</div>'
+          : '') +
+      '</div>';
+  },
+
+  /* ===================== Kernel 第二阶段：事件溯源重放 ===================== */
+
+  /** 判断重放对话框是否打开
+   * @returns {boolean}
+   * @private */
+  _replayDialogOpen() {
+    return !!document.getElementById('tlReplayDialog');
+  },
+
+  /** 打开重放对话框（修改参数并重放历史工具调用）
+   * @param {Object} row - 审计记录
+   * @returns {void} */
+  openReplayDialog(row) {
+    if (this._replayDialogOpen()) this.closeReplayDialog();
+    this.state.replayRow = row;
+    let argsJson = '{}';
+    const isSideEffect = ['write_file', 'create_file', 'move_file', 'run_command', 'edit_file'].indexOf(String(row.tool)) >= 0;
+    const dialog = document.createElement('div');
+    dialog.id = 'tlReplayDialog';
+    dialog.className = 'fixed inset-0 z-[9600] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+    dialog.innerHTML = '' +
+      '<div class="w-[520px] max-w-[92vw] max-h-[85vh] flex flex-col bg-surface-deep rounded-xl border border-line-ghost shadow-2xl">' +
+        '<div class="flex items-center gap-2 px-4 py-3 border-b border-line-ghost/60 flex-shrink-0">' +
+          '<i data-lucide="rotate-ccw" class="w-4 h-4 text-brand-cyan flex-shrink-0"></i>' +
+          '<div class="min-w-0 flex-1">' +
+            '<div class="text-sm font-medium text-text-primary">修改并重放</div>' +
+            '<div class="text-[10px] text-text-tertiary">' + escapeHtml(this.toolLabel(row.tool)) + ' · 记录 #' + Number(row.id) + '</div>' +
+          '</div>' +
+          '<button id="tlReplayClose" class="btn-ghost p-1.5 rounded-lg border border-line-ghost" aria-label="关闭">' +
+            '<i data-lucide="x" class="w-4 h-4"></i>' +
+          '</button>' +
+        '</div>' +
+        '<div class="flex-1 overflow-y-auto p-4 space-y-3">' +
+          '<div>' +
+            '<div class="text-[10px] text-text-tertiary mb-1">工具名（只读）</div>' +
+            '<div class="font-mono text-xs text-text-secondary bg-surface-panel rounded-lg border border-line-ghost/50 px-3 py-2">' +
+              escapeHtml(String(row.tool || '')) + '</div>' +
+          '</div>' +
+          '<div>' +
+            '<div class="text-[10px] text-text-tertiary mb-1">原始参数摘要</div>' +
+            '<div class="font-mono text-[11px] text-text-tertiary bg-surface-panel/50 rounded-lg border border-line-ghost/30 px-3 py-2 break-all whitespace-pre-wrap max-h-24 overflow-auto">' +
+              escapeHtml(String(row.args_summary || '（无）')) + '</div>' +
+          '</div>' +
+          '<div>' +
+            '<div class="text-[10px] text-text-tertiary mb-1">重放参数（JSON，可修改）</div>' +
+            '<textarea id="tlReplayArgs" class="w-full font-mono text-xs bg-surface-deep rounded-lg border border-line-ghost/50 px-3 py-2 text-text-secondary resize-y" ' +
+              'rows="8" spellcheck="false" placeholder="{\n  &quot;path&quot;: &quot;example.txt&quot;,\n  &quot;content&quot;: &quot;hello&quot;\n}">' + escapeHtml(argsJson) + '</textarea>' +
+            '<div id="tlReplayArgsErr" class="hidden text-[10px] text-danger mt-1">JSON 格式错误，请检查括号和引号</div>' +
+          '</div>' +
+          (isSideEffect
+            ? '<div class="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2">' +
+                '<div class="flex items-start gap-2">' +
+                  '<i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-warning flex-shrink-0 mt-0.5"></i>' +
+                  '<div class="text-[10px] text-text-secondary leading-relaxed">' +
+                    '这是副作用工具（写文件/执行命令等），重放需要勾选下方「确认执行」才会真正执行。' +
+                    '所有操作仍经过完整的路径越界防护和安全校验。' +
+                  '</div>' +
+                '</div>' +
+              '</div>' +
+              '<label class="flex items-center gap-2 cursor-pointer select-none">' +
+                '<input type="checkbox" id="tlReplayApprove" class="w-3.5 h-3.5 accent-brand-cobalt">' +
+                '<span class="text-[11px] text-text-secondary">确认执行此副作用操作</span>' +
+              '</label>'
+            : '') +
+        '</div>' +
+        '<div class="flex items-center gap-2 px-4 py-3 border-t border-line-ghost/60 flex-shrink-0">' +
+          '<button id="tlReplayCancel" class="btn-ghost px-4 py-1.5 rounded-lg text-[11px] border border-line-ghost">取消</button>' +
+          '<div class="flex-1"></div>' +
+          '<button id="tlReplayRun" class="btn-primary px-4 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5">' +
+            '<i data-lucide="play" class="w-3.5 h-3.5"></i>执行重放' +
+          '</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(dialog);
+    refreshIcons();
+    const closeBtn = dialog.querySelector('#tlReplayClose');
+    if (closeBtn) closeBtn.addEventListener('click', () => this.closeReplayDialog());
+    const cancelBtn = dialog.querySelector('#tlReplayCancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => this.closeReplayDialog());
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) this.closeReplayDialog(); });
+    const runBtn = dialog.querySelector('#tlReplayRun');
+    if (runBtn) runBtn.addEventListener('click', () => this.doReplay());
+    const ta = dialog.querySelector('#tlReplayArgs');
+    if (ta) ta.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); this.doReplay(); }
+    });
+  },
+
+  /** 执行重放（调用后端 /api/agent/replay）
+   * @returns {Promise<void>} */
+  async doReplay() {
+    const dialog = document.getElementById('tlReplayDialog');
+    const row = this.state.replayRow;
+    if (!dialog || !row) return;
+    const ta = dialog.querySelector('#tlReplayArgs');
+    const errEl = dialog.querySelector('#tlReplayArgsErr');
+    const runBtn = dialog.querySelector('#tlReplayRun');
+    if (!ta) return;
+    // 解析 JSON
+    let modifiedArgs = {};
+    const raw = ta.value.trim();
+    if (raw) {
+      try {
+        modifiedArgs = JSON.parse(raw);
+        if (typeof modifiedArgs !== 'object' || modifiedArgs === null || Array.isArray(modifiedArgs)) {
+          throw new Error('必须是 JSON 对象');
+        }
+      } catch (e) {
+        if (errEl) { errEl.classList.remove('hidden'); errEl.textContent = 'JSON 格式错误：' + String(e.message || e); }
+        return;
+      }
+    }
+    if (errEl) errEl.classList.add('hidden');
+    // 防御性检查：snapshot_id 必须存在且有效
+    if (!row.snapshot_id || Number(row.snapshot_id) <= 0) {
+      showNotification('无法重放', '该记录没有关联的事件快照，暂不支持重放', 'warning', 3000);
+      this.closeReplayDialog();
+      return;
+    }
+    // 副作用工具需要确认
+    const isSideEffect = ['write_file', 'create_file', 'move_file', 'run_command', 'edit_file'].indexOf(String(row.tool)) >= 0;
+    const approved = isSideEffect ? !!(dialog.querySelector('#tlReplayApprove') && dialog.querySelector('#tlReplayApprove').checked) : true;
+    if (isSideEffect && !approved) {
+      showNotification('需要确认', '副作用工具请先勾选「确认执行」', 'warning', 2500);
+      return;
+    }
+    if (runBtn) { runBtn.disabled = true; runBtn.innerHTML = '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>执行中…'; refreshIcons(); }
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      let res;
+      try {
+        res = await fetch(agentBackendBase() + '/api/agent/replay', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            snapshot_id: row.snapshot_id,
+            modified_args: modifiedArgs,
+            approved: approved
+          }),
+          signal: ctrl.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      const j = await res.json().catch(() => null);
+      if (!res.ok || !j) throw new Error((j && (j.message || j.error)) || ('后端返回 HTTP ' + res.status));
+      const replayInfo = j.replay || {};
+      const status = String(replayInfo.status || 'ok');
+      if (j.ok && status === 'ok') {
+        showNotification('重放成功', this.toolLabel(row.tool) + ' 重放执行成功（' + this.formatMs(replayInfo.ms) + '）', 'success', 3000);
+      } else if (j.needsApproval) {
+        showNotification('需要审批', '该操作需要审批后才能执行', 'warning', 3000);
+      } else {
+        showNotification('重放完成', '状态：' + status + (j.message ? '（' + String(j.message).slice(0, 60) + '）' : ''),
+          status === 'rejected' ? 'warning' : 'error', 3500);
+      }
+      this.closeReplayDialog();
+      this.load(false);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      showNotification('重放失败', msg.slice(0, 100), 'error', 3500);
+    } finally {
+      if (runBtn) { runBtn.disabled = false; runBtn.innerHTML = '<i data-lucide="play" class="w-3.5 h-3.5"></i>执行重放'; refreshIcons(); }
+    }
+  },
+
+  /** 关闭重放对话框
+   * @returns {void} */
+  closeReplayDialog() {
+    const dialog = document.getElementById('tlReplayDialog');
+    if (dialog) dialog.remove();
+    this.state.replayRow = null;
+  },
+
+  /* ===================== 展开/收起 ===================== */
+
+  /** 切换展开/收起（手风琴：展开新卡片时自动收起上一张；再次点击同一张收起）
+   * @param {number|string} id - 记录 id
+   * @returns {void} */
+  toggleExpand(id) {
+    const nid = Number(id);
+    if (this.state.expandedId != null && Number(this.state.expandedId) === nid) {
+      this._collapse(nid);
+      this.state.expandedId = null;
+      this._syncCards();
+      return;
+    }
+    if (this.state.expandedId != null) this._collapse(Number(this.state.expandedId));
+    this.state.expandedId = nid;
+    this._expand(nid);
+    this._syncCards();
+  },
+
+  /** 展开某卡片（平滑高度动画；instant=true 直接展开不动画）
+   * @param {number} id - 记录 id
+   * @param {boolean} [instant] - 跳过动画
+   * @returns {void}
+   * @private */
+  _expand(id, instant) {
+    const card = document.querySelector('#timelineList [data-tl-id="' + id + '"]');
+    if (!card) return;
+    const box = card.querySelector('[data-tl-detail]');
+    const row = this.state.rows.filter(r => Number(r.id) === id)[0];
+    if (!box || !row) return;
+    box.innerHTML = this.renderDetail(row);
+    refreshIcons();
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (instant || reduce) { box.style.transition = ''; box.style.maxHeight = 'none'; return; }
+    const h = box.scrollHeight;
+    box.style.transition = 'max-height .28s ease-out';
+    box.style.maxHeight = '0px';
+    void box.offsetHeight;
+    box.style.maxHeight = h + 'px';
+    clearTimeout(box._tlTimer);
+    box._tlTimer = setTimeout(() => {
+      if (box.isConnected && box.style.maxHeight !== '0px') box.style.maxHeight = 'none';
+    }, 340);
+  },
+
+  /** 收起某卡片（动画结束后清空内容，保持 DOM 轻量）
+   * @param {number} id - 记录 id
+   * @returns {void}
+   * @private */
+  _collapse(id) {
+    const card = document.querySelector('#timelineList [data-tl-id="' + id + '"]');
+    if (!card) return;
+    const box = card.querySelector('[data-tl-detail]');
+    if (!box) return;
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    clearTimeout(box._tlTimer);
+    if (reduce || box.style.maxHeight === '0px') { box.innerHTML = ''; box.style.transition = ''; box.style.maxHeight = '0px'; return; }
+    const h = box.scrollHeight;
+    box.style.transition = 'max-height .24s ease-out';
+    box.style.maxHeight = h + 'px';
+    void box.offsetHeight;
+    box.style.maxHeight = '0px';
+    box._tlTimer = setTimeout(() => {
+      if (!box.isConnected) return;
+      box.innerHTML = '';
+      box.style.transition = '';
+      box.style.maxHeight = '0px';
+    }, 280);
+  },
+
+  /** 同步所有卡片的展开视觉态（边框高亮 / 箭头方向 / aria-expanded）
+   * @returns {void}
+   * @private */
+  _syncCards() {
+    const list = document.getElementById('timelineList');
+    if (!list) return;
+    list.querySelectorAll('[data-tl-id]').forEach(el => {
+      const on = Number(this.state.expandedId) === Number(el.dataset.tlId);
+      el.setAttribute('aria-expanded', on ? 'true' : 'false');
+      el.classList.toggle('border-brand-cobalt/50', on);
+      el.classList.toggle('border-line-ghost/50', !on);
+      const caret = el.querySelector('.tl-caret');
+      if (caret) caret.classList.toggle('rotate-180', on);
+    });
+  },
+
+  /** 前端筛选（不发新请求）
+   * @returns {Array<Object>} 过滤后的记录 */
+  getFilteredRows() {
+    const fs = String(this.state.filterStatus || 'all');
+    const ft = String(this.state.filterTool || 'all');
+    return this.state.rows.filter(r => {
+      if (ft !== 'all' && String(r.tool) !== ft) return false;
+      if (fs !== 'all' && String(r.status) !== fs) return false;
+      return true;
+    });
+  },
+
+  /* ===================== 自动刷新 ===================== */
+
+  /** 开启自动刷新（每 10 秒一次；document.hidden 时跳过）
+   * @returns {void} */
+  startAutoRefresh() {
+    this.stopAutoRefresh();
+    this.state.refreshTimer = setInterval(() => {
+      if (document.hidden) return;
+      if (!this.state.open || this.state.loading) return;
+      this.load(false);
+    }, this.AUTO_REFRESH_MS);
+  },
+
+  /** 停止自动刷新（只清定时器；开关状态保留，面板重开时按开关恢复） */
+  stopAutoRefresh() {
+    if (this.state.refreshTimer) { clearInterval(this.state.refreshTimer); }
+    this.state.refreshTimer = null;
+  },
+
+  /* ===================== 工具栏 / 状态渲染 ===================== */
+
+  /** 状态筛选/工具筛选下拉框（工具项从已加载数据动态去重提取；保留当前选择）
+   * @returns {void}
+   * @private */
+  _updateFilterOptions() {
+    const panel = document.getElementById('timelinePanel');
+    if (!panel) return;
+    const statusSel = panel.querySelector('#timelineStatusSel');
+    if (statusSel) {
+      const known = {};
+      this.STATUS_FILTERS.forEach(o => { known[o.value] = true; });
+      const extra = [];
+      this.state.rows.forEach(r => {
+        const s = String(r.status || '');
+        if (s && !known[s]) { known[s] = true; extra.push({ value: s, label: s }); }
+      });
+      const items = this.STATUS_FILTERS.concat(extra);
+      const sig = items.map(o => o.value).join('|');
+      if (statusSel.dataset.tlSig !== sig) {
+        statusSel.dataset.tlSig = sig;
+        statusSel.innerHTML = items.map(o =>
+          '<option value="' + escapeHtml(o.value) + '">' + escapeHtml(o.label) + '</option>').join('');
+      }
+      if (statusSel.value !== this.state.filterStatus) statusSel.value = this.state.filterStatus;
+    }
+    const toolSel = panel.querySelector('#timelineToolSel');
+    if (toolSel) {
+      const seen = {};
+      this.state.rows.forEach(r => { const t = String(r.tool || ''); if (t) seen[t] = true; });
+      const tools = Object.keys(seen).sort((a, b) => this.toolLabel(a).localeCompare(this.toolLabel(b), 'zh-Hans-CN'));
+      const sig = tools.join('|');
+      if (toolSel.dataset.tlSig !== sig) {
+        toolSel.dataset.tlSig = sig;
+        toolSel.innerHTML = '<option value="all">全部工具</option>' + tools.map(t =>
+          '<option value="' + escapeHtml(t) + '">' + escapeHtml(this.toolLabel(t)) + ' · ' + escapeHtml(t) + '</option>').join('');
+      }
+      if (toolSel.value !== this.state.filterTool) toolSel.value = this.filterTool;
+    }
+  },
+
+  /** 统计行：显示 X / 共 Y 条（+ 筛选后条数 + 最近更新时间）
+   * @param {number} filteredCount - 筛选后条数
+   * @returns {void}
+   * @private */
+  _updateStats(filteredCount) {
+    const panel = document.getElementById('timelinePanel');
+    if (!panel) return;
+    const stats = panel.querySelector('#timelineStats');
+    if (stats) {
+      const loaded = this.state.rows.length;
+      const filtered = (typeof filteredCount === 'number') ? filteredCount : this.getFilteredRows().length;
+      let text = '显示 ' + loaded + ' / 共 ' + this.state.total + ' 条';
+      if (this.state.filterStatus !== 'all' || this.state.filterTool !== 'all') text += '（筛选后 ' + filtered + ' 条）';
+      stats.textContent = text;
+    }
+    const upd = panel.querySelector('#timelineUpdated');
+    if (upd) {
+      upd.textContent = this.state.updatedAt
+        ? '已更新 ' + this._timeOfDay(this.state.updatedAt)
+        : (this.state.loading ? '加载中…' : '');
+    }
+  },
+
+  /** 底部状态：加载指示器 / 加载更多 / 已加载全部
+   * @returns {void}
+   * @private */
+  _updateFooter() {
+    const panel = document.getElementById('timelinePanel');
+    if (!panel) return;
+    const f = panel.querySelector('#timelineFooter');
+    if (!f) return;
+    if (this.state.error) { f.innerHTML = ''; return; }
+    if (!this.state.rows.length) { f.innerHTML = this.state.loading ? this._dotsHtml() + '加载中…' : ''; return; }
+    if (this.state.loading) { f.innerHTML = this._dotsHtml() + '加载中…'; return; }
+    const hasMore = this.state.rows.length < this.state.total;
+    if (hasMore) {
+      f.innerHTML = '<button id="timelineMoreBtn" class="btn-ghost px-3 py-1 rounded-lg border border-line-ghost text-[10px]">' +
+        '加载更多（已加载 ' + this.state.rows.length + ' / ' + this.state.total + ' 条）</button>' +
+        '<div class="mt-1 opacity-70">滚动到底部也会自动加载</div>';
+      refreshIcons();
+      return;
+    }
+    f.innerHTML = '<span class="inline-flex items-center gap-1.5"><i data-lucide="check-circle-2" class="w-3 h-3 opacity-60"></i>已加载全部记录</span>';
+    refreshIcons();
+  },
+
+  /** 错误提示条（红底 + 排查建议 + 重试按钮）
+   * @returns {void}
+   * @private */
+  _renderError() {
+    const panel = document.getElementById('timelinePanel');
+    if (!panel) return;
+    const box = panel.querySelector('#timelineError');
+    if (!box) return;
+    if (!this.state.error) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    const msg = panel.querySelector('#timelineErrorMsg');
+    const hint = panel.querySelector('#timelineErrorHint');
+    if (msg) msg.textContent = this.state.error.title + (this.state.error.detail ? '（' + this.state.error.detail + '）' : '');
+    if (hint) hint.textContent = this.state.error.hint;
+    refreshIcons();
+  },
+
+  /** 刷新按钮旋转 + 禁用（加载中）
+   * @param {boolean} on - 是否加载中
+   * @returns {void}
+   * @private */
+  _setRefreshing(on) {
+    const btn = document.getElementById('timelineRefreshBtn');
+    if (!btn) return;
+    btn.disabled = !!on;
+    const svg = btn.querySelector('svg');
+    if (svg) svg.classList.toggle('animate-spin', !!on);
+    const i = btn.querySelector('i[data-lucide]');
+    if (i) i.classList.toggle('animate-spin', !!on);
+  },
+
+  /* ===================== 小组件 / 格式化 ===================== */
+
+  /** 加载中的三点跳动指示器
+   * @returns {string} HTML
+   * @private */
+  _dotsHtml() {
+    return '<span class="inline-flex items-center gap-1 mr-2 align-middle">' +
+      '<span class="w-1.5 h-1.5 rounded-full bg-brand-cobalt animate-bounce" style="animation-delay:0ms"></span>' +
+      '<span class="w-1.5 h-1.5 rounded-full bg-brand-cobalt animate-bounce" style="animation-delay:150ms"></span>' +
+      '<span class="w-1.5 h-1.5 rounded-full bg-brand-cobalt animate-bounce" style="animation-delay:300ms"></span>' +
+      '</span>';
+  },
+
+  /** 首屏居中加载指示
+   * @returns {string} HTML
+   * @private */
+  _loadingHtml() {
+    return '<div class="flex flex-col items-center justify-center py-16 text-text-tertiary">' +
+      this._dotsHtml() + '<div class="text-[11px] mt-1">正在读取审计记录…</div></div>';
+  },
+
+  /** 后端不可用时的中性占位（区别于「确无记录」）
+   * @returns {string} HTML
+   * @private */
+  _offlineHtml() {
+    return '<div class="flex flex-col items-center justify-center py-20 text-text-tertiary">' +
+      '<i data-lucide="alert-triangle" class="w-8 h-8 opacity-40 mb-3"></i>' +
+      '<div class="text-[11px] text-text-secondary mb-1">后端不可用：无法读取审计记录</div>' +
+      '<div class="text-[10px] text-center leading-relaxed">启动后端后点上方「重试」重新加载</div></div>';
+  },
+
+  /** 空状态（无任何记录）
+   * @returns {string} HTML
+   * @private */
+  _emptyHtml() {
+    return '<div class="flex flex-col items-center justify-center py-20 text-text-tertiary">' +
+      '<i data-lucide="inbox" class="w-10 h-10 opacity-40 mb-3"></i>' +
+      '<div class="text-xs text-text-secondary mb-1">暂无工具调用记录</div>' +
+      '<div class="text-[10px] text-center leading-relaxed">开启本机工具后，所有操作将在此记录<br>（含未审批与安全拒绝）</div></div>';
+  },
+
+  /** write_file / edit_file / create_file 的 before→after 结构化 diff
+   * 优先复用 125_tools.js 的 buildApprovalDiff（行级 LCS）；detail 非结构化文本时返回 ''（纯文本展示）
+   * @param {Object} row - 审计记录
+   * @param {string} detailText - detail 原文
+   * @returns {string} diff HTML 或 ''
+   * @private */
+  _diffHtml(row, detailText) {
+    if (!detailText) return '';
+    const tool = String(row.tool || '');
+    if (['write_file', 'edit_file', 'create_file', 'rename_file', 'move_file'].indexOf(tool) < 0) return '';
+    let before = '', after = '', found = false;
+    const trimmed = detailText.trim();
+    if (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[') {
+      try {
+        const obj = JSON.parse(trimmed);
+        const b = obj && (obj.before_snippet != null ? obj.before_snippet : obj.before);
+        const a = obj && (obj.after_snippet != null ? obj.after_snippet : obj.after);
+        if (b != null || a != null) {
+          before = b == null ? '' : String(b);
+          after = a == null ? '' : String(a);
+          found = true;
+        }
+      } catch (e) { /* 非 JSON：继续按文本标记解析 */ }
+    }
+    if (!found) {
+      const mb = detailText.match(/before_snippet["']?\s*[:=]\s*(["'])([\s\S]*?)\1/);
+      const ma = detailText.match(/after_snippet["']?\s*[:=]\s*(["'])([\s\S]*?)\1/);
+      if (mb || ma) { before = mb ? mb[2] : ''; after = ma ? ma[2] : ''; found = true; }
+    }
+    if (!found) return '';
+    if (typeof buildApprovalDiff === 'function') return buildApprovalDiff(before, after, 400);
+    return this._plainDiff(before, after);
+  },
+
+  /** 无 buildApprovalDiff 时的降级 diff（红=变更前 / 绿=变更后）
+   * @param {string} before - 变更前片段
+   * @param {string} after - 变更后片段
+   * @returns {string} HTML
+   * @private */
+  _plainDiff(before, after) {
+    const block = (text, cls, sign) => String(text || '').split('\n')
+      .map(l => '<div class="font-mono text-[10px] whitespace-pre-wrap break-all px-1 ' + cls + '">' +
+        escapeHtml(sign + l) + '</div>').join('');
+    return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-1.5 max-h-44 overflow-auto">' +
+      block(before, 'text-danger bg-danger/10', '-') + block(after, 'text-success bg-success/10', '+') + '</div>';
+  },
+
+  /** 格式化耗时（ms → 12ms / 1.2s / 1m12s）
+   * @param {number} ms - 毫秒
+   * @returns {string} 展示文本 */
+  formatMs(ms) {
+    const v = Number(ms);
+    if (!isFinite(v) || v <= 0) return '—';
+    if (v < 1000) return v + 'ms';
+    const sec = v / 1000;
+    if (sec < 60) return sec.toFixed(sec < 10 ? 1 : 0) + 's';
+    return Math.floor(sec / 60) + 'm' + Math.round(sec % 60) + 's';
+  },
+
+  /** 格式化时间分组标签（今天 9月17日 / 昨天 9月16日 / 9月15日 / 2025年12月31日）
+   * @param {string} ts - 时间戳
+   * @returns {string} 日期标签 */
+  formatDateGroup(ts) {
+    const d = this._parseTs(ts);
+    if (!d) return String(ts || '').slice(0, 10) || '未知时间';
+    const md = (d.getMonth() + 1) + '月' + d.getDate() + '日';
+    const now = new Date();
+    if (this._dayKey(d) === this._dayKey(now)) return '今天 ' + md;
+    if (this._dayKey(d) === this._dayKey(new Date(now.getTime() - 86400000))) return '昨天 ' + md;
+    if (d.getFullYear() === now.getFullYear()) return md;
+    return d.getFullYear() + '年' + md;
+  },
+
+  /** 工具中文标签（未登记的工具直接显示原始名）
+   * @param {string} tool - 工具名
+   * @returns {string} 中文标签 */
+  toolLabel(tool) {
+    const t = String(tool || '');
+    return this.TOOL_LABELS[t] || t || '未知工具';
+  },
+
+  /** 工具节点图标（未登记 → circle-dot）
+   * @param {string} tool - 工具名
+   * @returns {string} lucide 图标名 */
+  toolIcon(tool) {
+    return this.TOOL_ICONS[String(tool || '')] || 'circle-dot';
+  },
+
+  /** 状态元信息（未登记状态按灰色降级展示）
+   * @param {string} status - 状态值
+   * @returns {{label:string, node:string, badge:string}} 状态元信息 */
+  statusInfo(status) {
+    return this.STATUS_MAP[String(status || '')] || {
+      label: String(status || '未知'),
+      node: 'text-text-tertiary border-line-ghost',
+      badge: 'bg-surface-panel text-text-tertiary border-line-ghost'
+    };
+  },
+
+  /* ===================== 时间解析工具 ===================== */
+
+  /** 解析后端时间戳（兼容 "2026-09-17 14:30:22" / "2026-09-17T14:30:22" / ISO）
+   * @param {string} ts - 时间戳字符串
+   * @returns {Date|null} 解析后的 Date，失败返回 null
+   * @private */
+  _parseTs(ts) {
+    if (!ts) return null;
+    const s = String(ts).trim();
+    if (!s) return null;
+    const normalized = s.replace(' ', 'T');
+    const d = new Date(normalized);
+    if (isNaN(d.getTime())) return null;
+    return d;
+  },
+
+  /** 日期的天级 key（用于按天分组）
+   * @param {Date} d - 日期
+   * @returns {string} YYYY-MM-DD
+   * @private */
+  _dayKey(d) {
+    return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+  },
+
+  /** 提取时间部分（HH:MM）
+   * @param {string} ts - 时间戳
+   * @returns {string} HH:MM
+   * @private */
+  _timeOnly(ts) {
+    const d = this._parseTs(ts);
+    if (!d) return String(ts || '').slice(11, 16) || '';
+    const p = (n) => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes());
+  },
+
+  /** Date → HH:MM:SS（用于"已更新"显示）
+   * @param {Date} d - 日期
+   * @returns {string} HH:MM:SS
+   * @private */
+  _timeOfDay(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  },
+
+  /** 截断字符串（超出加省略号）
+   * @param {string} s - 文本
+   * @param {number} n - 最大长度
+   * @returns {string} 截断结果
+   * @private */
+  _truncate(s, n) {
+    const t = String(s == null ? '' : s);
+    return t.length > n ? t.slice(0, n) + '…' : t;
+  }
+};
+
+/* 暴露到 window：便于控制台/自动化测试直接调用 */
+window.TimelineViewer = TimelineViewer;
+
+// DOMContentLoaded 后初始化（或 typeof 守卫延迟初始化）
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function () { TimelineViewer.init(); });
+} else {
+  TimelineViewer.init();
+}
 
 
 /* ===================== [任务十] PWA / Service Worker ===================== */

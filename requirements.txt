@@ -1,0 +1,19 @@
+# MoRay 本地薄后端第三方依赖（工程根，供 启动MoRay.bat 自动安装 / 手动 pip 使用）
+#
+# 说明：
+# - 标准库（sqlite3 / subprocess / pathlib / json 等）无需列出
+# - 版本策略与 server/requirements.txt 同口径：最低兼容版本 + 兼容上界
+# - python-dotenv 为可选依赖：server/app/config.py 已用 try/except 包裹，
+#   缺失时后端自动降级为「仅读环境变量」，本机功能不受影响
+# - httpx 用于云端 LLM 代理转发（server/app/llm_proxy.py、server/app/agent_runner.py）
+# - uvicorn[standard] 含 uvloop/httptools/watchfiles 等加速件（Windows 下自动跳过 uvloop）
+# - [Kernel 阶段3] MCP 兼容层（server/app/mcp_server.py）**不新增任何依赖**：
+#   SSE 传输用 FastAPI 自带 StreamingResponse + 标准库 asyncio.Queue/json/uuid 实现，
+#   异步运行时 anyio 已由 starlette/fastapi 传递安装。刻意不引入官方 mcp SDK（过重）。
+
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+
+# 安装命令：pip install -r requirements.txt

@@ -51,10 +51,15 @@ u2.py
 tmp_clean.py
 clean2.py
 patch_tools1.py
+fix_snapshot.py
+test_mcp.py
 uvicorn
 _q*.png
 *.tmp
 *.log
+
+# ---- 静态部署目录（可由 assemble.py --web 重新生成）----
+web/
 
 # ---- 系统 / 编辑器杂项 ----
 Thumbs.db

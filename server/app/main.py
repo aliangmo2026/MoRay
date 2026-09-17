@@ -19,6 +19,7 @@ from . import config, db
 from .llm_proxy import router as llm_router
 from .api import router as api_router
 from .agent_tools import router as agent_tools_router
+from .mcp_server import router as mcp_router
 from .crud import counts as db_counts
 
 # 工程根（server/ 的上一级；moray-workbench.html / vendor/ 所在处）
@@ -41,6 +42,10 @@ app = FastAPI(title="MoRay 本地薄后端", version=config.VERSION, lifespan=li
 app.include_router(llm_router)
 app.include_router(api_router)
 app.include_router(agent_tools_router)
+# [Kernel 阶段3] MCP 兼容层：GET/POST /api/mcp/sse（SSE 长连接 + JSON-RPC 2.0）
+# 独立模块自带 APIRouter（server/app/mcp_server.py）；路径 /api/mcp/* 与既有路由不冲突，
+# 且本行放在最后 → 既有 /api/agent/* 的匹配顺序与行为完全不变。
+app.include_router(mcp_router)
 
 # 关键坑：前端可能以 file:// 打开（Origin 为字符串 "null"），也可能来自
 # http://127.0.0.1 或 http://localhost 的任意端口 —— 正则统一放行

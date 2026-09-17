@@ -21,7 +21,7 @@ SQLITE_PATH = Path(_env_db).expanduser() if _env_db else (DATA_DIR / "moray.sqli
 
 SERVICE_NAME = "moray-backend"
 VERSION = "1.0.0"      # 产品版本（对外，与前端 MORAY_VERSION 一致）
-BUILD = "3.20.1"      # 内部构建号（对应 CHANGELOG 迭代序号，随发布更新）
+BUILD = "3.22.0"      # 内部构建号（对应 CHANGELOG 迭代序号，随发布更新）
 # 对外产品版本权威字段（assemble 构建期校验 MORAY_VERSION 用；与内部 BUILD 数值不同属正常）
 PRODUCT_VERSION = "1.0.0"
 
@@ -40,3 +40,33 @@ except Exception:  # noqa: BLE001 - dotenv 缺失时仅用环境变量
 LLM_BASE_URL = os.environ.get("MORAY_LLM_BASE_URL", "").strip()
 LLM_API_KEY = os.environ.get("MORAY_LLM_API_KEY", "").strip()
 LLM_MODEL = os.environ.get("MORAY_LLM_MODEL", "").strip()
+
+# ---- [Kernel 阶段3] MCP（Model Context Protocol）兼容层 ----
+# 把 11 个本机工具暴露为标准 MCP Server（SSE 传输），供 Claude Desktop / Cursor 等外部客户端调用。
+# 实现见 server/app/mcp_server.py；零新增依赖（FastAPI StreamingResponse + asyncio.Queue）。
+MCP_ENABLED = os.environ.get("MORAY_MCP_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+MCP_SSE_PATH = "/api/mcp/sse"
+MCP_SERVER_NAME = "moray-mcp"
+
+# 只读工具：MCP 调用不需要审批，恒放行（不属于白名单管控范围）
+MCP_READONLY_TOOLS = (
+    "list_directory", "read_file", "find_files",
+    "search_text", "list_processes", "system_info",
+)
+
+# 副作用工具（与 agent_tools.SIDE_EFFECT_TOOLS 一致）：默认【禁止】MCP 调用，
+# 必须在 MCP_ALLOWED_TOOLS 里显式放行；放行后 MCP 调用自动 approved=true（仍受 _safe_path 等全部防护）。
+MCP_SIDE_EFFECT_TOOLS = (
+    "write_file", "create_file", "move_file", "run_command", "edit_file",
+)
+MCP_WRITE_TOOLS = MCP_SIDE_EFFECT_TOOLS  # 兼容别名
+
+# MCP 白名单：默认只含只读工具（即"外部客户端只读"）。要授权写操作就把它加进来，例如：
+#   set MORAY_MCP_ALLOWED_TOOLS=read_file,write_file,create_file
+# 运行期还可在 kv 表写入 mcp_allowed_tools（JSON 数组或逗号串）覆盖本默认值 ——
+# 优先级：kv(mcp_allowed_tools) > 本配置项（含环境变量）> 默认只读。
+_env_mcp_allowed = os.environ.get("MORAY_MCP_ALLOWED_TOOLS", "").strip()
+MCP_ALLOWED_TOOLS = (
+    tuple(x.strip() for x in _env_mcp_allowed.split(",") if x.strip())
+    if _env_mcp_allowed else MCP_READONLY_TOOLS
+)

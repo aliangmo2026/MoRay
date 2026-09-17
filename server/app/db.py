@@ -54,6 +54,21 @@ CREATE TABLE IF NOT EXISTS agent_tool_log (
   detail       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_agent_log_ts ON agent_tool_log(id DESC);
+
+-- [Kernel 阶段1 预埋] 事件溯源快照：记录关键事件发生时的状态，供未来「回放」使用。
+-- 当前阶段只建表 + 提供读写接口，不自动写入（写入钩子见 agent_tools._audit_snapshot）。
+CREATE TABLE IF NOT EXISTS event_snapshots (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type    TEXT NOT NULL,           -- 事件类型：tool_call / conversation_created / message_sent / model_changed / settings_changed 等
+  entity_id     TEXT NOT NULL DEFAULT '', -- 关联实体 ID（如 tool 调用关联 agent_tool_log.id，会话关联 conversations.id）
+  source_log_id INTEGER,                  -- 关联 agent_tool_log.id（如果是工具调用事件）
+  snapshot_json TEXT NOT NULL DEFAULT '{}', -- 事件发生时的状态快照（JSON 字符串）
+  created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  FOREIGN KEY (source_log_id) REFERENCES agent_tool_log(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_snapshots_type ON event_snapshots(event_type);
+CREATE INDEX IF NOT EXISTS idx_event_snapshots_entity ON event_snapshots(entity_id);
+CREATE INDEX IF NOT EXISTS idx_event_snapshots_created ON event_snapshots(created_at);
 """
 
 

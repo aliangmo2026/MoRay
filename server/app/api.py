@@ -177,3 +177,93 @@ async def kv_put(key: str, request: Request):
         return _bad("bad_request", "缺少 value 字段")
     crud.kv_put(key, str(value))
     return _ok({"key": key, "value": str(value)})
+
+
+# ---------------- [v3.21.0] 一键自动指挥 Codex ----------------
+# 编排逻辑单独成文件（server/app/agent_runner.py），自带 APIRouter：
+#   POST /api/agent/run · GET /api/agent/tasks/<id> · POST /api/agent/tasks/<id>/stop
+#   GET /api/agent/run/preflight · GET /api/agent/runs
+# 这里并入本模块 router（main.py 已注册 api_router），避免改动 main.py 的路由注册顺序。
+from .agent_runner import router as _agent_runner_router  # noqa: E402
+
+router.include_router(_agent_runner_router)
+
+# ---------------- [v3.22.0] 编排工头（大任务拆解 → 分工 → 串行队列 → 成本汇总） ----------------
+# 编排逻辑单独成文件（server/app/agent_orchestrator.py），自带 APIRouter：
+#   GET  /api/orchestrator/preflight · POST /api/orchestrator/decompose
+#   GET/POST /api/orchestrator/plans · GET /api/orchestrator/plans/<id>
+#   POST /api/orchestrator/plans/<id>/run · POST /api/orchestrator/plans/<id>/stop
+# 与 v3.21 的单任务入口共用同一把「单机串行」执行闸门（详见 agent_orchestrator._PlanToken）。
+from .agent_orchestrator import router as _orchestrator_router  # noqa: E402
+
+router.include_router(_orchestrator_router)
+
+# ---------------- [Kernel 预埋] 事件溯源快照 ----------------
+# 只读查询 + 写入钩子骨架（供未来「回放」UI 使用）。当前阶段无人自动写入：
+# 写入入口是 agent_tools._audit_snapshot()，由未来回放系统在关键事件点调用。
+# 注意：本段不修改任何既有路由与契约；GET /api/agent/log 保持原样。
+
+@router.get("/api/events/snapshots")
+def event_snapshots_list(event_type: str | None = None, entity_id: str | None = None, limit: int = 100, offset: int = 0):
+    """分页查询事件快照（只读，供未来回放 UI 使用）"""
+    try:
+        rows, total = crud.list_event_snapshots(event_type, entity_id, limit, offset)
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"读取快照失败：{e}", 500)
+    return _ok({
+        "rows": rows,
+        "total": total,
+        "limit": min(max(int(limit or 100), 1), 500),
+        "offset": max(int(offset or 0), 0),
+    })
+
+
+@router.get("/api/events/snapshots/{snapshot_id}")
+def event_snapshot_detail(snapshot_id: int):
+    """查询单条事件快照详情"""
+    row = crud.get_event_snapshot(snapshot_id)
+    if not row:
+        return _bad("not_found", f"快照不存在：{snapshot_id}", 404)
+    return _ok(row)
+
+
+@router.post("/api/events/snapshots")
+async def event_snapshot_create(request: Request):
+    """写入事件快照（当前为预埋钩子，仅内部调用；未来回放系统启用后开放）。
+    注意：当前阶段此接口仅用于开发测试，生产环境应限制为仅本地回环调用（已由 HOST=127.0.0.1 保证）。"""
+    try:
+        body = await _read_json(request)
+    except ValueError as e:
+        return _bad("bad_json", str(e))
+    if not isinstance(body, dict) or not str(body.get("event_type") or "").strip():
+        return _bad("bad_request", "缺少 event_type 字段")
+    snapshot = body.get("snapshot")
+    if snapshot is not None and not isinstance(snapshot, (dict, list, str, int, float, bool)):
+        return _bad("bad_request", "snapshot 必须是 JSON 对象（或可序列化标量）")
+    source_log_id = body.get("source_log_id")
+    if source_log_id is not None:
+        try:
+            source_log_id = int(source_log_id)
+        except (TypeError, ValueError):
+            return _bad("bad_request", "source_log_id 必须是整数")
+    try:
+        new_id = crud.append_event_snapshot(
+            str(body.get("event_type")).strip(),
+            str(body.get("entity_id") or ""),
+            source_log_id,
+            snapshot if isinstance(snapshot, dict) else None,
+        )
+        return _ok({"id": new_id})
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"写入失败：{e}", 500)
+
+
+@router.delete("/api/events/snapshots")
+def event_snapshots_clear(event_type: str | None = None):
+    """清空事件快照（带确认参数，前端二次确认后调用）"""
+    try:
+        n = crud.clear_event_snapshots(event_type)
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"清空失败：{e}", 500)
+    return _ok({"cleared": n})
+

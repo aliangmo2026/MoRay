@@ -217,11 +217,56 @@ def _summarize_args(name: str, args: dict) -> str:
         return str(args)[:200]
 
 
-def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, detail: str = ""):
+def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, detail: str = "", source: str = "web"):
+    """写审计日志 + 同步写事件溯源快照（Kernel 第二阶段）。
+
+    快照记录完整的工具入参、审批状态、执行结果摘要，供 /api/agent/replay 重放使用。
+    快照写入失败不影响主流程（内部 try/catch，仅 warning 日志）。
+
+    source：调用通道（web = 前端/HTTP 直调，mcp = MCP Server）。非 web 时在 detail 前缀标注
+    "source=xxx"：不改变 agent_tool_log 表结构、不影响 GET /api/agent/log 契约，审计表格与
+    时间轴都能直接看到来源（既有调用方不传该参数 → 行为与之前完全一致）。
+    """
+    detail_text = str(detail or "")
+    if source and source != "web":
+        detail_text = ("source=%s | %s" % (source, detail_text)).rstrip(" |")
+    log_id = 0
     try:
-        crud.append_agent_log(name, _summarize_args(name, args), approved, status, ms, detail)
+        log_id = crud.append_agent_log(name, _summarize_args(name, args), approved, status, ms, detail_text)
     except Exception as e:  # noqa: BLE001 - 审计失败不影响工具结果
         _logger.warning("agent audit write failed: %s", e)
+    # 同步写事件溯源快照（仅对真实工具调用写快照，配置类操作不写）
+    if log_id and name in TOOL_IMPLS:
+        try:
+            snapshot = {
+                "tool": name,
+                "args": args,
+                "approved": bool(approved),
+                "status": status,
+                "ms": int(ms or 0),
+                "detail": detail_text[:1000],
+                "timestamp": _TS_snapshot(),
+                "workspace": str(_workspace_root(create=False)),
+                "schema_version": 1,
+            }
+            crud.append_event_snapshot("tool_call", f"{name}:{log_id}", log_id, snapshot)
+        except Exception as e:  # noqa: BLE001 - 快照失败绝不影响工具执行
+            _logger.warning("event snapshot write failed: %s", e)
+
+
+def _TS_snapshot() -> str:
+    """快照用时间戳（ISO 格式）"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+def _audit_snapshot(event_type: str, entity_id: str, source_log_id: int | None, snapshot: dict):
+    """事件溯源快照写入钩子（预埋，当前不自动调用；未来回放系统启用后，
+    在关键事件点（工具调用完成、会话创建、模型切换等）调用此函数记录状态快照）。
+    失败不影响主流程（内部 try/catch，仅 warning 日志）。"""
+    try:
+        crud.append_event_snapshot(event_type, entity_id, source_log_id, snapshot)
+    except Exception as e:  # noqa: BLE001 - 快照失败绝不影响工具执行
+        _logger.warning("event snapshot write failed: %s", e)
 
 
 def _err(status_code: int, code: str, message: str):
@@ -961,57 +1006,86 @@ def _human_summary(name: str, args: dict) -> dict:
     return {"tool": name, "title": name, "detail": json.dumps(args, ensure_ascii=False)[:300]}
 
 
+# ---------------------------------------------------------------- 统一执行入口
+
+def _execute_tool_internal(name: str, args: dict, approved: bool = False,
+                           decision: str = "", source: str = "web") -> tuple[dict, int]:
+    """执行一个本机工具 —— 唯一执行入口（/api/agent/tool 与 MCP Server 共用）。
+
+    安全边界完全沿用既有实现，本函数不做任何放宽：
+      - 工具查找：仅 TOOL_IMPLS 里的 11 个本机工具，其它名字一律拒绝；
+      - 副作用双保险：SIDE_EFFECT_TOOLS 且 approved is not True → 绝不执行（needs_approval）；
+      - 路径/后缀/命令白名单等防护全部在各自 _tool_* 实现内经 _safe_path 与 SafeError 生效，
+        本函数既不绕过也不复制这些校验；
+      - 每一次调用（含客户端拒绝、未审批、安全拒绝、执行失败）都写审计与事件快照；
+        source != "web" 时在 detail 前缀标注来源（MCP 调用落 "source=mcp"）。
+    返回 (payload, http_status)：未知工具 → 400；其余一律 200（与既有路由行为一致）。
+    """
+    if not isinstance(args, dict):
+        args = {}
+    impl = TOOL_IMPLS.get(name)
+    if impl is None:
+        return {"ok": False, "code": "unknown_tool",
+                "message": f"未知本机工具：{name}（可用：{', '.join(sorted(TOOL_IMPLS))}）"}, 400
+    is_side_effect = name in SIDE_EFFECT_TOOLS
+    # 客户端拒绝上报：只审计，绝不执行任何工具（即使是只读的也按上报处理）
+    if str(decision or "") == "denied":
+        _audit(name, args, False, "denied", 0, "客户端明确拒绝", source=source)
+        return {"ok": True, "data": {"denied": True}}, 200
+    # 副作用双保险：未带 approved:true 一律不执行
+    if is_side_effect and approved is not True:
+        _audit(name, args, False, "needs_approval", 0, "副作用工具未获审批，未执行", source=source)
+        return {"ok": True, "needsApproval": True, "summary": _human_summary(name, args)}, 200
+    t0 = time.perf_counter()
+    try:
+        data = impl(args)
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, True, "ok", ms, source=source)
+        return {"ok": True, "data": data}, 200
+    except SafeError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "rejected", ms, str(e)[:200], source=source)
+        return {"ok": False, "code": e.code, "message": str(e)}, 200
+    except ToolError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "error", ms, str(e)[:200], source=source)
+        return {"ok": False, "code": e.code, "message": str(e)}, 200
+    except Exception as e:  # noqa: BLE001 - 兜底：内部错误不泄漏堆栈
+        _logger.exception("agent tool %s crashed", name)
+        ms = int((time.perf_counter() - t0) * 1000)
+        _audit(name, args, approved, "error", ms, "internal: " + type(e).__name__, source=source)
+        return {"ok": False, "code": "internal_error",
+                "message": f"工具执行内部错误：{type(e).__name__}"}, 200
+
+
 # ---------------------------------------------------------------- 路由
 
 @router.post("/api/agent/tool")
 async def agent_tool_call(request: Request):
-    """执行一个本机工具。
+    """执行一个本机工具（HTTP 外观层，行为与抽取前完全一致）。
 
     body: {name, args, approved?, decision?}
     - 只读工具（list_directory/read_file）：approved 无关，直接执行；
     - 副作用工具（write_file/run_command）：approved !== true → {needsApproval:true, summary} 绝不执行；
     - decision='denied'：客户端拒绝上报，仅写审计（status=denied），绝不执行。
+
+    真正的执行/审批/审计在 _execute_tool_internal —— 与 MCP Server 共用同一入口，
+    不存在第二条执行路径（避免"两套实现安全策略漂移"）。
     """
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         return _err(400, "bad_json", "请求体不是合法 JSON")
-    name = str(body.get("name") or "").strip()
-    args = body.get("args")
-    if not isinstance(args, dict):
-        args = {}
-    impl = TOOL_IMPLS.get(name)
-    if impl is None:
-        return _err(400, "unknown_tool", f"未知本机工具：{name}（可用：{', '.join(sorted(TOOL_IMPLS))}）")
-    is_side_effect = name in SIDE_EFFECT_TOOLS
-    approved = body.get("approved") is True
-    # 客户端拒绝上报：只审计，绝不执行任何工具（即使是只读的也按上报处理）
-    if str(body.get("decision") or "") == "denied":
-        _audit(name, args, False, "denied", 0, "客户端明确拒绝")
-        return {"ok": True, "data": {"denied": True}}
-    # 副作用双保险：未带 approved:true 一律不执行
-    if is_side_effect and not approved:
-        _audit(name, args, False, "needs_approval", 0, "副作用工具未获审批，未执行")
-        return {"ok": True, "needsApproval": True, "summary": _human_summary(name, args)}
-    t0 = time.perf_counter()
-    try:
-        data = impl(args)
-        ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, True, "ok", ms)
-        return {"ok": True, "data": data}
-    except SafeError as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "rejected", ms, str(e)[:200])
-        return {"ok": False, "code": e.code, "message": str(e)}
-    except ToolError as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "error", ms, str(e)[:200])
-        return {"ok": False, "code": e.code, "message": str(e)}
-    except Exception as e:  # noqa: BLE001 - 兜底：内部错误不泄漏堆栈
-        _logger.exception("agent tool %s crashed", name)
-        ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "error", ms, "internal: " + type(e).__name__)
-        return {"ok": False, "code": "internal_error", "message": f"工具执行内部错误：{type(e).__name__}"}
+    payload, status = _execute_tool_internal(
+        str(body.get("name") or "").strip(),
+        body.get("args"),
+        approved=body.get("approved") is True,
+        decision=str(body.get("decision") or ""),
+        source="web",
+    )
+    if status != 200:
+        return _err(status, str(payload.get("code") or "error"), str(payload.get("message") or ""))
+    return payload
 
 
 @router.get("/api/agent/config")
@@ -1082,3 +1156,119 @@ def agent_log_clear():
         return {"ok": True, "data": {"cleared": n}}
     except Exception as e:  # noqa: BLE001
         return _err(500, "db_error", f"清空失败：{e}")
+
+
+# ---------------------------------------------------------------- Kernel 第二阶段：事件溯源重放
+
+@router.post("/api/agent/replay")
+async def agent_replay(request: Request):
+    """重放一次历史工具调用（Kernel 第二阶段：Event Sourcing 确定性回放）。
+
+    body: {snapshot_id, modified_args?, approved?}
+    - 从 event_snapshots 表读取原始快照（工具名、原始参数）
+    - 如果提供 modified_args，则用修改后的参数重放（允许用户调整参数后重试）
+    - 重放强制经过原有安全校验（_safe_path 路径防护、SIDE_EFFECT_TOOLS 审批逻辑）
+    - 副作用工具必须带 approved:true 才会执行，否则返回 needsApproval
+    - 重放结果写入新的审计日志和事件快照（source_log_id 指向原始日志）
+    - 返回执行结果 + 重放元信息（原始快照ID、新日志ID、新快照ID）
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _err(400, "bad_json", "请求体不是合法 JSON")
+
+    snapshot_id = body.get("snapshot_id")
+    if snapshot_id is None:
+        return _err(400, "bad_request", "缺少 snapshot_id 字段（要重放的事件快照 ID）")
+
+    # 1. 读取原始快照
+    try:
+        snap = crud.get_event_snapshot(int(snapshot_id))
+    except Exception as e:  # noqa: BLE001
+        return _err(500, "db_error", f"读取快照失败：{e}")
+
+    if not snap:
+        return _err(404, "snapshot_not_found", f"快照 ID {snapshot_id} 不存在")
+
+    snapshot_data = snap.get("snapshot") or {}
+    tool_name = snapshot_data.get("tool", "")
+    original_args = snapshot_data.get("args", {})
+
+    if not tool_name or tool_name not in TOOL_IMPLS:
+        return _err(400, "invalid_snapshot", f"快照中的工具名无效：{tool_name}")
+
+    # 2. 确定重放参数（modified_args 覆盖原始参数）
+    modified_args = body.get("modified_args")
+    if isinstance(modified_args, dict) and modified_args:
+        replay_args = dict(original_args)
+        replay_args.update(modified_args)
+    else:
+        replay_args = dict(original_args)
+
+    # 3. 安全校验：副作用工具需要 approved
+    is_side_effect = tool_name in SIDE_EFFECT_TOOLS
+    approved = body.get("approved") is True
+
+    if is_side_effect and not approved:
+        # 副作用工具未审批：不执行，返回 needsApproval（与 /api/agent/tool 行为一致）
+        _audit(tool_name, replay_args, False, "needs_approval", 0, f"重放未获审批（原始快照 {snapshot_id}）")
+        return {
+            "ok": True,
+            "needsApproval": True,
+            "summary": _human_summary(tool_name, replay_args),
+            "replay": {"original_snapshot_id": int(snapshot_id), "tool": tool_name, "status": "needs_approval"},
+        }
+
+    # 4. 执行重放（复用原有工具实现，自动经过 _safe_path 等安全校验）
+    impl = TOOL_IMPLS[tool_name]
+    t0 = time.perf_counter()
+    try:
+        data = impl(replay_args)
+        ms = int((time.perf_counter() - t0) * 1000)
+        status = "ok"
+        error_code = None
+        error_message = None
+    except SafeError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        status = "rejected"
+        error_code = e.code
+        error_message = str(e)
+        data = None
+    except ToolError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        status = "error"
+        error_code = e.code
+        error_message = str(e)
+        data = None
+    except Exception as e:  # noqa: BLE001
+        _logger.exception("agent replay %s crashed", tool_name)
+        ms = int((time.perf_counter() - t0) * 1000)
+        status = "error"
+        error_code = "internal_error"
+        error_message = f"重放内部错误：{type(e).__name__}"
+        data = None
+
+    # 5. 写审计日志（_audit 会自动写事件快照，source_log_id 指向新日志）
+    detail = f"重放自快照 {snapshot_id}"
+    if error_message:
+        detail += f"：{error_message[:200]}"
+    _audit(tool_name, replay_args, approved, status, ms, detail)
+
+    # 6. 返回结果
+    result = {
+        "ok": status == "ok",
+        "replay": {
+            "original_snapshot_id": int(snapshot_id),
+            "tool": tool_name,
+            "status": status,
+            "ms": ms,
+            "args_used": replay_args,
+        },
+    }
+    if data is not None:
+        result["data"] = data
+    if error_code:
+        result["code"] = error_code
+        result["message"] = error_message
+
+    return result

@@ -1,6 +1,7 @@
 /* MoRay Service Worker —— 静态资源缓存（离线可用，AI 请求除外）
-   策略：HTML/导航请求 -> 网络优先（失败回退缓存）；CDN 与静态资源 -> 缓存优先（后台更新） */
-const CACHE_NAME = 'moray-3.20.1';
+   策略：HTML/导航请求 -> 网络优先（失败回退缓存）；CDN 与静态资源 -> 缓存优先（后台更新）
+   例外：/api/* 一律不拦截（见下方注释） */
+const CACHE_NAME = 'moray-3.22.0';
 const SHELL_URLS = [
   './moray-workbench.html',
   './index.html',
@@ -27,6 +28,11 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
   // AI 请求（Ollama / OpenAI）绝不缓存
   if (url.port === '11434' || /openai|anthropic/i.test(url.hostname)) return;
+  // [3.21.0] 本地后端 API 一样绝不拦截：/api/* 是动态数据，走下面的"缓存优先"会把**固定 URL** 的
+  // 响应（如 /api/agent/runs?limit=50）当成静态资源返回旧值 —— 页面的 cache:'no-store' 也挡不住
+  // （SW 在 HTTP 层之前就应答了）。真机现象：运行中刷新页面，重新对齐运行态读到的是"没有运行记录"
+  // 的旧响应，于是把仍在跑的任务误标成失败。API 请求一律交给网络，不进缓存。
+  if (url.pathname.startsWith('/api/')) return;
   // HTML / 导航请求：网络优先，离线时回退缓存
   if (e.request.mode === 'navigate' || url.pathname.endsWith('.html')) {
     e.respondWith(

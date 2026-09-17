@@ -903,7 +903,12 @@ async function appendAgentSettings() {
     '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
     '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
-    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button></div>',
+    '<div class="flex items-center gap-1.5">' +
+    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button>' +
+    // [Kernel 阶段1] 飞行记录仪（时间轴）：与审计表格同一数据源（GET /api/agent/log），改视图不改数据
+    '<button id="agentTimelineBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost flex items-center gap-1" title="按天分组的时间轴视图：状态/工具筛选、展开详情、自动刷新">' +
+    '<i data-lucide="activity" class="w-3 h-3"></i>飞行记录仪</button>' +
+    '</div></div>',
     // [阶段1 M1] 上次 Agent 自检结果
     (() => {
       const sc = MoraySettings.get('agentSelfCheck');
@@ -946,6 +951,11 @@ async function appendAgentSettings() {
     showNotification('已保存', '最大工具轮数 = ' + v, 'success', 1500);
   });
   on(card.querySelector('#agentAuditViewBtn'), 'click', () => showAgentAuditLog());
+  // [Kernel 阶段1] 飞行记录仪入口（时间轴视图在 138_timeline.js；此处只转发，不改审计表格功能）
+  on(card.querySelector('#agentTimelineBtn'), 'click', () => {
+    if (typeof TimelineViewer !== 'undefined' && TimelineViewer.open) TimelineViewer.open();
+    else showNotification('时间轴未就绪', '前端分片未加载完成，请刷新页面后重试', 'warning', 2600);
+  });
   // [阶段0.5 E] 清除本会话已信任操作（相同工具+参数将重新询问）
   const trustedClear = card.querySelector('#agentTrustedClear');
   if (trustedClear) on(trustedClear, 'click', () => {

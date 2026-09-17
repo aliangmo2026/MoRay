@@ -1,5 +1,319 @@
 # MoRay 变更日志
 
+## 3.22.2（2026-09-17）MCP 协议兼容层：11 个本机工具变成标准 MCP Server，外部 AI 可安全调用
+
+### 目标与边界
+- 目标：实现标准 MCP（Model Context Protocol）Server（SSE 传输），让 Claude Desktop / Cursor /
+  Cherry Studio 等外部 AI 客户端通过标准协议安全调用 MoRay 的 11 个本机工具。
+- 边界（明确不做）：不实现 stdio 传输（仅 SSE）、不引入官方 mcp SDK（零新增依赖）、
+  不实现 resources / prompts 能力（仅 tools）、不修改现有 /api/agent/* 接口行为。
+
+### 新增 1：MCP Server（新文件 `server/app/mcp_server.py`，507 行）
+- **传输**：SSE（Server-Sent Events）+ JSON-RPC 2.0。
+  - `GET /api/mcp/sse`：建立长连接，先发 `event: endpoint` 告知 POST 地址（带 sessionId），
+    随后以 `event: message` 推送 JSON-RPC 响应；15 秒心跳保活。
+  - `POST /api/mcp/sse?sessionId=xxx`：接收 JSON-RPC 请求，处理后经 SSE 推送响应（HTTP 202）。
+  - 便利模式：未带 sessionId 时直接把响应放在 HTTP 响应体返回，便于 curl / 手工验证。
+  - 多客户端并发：`_SESSIONS` 字典管理 session_id → asyncio.Queue，单队列上限 256 条防内存溢出。
+- **协议**：兼容 MCP 2024-11-05 / 2025-03-26 / 2025-06-18。
+  - 支持方法：`initialize` / `notifications/initialized` / `notifications/cancelled` /
+    `ping` / `tools/list` / `tools/call`。
+  - 错误码：-32700 / -32600 / -32601 / -32602 / -32603（标准 JSON-RPC 错误码）。
+- **tools/list**：遍历 `agent_tools.TOOL_IMPLS`，为 11 个工具生成 MCP 标准描述
+  （name / description / inputSchema / annotations）。参数名严格对齐各工具实现真正读取的键
+  （如 move_file 用 from/to、edit_file 用 old_str/new_str、read_file 有 maxBytes）。
+- **tools/call 安全模型（核心底线）**：
+  - **唯一执行入口**：所有 MCP 工具调用都走 `agent_tools._execute_tool_internal`——与
+    /api/agent/tool 共用同一份 _safe_path 七层防护、危险后缀拒绝、命令白名单、
+    SIDE_EFFECT_TOOLS 审批双保险、错误截断与审计落库。本模块不重新实现任何工具、不放宽任何校验。
+  - **副作用工具默认禁止**：write_file / create_file / move_file / run_command / edit_file
+    只有在白名单里才允许被 MCP 调用；白名单默认只含 6 个只读工具
+    （list_directory / read_file / find_files / search_text / list_processes / system_info），
+    于是"开箱即用 = 外部客户端只能读，不能写"。
+  - **白名单配置**：优先级 kv(mcp_allowed_tools) > 环境变量 MORAY_MCP_ALLOWED_TOOLS >
+    config.MCP_ALLOWED_TOOLS > 默认只读。支持 JSON 数组或逗号串。
+  - **全量审计**：每次调用（含被白名单拒绝、参数不合法、安全拒绝、执行失败）都写
+    agent_tool_log，detail 前缀 `source=mcp`，可在「飞行记录仪」时间轴看到来源。
+  - **不泄漏内部堆栈**：所有异常转成可读文案，内部错误只落服务端日志。
+
+### 新增 2：执行逻辑抽取（修改 `server/app/agent_tools.py`）
+- 把 /api/agent/tool 路由中的执行逻辑抽取为独立函数 `_execute_tool_internal(name, args, approved, decision, source)`，
+  返回 `(payload, status_code)`。
+- /api/agent/tool 路由改为调用此函数（source="web"），MCP Server 也调用此函数（source="mcp"）。
+- 抽取过程中**未修改任何安全逻辑**：_safe_path、SIDE_EFFECT_TOOLS、_audit、_audit_snapshot、
+  危险后缀拒绝、命令白名单全部原样保留。
+- 新增 `source` 参数用于审计日志标注调用来源（web / mcp / replay），不影响执行逻辑。
+
+### 修改 3：配置与挂载
+- `server/app/config.py`：新增 MCP 配置项——MCP_ENABLED / MCP_SSE_PATH / MCP_SERVER_NAME /
+  MCP_READONLY_TOOLS / MCP_SIDE_EFFECT_TOOLS / MCP_ALLOWED_TOOLS（含环境变量覆盖）。
+- `server/app/main.py`：导入并挂载 mcp_router（`app.include_router(mcp_router)`），
+  排在最后，不影响既有路由匹配顺序。
+- `requirements.txt`：**零新增依赖**——MCP SSE 用 FastAPI 自带 StreamingResponse +
+  标准库 asyncio.Queue / json / uuid 实现。刻意不引入官方 mcp SDK（过重）。
+
+### 验证
+- 语法检查：mcp_server.py / main.py / agent_tools.py / config.py 全部通过 py_compile。
+- initialize：返回 protocolVersion=2024-11-05、serverInfo={name:moray-mcp, title:MoRay 本机工具}、
+  capabilities={tools:{listChanged:false}, logging:{}}。
+- tools/list：返回 11 个工具，正确标注只读 / 副作用，inputSchema 合法。
+- tools/call（只读）：system_info 返回真实系统信息（OS / CPU / 内存 / 磁盘），isError=false。
+- tools/call（副作用默认禁止）：write_file 返回 isError=true，提示需要配置 MCP 白名单。
+- 路径越权防护：read_file 读取 ../../windows/win.ini 被 _safe_path 拦截，返回 unsafe 错误。
+- 审计日志：所有 MCP 调用记录 detail 前缀 source=mcp，飞行记录仪可见。
+- 原有接口不受影响：/api/agent/tool 正常工作，/api/health 正常。
+
+---
+
+## 3.22.1（2026-09-16）Event Sourcing 确定性回放：事件快照 + 时间轴 UI + 修改重跑
+
+### 目标与边界
+- 目标：实现基于事件溯源（Event Sourcing）的确定性回放能力——把每次工具调用的完整入参、
+  出参、上下文状态序列化为事件快照，在前端时间轴 UI 中可视化，并支持对失败 / 超时步骤
+  修改参数后重新执行。
+- 边界（明确不做）：不做全链路状态回滚（仅单步骤重放）、不做分支 / 多版本回放、
+  不修改现有工具执行逻辑、不破坏 agent_tool_log 表现有数据。
+
+### 新增 1：事件快照表（修改 `server/app/db.py`）
+- 新增 `event_snapshots` 表：
+  - `id` INTEGER PRIMARY KEY AUTOINCREMENT
+  - `event_type` TEXT NOT NULL（如 tool_call / tool_result / replay）
+  - `entity_id` TEXT（关联的会话 ID 或任务 ID）
+  - `source_log_id` INTEGER（外键 → agent_tool_log.id，ON DELETE SET NULL）
+  - `snapshot_json` TEXT NOT NULL（完整的入参 / 出参 / 上下文状态，JSON 序列化）
+  - `created_at` TEXT NOT NULL（ISO 8601 时间戳）
+- 新增 3 个索引：`idx_event_snapshots_source_log_id` / `idx_event_snapshots_entity_id` /
+  `idx_event_snapshots_created_at`。
+- 建表 DDL 幂等（CREATE TABLE IF NOT EXISTS），不影响现有表。
+
+### 新增 2：快照 CRUD（修改 `server/app/crud.py`）
+- 新增 4 个函数：`create_event_snapshot` / `get_event_snapshot` / `list_event_snapshots` /
+  `delete_event_snapshot`。
+- 修改 `append_agent_log`：返回新插入记录的 ID（int），供快照关联 source_log_id。
+- 修改 `list_agent_log`：查询时 LEFT JOIN event_snapshots 表，返回每条审计记录的
+  `snapshot_id` 字段（无快照时为 null）。
+
+### 新增 3：快照写入钩子（修改 `server/app/agent_tools.py`）
+- 在 `_audit` 函数中增加快照写入逻辑：每次工具调用完成后，把完整的工具名、入参、出参、
+  审批状态、执行结果序列化为 JSON，调用 `_audit_snapshot` 写入 event_snapshots 表。
+- `_audit_snapshot(event_type, entity_id, source_log_id, snapshot)`：内部辅助函数，
+  负责快照序列化与落库，失败不影响主流程（仅记 warning 日志）。
+- 快照内容包含：tool / args / approved / status / ms / detail / result / timestamp。
+
+### 新增 4：重放接口（修改 `server/app/agent_tools.py`）
+- 新增 `POST /api/agent/replay` 路由：
+  - 请求体：`{snapshot_id, modified_args, approved}`
+  - 逻辑：根据 snapshot_id 读取原始快照 → 用 modified_args 覆盖原始参数 →
+    经过完整的 _safe_path 路径防护和 SIDE_EFFECT_TOOLS 审批逻辑 → 执行工具 →
+    写入新的审计记录和事件快照 → 返回重放结果。
+  - 错误处理：snapshot_id 不存在 → 404 snapshot_not_found；缺少 snapshot_id → 400 bad_request；
+    副作用工具未审批 → 返回 needsApproval。
+  - 返回体：`{ok:true, data:{...}, replay:{original_snapshot_id, tool, status, ms, args_used}}`。
+
+### 新增 5：时间轴 UI（新文件 `parts/138_timeline.js`，已加入 assemble.py PARTS）
+- 左侧导航新增「飞行记录仪」入口（activity 图标，在 cost 按钮之后）。
+- 可视化时间轴：带时间刻度、状态颜色（ok=绿 / error=红 / timeout=橙 / rejected=紫 /
+  needs_approval=黄 / denied=灰）、可点击展开详情。
+- 详情面板：展示工具名、参数摘要（完整 JSON）、执行详情、耗时、时间、记录 ID。
+- 「修改并重放此步骤」按钮：对失败 / 超时 / 待审批的记录，点击弹出重放对话框，
+  可修改参数后调用 /api/agent/replay 重新执行。
+- 按钮显示条件：`replayable && hasSnapshot`——只有状态可重放且有事件快照的记录才显示按钮；
+  无快照的旧记录显示友好提示「该记录无事件快照，暂不支持重放（新产生的记录将自动支持）」。
+- 自动刷新开关：可开启 / 关闭，开启时每 5 秒自动拉取最新记录。
+- 状态筛选 + 工具筛选：可按状态和工具类型过滤记录。
+- 颜色统一：使用项目设计令牌 text-warning / text-danger（非 Tailwind 默认色）。
+
+### 修复：snapshot_id 缺失 Bug
+- 问题：早期版本重放按钮只检查 `replayable`（状态），未检查 `hasSnapshot`（是否有快照），
+  导致无快照的旧记录也显示重放按钮，点击后发送 snapshot_id: null，后端报错
+  「缺少 snapshot_id 字段」。
+- 修复：重放按钮显示条件改为 `replayable && hasSnapshot`；无快照时显示友好提示；
+  doReplay 增加 snapshot_id 防御性检查。
+
+### 验证
+- 构建：python assemble.py 成功，27369 行 HTML，123 个 Lucide 图标有效。
+- 后端：/api/agent/log 返回 snapshot_id 字段；/api/agent/replay 正常响应。
+- 真机测试：qwen3.5:4b 调用 read_file 读取不存在的文件 → 产生失败记录（带快照）→
+  飞行记录仪显示蓝色「修改并重放此步骤」按钮 → 点击重放成功 → 产生新记录。
+- 无快照旧记录：显示「暂不支持重放」提示，不再报错。
+- 安全校验：重放仍经过 _safe_path 路径防护和审批逻辑。
+
+---
+
+## 3.22.0（2026-09-15）编排工头：大任务自动拆解 → 按类型分配工人 → 串行队列 → 成本汇总
+
+### 目标与边界
+- 目标：把 v3.21 的「单任务执行器」升级为「工头」。用户只给一个**大任务**，MoRay 用**真实模型**
+  把它拆成子任务，按类型分给不同**工人**（本地 Ollama 免费 / Codex+DeepSeek 付费），**串行**跑完，
+  最后给出汇总：每个子任务的状态/工人/耗时/成本 + 计划总成本与每工人成本拆解。
+- 边界（明确不做）：不做并行执行、不做子任务间依赖（DAG）、不接 zcode/豆包（无 CLI）、
+  不做定时自动调度；不改壁纸/知识库/对话等既有模块；所有数字必须来自真实回传，拿不到就写「未能获取」。
+
+### 新增 1：后端编排引擎（新文件 `server/app/agent_orchestrator.py`，路由由 `server/app/api.py` 挂载）
+- 路由：`GET /api/orchestrator/preflight`（工人可用性 + 占用状态）·
+  `POST /api/orchestrator/decompose`（大任务 → 子任务，真调本地 Ollama）·
+  `GET/POST /api/orchestrator/plans`（列表/创建）·`GET /api/orchestrator/plans/<id>?offset=N`（详情 + 增量日志）·
+  `POST /api/orchestrator/plans/<id>/run`（启动串行队列）·`POST /api/orchestrator/plans/<id>/stop`（停止）。
+- **拆解**：调本地 Ollama `POST /api/chat`（stream=false，system 提示词限定"只输出 JSON 数组"），
+  首选 `qwen3.5:9b` → 降级 `qwen2.5:7b`；`/api/tags` 可达时**跳过未安装的模型**并如实说明。
+  解析做代码块围栏剥离 + 首尾 `[...]` 截取 + object-with-array 兜底；最多个 `DECOMPOSE_MAX=8` 个。
+  **解析失败返回 502 + `codex:'decompose_failed'` + 每个候选模型的原始输出**（前端展示），绝不静默吞掉。
+- **工人抽象**：`子任务 → {status, output, usage, local_tokens, changed_files, error, log_path}`。
+  - *codex 工人*：直接复用 `agent_runner.Run` + `agent_runner._worker`（真 `codex exec --json`、
+    真 JSONL usage、真 `taskkill /T /F` 进程树、真审计）。**刻意不注册**到 agent_runner 的运行表 ——
+    计划的锁令牌已占用执行闸门，注册会覆盖 `_ACTIVE`，导致第一个子任务结束后闸门被误释放（自测踩到过）。
+  - *ollama 工人*：直调 `<ollama>/api/chat`（stream=false，默认超时 120s），回复即子任务输出；
+    记录 Ollama 自己上报的真实 `prompt_eval_count/eval_count`（仅展示，**不参与计费**：本地推理成本恒为 ¥0）。
+    停止时**关闭在途 HTTP 连接**真打断请求（不是假装中断）。
+- **串行队列**：一个子任务跑完（无论成败）→ 下一个；全部结束 → 计划 `completed`（部分失败也 completed，
+  同时给出 `failed_count`）。失败策略默认「失败继续」，创建时可选「失败即停」（剩余标 `canceled` 并写明原因）。
+- **共用执行闸门（单机串行）**：计划运行时 v3.21 的单任务入口会 409 busy，反之亦然。
+  实现方式是复用 agent_runner 的运行注册表放一个诚实的「计划令牌」（`_PlanToken`）——
+  **不改动 agent_runner.py** 就做到了双向互斥。收尾期间（已取消但子进程还在被杀）令牌仍被持有，
+  避免出现"抢到闸门"的空洞（自测 D/E 场景覆盖）。
+- **持久化**：SQLite 新表 `orchestrator_plans` / `orchestrator_subtasks`（本模块自带幂等 DDL，
+  不动 db.py 的 SCHEMA；连 `db.connect()`，`MORAY_DB` 隔离依然生效）。后端重启后仍标 `running` 的计划，
+  在读取时**如实改标 `interrupted`「应用重启导致中断」**并把 running/pending 子任务标 canceled。
+- **成本口径（铁律）**：后端**只回传原始 usage**，不算钱（价格表只有前端 `CostEngine` 一份，避免两处漂移）；
+  ollama 子任务落 `cost_cny = 0.0`（真实常量）；拿不到 usage 的 codex 子任务落 `NULL`，前端显示「未能获取」。
+- 每计划结束写一条既有审计（`orchestrator_plan`，含完成/失败数与耗时）。
+
+### 新增 2：编排面板（新分片 `parts/69_orchestrator.js`，已加入 `assemble.py` 的 PARTS，排在 68 之后）
+- 新增导航「编排工头」页，并在**任务分派页头部加「编排计划」入口按钮**（68 分片，纯追加）。
+- 新建大任务：名称 / 项目路径（带最近路径下拉）/ 目标描述 / **工人池（both·codex·ollama）** /
+  失败策略 / 每子任务超时；点「拆解为子任务」→ 真调本地模型，把结果渲染成**可编辑列表**
+  （逐条改标题、改内容、改工人、上移/下移、删除、添加；工人池非 both 时下拉锁定并写明原因）。
+- 计划列表卡：进度 `3/5`、状态徽章、工人池、总耗时、总成本；展开后是子任务表
+  （编号/标题/工人徽章/状态徽章/耗时/成本/改动文件/错误）+ **汇总卡**（总耗时 · 总成本 ·
+  Codex 子任务 ¥X · 本地 Ollama ¥0 · 完成/失败/取消计数）+ 执行日志区（1.5s 轮询增量拉取，
+  换子任务时游标自动重置；计划结束后钉在最后跑过的那个子任务上）。
+- 不可用一律**禁用 + 把唯一原因写进 tooltip**（无后端 / 本机已有任务或计划在跑 / codex 工人不可用 /
+  该计划已结束不能再跑）；运行中的计划显示「停止」，点击走确认框。
+- 刷新语义：**后端为权威**，`localStorage`（`moray_orchestrator_v1`）保存快照保证离线可见；
+  上次关页面时还在 running 的计划先如实标注，再与后端对齐（不谎报中断）。
+- 设置页新增「编排工头」说明卡（拆解模型链 / Ollama 地址与已装模型 / codex 命令与成本口径 / 超时口径）。
+
+### 验证（详见 `work/ORCHESTRATOR_REPORT.md`）
+- 构建门禁：21 个 parts 全量 `node --check` 通过；`python assemble.py` 幂等（两次 md5 一致）；
+  注入块 `node --check` 通过；script 标签 9/9 配平且与 pre 备份完全一致；div 开闭各 +67 配平；
+  三处内部版本 3.22.0 一致；SW `CACHE_NAME = moray-3.22.0`。
+- 后端单测 **60 断言全过**（假 codex 脚本 + 本地 mock Ollama + `MORAY_DB` 临时库）：
+  A 混合串行 / B 失败继续 / C 失败即停 / D 停止杀进程树（心跳文件取证）/ D2 停止打断在途 Ollama 请求 /
+  E 与单任务双向 409 busy / F 拆解成功与非 JSON 失败与 Ollama 不可用 / G 持久化 + 另一个进程模拟重启。
+- 前端真机（headless Edge + CDP，同源全栈 8000）**42 断言全过**：面板注入 / 任务面板入口跳转 /
+  工人状态 / 真 Ollama 拆解 → 可编辑列表（改标题·改工人·上移下移·删除·添加）/ 真实执行与实时刷新 /
+  汇总与每工人成本拆解 / 子任务输出可展开 / 刷新后计划仍在 / 运行中禁用+tooltip / 停止（确认框 →
+  进程树终止 → 日志写明 taskkill）。截图 `work/shots/orch_1..6*.png`。
+- 真机端到端：真 `qwen3.5:9b` 拆解一个真实大任务（116s，5 个子任务，worker 分类正确）→ 计划串行执行
+  （codex 31.7s / codex 80.4s / ollama 11.7s）→ 全部完成，真实 usage 与成本汇总 ¥0.2044。
+- 安全边界专项：codex 子任务前后对 `D:\ai工具台` 全量快照对比 **0 新增 / 0 删除 / 0 修改**，
+  文件只落在 `-C` 指定的临时目录里。
+- 回归：`scripts/agent_e2e_check.py` 37/0 保持；v3.21 单任务自动执行（含设置卡与日志流）照常。
+
+### 真机验证中发现并修复的四个真实缺陷（都不是"看起来能跑"就算过）
+1. **思考型模型的 token 预算全花在 reasoning 上** → 本机 `qwen3.5:9b` 对拆解提示词会返回
+   HTTP 200 但 `message.content` 为空（实测 115.8s 后空内容），导致拆解**必然降级**到下一个模型。
+   修复：拆解与 ollama 工人都传 `think:false`（同提示词 19.9s 返回完整 JSON 数组；不支持该参数的
+   Ollama/模型会自动去掉重试一次），并在 `content` 为空而 `thinking` 非空时如实标注来源后取用。
+   复测：反复卸载模型制造冷启动，连续 3 次拆解全部一次成功（15.1/15.2/15.0s，零候选失败）。
+2. **执行闸门存在"空洞"**：停止时计划状态已置 canceled，但收尾线程还没释放令牌，
+   而"是否为计划占用"的判断只看状态 → 新计划能在旧令牌还活着时抢到闸门。
+   修复：统一为 `_live_gate()`（谁持有活着的令牌谁占闸门），收尾期一律判忙并写明原因。
+3. **前端日志游标在"换子任务"时会漏掉开头几行**：缓冲被清空，而正在飞行的响应是用**旧偏移**取回的，
+   推入后被推进到 total，丢掉的几行再也补不回来。修复：偏移非 0 时丢弃该响应并按新游标立即重拉；
+   计划结束/用户停止时强制按 `offset=0` 完整重拉一次。
+4. **重新展开一个已结束的计划会把日志清空**：`loadLogOnce` 按"最后一个非 pending 子任务"取日志，
+   而它可能恰好没有日志 → 用空结果覆盖了已经拉到手的日志（收起再展开日志就没了）。
+   修复：后端新增 `log_index=-2`（自动挑"日志最多的子任务"），前端只在不拿空结果覆盖已有日志；
+   并加了「展开/收起/再展开」回归用例。
+
+
+
+## 3.21.0（2026-09-14）一键自动指挥 Codex：任务分派从"复制指令"升级为"后端拉起 codex 干活"
+
+### 目标与边界
+- 目标：任务分派面板的每条任务可点 🚀，由**本地后端**在该任务的项目目录里拉起 `codex exec` 真正干活，
+  日志流式回传、状态按真实退出码流转、token usage 折算成本。
+- 边界（明确不做）：不接 zcode/豆包（无 CLI）；不改壁纸/知识库/对话等既有模块；
+  不做并发执行（单机固定串行）；所有成本/耗时数字必须来自真实回传，拿不到就写"未能获取"。
+
+### 新增 1：后端编排层（新文件 `server/app/agent_runner.py`，路由由 `server/app/api.py` 挂载）
+- 路由：`GET /api/agent/run/preflight`（路径/命令/占用/模型名预检）·`POST /api/agent/run`（启动）·
+  `GET /api/agent/tasks/<id>?offset=N`（状态 + **增量**日志）·`POST /api/agent/tasks/<id>/stop`（停止）·
+  `GET /api/agent/runs`（最近运行记录，供刷新后对齐）。
+- 命令固定为 `codex exec --json --skip-git-repo-check -s workspace-write -C <项目目录> -`：
+  - `--json` 是拿到**真实 usage** 的唯一途径（`turn.completed.usage` 含输入/缓存命中/输出/推理 token）；
+  - `--skip-git-repo-check` 必需（工程目录常常不是 git 仓库，不加直接拒绝执行）；
+  - `-s workspace-write` 必需（真机实测：默认只读沙箱下 codex 会明确回报"writing is blocked by read-only sandbox"，
+    即点了自动执行却什么也改不了 —— 这是"假成功"，必须避免）；越界写入仍被沙箱拦住；
+  - **提示词走 stdin（`-`）**：彻底规避 cmd.exe 对 `& | " ^ %` 的转义地狱（对含中文/引号/换行的长指令尤其关键）。
+- 超时/停止 → `taskkill /T /F /PID`（Windows 进程树，codex.cmd → node → 子命令全部收掉）；
+  非 Windows 走 `killpg`。真机用"假 codex 派孙进程"验证过整棵树确实消失。
+- 日志：内存保留最近 4000 行供增量拉取，全文落 `%TEMP%\moray_agent_<task_id>.log`；stderr 一并入日志。
+- 诚实告警：日志命中"沙箱拒绝写入 / 审批被拒 / 余额不足 / 401"等真实信号时，结果里带 `warnings`，前端显著提示。
+- 审计：每次运行结束写一条既有 `agent_log`（`run_codex`，含状态/退出码/耗时）。
+
+### 新增 2：任务面板「自动执行」全链路（`parts/68_task_dispatch.js`）
+- 每条任务行新增 🚀（运行时变停止）：不满足条件时**禁用并把原因写进 tooltip**（需要本地后端 / 未填项目路径 / 路径不可用）。
+- 点击 → 状态 `running` + 任务卡内联展开日志区（逐行追加、自动滚到底、可收起/复制日志；
+  用户往上翻时不打断自动滚动）。
+- 状态流转 `pending(todo) → running(doing) → completed(done)/failed/timeout/canceled`，随任务一起 localStorage 持久化；
+  执行记录另存一条（task_id/开始结束时间/耗时秒/退出码/状态/usage/估算成本/日志尾 200 行，最多 50 条）。
+- 刷新页面：**先如实标注"应用重启导致中断"，再与后端真实记录对齐** ——
+  后端仍在跑则重新接上日志流（不谎报中断），后端有更新的真实结果则以它为准，两者都没有才保留中断标注。
+- 成本：`usage` + 成本中心既有单价（`CostEngine`）折算，显示「本次估算成本 ¥X」，
+  hover 展示单价来源与用量口径；model 取 `~/.codex/config.toml` 的 `model`；
+  **模型侧没返回 usage 时显示「成本：未能获取（模型侧未返回 usage）」，绝不编造**。
+- 顶部能力提示：后端在线显示就绪说明；后端不在线（纯静态打开）明确写「自动执行需要本地后端」并禁用入口。
+
+### 新增 3：设置页「Agent 编排」配置组（`parts/68` 提供卡片，`parts/70` 在设置页重建时重挂）
+- 字段：Codex 命令路径（默认 `codex.cmd`，可填绝对路径）·默认工作目录（默认 `D:\ai工具台`，datalist 列出最近项目）·
+  任务超时秒数（默认 600，10-3600）·最大并发（固定 1，只读展示）；另有「测试命令与路径」按钮（真机预检）。
+- 约定：**默认值不写库**，只有用户改动才落 `MoraySettings`；无默认值的键不污染设置持久化。
+
+### 修复（真机验证中发现，属本次功能的必要修复）
+1. **Service Worker 把固定 URL 的 API GET 当静态资源缓存（cache-first）**：`sw_template.js` 的"其他资源"分支
+   会把 `/api/agent/runs?limit=50` 这类响应存进 Cache Storage 并优先返回旧值，
+   **`cache:'no-store'` 也挡不住**（SW 在 HTTP 层之前就应答了）。真机现象：运行中刷新页面 → 重新对齐运行态
+   读到"没有运行记录"的旧响应 → 把仍在跑的任务误标成失败。
+   改动：`sw_template.js` 的 fetch 处理里**跳过 `/api/*`**（动态数据一律交网络，不进缓存）；
+   同时 `parts/68` 的 `apiCall` 追加 `_t=<时间戳>` 双保险（与既有 `/api/health` 反 SW 缓存同手法）。
+   影响面：本次仅"自动执行"依赖固定 URL 的 API；该修复同时也消除了历史遗留的 API 响应缓存污染。
+2. **超时收尾状态被退出码覆盖**：超时先杀进程再判状态，导致 kill 后的非 0 退出码把 `timeout` 覆盖成 `failed`；
+   改为**先定状态再杀进程**。
+3. **闸门释放窗口**：`_finalize` 在设置状态之后才释放"单任务"闸门，竞态下会把紧接着的启动请求误判为 busy；
+   改为释放闸门与状态变更原子化（并按状态复核 busy）。
+4. **命令摘要引号顺序**：先 `strip('"')` 再正则匹配解释器路径，导致摘要残留半个引号；调整顺序。
+
+### 验证（全部真机/真后端，非静态检查）
+- 分片与构建：20 分片 `node --check` 全过；`assemble.py` 幂等 ×2（SHA256 一致）；sw CACHE_NAME=`moray-3.21.0`。
+- 后端六场景单测 `work/agent_runner_check.py`（假 codex 替身，不烧额度）：**29 PASS / 0 FAIL** ——
+  正常完成（usage 真实解析）· 非 0 退出码失败 · 超时强杀（含孙进程确实消失）· 用户停止 ·
+  并发 409 busy（且前一个结束后可再启动）· 路径不存在/不是目录/prompt 为空/命令不可用/无记录 404 全部明确拒绝。
+- 真机端到端 `work/v3210_real_run.py`：`codex.cmd exec "列出当前目录下的文件名"` 经新接口跑通 ——
+  completed/退出码 0/耗时 14.0s/usage `input 20122（缓存 19712）· output 141`/估算 ¥0.0118/日志全文落盘。
+- GUI 全链路 `work/cdp_v3210.mjs`（headless Edge + CDP，1440）：**28 PASS / 0 FAIL** ——
+  设置卡四字段与真实预检 · 假 codex 跑通"运行中→日志流式→停止→已取消" · 单机串行拒绝第二个任务 ·
+  真 codex **真的在项目目录建出文件** · 成本行与价格口径 · 刷新后状态/日志/成本持久化。
+- 中断两阶段 `work/v3210_interrupt_a.mjs`(9 PASS) + `_b.mjs`(6 PASS)：后端仍在跑则刷新后**重新接上**（不谎报中断）；
+  后端已停则标为失败 + 「应用重启导致中断」+ 日志留痕 + 按钮禁用说明。
+- 纯静态（后端起不来）`work/v3210_offline.mjs`：**8 PASS / 0 FAIL**（入口禁用 + 原因 tooltip + 点击不发请求 + 手动链路不受影响）。
+- 布局几何自证 `work/v3210_layout.mjs`：1440/360 两档 **32 PASS / 0 FAIL**（页面/卡片/日志面板/设置卡均无横向溢出，
+  按钮不被裁出卡片；日志框 `word-break:break-all` 防长路径撑宽）。
+- 回归：`scripts/agent_e2e_check.py` **37 PASS / 0 FAIL**（原本机 Agent 链路未受影响）；
+  手动链路（指令生成 / 复制 / 状态登记 / 备注）**7 PASS / 0 FAIL**（`work/v3210_status_regression.mjs`）。
+- 最终 hash：根 `moray-workbench.html` = `0f11c05dbfbe6997…`（`sw.js` = `cbc8f139212048c4…`，CACHE_NAME=moray-3.21.0）。
+
+### 交付
+- 版本：内部 **3.21.0** 三处同步（`110_polish.js` MORAY_BUILD / `70_models_settings_boot.js` APP_VERSION /
+  `server/app/config.py` BUILD）；对外 `MORAY_VERSION` = `PRODUCT_VERSION` = `VERSION` = **1.0.0** 未动。
+- 改动文件：`parts/68_task_dispatch.js`、`parts/70_models_settings_boot.js`、`parts/110_polish.js`、
+  `server/app/agent_runner.py`（新）、`server/app/api.py`、`server/app/config.py`、`sw_template.js`、
+  `CHANGELOG.md`（+ 重建产物 `moray-workbench.html` / `sw.js`）。
+- 报告：`work/V3210_REPORT.md`；验证脚本与证据：`work/agent_runner_check.py`、`work/v3210_*.mjs`、
+  `work/v3210_real_run.py`、`work/shots/v3210_*.png`。
+- 未做（按约定由主控负责）：git 提交/推送与线上同步。
+
 ## 3.20.1（2026-09-13）收尾修复：工具开关状态持久化 + RAG 来源标注去嵌套
 
 ### 修复 1：工具开关状态未持久化（设置页「启用工具调用」刷新后回弹为关）

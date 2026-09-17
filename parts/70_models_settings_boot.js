@@ -584,6 +584,10 @@ const SettingsApp = {
         </div>
       </div>`;
     this.bind();
+    // [v3.21.0] 设置页重建后重新挂上「Agent 编排」卡（由任务分派分片提供，幂等）
+    if (window.__taskDispatch && typeof window.__taskDispatch.appendRunSettingsCard === 'function') {
+      try { window.__taskDispatch.appendRunSettingsCard(); } catch (e) { /* 卡挂失败不影响设置页 */ }
+    }
     refreshIcons();
   },
 
@@ -1095,7 +1099,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.20.1'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.22.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
