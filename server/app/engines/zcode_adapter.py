@@ -417,7 +417,7 @@ class ZCodeAdapter(ExecutionEngine):
         action = task.get("action")
         if action not in SUPPORTED_ACTIONS:
             return ("action_not_supported: %r（ZCodeAdapter 骨架仅支持 run_zcode）" % (action,))
-        # 提示词必填（stdin 喂给 CLI，空任务拒绝受理）
+        # 提示词必填（落盘沙箱 inbox/ 后由 argv 的 Read 指令交付 CLI，空任务拒绝受理）
         prompt = task.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return "missing prompt（任务指令为空，拒绝受理）"
