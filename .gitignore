@@ -68,3 +68,109 @@ Desktop.ini
 .DS_Store
 .idea/
 .vscode/
+
+# ---- 2026-09-25 开源准备追加（与上方既有条目按字面去重后补齐）----
+.env.*
+*.env
+*.env.*
+# 模板必须随仓库发布：上面的 .env.* / *.env.* 会把 .env.example 一起匹配，
+# 而 gitignore 是"最后一条命中的规则胜出"——所以放行必须写在它们**之后**，
+# 否则陌生人 clone 下来拿不到模板（O4：.env.example 字段齐全且可提交）。
+!**/.env.example
+!.env.example
+data/
+.pytest_cache/
+*.db-wal
+*.db-shm
+node_modules/
+engines/docker/zcode-src/
+engines/docker/build*.log
+engines/docker/verify_result*.log
+engines/docker/fix_bat_lineendings.ps1
+# ==== 2026-10-10 追加：内部文档屏蔽（防快照泄露；改前备份见 backup/pre_gitignore_20261010_124454/）====
+
+# ---- 内部文档（战略 / 架构 / 快照，绝不公开）----
+# 架构记忆文档：含内部架构决策与 AI 协作史，绝不能进公开历史
+docs/ARCHITECT_MEMORY.md
+# UI 方向内部决策稿（设计演进过程稿，不随仓库发布）
+docs/UI_DIRECTION.md
+# zcode 适配器内部设计稿（含本机适配与连接实现细节）
+docs/zcode_adapter_design.md
+# 北极星战略目录（产品战略/路线图，纯内部；不带斜杠可同时命中文件与目录，当前是目录）
+docs/NORTH.md
+# 兜底：任何名为 MEMORY 的文档（含子目录），防止今后新建内部记忆文档被 git add -A 带入
+*MEMORY*.md
+# 兜底：任何名为 ARCHITECT 的文档（架构总览类）
+*ARCHITECT*.md
+# 兜底：MEMORY 快照产物 *.snapshot（内部文档的时点归档，绝不公开）
+*MEMORY*.snapshot
+
+# ---- docs/ 内部过程稿（与上方已忽略的 audit_report.md / NIGHT_REPORT.md 同性质）----
+# 冲刺/交付/验收报告：内部过程记录
+docs/guoqing_sprint_report.md
+docs/stage3b_argus_scheduler_delivery.md
+docs/u6_2_report.md
+# 逐层审计记录：l4_min / l45 / l50 / l51 / l5253 / l60 / l65 / l70 均可被 l*_audit.md 命中
+docs/l*_audit.md
+docs/l75_laya_link.md
+# Laya 接入过程稿（prompt_replace / v2 / v3_proxy_registry 三件）
+docs/laya_*_20260930.md
+# 启动优化 / zcode 连接修复 / docker 隔离过程稿
+docs/startup_optimize_20260930.md
+docs/zcode_connect_fix_20260930.md
+docs/zcode_docker_isolation.md
+# m4b diff 过程稿（含内部代码改动明细）
+docs/m4b_diff_20261002.txt
+# 内部过程截图目录与单图（对外截图仅 docs/screenshots/，其已追踪、不受影响）
+docs/m4a_shots/
+docs/m4b_screenshots/
+docs/model_route_fix_screenshots/
+docs/ui_a1_screenshots/
+docs/ui_a2_screenshots/
+docs/l77_agent_mode_topbar.png
+# 内部过程稿归档 / 交付目录
+docs/archive/
+docs/delivery/
+
+# ---- 大肥鱼会话产物 ----
+# 备份目录兜底：泛化既有 backup/ 与 backups/，覆盖 backup_xxx/ 等变体命名（原规则保留不删）
+backup*/
+# 兜底：名字含「备份」的时点快照目录（如 decision-kernel-v1.0.0-正式备份/，绝不进仓库）
+*备份*/
+# 运行日志目录（任意层级 logs/，含真实运行记录）
+logs/
+# 根级过程截图目录（day24.x / fix_verify / rollback 等验收截图；前导斜杠限定仅根级，不影响 docs/screenshots/）
+/screenshots/
+# 根级临时目录（会话临时产物）
+tmp/
+# 会话临时脚本/目录：如 _tmp_probe.py、.tmp_pw/
+_tmp_*
+.tmp_*
+# 注：*.log 已由上方既有规则屏蔽，此处不重复添加
+# ---- 2026-10-10 补记（侦察验证时发现 l* 前缀漏掉 p_mcp_audit.md）----
+# 兜底 docs/ 下全部审计记录（p_mcp_audit.md 等；涵盖此前的 docs/l*_audit.md）
+docs/*_audit.md
+# ==== 2026-10-12 追加：模型权重 / 训练产物 / 安装包（实锤 >10MB 未追踪大件全在 lora-training，约 21GB，绝不进仓库）====
+
+# ---- Laya 训练链路本地产物（基座/HF缓存/LoRA adapter/合并模型/第三方 llama.cpp，均可重下载或重训）----
+decision-kernel/lora-training/base_model/
+decision-kernel/lora-training/hf_cache/
+decision-kernel/lora-training/lora-adapter/
+decision-kernel/lora-training/merged_moray_decision/
+decision-kernel/lora-training/merged_moray_v1.1/
+decision-kernel/lora-training/llama-cpp-src/
+decision-kernel/lora-training/llama-cpp-src.zip
+decision-kernel/lora-training/moray-laya-fp16.gguf
+decision-kernel/lora-training/OllamaSetup.exe
+
+# ---- 全局扩展兜底：权重格式今后无论落在仓库哪里一律拦截 ----
+# （不写 *.bin / *.json：training_args.bin、tokenizer.json 已被上面的目录规则覆盖，全局封杀误伤面太大）
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# ---- Windows 快捷方式（根级 MoRay.lnk 等，1KB 级，防 git add -A 顺手带入）----
+*.lnk
