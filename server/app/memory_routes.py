@@ -58,6 +58,7 @@ _SOURCE_KIND_MATRIX = {
     "argus_research": {"task_result"},
     "self_model": {"self"},
     "self_reflection": {"self_observation"},
+    "self_narrative": {"self_narrative"},  # [桥三 stage2 预埋 2026-10-14] 叙事产物专属 source×kind
 }
 
 #: 写入校验拒绝的错误前缀——端点据此判定 HTTP code
