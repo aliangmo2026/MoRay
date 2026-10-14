@@ -40,6 +40,7 @@ SUITES = [
 
 PASSED_RE = re.compile(r"(\d+) passed")
 FAILED_RE = re.compile(r"(\d+) failed|(\d+) errors?|(\d+) error")
+SKIPPED_RE = re.compile(r"(\d+) skipped")
 
 
 def run_one(rel: str):
@@ -49,31 +50,34 @@ def run_one(rel: str):
     out = (p.stdout or "") + (p.stderr or "")
     passed = sum(int(m.group(1)) for m in PASSED_RE.finditer(out) if m.group(1))
     failed = sum(int(x) for m in FAILED_RE.finditer(out) for x in m.groups() if x)
-    return passed, failed, out
+    skipped = sum(int(m.group(1)) for m in SKIPPED_RE.finditer(out) if m.group(1))
+    return passed, failed, skipped, out
 
 
 def main() -> int:
     out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "work" / "l75_baseline.txt"
-    lines, grand_p, grand_f = [], 0, 0
+    lines, grand_p, grand_f, grand_s = [], 0, 0, 0
     for name, files in SUITES:
-        sp, sf = 0, 0
+        sp, sf, ss = 0, 0, 0
         for rel in files:
             if not os.path.exists(os.path.join(ROOT, rel.replace("/", os.sep))):
                 print(f"[{name}] {rel}: (absent, skipped)")
                 continue
-            passed, failed, out = run_one(rel)
+            passed, failed, skipped, out = run_one(rel)
             sp += passed
             sf += failed
+            ss += skipped
             status = "PASS" if failed == 0 and passed > 0 else "FAIL"
-            lines.append(f"[{name}] {rel}: {passed} passed, {failed} failed/error -> {status}")
+            lines.append(f"[{name}] {rel}: {passed} passed, {failed} failed/error, {skipped} skipped -> {status}")
             if status == "FAIL":
                 tail = "\n".join(out.splitlines()[-25:])
                 lines.append("---- output tail ----\n" + tail + "\n---------------------")
         grand_p += sp
         grand_f += sf
-        lines.append(f"== {name}: {sp} passed, {sf} failed ==")
+        grand_s += ss
+        lines.append(f"== {name}: {sp} passed, {sf} failed, {ss} skipped ==")
         lines.append("")
-    lines.append(f"TOTAL: {grand_p} passed, {grand_f} failed")
+    lines.append(f"TOTAL: {grand_p} passed, {grand_f} failed, {grand_s} skipped")
     text = "\n".join(lines) + "\n"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
