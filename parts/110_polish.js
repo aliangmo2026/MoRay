@@ -46,8 +46,8 @@ const ConnectionGuide = {
     }
     if (AI.health === 'checking') {
       card.innerHTML = `<div class="p-4 flex items-center gap-3">
-        <div class="skeleton" style="width:36px;height:36px;border-radius:10px"></div>
-        <div class="flex-1"><div class="skeleton" style="height:12px;width:180px;margin-bottom:6px"></div>
+        <div class="skeleton" style="width:36px;height:36px;border-radius:8px"></div>
+        <div class="flex-1"><div class="skeleton" style="height:12px;width:180px;margin-bottom:8px"></div>
         <div class="skeleton" style="height:10px;width:260px"></div></div>
         <span class="text-[11px] text-text-tertiary">正在检测本地 AI 服务…</span></div>`;
       return;
@@ -66,19 +66,19 @@ const ConnectionGuide = {
           <button class="tool-btn" id="connGuideClose" title="本次不显示" aria-label="关闭引导"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
         </div>
         <div class="space-y-2 mb-2">
-          <select id="connGuidePreset" class="form-select" style="font-size:12px;padding:6px 8px">
+          <select id="connGuidePreset" class="form-select" style="font-size:12px;padding:8px 8px">
             <option value="">— 选择服务商 —</option>
             ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" data-base="${escapeHtml(p.base)}" data-model="${escapeHtml(p.models)}" data-doc="${escapeHtml(p.doc)}">${escapeHtml(p.name)}</option>`).join('')}
             <option value="custom">自定义（手动填地址）</option>
           </select>
-          <input type="text" id="connGuideBase" class="form-input" style="font-size:12px;padding:6px 8px" placeholder="接口地址（选服务商自动填充）">
+          <input type="text" id="connGuideBase" class="form-input" style="font-size:12px;padding:8px 8px" placeholder="接口地址（选服务商自动填充）">
           <div class="flex gap-2">
-            <input type="password" id="connGuideKey" class="form-input flex-1" style="font-size:12px;padding:6px 8px" placeholder="粘贴 API Key（sk-...）" autocomplete="off">
+            <input type="password" id="connGuideKey" class="form-input flex-1" style="font-size:12px;padding:8px 8px" placeholder="粘贴 API Key（sk-...）" autocomplete="off">
             <button class="btn-ghost px-2 rounded-lg border border-line-ghost text-text-tertiary" id="connGuideKeyToggle" title="显示/隐藏" aria-label="显示或隐藏 API Key"><i data-lucide="eye" class="w-3.5 h-3.5"></i></button>
           </div>
           <div class="flex gap-2">
-            <button class="btn-primary px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1" id="connGuideTest"><i data-lucide="zap" class="w-3.5 h-3.5"></i>测试连接</button>
-            <button class="btn-primary px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1 hidden" id="connGuideGo"><i data-lucide="message-circle" class="w-3.5 h-3.5"></i>开始第一次对话</button>
+            <button class="btn-primary px-3 py-2 rounded-lg text-[11px] flex items-center gap-1" id="connGuideTest"><i data-lucide="zap" class="w-3.5 h-3.5"></i>测试连接</button>
+            <button class="btn-primary px-3 py-2 rounded-lg text-[11px] flex items-center gap-1 hidden" id="connGuideGo"><i data-lucide="message-circle" class="w-3.5 h-3.5"></i>开始第一次对话</button>
           </div>
           <div class="text-[10px] leading-relaxed" id="connGuideDiag"></div>
         </div>
@@ -90,18 +90,18 @@ const ConnectionGuide = {
               ['2', '启动服务', '安装后 Ollama 通常自动后台运行；也可手动执行 ollama serve'],
               ['3', '拉取第一个模型', '终端执行：ollama pull qwen2.5:7b（约 4.7GB，一次即可）']
             ].map(([n, t, d]) => `
-              <div class="flex items-start gap-2.5 px-3 py-2 rounded-lg bg-surface-panel/60">
-                <span class="w-5 h-5 rounded-full bg-brand-cobalt/15 text-brand-cobalt text-[10px] font-mono flex items-center justify-center flex-shrink-0 mt-0.5">${n}</span>
+              <div class="flex items-start gap-3 px-3 py-2 rounded-lg bg-surface-panel/60">
+                <span class="w-5 h-5 rounded-full bg-brand-cobalt/15 text-brand-cobalt text-[10px] font-mono flex items-center justify-center flex-shrink-0 mt-1">${n}</span>
                 <div><div class="text-xs text-text-primary">${t}</div><div class="text-[10px] text-text-tertiary">${d}</div></div>
               </div>`).join('')}
             <div class="flex flex-wrap gap-2">
-              <a href="https://ollama.com" target="_blank" rel="noopener" class="btn-ghost px-3 py-1.5 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary">
+              <a href="https://ollama.com" target="_blank" rel="noopener" class="btn-ghost px-3 py-2 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary">
                 <i data-lucide="external-link" class="w-3 h-3"></i>ollama.com
               </a>
-              <button class="btn-ghost px-3 py-1.5 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary" id="connGuideRedetect">
+              <button class="btn-ghost px-3 py-2 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary" id="connGuideRedetect">
                 <i data-lucide="refresh-cw" class="w-3 h-3"></i>我已安装，重新检测
               </button>
-              ${window.__TAURI__ ? `<button class="btn-ghost px-3 py-1.5 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary" id="connGuideStart">
+              ${window.__TAURI__ ? `<button class="btn-ghost px-3 py-2 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 text-text-secondary" id="connGuideStart">
                 <i data-lucide="play" class="w-3 h-3"></i>一键启动 Ollama 服务
               </button>` : ''}
             </div>
@@ -272,8 +272,8 @@ const Onboarding = {
             <div class="grid grid-cols-3 gap-2 text-center">
               ${[['shield-check', '本地隐私', '对话/文档全本地'], ['columns-2', '多模型对比', '竞速+评分'], ['zap', '省钱网关', '缓存省 30-50% token']].map(([ic, t, d]) => `
                 <div class="rounded-lg bg-surface-panel/70 border border-line-ghost/60 p-3">
-                  <i data-lucide="${ic}" class="w-4 h-4 text-brand-cobalt mx-auto mb-1.5"></i>
-                  <div class="text-[11px] text-text-primary mb-0.5">${t}</div>
+                  <i data-lucide="${ic}" class="w-4 h-4 text-brand-cobalt mx-auto mb-2"></i>
+                  <div class="text-[11px] text-text-primary mb-1">${t}</div>
                   <div class="text-[10px] text-text-tertiary">${d}</div>
                 </div>`).join('')}
             </div>
@@ -301,7 +301,7 @@ const Onboarding = {
           <div class="text-[11px] text-text-tertiary">之后可在设置中更换壁纸与强调色</div></div>
           <div class="grid grid-cols-2 gap-3">
             <div class="doc-card p-4 cursor-pointer text-center" data-ob-theme="dark">
-              <div class="h-16 rounded-lg mb-2 border border-line-ghost" style="background:linear-gradient(135deg,#0A0C14,#1A1F30)"></div>
+              <div class="h-16 rounded-lg mb-2 border border-line-ghost" style="background:linear-gradient(135deg,#0a0a0a,#161616)"></div>
               <span class="text-xs text-text-primary">深色</span>
             </div>
             <div class="doc-card p-4 cursor-pointer text-center" data-ob-theme="light">
@@ -311,13 +311,13 @@ const Onboarding = {
           </div>`;
       }
       body.innerHTML = `
-        <div class="flex justify-center gap-1.5 mb-4">${dots}</div>
+        <div class="flex justify-center gap-2 mb-4">${dots}</div>
         <div class="ob-step" style="animation:modalIn 200ms ease-in-out">${inner}</div>
         <div class="flex justify-between items-center mt-5">
           <button class="text-[11px] text-text-tertiary hover:text-text-secondary" id="obSkip">跳过引导</button>
           <div class="flex gap-2">
-            ${step > 0 ? '<button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="obPrev">上一步</button>' : ''}
-            <button class="btn-primary px-4 py-1.5 rounded-lg text-xs" id="obNext">${step === 2 ? '开始使用' : '下一步'}</button>
+            ${step > 0 ? '<button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="obPrev">上一步</button>' : ''}
+            <button class="btn-primary px-4 py-2 rounded-lg text-xs" id="obNext">${step === 2 ? '开始使用' : '下一步'}</button>
           </div>
         </div>`;
       refreshIcons();
@@ -361,7 +361,7 @@ function renderEmptyState(cfg) {
     <div class="empty-icon"><i data-lucide="${cfg.icon}" class="w-6 h-6 text-brand-cobalt"></i></div>
     <div class="empty-title">${cfg.title}</div>
     <div class="empty-hint mb-3">${cfg.desc}${cfg.dragHint ? '<br>也可以直接拖拽文件到窗口' : ''}</div>
-    ${cfg.actionText ? `<button class="btn-primary px-4 py-1.5 rounded-lg text-xs relative overflow-hidden" data-empty-action onclick="createRipple(event)">${cfg.actionText}</button>` : ''}
+    ${cfg.actionText ? `<button class="btn-primary px-4 py-2 rounded-lg text-xs relative overflow-hidden" data-empty-action>${cfg.actionText}</button>` : ''}
   </div>`;
 }
 
@@ -483,8 +483,8 @@ const ErrorLog = {
       : '<div class="text-xs text-text-tertiary text-center py-8">运行良好，没有错误记录 🎉</div>';
     const box = showModal(`<div class="space-y-2" style="max-height:55vh;overflow-y:auto">${items}</div>`,
       { title: '错误日志（最近 ' + this.entries.length + ' 条）', icon: 'bug', wide: true,
-        footer: `<button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="errCopyBtn">复制全部</button>
-                 <button class="btn-primary px-3 py-1.5 rounded-lg text-xs" id="errCloseBtn">关闭</button>` });
+        footer: `<button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="errCopyBtn">复制全部</button>
+                 <button class="btn-primary px-3 py-2 rounded-lg text-xs" id="errCloseBtn">关闭</button>` });
     on(box.querySelector('#errCloseBtn'), 'click', closeModal);
     on(box.querySelector('#errCopyBtn'), 'click', async () => {
       const ok = await copyToClipboard(JSON.stringify(this.entries, null, 2));
@@ -538,7 +538,7 @@ const AutoBackup = {
         <div class="doc-card p-3 flex items-center justify-between">
           <div><div class="text-xs text-text-primary">备份 #${i + 1}</div>
             <div class="text-[10px] text-text-tertiary">${new Date(b.at).toLocaleString()} · ${formatBytes(b.size)}</div></div>
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" data-restore-idx="${i}">恢复此备份</button>
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" data-restore-idx="${i}">恢复此备份</button>
         </div>`).join('')}
     </div>`, { title: '自动备份恢复', icon: 'archive', wide: true, footer: false });
     box.querySelectorAll('[data-restore-idx]').forEach(btn => {
@@ -569,7 +569,7 @@ const AutoBackup = {
         <div class="rounded-lg border border-line-ghost p-3">
           <div class="text-xs text-text-primary font-medium mb-1">重置应用</div>
           <div class="text-[10px] text-text-tertiary mb-2">清空数据并恢复默认设置与引导（等同于全新安装）。</div>
-          <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="dzResetBtn">重置应用</button>
+          <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="dzResetBtn">重置应用</button>
         </div>
       </div>`, { title: '危险操作区', icon: 'alert-triangle', footer: false });
     const input = box.querySelector('#dzConfirmInput');
@@ -638,7 +638,7 @@ function installMicroInteractions() {
 
   // 3) 响应式：窗口 <1024px 时中间栏折叠为抽屉（汉堡按钮）
   const mq = window.matchMedia('(max-width: 1023px)');
-  const midBar = document.querySelector('aside.w-\\[260px\\], aside:nth-child(2)');
+  const midBar = document.querySelector('aside.w-\\[220px\\], aside:nth-child(2)');
   if (midBar && !document.getElementById('drawerToggleBtn')) {
     const drawerBtn = document.createElement('button');
     drawerBtn.id = 'drawerToggleBtn';
@@ -711,7 +711,7 @@ function installHourlyTracking() {
 /** 渲染数据洞察面板（插入设置页网关卡片之后）
  * @returns {Promise<void>} */
 async function renderInsightsPanel() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container) return;
   let anchor = container.querySelector('#gatewaySettingsCard');
   if (!anchor) anchor = container.querySelector('#enhanceSettingsCard');
@@ -762,9 +762,9 @@ async function renderInsightsPanel() {
   const bars = last7.map(k => {
     const d = usage.byDay[k];
     const used = (d.prompt || 0) + (d.completion || 0);
-    return `<div class="flex-1 flex flex-col items-center gap-0.5" title="${k}：消耗 ${used} tokens">
-      <div style="width:70%;max-width:22px;height:${Math.max(3, used / maxTok * 42)}px;background:linear-gradient(180deg,var(--color-brand-cobalt),var(--color-brand-cobalt-hover));border-radius:3px"></div>
-      <span class="text-[9px] text-text-tertiary">${k.slice(5)}</span></div>`;
+    return `<div class="flex-1 flex flex-col items-center gap-1" title="${k}：消耗 ${used} tokens">
+      <div style="width:70%;max-width:22px;height:${Math.max(3, used / maxTok * 42)}px;background:linear-gradient(180deg,var(--color-brand-cobalt),var(--color-brand-cobalt-hover));border-radius:4px"></div>
+      <span class="text-[10px] text-text-tertiary">${k.slice(5)}</span></div>`;
   }).join('');
   // 7×24 活跃热力
   const heatCells = [];
@@ -773,11 +773,12 @@ async function renderInsightsPanel() {
     for (let h = 0; h < 24; h += 2) {
       const v = (hourly[day] && hourly[day][h]) || 0;
       const alpha = Math.min(0.9, v * 0.25);
-      heatCells.push(`<div title="${day.slice(5)} ${h}时：${v} 次请求" style="width:100%;aspect-ratio:1;border-radius:2px;background:rgba(91,140,255,${alpha.toFixed(2)})"></div>`);
+      heatCells.push(`<div title="${day.slice(5)} ${h}时：${v} 次请求" style="width:100%;aspect-ratio:1;border-radius:4px;background:rgba(229,115,74,${alpha.toFixed(2)})"></div>`);
     }
   }
 
   card.innerHTML = `
+    <div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:4px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">系统与数据</span></div>
     <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
       <i data-lucide="chart-column" class="w-4 h-4 text-brand-cyan"></i>数据洞察
       <span class="text-[10px] text-text-tertiary font-normal ml-1">悬停图表查看数值</span>
@@ -793,29 +794,29 @@ async function renderInsightsPanel() {
     </div>
     <div class="grid grid-cols-2 gap-4 mb-4">
       <div>
-        <div class="text-[10px] text-text-tertiary mb-1.5">近 7 天对话次数</div>
+        <div class="text-[10px] text-text-tertiary mb-2">近 7 天对话次数</div>
         <svg viewBox="0 0 340 64" style="width:100%;height:64px">
           <polyline points="${pts}" fill="none" stroke="var(--color-brand-cobalt)" stroke-width="2" stroke-linejoin="round"/>
           ${last7.map((k, i) => `<circle cx="${20 + i * (300 / Math.max(1, last7.length - 1))}" cy="${58 - (usage.byDay[k].requests || 0) / maxReq * 46}" r="2.5" fill="var(--color-brand-cyan)"><title>${k}：${usage.byDay[k].requests || 0} 次</title></circle>`).join('')}
         </svg>
       </div>
       <div>
-        <div class="text-[10px] text-text-tertiary mb-1.5">模型使用占比</div>
+        <div class="text-[10px] text-text-tertiary mb-2">模型使用占比</div>
         <div class="flex items-center gap-3">
           <svg viewBox="0 0 60 60" style="width:60px;height:60px">${donut}</svg>
-          <div class="text-[10px] text-text-tertiary space-y-0.5">
-            ${modelNames.slice(0, 4).map((m, i) => `<div class="flex items-center gap-1"><span style="width:8px;height:8px;border-radius:2px;background:${COLORS[i % COLORS.length]};display:inline-block"></span>${escapeHtml(shortModelName(m))}</div>`).join('') || '暂无数据'}
+          <div class="text-[10px] text-text-tertiary space-y-1">
+            ${modelNames.slice(0, 4).map((m, i) => `<div class="flex items-center gap-1"><span style="width:8px;height:8px;border-radius:4px;background:${COLORS[i % COLORS.length]};display:inline-block"></span>${escapeHtml(shortModelName(m))}</div>`).join('') || '暂无数据'}
           </div>
         </div>
       </div>
     </div>
     <div class="grid grid-cols-2 gap-4">
       <div>
-        <div class="text-[10px] text-text-tertiary mb-1.5">近 7 天 token 消耗</div>
+        <div class="text-[10px] text-text-tertiary mb-2">近 7 天 token 消耗</div>
         <div class="flex items-end gap-1" style="height:52px">${bars || '<span class="text-[10px] text-text-tertiary">暂无数据</span>'}</div>
       </div>
       <div>
-        <div class="text-[10px] text-text-tertiary mb-1.5">活跃时段（近7天 · 2小时粒度）</div>
+        <div class="text-[10px] text-text-tertiary mb-2">活跃时段（近7天 · 2小时粒度）</div>
         <div class="grid gap-px" style="grid-template-columns:repeat(12,1fr)">${heatCells.join('')}</div>
       </div>
     </div>`;
@@ -856,9 +857,15 @@ function installModelSelector() {
     if (!models.length) {
       pop.innerHTML = '<div class="text-xs text-text-tertiary text-center py-4">未检测到模型。<br>请启动 Ollama 或在设置中配置云端 API。</div>';
     } else {
+      // [2026-10-01 U-6-3] moray-laya-* 是 Laya 判定/蒸馏专用模型（输出恒为结构化 JSON，
+      // 非聊天模型）：选项尾部加"判定专用"标注提醒，避免误选后拿它当聊天模型收到裸 JSON。
+      // 只加标注不移除：用户调试判定链路时仍可在选择器里找到它。
+      const judgeTag = (m) => /^moray-laya-/.test(String(m))
+        ? '<span class="text-[10px] text-text-tertiary flex-shrink-0" style="margin-left:8px">判定专用</span>' : '';
       pop.innerHTML = models.map(m => `
         <div class="model-pop-item ${m === current ? 'selected' : ''}" data-pick-model="${escapeHtml(m)}">
           <span class="truncate" title="${escapeHtml(m)}">${escapeHtml(uniqueModelName(m))}</span>
+          ${judgeTag(m)}
           ${m === current ? '<i data-lucide="check" class="w-3.5 h-3.5 text-brand-cobalt"></i>' : ''}
         </div>`).join('');
       pop.querySelectorAll('[data-pick-model]').forEach(item => {
@@ -1058,7 +1065,7 @@ function openGroupManager() {
         <button class="btn-primary px-3 h-8 rounded-lg text-xs whitespace-nowrap" id="addGroupBtn">添加</button>
       </div>
     </div>
-    <div class="space-y-1.5" id="groupListArea">
+    <div class="space-y-2" id="groupListArea">
       ${groups.length ? groups.map(g => `
         <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-panel/60">
           <i data-lucide="folder" class="w-3.5 h-3.5 text-brand-cobalt flex-shrink-0"></i>
@@ -1071,7 +1078,7 @@ function openGroupManager() {
     </div>`,
     { title: '新建项目（分组）', icon: 'folder-plus', footer: false });
   const foot = document.createElement('div');
-  foot.style.cssText = 'display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--color-line-ghost)';
+  foot.style.cssText = 'display:flex;justify-content:flex-end;padding:16px 20px;border-top:1px solid var(--color-line-ghost)';
   foot.innerHTML = `<button class="px-3 h-8 rounded-lg text-xs text-text-tertiary hover:text-text-primary" onclick="closeGroupManager()">关闭</button>`;
   box.appendChild(foot);
   refreshIcons();
@@ -1159,7 +1166,7 @@ function showMoveToGroupMenu(e, btn) {
   const row = (gid, label) => `<div class="model-pop-item ${current === gid ? 'selected' : ''}" data-move-to="${gid}">
     ${gid ? '<i data-lucide="folder" class="w-3 h-3"></i>' : '<i data-lucide="inbox" class="w-3 h-3"></i>'} ${escapeHtml(label)}
     ${current === gid ? '<i data-lucide="check" class="w-3 h-3 text-brand-cobalt"></i>' : ''}</div>`;
-  menu.innerHTML = `<div class="text-[10px] text-text-tertiary px-3 py-1.5">移动到项目</div>
+  menu.innerHTML = `<div class="text-[10px] text-text-tertiary px-3 py-2">移动到项目</div>
     ${row('', '未分组')}
     ${groups.map(g => row(g.id, g.name)).join('')}`;
   document.body.appendChild(menu);
@@ -1203,9 +1210,9 @@ Onboarding.openV2 = function () {
             <div class="flex gap-2">
               <input type="text" id="ob2Base" class="form-input" value="https://api.deepseek.com/v1" style="flex:1">
               <input type="password" id="ob2Key" class="form-input" value="" placeholder="sk-...（选填）" style="flex:1">
-              <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost whitespace-nowrap" id="ob2Test">测试连接</button>
+              <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost whitespace-nowrap" id="ob2Test">测试连接</button>
             </div>
-            <div class="text-[10px] text-text-tertiary mt-1.5" id="ob2CloudHint">填写 Key 后点击测试；也可稍后在设置页配置</div>
+            <div class="text-[10px] text-text-tertiary mt-2" id="ob2CloudHint">填写 Key 后点击测试；也可稍后在设置页配置</div>
           </div>
           <div class="doc-card p-4" data-ob2-backend="ollama">
             <div class="flex items-center gap-2">
@@ -1233,7 +1240,7 @@ Onboarding.openV2 = function () {
             <select id="ob2Model" class="form-select">${models || '<option value="">（暂无可用模型，可在设置中配置）</option>'}</select>
           </div>
           <div>
-            <div class="flex justify-between text-xs mb-1.5"><span class="text-text-secondary">Temperature（创意↔精确）</span><span class="font-mono text-text-primary" id="ob2TempVal">0.70</span></div>
+            <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">Temperature（创意↔精确）</span><span class="font-mono text-text-primary" id="ob2TempVal">0.70</span></div>
             <input type="range" min="0" max="2" step="0.05" value="0.7" id="ob2Temp" class="w-full accent-brand-cobalt">
           </div>
         </div>`;
@@ -1243,7 +1250,7 @@ Onboarding.openV2 = function () {
         <div class="text-[11px] text-text-tertiary">也可稍后在设置中更换</div></div>
         <div class="grid grid-cols-2 gap-3 mb-3">
           <div class="doc-card p-3 cursor-pointer text-center" data-ob2-theme="dark">
-            <div class="h-14 rounded-lg mb-1 border border-line-ghost" style="background:linear-gradient(135deg,#0A0C14,#1A1F30)"></div>
+            <div class="h-14 rounded-lg mb-1 border border-line-ghost" style="background:linear-gradient(135deg,#0a0a0a,#161616)"></div>
             <span class="text-xs text-text-primary">深色</span>
           </div>
           <div class="doc-card p-3 cursor-pointer text-center" data-ob2-theme="light">
@@ -1251,19 +1258,19 @@ Onboarding.openV2 = function () {
             <span class="text-xs text-text-primary">浅色</span>
           </div>
         </div>
-        <label class="flex items-center gap-2 text-xs text-text-secondary cursor-pointer rounded-lg bg-surface-panel/50 px-3 py-2.5">
+        <label class="flex items-center gap-2 text-xs text-text-secondary cursor-pointer rounded-lg bg-surface-panel/50 px-3 py-3">
           <input type="checkbox" id="ob2Sample" checked class="accent-brand-cobalt w-3.5 h-3.5">
           载入示例包（10 条精选提示词 + 6 个代码片段 + 1 个工作流，随时可一键清空）
         </label>`;
     }
     body.innerHTML = `
-      <div class="flex justify-center gap-1.5 mb-4">${dots}</div>
+      <div class="flex justify-center gap-2 mb-4">${dots}</div>
       <div style="animation:modalIn 200ms ease-in-out">${inner}</div>
       <div class="flex justify-between items-center mt-5">
         <button class="text-[11px] text-text-tertiary hover:text-text-secondary" id="ob2Skip">跳过引导</button>
         <div class="flex gap-2">
-          ${step > 0 ? '<button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="ob2Prev">上一步</button>' : ''}
-          <button class="btn-primary px-4 py-1.5 rounded-lg text-xs" id="ob2Next">${step === 2 ? '开始使用' : '下一步'}</button>
+          ${step > 0 ? '<button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="ob2Prev">上一步</button>' : ''}
+          <button class="btn-primary px-4 py-2 rounded-lg text-xs" id="ob2Next">${step === 2 ? '开始使用' : '下一步'}</button>
         </div>
       </div>`;
     refreshIcons();
@@ -1310,9 +1317,175 @@ Onboarding.openV2 = function () {
         showNotification('示例包已载入', n ? `共写入 ${n} 条示例数据` : '示例数据已存在', 'success', 3000);
       }
       // [阶段1.5 A] 启动摘要由 probeBackend 统一弹出（此处不再叠加“一切就绪”，避免启动连叠）
+      // [认识你 v1] 引导完成后接力「认识你」三问（moray_met 已置则 maybeAsk 内静默跳过）
+      setTimeout(() => { try { MeetYou.maybeAsk(); } catch (e) { /* 忽略 */ } }, 400);
     };
   render();
 };
+
+/* ===================== [认识你 v1] 首次见面三问（名字/用途/风格 → memory_bank preference 行） ===================== */
+
+/** 三问弹窗：showModal 标准件一屏三问；写入走 MorayMemory.save（kind=preference,
+ * tags=['identity',子类]，source=manual，后端 save 端点 kind 自由无枚举）。
+ * 旗标=localStorage['moray_met']：提交成功才落旗标；失败/未提交不落 → 下次启动重问；
+ * 「跳过」落旗标且不写入。名字行（tags 含 'name'）供 30_chat attachHelloLine 渲染「你好，X」。
+ * @returns {void} */
+const MeetYou = {
+  /** 判据入口：旗标已置 → 静默跳过；已有弹窗激活（如 onboarding 正在展示）→ 跳过，
+   * 交给 openV2 finish() 的接力调用，避免 showModal 单例弹窗被覆盖
+   * @returns {void} */
+  maybeAsk() {
+    try { if (localStorage.getItem('moray_met')) return; } catch (e) { return; }
+    try {
+      const ov = document.getElementById('modalOverlay');
+      if (ov && ov.classList.contains('active')) return;
+    } catch (e) { /* 忽略 */ }
+    this.ask();
+  },
+
+  /** [窗户v3] 重开预填：读当前最新三类 identity 行 + 本轮旧行 id（供保存成功后顺手清理，见 ask）。
+   * list 为 created_at DESC → 首条命中即最新；解析正则与 30_chat attachHelloLine/attachRememberLine 同款。
+   * 任何失败返回 null（弹窗退化首启形态，fail-open）。
+   * @returns {Promise<Object|null>} {name, usage, style, oldIds:{name:[],usage:[],style:[]}} */
+  async _fetchPrefill() {
+    try {
+      if (typeof MorayMemory === 'undefined' || !MorayMemory || typeof MorayMemory.list !== 'function') return null;
+      const data = await MorayMemory.list({ limit: 200 });
+      const items = (data && Array.isArray(data.items)) ? data.items : [];
+      const out = { name: '', usage: '', style: '', oldIds: { name: [], usage: [], style: [] } };
+      const styleRev = { '简洁要点': 'concise', '平衡': 'balanced', '详细解释': 'detailed' };
+      for (const it of items) {
+        if (!it || it.kind !== 'preference') continue;
+        const tg = Array.isArray(it.tags) ? it.tags : [];
+        if (tg.indexOf('identity') === -1) continue;
+        const mSaid = String(it.content || '').match(/^[^:：]{1,30}[:：]\s*(.+)$/);
+        const said = (mSaid && mSaid[1]) ? mSaid[1].trim() : '';
+        if (tg.indexOf('name') !== -1) {
+          out.oldIds.name.push(it.id);
+          if (!out.name) {
+            const m = String(it.content || '').match(/^用户的名字是[:：]\s*(.+)$/);
+            if (m && m[1]) out.name = m[1].trim();
+          }
+        } else if (tg.indexOf('usage') !== -1) {
+          out.oldIds.usage.push(it.id);
+          if (!out.usage && said) out.usage = said;
+        } else if (tg.indexOf('style') !== -1) {
+          out.oldIds.style.push(it.id);
+          if (!out.style && said && styleRev[said]) out.style = styleRev[said];
+        }
+      }
+      if (!out.name) return null;   // 无名字行 = 首启形态，无预填意义
+      return out;
+    } catch (e) { return null; }
+  },
+
+  /** 打开三问弹窗
+   * @param {Object} [prefill] - [窗户v3] 重开预填 {name,usage,style,oldIds}；缺省=首启三问（行为不变）。
+   *   prefill.name 非空 → 标题「更新一下」+跳过钮「取消」；保存成功后按 oldIds 顺手清理旧行（乙路线）。
+   * @returns {void} */
+  ask(prefill) {
+    const pf = prefill || null;
+    const isReopen = !!(pf && pf.name);
+    const box = showModal('<div id="myBody"></div>', { title: isReopen ? '更新一下' : '认识一下', icon: 'sparkles', footer: false });
+    box.style.width = '520px';
+    const body = box.querySelector('#myBody');
+    const styleMap = { concise: '简洁要点', balanced: '平衡', detailed: '详细解释' };
+    const pickedStyle = (pf && styleMap[pf.style]) ? pf.style : 'balanced';
+    // [窗户v3·乙] 写新行成功后顺手清本轮旧行。判重保护：后端按 source+norm(content) 判重，
+    // 内容没变时不插新行、save 返回的就是旧行 id → 旧行仍是活行，绝不能删（否则「你好，X」会消失）。
+    // forget 逐条 catch 静默（fail-open：显示层恒取最新，删失败无感）。
+    const cleanupOld = (newId, oldIds) => {
+      try {
+        if (!newId || !Array.isArray(oldIds) || !oldIds.length) return;
+        if (oldIds.indexOf(newId) !== -1) return;   // 判重命中=未插新行，旧行保留
+        if (typeof MorayMemory === 'undefined' || !MorayMemory || typeof MorayMemory.forget !== 'function') return;
+        oldIds.forEach(oid => {
+          if (!oid || oid === newId) return;
+          try { MorayMemory.forget(oid).catch(() => {}); } catch (e) { /* 忽略 */ }
+        });
+      } catch (e) { /* 忽略 */ }
+    };
+    body.innerHTML = `
+      <div class="text-sm text-text-primary mb-1">三个小问题，让 MoRay 记住你</div>
+      <div class="text-[11px] text-text-tertiary mb-4">只存本机记忆库（kind=preference），之后可在记忆浏览器查看或删除</div>
+      <label class="form-label">怎么称呼你（必填）</label>
+      <input type="text" id="myName" class="form-input" placeholder="例如：小莫" value="${pf ? escapeHtml(pf.name || '') : ''}" style="margin-bottom:12px">
+      <label class="form-label">你主要用 MoRay 做什么</label>
+      <input type="text" id="myUsage" class="form-input" placeholder="例如：写代码、整理文档（可留空）" value="${pf ? escapeHtml(pf.usage || '') : ''}" style="margin-bottom:12px">
+      <label class="form-label">偏好 MoRay 的回答风格</label>
+      <div class="flex gap-2">
+        ${[['concise', '简洁要点'], ['balanced', '平衡'], ['detailed', '详细解释']].map(([v, t]) => `
+          <label class="doc-card p-3 cursor-pointer flex items-center gap-2 text-xs text-text-primary">
+            <input type="radio" name="myStyle" value="${v}" ${v === pickedStyle ? 'checked' : ''} class="accent-brand-cobalt"> ${t}
+          </label>`).join('')}
+      </div>
+      <div class="text-[11px] text-danger" id="myHint" style="min-height:16px;margin-top:10px;"></div>
+      <div class="flex justify-between items-center">
+        <button class="text-[11px] text-text-tertiary hover:text-text-secondary" id="mySkip">${isReopen ? '取消' : '跳过，以后不再问'}</button>
+        <button class="btn-primary px-4 py-2 rounded-lg text-xs" id="mySave">保存</button>
+      </div>`;
+    refreshIcons();
+    try { body.querySelector('#myName').focus(); } catch (e) { /* 忽略 */ }
+    on(body.querySelector('#mySkip'), 'click', () => {
+      try { localStorage.setItem('moray_met', '1'); } catch (e) { /* 忽略 */ }
+      closeModal();
+    });
+    body.querySelector('#mySave').addEventListener('click', async () => {
+      const name = (body.querySelector('#myName').value || '').trim();
+      const hint = body.querySelector('#myHint');
+      if (!name) {
+        hint.textContent = '先告诉我怎么称呼你（必填）';
+        try { body.querySelector('#myName').focus(); } catch (e) { /* 忽略 */ }
+        return;
+      }
+      const saveBtn = body.querySelector('#mySave');
+      saveBtn.disabled = true;
+      try {
+        if (typeof MorayMemory === 'undefined' || !MorayMemory || typeof MorayMemory.save !== 'function') {
+          throw new Error('记忆客户端未就绪（memory_client 未加载）');
+        }
+        const pfOld = (pf && pf.oldIds) || {};
+        // 名字行：attachHelloLine 按 tags 含 'name' 取最新一条渲染「你好，X」
+        const savedName = await MorayMemory.save({ content: '用户的名字是：' + name, kind: 'preference', tags: ['identity', 'name'], source: 'manual' });
+        cleanupOld(savedName && savedName.memory_id, pfOld.name);
+        const usage = (body.querySelector('#myUsage').value || '').trim();
+        if (usage) {
+          const savedUsage = await MorayMemory.save({ content: '用户的主要用途是：' + usage, kind: 'preference', tags: ['identity', 'usage'], source: 'manual' });
+          cleanupOld(savedUsage && savedUsage.memory_id, pfOld.usage);
+        } else if (pfOld.usage && pfOld.usage.length) {
+          // [窗户v4] 用户清空了用途 → forget 旧行（“取消记忆”路径）
+          pfOld.usage.forEach(oid => { try { MorayMemory.forget(oid).catch(() => {}); } catch (e) { /* 忽略 */ } });
+        }
+        const picked = body.querySelector('input[name="myStyle"]:checked');
+        if (picked && styleMap[picked.value]) {
+          const savedStyle = await MorayMemory.save({ content: '用户偏好的回答风格是：' + styleMap[picked.value], kind: 'preference', tags: ['identity', 'style'], source: 'manual' });
+          cleanupOld(savedStyle && savedStyle.memory_id, pfOld.style);
+        }
+        try { localStorage.setItem('moray_met', '1'); } catch (e) { /* 忽略 */ }
+        closeModal();
+        showNotification('已记住你', '你好，' + name + '！信息已存入本机记忆库', 'success', 3000);
+        // 当前在欢迎页则立即刷新问候行（覆盖「首启 0 消息、三行早退、欢迎页仍在」的时序）
+        // [窗户v3] hello → remember 串行刷新（usage/style 也可能改，remember 行锚在 hello 之后）
+        if (typeof attachHelloLine === 'function' && document.getElementById('welcomeScreen')) {
+          try {
+            attachHelloLine().catch(() => {}).then(() => {
+              if (typeof attachRememberLine === 'function') { try { attachRememberLine().catch(() => {}); } catch (e) { /* 忽略 */ } }
+            });
+          } catch (e) { /* 忽略 */ }
+        }
+      } catch (e) {
+        saveBtn.disabled = false;
+        showNotification('保存失败', String((e && e.message) || e), 'error', 5000);
+        // 不落 moray_met 旗标：下次启动重新问
+      }
+    });
+  }
+};
+
+// [认识你 v1] 老装机兜底：onboarding 已完成过（openV2 不会再弹）则启动后择机补问；
+// 新装机走 openV2 finish() 接力。+2600ms 避开 onboarding +1200ms 的弹窗窗口，
+// 且 maybeAsk 带「弹窗激活即跳过」护栏双保险。
+setTimeout(() => { try { MeetYou.maybeAsk(); } catch (e) { /* 忽略 */ } }, 2600);
 
 /* ===================== [交互健壮性] 开发态交互自检（仅手动调用，不在生产环境自动弹错） ===================== */
 
@@ -1408,7 +1581,7 @@ window.__morayAudit = function () {
       st.textContent =
         '.moray-resize-handle{position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:40;touch-action:none}' +
         '.moray-resize-handle::after{content:"";position:absolute;top:0;bottom:0;left:3px;width:1px;background:transparent;transition:background .15s}' +
-        '.moray-resize-handle:hover::after,.moray-resize-handle.dragging::after{background:var(--color-brand-cobalt,#5B8CFF);box-shadow:0 0 8px rgba(91,140,255,.6)}' +
+        '.moray-resize-handle:hover::after,.moray-resize-handle.dragging::after{background:var(--color-brand-cobalt,#E5734A);box-shadow:0 0 8px rgba(229, 115, 74,.6)}' +
         'body.moray-resizing{cursor:col-resize!important;user-select:none!important}';
       document.head.appendChild(st);
     }
@@ -1440,6 +1613,100 @@ window.__morayAudit = function () {
   setTimeout(init, 300);
 })();
 
+/* ===================== [A-1.6] 中栏可折叠（默认收起，各页独立记忆） =====================
+   状态：localStorage 键 moray.middleSidebar.collapsed.{page}，'1'/无键=收起（默认 true）、'0'=展开。
+   范围：有 .sidebar-panel 的五页 chat/prompts/snippets/docs/cost；settings/apps/memory 由既有
+   body:has() 整栏隐藏不受影响；其余页（tasks/orchestrator/automation 等）currentPage 返回 null，
+   折叠标记不施加（维持 A-1.5 现状）。
+   UI：全局单例 ☰ 挂 #app 左上（仅折叠态显示，页头 CSS padding-left 避让防压内容——docs 页无
+   header、cost 页 header 由 120 运行时重建，故不逐页注入）；✕ 挂 #middleSidebar 右上（仅展开态
+   显示，sidebar-panel 头部 padding-right 避让 +/upload 按钮）。显隐/宽度全由 body[data-mid-collapsed]
+   + 135 §32 CSS 驱动，本函数只写一个属性。Ctrl+B 切换当前页。
+   折叠形态：width/flex-basis 0 + border 0（!important 压过 110 拖宽内联样式），overflow:hidden 使
+   收起态拖拽把手不可见不可点（"收起状态下不响应"自动满足）。 */
+(function installMiddleSidebarCollapse() {
+  const KEY_PREFIX = 'moray.middleSidebar.collapsed.';
+  const SIDEBAR_PAGES = ['chat', 'prompts', 'snippets', 'docs', 'cost'];
+
+  /** 当前显示的、带中栏面板的页 id；其余页返回 null */
+  function currentPage() {
+    for (const p of SIDEBAR_PAGES) {
+      const el = document.getElementById('page-' + p);
+      if (el && !el.classList.contains('hidden')) return p;
+    }
+    return null;
+  }
+  function isCollapsed(page) {
+    try { return localStorage.getItem(KEY_PREFIX + page) !== '0'; } // 无键/非'0'一律视为收起（默认 true）
+    catch (e) { console.warn('[MoRay] 中栏折叠状态读取失败，按收起处理：', e); return true; }
+  }
+  function setCollapsed(page, v) {
+    try { localStorage.setItem(KEY_PREFIX + page, v ? '1' : '0'); }
+    catch (e) { console.warn('[MoRay] 中栏折叠状态写入失败（仅当前会话生效）：', e); }
+  }
+  /** 把当前页折叠态投影到 body 属性，135 §32 负责一切显隐与宽度 */
+  function sync() {
+    const page = currentPage();
+    if (!page) { document.body.removeAttribute('data-mid-collapsed'); return; }
+    document.body.setAttribute('data-mid-collapsed', isCollapsed(page) ? '1' : '0');
+  }
+  function toggle() {
+    const page = currentPage();
+    if (!page) return;
+    setCollapsed(page, !isCollapsed(page));
+    sync();
+  }
+
+  /** 单例按钮注入：☰→#app（absolute），✕→#middleSidebar（absolute）。幂等 */
+  function ensureButtons() {
+    const app = document.getElementById('app');
+    const aside = document.getElementById('middleSidebar');
+    if (!app || !aside) return false;
+    if (!document.getElementById('midExpandBtn')) {
+      const b = document.createElement('button');
+      b.id = 'midExpandBtn';
+      b.className = 'mid-collapse-btn mid-expand-btn';
+      b.setAttribute('aria-label', '展开列表栏');
+      b.title = '展开列表栏（Ctrl+B）';
+      b.innerHTML = '<i data-lucide="panel-left-open" class="w-4 h-4"></i>';
+      b.addEventListener('click', toggle);
+      app.appendChild(b);
+    }
+    if (!document.getElementById('midCollapseBtn')) {
+      const x = document.createElement('button');
+      x.id = 'midCollapseBtn';
+      x.className = 'mid-collapse-btn mid-collapse-close';
+      x.setAttribute('aria-label', '收起列表栏');
+      x.title = '收起列表栏（Ctrl+B）';
+      x.innerHTML = '<i data-lucide="panel-left-close" class="w-4 h-4"></i>';
+      x.addEventListener('click', toggle);
+      aside.appendChild(x);
+    }
+    if (typeof refreshIcons === 'function') refreshIcons();
+    return true;
+  }
+
+  function init() {
+    if (!ensureButtons()) { setTimeout(init, 300); return; }
+    sync();
+    // 页面切换后重新投影状态：逐 .page-panel 监听 class 变化（覆盖骨架/68/69/86/memory 全部切换路径；
+    // 五页面板全是静态骨架节点，运行时注入的 apps/tasks/orchestrator/memory 不在五页内，
+    // 其激活必然伴随某个静态面板被加 hidden → 触发本监听，无需额外观察）
+    const mo = new MutationObserver(() => sync());
+    document.querySelectorAll('.page-panel').forEach(el => mo.observe(el, { attributes: true, attributeFilter: ['class'] }));
+    // Ctrl+B 切换当前页（浏览器默认加粗让位给本应用）
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'b') {
+        if (!currentPage()) return;
+        e.preventDefault();
+        toggle();
+      }
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+
 /* ===================== [壁纸贯穿] data-wallpaper 作用域 + 毛玻璃穿透 ===================== */
 (function () {
   /* ---------- A. data-wallpaper 属性同步（包装静态骨架三函数 + 观察兜底） ---------- */
@@ -1449,13 +1716,13 @@ window.__morayAudit = function () {
    * ① moray_wallpaper==='custom' 且 moray_custom_wallpaper 存在 → 'custom'
    * ② moray_wallpaper 命中 __WALL_LIST → 该内置名（即使 custom 数据残留也不受影响——保留它
    *    是为了能切回自定义，绝不压过明确的内置选择）
-   * ③ moray_wallpaper 为空：存在自定义数据 → 回退 'custom'；否则默认 'anime-starry'
+   * ③ moray_wallpaper 为空：存在自定义数据 → 回退 'custom'；否则默认 'pure'（纯色态，[Day22e] 由 anime-starry 改）
    * 顺带保证 #app 始终有壁纸类（首次加载即有壁纸背景）
    * @returns {void} */
   function __syncWallpaperAttr() {
     const shell = document.getElementById('appShell') || document.getElementById('app');
     if (!shell) return;
-    let v = 'anime-starry'; // 默认壁纸（首次使用/无 saved 值）
+    let v = 'pure'; // [Day22e] 默认壁纸＝纯色态（首次使用/无 saved 值）；壁纸仍可在设置里手选
     try {
       const saved = localStorage.getItem('moray_wallpaper');
       const custom = localStorage.getItem('moray_custom_wallpaper');
@@ -1543,42 +1810,42 @@ window.__morayAudit = function () {
   /* 统一变量，便于回调：面板透明度 / 毛玻璃模糊 / 压暗层 / 内部卡片透明度 / 浮层不透明度 */
   --wall-panel-alpha: 0.62;
   --wall-blur: 10px;
-  --wall-scrim: rgba(6, 8, 14, 0.30);
+  --wall-scrim: rgba(0, 0, 0, 0.30);
   --wall-card-alpha: 0.45;
   --wall-floating-alpha: 0.90;
   /* [3.20 阶段1] 联动光晕色（默认 = 品牌钴蓝/青），由 data-wall-tone 分档覆盖；
      组件规则以 rgba(var(--wall-glow-rgb), α) 消费，未分档时回退本默认值 */
-  --wall-glow-rgb: 91, 140, 255;
-  --wall-accent-rgb: 58, 214, 232;
-  --wall-tint-color: rgb(91, 140, 255);
+  --wall-glow-rgb: 229, 115, 74;
+  --wall-accent-rgb: 229, 115, 74;
+  --wall-tint-color: rgb(229, 115, 74);
 }
 /* ---- 三栏骨架：唯一 backdrop-filter 层（内部卡片/气泡不再 blur，防嵌套掉帧） ---- */
 #app[data-wallpaper] aside.bg-surface-deep {
-  background-color: rgba(16, 19, 29, var(--wall-panel-alpha));
+  background-color: rgba(16, 16, 16, var(--wall-panel-alpha));
   backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   box-shadow: inset 0 0 0 9999px var(--wall-scrim); /* 淡暗色压暗层：壁纸最亮时文字仍可读 */
 }
 #app[data-wallpaper] #middleSidebar {
-  background-color: rgba(21, 25, 39, var(--wall-panel-alpha));
+  background-color: rgba(10, 10, 10, var(--wall-panel-alpha)); /* [A-1.5] 与 main 同色，消除双面板感 */
   backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   box-shadow: inset 0 0 0 9999px var(--wall-scrim);
 }
 #app[data-wallpaper] main.bg-surface-void {
-  background-color: rgba(10, 12, 20, var(--wall-panel-alpha));
+  background-color: rgba(10, 10, 10, var(--wall-panel-alpha));
   backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--wall-blur)) saturate(1.1);
   box-shadow: inset 0 0 0 9999px var(--wall-scrim);
 }
 /* ---- 三栏内部卡片/气泡/输入台：更透明的纯色，取消嵌套 blur（性能红线） ---- */
 #app[data-wallpaper] main .glass-card {
-  background: rgba(26, 31, 48, var(--wall-card-alpha));
+  background: rgba(22, 22, 22, var(--wall-card-alpha));
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
 #app[data-wallpaper] main .bg-surface-card {
-  background-color: rgba(26, 31, 48, var(--wall-card-alpha));
+  background-color: rgba(22, 22, 22, var(--wall-card-alpha));
 }
 #app[data-wallpaper] #coreInputContainer {
   background: rgba(15, 18, 28, var(--wall-card-alpha));
@@ -1591,7 +1858,7 @@ window.__morayAudit = function () {
 .notification,
 .surface-floating,
 .slash-menu {
-  background-color: rgba(21, 25, 39, var(--wall-floating-alpha, 0.90));
+  background-color: rgba(20, 20, 20, var(--wall-floating-alpha, 0.90));
   backdrop-filter: blur(18px) saturate(1.1);
   -webkit-backdrop-filter: blur(18px) saturate(1.1);
 }
@@ -1607,7 +1874,7 @@ html[data-theme="light"] .slash-menu {
 #app[data-wallpaper="pure"] {
   --wall-panel-alpha: 0.96;
   --wall-card-alpha: 0.94;
-  --wall-scrim: rgba(6, 8, 14, 0.02);
+  --wall-scrim: rgba(0, 0, 0, 0.02);
 }
 /* ---- [动漫图片壁纸] 内置三张 + 自定义上传：图片类壁纸专用穿透参数（人物不被默认遮罩压暗） ---- */
 #app[data-wallpaper="anime-starry"] {
@@ -1638,7 +1905,7 @@ html[data-theme="light"] .slash-menu {
 #app[data-wallpaper="custom"] {
   --wall-panel-alpha: 0.32;
   --wall-blur: 4px;
-  --wall-scrim: rgba(6, 8, 14, 0.08);
+  --wall-scrim: rgba(0, 0, 0, 0.08);
   --wall-card-alpha: 0.62;
 }
 /* ---- 浅色主题：浅色半透明值（壁纸仍可透出，对比度正常） ---- */
@@ -1649,7 +1916,7 @@ html[data-theme="light"] #app[data-wallpaper] aside.bg-surface-deep {
   background-color: rgba(233, 237, 245, var(--wall-panel-alpha));
 }
 html[data-theme="light"] #app[data-wallpaper] #middleSidebar {
-  background-color: rgba(255, 255, 255, var(--wall-panel-alpha));
+  background-color: rgba(243, 245, 250, var(--wall-panel-alpha)); /* [A-1.5] 与 main 同色 */
 }
 html[data-theme="light"] #app[data-wallpaper] main.bg-surface-void {
   background-color: rgba(243, 245, 250, var(--wall-panel-alpha));
@@ -1669,7 +1936,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-starry"],
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"],
 html[data-theme="light"] #app[data-wallpaper="anime-window"],
 html[data-theme="light"] #app[data-wallpaper="custom"] {
-  --wall-scrim: rgba(6, 8, 14, 0.08);
+  --wall-scrim: rgba(0, 0, 0, 0.08);
   --wall-panel-alpha: 0.32;
   --wall-blur: 4px;
   --wall-card-alpha: 0.62;
@@ -1678,19 +1945,19 @@ html[data-theme="light"] #app[data-wallpaper="anime-starry"] aside.bg-surface-de
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] aside.bg-surface-deep,
 html[data-theme="light"] #app[data-wallpaper="anime-window"] aside.bg-surface-deep,
 html[data-theme="light"] #app[data-wallpaper="custom"] aside.bg-surface-deep {
-  background-color: rgba(16, 19, 29, var(--wall-panel-alpha));
+  background-color: rgba(16, 16, 16, var(--wall-panel-alpha));
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] #middleSidebar,
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #middleSidebar,
 html[data-theme="light"] #app[data-wallpaper="anime-window"] #middleSidebar,
 html[data-theme="light"] #app[data-wallpaper="custom"] #middleSidebar {
-  background-color: rgba(21, 25, 39, var(--wall-panel-alpha));
+  background-color: rgba(10, 10, 10, var(--wall-panel-alpha)); /* [A-1.5] 与 main 同色 */
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] main.bg-surface-void,
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] main.bg-surface-void,
 html[data-theme="light"] #app[data-wallpaper="anime-window"] main.bg-surface-void,
 html[data-theme="light"] #app[data-wallpaper="custom"] main.bg-surface-void {
-  background-color: rgba(10, 12, 20, var(--wall-panel-alpha));
+  background-color: rgba(10, 10, 10, var(--wall-panel-alpha));
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] main .glass-card,
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] main .glass-card,
@@ -1700,7 +1967,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-starry"] main .bg-surface-ca
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] main .bg-surface-card,
 html[data-theme="light"] #app[data-wallpaper="anime-window"] main .bg-surface-card,
 html[data-theme="light"] #app[data-wallpaper="custom"] main .bg-surface-card {
-  background-color: rgba(26, 31, 48, var(--wall-card-alpha));
+  background-color: rgba(22, 22, 22, var(--wall-card-alpha));
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] #coreInputContainer,
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer,
@@ -1736,7 +2003,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-aurora"] main .msg-bubble__u
 html[data-theme="light"] #app[data-wallpaper="anime-window"] main .msg-bubble__user-box,
 html[data-theme="light"] #app[data-wallpaper="custom"] main .msg-bubble__user-box {
   background-color: rgba(214, 225, 255, 0.88);
-  border-color: rgba(91, 140, 255, 0.45);
+  border-color: rgba(229, 115, 74, 0.45);
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] main .msg-bubble__ai-box,
 html[data-theme="light"] #app[data-wallpaper="anime-aurora"] main .msg-bubble__ai-box,
@@ -1766,8 +2033,8 @@ html[data-theme="light"] #app[data-wallpaper="custom"] .msg-bubble .md-body {
 #app[data-wallpaper="anime-aurora"] #coreInputContainer:focus-within,
 #app[data-wallpaper="anime-window"] #coreInputContainer:focus-within,
 #app[data-wallpaper="custom"] #coreInputContainer:focus-within {
-  border-color: rgba(var(--wall-glow-rgb, 91, 140, 255), 0.90);
-  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.35), 0 0 28px rgba(var(--wall-glow-rgb, 91, 140, 255), 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
+  border-color: rgba(var(--wall-glow-rgb, 229, 115, 74), 0.90);
+  box-shadow: 0 0 0 1px rgba(var(--wall-glow-rgb, 229, 115, 74), 0.35), 0 0 28px rgba(var(--wall-glow-rgb, 229, 115, 74), 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 /* 输入框：极轻衬底 + 圆角；正文保持主题色；placeholder 提亮 */
 #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -1775,7 +2042,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] .msg-bubble .md-body {
 #app[data-wallpaper="anime-window"] #chatInputNormal,
 #app[data-wallpaper="custom"] #chatInputNormal {
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--color-text-primary);
 }
 #app[data-wallpaper="anime-starry"] #chatInputNormal::placeholder,
@@ -1803,7 +2070,7 @@ html[data-theme="light"] #app[data-wallpaper="anime-aurora"] #coreInputContainer
 html[data-theme="light"] #app[data-wallpaper="anime-window"] #coreInputContainer,
 html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
   background-color: rgba(255, 255, 255, 0.90);
-  border: 1px solid rgba(var(--wall-glow-rgb, 91, 140, 255), 0.30);
+  border: 1px solid rgba(var(--wall-glow-rgb, 229, 115, 74), 0.30);
   box-shadow: 0 10px 30px rgba(26, 34, 51, 0.18);
 }
 html[data-theme="light"] #app[data-wallpaper="anime-starry"] #chatInputNormal,
@@ -1835,19 +2102,21 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
   document.head.appendChild(st);
 })();
 
-/* ===================== [M5.1] 布局：欢迎区底部预留输入台高度 ===================== */
+/* ===================== [M5.1] 布局：主内容区窄屏压缩（底距改由 135 显式给出） ===================== */
 (function () {
   if (document.getElementById('layoutFixStyle')) return;
   const st = document.createElement('style');
   st.id = 'layoutFixStyle';
   st.textContent = `
-/* [M5.1] 欢迎区/消息滚动容器底部预留"输入台高度+安全间距"，1280×720 不被遮挡 */
-.welcome-screen { padding-bottom: calc(40px + 96px); }
-#chatMessagesNormal { padding-bottom: 96px; box-sizing: border-box; }
+/* [M5.1 修订] 输入台已改为 #chat-normal 的 flex 兄弟、不再浮层覆盖消息列表（见骨架
+   chatNormalContent 收尾注释），消息列也就不再需要预留"输入台高度"：
+   滚动到底的底距由 135 显式给出（消息列 28px + #chatNormalContent 的 py-5 20px = 48px）。
+   注意：切勿在此恢复 padding-bottom 96px —— 那是浮层时代的预留，会让底距变成 116px。 */
+#chatMessagesNormal { box-sizing: border-box; }
 /* 视口 ≤720px：压缩欢迎区上下间距与快捷卡片 */
 @media (max-height: 720px) {
-  .welcome-screen { padding-top: 14px; padding-bottom: calc(14px + 92px); justify-content: flex-start; }
-  .welcome-logo { width: 52px; height: 52px; margin-bottom: 10px; }
+  .welcome-screen { padding-top: 16px; justify-content: flex-start; }
+  .welcome-logo { width: 52px; height: 52px; margin-bottom: 12px; }
   .welcome-title { font-size: 20px; }
   .welcome-subtitle { margin-top: 4px; font-size: 12px; }
   .welcome-suggestions { gap: 8px; margin-top: 12px; }
@@ -1864,7 +2133,7 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer .inpu
 /** [M5.1] 前端单一版本常量（与后端 /api/health version 保持一致，见 server/app/config.py）；
  * MORAY_VERSION = 产品版本（对外）；MORAY_BUILD = 内部构建号（对应 CHANGELOG 迭代序号） */
 window.MORAY_VERSION = '1.0.0';
-window.MORAY_BUILD = '3.22.0';
+window.MORAY_BUILD = '3.25.0';
 
 (function () {
   /** [M5修复] 统一后端 origin 解析，优先级从高到低：
@@ -2002,23 +2271,23 @@ window.MORAY_BUILD = '3.22.0';
    *  scrimLight  ：浅色主题下的着色薄纱（亮度与既有白色薄纱相当，只带色相）。 */
   const WALL_TONES = {
     cobalt: {
-      glow: '91, 140, 255', accent: '157, 123, 255',
+      glow: '229, 115, 74', accent: '229, 115, 74',
       scrim: 'rgba(4, 9, 22, 0.36)', scrimImg: 'rgba(4, 10, 22, 0.12)', scrimLight: 'rgba(240, 244, 255, 0.24)'
     },
     cyan: {
-      glow: '58, 214, 232', accent: '91, 140, 255',
+      glow: '229, 115, 74', accent: '229, 115, 74',
       scrim: 'rgba(2, 12, 15, 0.38)', scrimImg: 'rgba(4, 12, 15, 0.12)', scrimLight: 'rgba(238, 252, 255, 0.24)'
     },
     violet: {
-      glow: '157, 123, 255', accent: '110, 140, 255',
+      glow: '229, 115, 74', accent: '110, 140, 255',
       scrim: 'rgba(11, 6, 22, 0.38)', scrimImg: 'rgba(10, 7, 22, 0.12)', scrimLight: 'rgba(246, 240, 255, 0.24)'
     },
     magenta: {
-      glow: '214, 108, 214', accent: '157, 123, 255',
+      glow: '214, 108, 214', accent: '229, 115, 74',
       scrim: 'rgba(16, 6, 15, 0.38)', scrimImg: 'rgba(14, 6, 15, 0.12)', scrimLight: 'rgba(255, 240, 252, 0.24)'
     },
     green: {
-      glow: '86, 214, 160', accent: '58, 214, 232',
+      glow: '86, 214, 160', accent: '229, 115, 74',
       scrim: 'rgba(2, 13, 9, 0.38)', scrimImg: 'rgba(3, 12, 9, 0.12)', scrimLight: 'rgba(238, 255, 246, 0.24)'
     },
     warm: {
@@ -2028,7 +2297,7 @@ window.MORAY_BUILD = '3.22.0';
     neutral: {
       glow: '138, 150, 172', accent: '110, 124, 150',
       // 中性档（pure 等）：保持既有近乎不压暗的观感，不做着色
-      scrim: 'rgba(6, 8, 14, 0.02)', scrimImg: 'rgba(6, 8, 14, 0.08)', scrimLight: 'rgba(255, 255, 255, 0.22)'
+      scrim: 'rgba(0, 0, 0, 0.02)', scrimImg: 'rgba(0, 0, 0, 0.08)', scrimLight: 'rgba(255, 255, 255, 0.22)'
     }
   };
 
@@ -2066,7 +2335,7 @@ window.MORAY_BUILD = '3.22.0';
       if (saved && WALL_BUILTIN.includes(saved)) return saved;
       if (!saved && custom) return 'custom';
     } catch (e) { /* 忽略 */ }
-    return 'anime-starry';
+    return 'pure'; // [Day22e] 与 __syncWallpaperAttr 的默认值保持一致（纯色态）
   }
 
   /** 字符串指纹（用于自定义图取色缓存命中判断；改图即换键） */
@@ -2225,12 +2494,9 @@ window.MORAY_BUILD = '3.22.0';
 /* ========== [3.20 阶段1] 壁纸联动系统主题（独立样式表：同权重后定义获胜） ========== */
 /* ---- 1) 色相分档：决定光晕/强调/叠色（由 JS 写 #app[data-wall-tone]） ---- */
 ${toneCss}/* 未分档（JS 尚未执行 / 未知壁纸）时回退品牌钴蓝，视觉零回归 */
-#app[data-wallpaper] {
-  --shadow-glove: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.25), 0 0 16px rgba(var(--wall-accent-rgb), 0.15);
-  --shadow-glove-focus: 0 0 0 1px rgba(var(--wall-glow-rgb), 0.55), 0 0 28px rgba(var(--wall-accent-rgb), 0.30);
-  --shadow-glow-cobalt: 0 0 12px rgba(var(--wall-glow-rgb), 0.40);
-  --shadow-glow-cyan: 0 0 12px rgba(var(--wall-accent-rgb), 0.40);
-}
+/* [A-3b] 此处原有一组 --shadow-glove / --shadow-glove-focus / --shadow-glow-cobalt / --shadow-glow-cyan
+   壁纸令牌定义，已随 A-3b 光晕退役删除：全站没有任何 var() 消费方（Tailwind 工具类由
+   @theme 字面量编译，与运行时令牌无关），骨架令牌本身也已删除。 */
 /* ---- 2) 三栏面板与输入台的色相联动 = 压暗层着色（--wall-scrim 按色相档取深版/浅版）。
         纯色/渐变类用的深版比原 rgba(6,8,14,.30) 更暗 → 换壁纸改变整屏色相，同时正文对比度
         只升不降（可读性红线）；图片类用浅版，保住"不压暗人物" ---- */
@@ -2289,13 +2555,13 @@ html[data-theme="light"] #app[data-wallpaper="custom"] #coreInputContainer {
 /* ---- 7) 可读性红线：高亮度自定义图自动加深遮罩（正文对比度不低于现状）。
         权重：[data-wall-tone] 后缀保证压过上面的按色相着色规则（同权重时后定义获胜） ---- */
 #app[data-wall-bright="1"][data-wall-tone] {
-  --wall-scrim: rgba(6, 8, 14, 0.52);
+  --wall-scrim: rgba(0, 0, 0, 0.52);
 }
 #app[data-wall-bright="1"][data-wall-tone] main .msg-bubble .md-body {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
 }
 html[data-theme="light"] #app[data-wallpaper][data-wall-bright="1"][data-wall-tone] {
-  --wall-scrim: rgba(6, 8, 14, 0.42);
+  --wall-scrim: rgba(0, 0, 0, 0.42);
 }
 `;
     document.head.appendChild(st);

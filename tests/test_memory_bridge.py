@@ -530,5 +530,35 @@ class TestMemoryMatrixGuard(MemoryBridgeTestBase):
         self.assertIn("写入校验拒绝", err)
 
 
+class TestRejectionObservability(MemoryBridgeTestBase):
+    """[批3 2026-10-13] 拒绝可观测：拒绝留痕（ERROR 日志）+ 端点只读回读。"""
+
+    def test_rejection_logs_error_marker(self):
+        """[批3] 拒绝时落 [memory_reject] ERROR 日志（临时挂 handler，零磁盘）"""
+        from server.app.memory_routes import insert_memory
+        with self.assertLogs("moray.memory", level="ERROR") as cm:
+            mid, err = insert_memory("t", kind="task_result", source="manual")
+        self.assertEqual(mid, "")
+        self.assertTrue(any("[memory_reject]" in m for m in cm.output))
+
+    def test_rejections_endpoint_reads_log(self):
+        """[批3] 端点从 errors.log 尾部读 [memory_reject] 行"""
+        from server.app import self_check
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8")
+        tmp.write('2026-10-13T22:00:00+08:00 | ERROR | [memory_reject] {"source":"x","kind":"y"}\n')
+        tmp.write('2026-10-13T22:00:01+08:00 | ERROR | other error\n')
+        tmp.close()
+        orig = self_check._ERROR_LOG_PATH
+        try:
+            self_check._ERROR_LOG_PATH = tmp.name
+            lines, scanned, truncated = self_check.read_recent_error_lines("[memory_reject]", limit=50)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("[memory_reject]", lines[0])
+        finally:
+            self_check._ERROR_LOG_PATH = orig
+            os.unlink(tmp.name)
+
+
 if __name__ == "__main__":
     unittest.main()

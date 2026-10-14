@@ -1,10 +1,13 @@
 """MemoryBridge 记忆模块路由（2026-10-02 M1）
 
-授权：M1 任务书（MemoryBridge MVP）。四端点：
-  POST /api/memory/save    保存一条记忆（主表 + FTS 双写，单事务）
-  POST /api/memory/recall  FTS5 trigram 召回 + bm25 相关性 × 时间衰减 × weight 重排
-  POST /api/memory/forget  按 memory_id / query / tags 三选一删除（主表 + FTS 同步删）
-  GET  /api/memory/list    分页列出（created_at DESC）
+授权：M1 任务书（MemoryBridge MVP）。七端点：
+  POST /api/memory/save        保存一条记忆（主表 + FTS 双写，单事务）
+  POST /api/memory/recall      FTS5 trigram 召回 + bm25 相关性 × 时间衰减 × weight 重排
+  POST /api/memory/forget      按 memory_id / query / tags 三选一删除（主表 + FTS 同步删）
+  GET  /api/memory/list        分页列出（created_at DESC）
+  GET  /api/memory/stats       各 kind 条数统计（只读；自省面板「记忆」卡，v1.1）
+  GET  /api/memory/failures    失败档案（只读关键词候选；自省面板第七卡，v1）
+  GET  /api/memory/rejections  写入拒绝（读 errors.log 尾部；自省面板第八卡，v1 批3）
 
 风格：模块自包含（monitor_routes/self_routes 先例），手解 JSON + _ok/_bad 信封
 （全后端零 Pydantic 的既有惯例）；事务范式照抄 crud.py（BEGIN → commit / rollback / close）。
@@ -21,6 +24,8 @@ OR（_fts_expr mode="recall_or"）兜底重查一次——口语整句常带零�
 时间衰减：score = |bm25| × exp(-age_days/decay_days) × weight，查询期现算（无后台任务）。
 bm5 更负 = 更相关 → 取 abs 后越大越好，与衰减因子、weight 同向相乘后 DESC 排序。
 """
+import json
+import logging
 import math
 import uuid
 from datetime import datetime
@@ -29,6 +34,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from . import memory_db
+
+logger = logging.getLogger("moray.memory")
 
 router = APIRouter()
 
@@ -151,6 +158,12 @@ def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
 
     # [v1 写入校验 2026-10-13] source × kind 矩阵：未知 source 或越界 kind 一律拒绝
     if kind not in _SOURCE_KIND_MATRIX.get(source, ()):
+        # [v1 批3 2026-10-13] 拒绝留痕：ERROR → "moray" logger → logs/moray_errors.log，
+        # 本行即 GET /api/memory/rejections 的唯一数据源（拒绝不再静默消失）
+        logger.error("[memory_reject] %s", json.dumps(
+            {"source": source, "kind": kind, "entity_id": entity_id,
+             "session_id": session_id, "content": str(content)[:120]},
+            ensure_ascii=False))
         return "", _REJECT_PREFIX + f"source={source} kind={kind} 不在许可矩阵"
 
     # [P1精确判重 2026-10-06] norm 非空才查重：全标点/空白内容不互相挡（空键
@@ -543,3 +556,34 @@ async def memory_failures(limit: int = 50):
         "total": total,
         "matched_note": "宽口径关键词命中=候选标记，不判真伪；「验证：/结果：」行摘录见 verdict_excerpt"
     }
+
+
+# ── 写入拒绝 v1 批3（2026-10-13）────────────────────────────────────────────
+#
+# 只读回读端点：拒绝留痕已在 insert_memory 里落进 logs/moray_errors.log
+# （ERROR 级 [memory_reject] 行，见上方矩阵守卫分支）。本端点只从该文件尾部
+# 有界读，零写库、零新数据源——拒绝与错误共用同一份磁盘记忆，格式知识留在
+# self_check.py（formatter 与 parser 同居：| 分隔由 _ISO8601LineFormatter 定义）。
+@router.get("/api/memory/rejections")
+async def memory_rejections(limit: int = 50):
+    """[v1 批3 2026-10-13] 读 errors.log 尾部 [memory_reject] 行——只读，零写库。"""
+    limit = max(1, min(int(limit or 50), 200))
+    from .self_check import read_recent_error_lines
+    lines, scanned, truncated = read_recent_error_lines("[memory_reject]", limit=limit)
+    items = []
+    for ln in reversed(lines):
+        parts = ln.split(" | ", 2)
+        if len(parts) < 3:
+            continue
+        ts, lvl, msg = parts
+        payload = msg.strip()
+        if payload.startswith("[memory_reject] "):
+            payload = payload[len("[memory_reject] "):]
+        try:
+            obj = json.loads(payload)
+        except Exception:  # noqa: BLE001 - 非 JSON 行如实降级成 raw，不炸端点
+            obj = {"raw": payload}
+        obj["ts"] = ts
+        items.append(obj)
+    return {"ok": True, "items": items, "total": len(items),
+            "scanned_bytes": scanned, "truncated": truncated}

@@ -1,5 +1,66 @@
 # MoRay 变更日志
 
+## [3.25.0] - 2026-10-13
+### Added
+- v1 本体安全层：记忆写入校验（source × kind 许可矩阵）
+- 拒绝可观测：`/api/memory/rejections` 端点 + 自省面板第八卡「写入拒绝」
+### Fixed
+- zcode_adapter 注释去 stdin 旧措辞
+- baseline 去 audit 引用 + 6 补守卫 + docstring 对齐
+- 20 条既有失败清零
+### Chore
+- .gitignore 补齐（5 个 100MB+ 挡索引外）
+
+## 3.24.0（2026-10-03）版本 bump：壳缓存名轮换，4 笔欠账修复随新缓存下发
+
+> 本轮红线：只改版本号 + 本条目，功能代码零改动。三处内部版本同步 3.23.0 → 3.24.0：
+> parts/110_polish.js `MORAY_BUILD`、parts/70_models_settings_boot.js `APP_VERSION`（带 v 前缀）、
+> server/app/config.py `BUILD`。sw.js CACHE_NAME 由 moray-3.23.0 轮换为 moray-3.24.0
+> （assemble 构建期绑定 MORAY_BUILD），壳内旧缓存随之失效。
+> 以下 4 项修复此前已落地，但因缓存名未轮换壳内一直不可见，本次随新缓存生效：
+- **A-3a 圆角/间距/字号**：源头收紧骨架 @theme `--radius-xs..2xl`（归一到 4/6/6/8/8/8）+ 半步间距 + 微观字号
+- **模型路由**：判定专用模型（moray-laya-* 全系）排除出聊天候选集与默认模型，"你是谁"不再幻觉身份
+  （100_gateway.isJudgeOnlyModel 与 20_ai.autoSelectDefaultModel 同一正则口径，用户手动选择不受影响）
+- **bonsai（27B）**：工具轮超时（toolRoundTimeout 默认 180s，设置页可调 60–300s）+ AbortSignal 真正可中止
+  + reasoning_effort 显式下发（设置页 low/medium/xhigh，默认 low）
+- **fallback**：备选首选取"主选之外参数量最大"（complex 主选=最大时即参数量次大）；
+  默认模型 qwen3.5:9b 优先（与 server OLLAMA_MODEL 默认一致）
+
+## 3.23.0（2026-09-25）国庆冲刺成果：执行引擎接口化 + ZCode Docker 隔离 + 会话状态机与事件流加固
+
+> 注：`config.BUILD` 常量仍为 3.22.0（本轮按红线未改任何 .py），待下次发布统一 bump。
+
+### Added
+- ExecutionEngine 抽象接口（engines/base.py）
+- LocalAdapter 兜底执行引擎（engines/local_adapter.py）
+- ZCodeAdapter 骨架（engines/zcode_adapter.py，subprocess 直调，is_isolated=False 诚实申报）
+- ZCode Docker 隔离配置（engines/docker/：Dockerfile、compose（含网关边车代理 moray-gw-proxy）、
+  双验收脚本等 6 文件；镜像 moray/zcode-agent:0.16.9，380 MB，构建 ID 70cf1af854a3）
+- agent_sessions 状态机（五态流转 + 断点恢复）
+- event_snapshots 全量事件流（9 字段 + 幂等迁移）
+- 服务端预算熔断（MAX_LLM_CALLS_PER_SESSION 计数）
+
+### Changed
+- agent_runner 收尾路径改走 agent_tools._audit（事件流 + 状态机双接线）
+- verify_isolation.bat 全量 ASCII 化（Day 12）：修复 cmd `for /f` 在 `=` 处拆分
+  `--tmpfs /tmp:size=512m` 导致 C5 捕获恒空的真因（并非中文编码）；C4 同源假阳性一并修复
+  （改为临时文件重定向 + set /p 捕获，检查语义不变，.sh 孪生无需同步）
+- docs/zcode_docker_isolation.md d 节按 Day 12 实证修正：Docker Desktop WSL2 + internal:true
+  下 host-gateway 无路由，网关可达性依赖宿主侧转发通路，后端保持 127.0.0.1 绑定不开放局域网
+- Day 12-13 zcode 自主决策采用边车代理方案（替代 netsh portproxy；架构师事后追认 2026-09-25）并接线：compose 新增常驻
+  `moray-gw-proxy`（同镜像 node 裸 TCP 转发，双网卡，与 agent 同款安全硬化 + 轻量资源限制）；
+  `ZCODE_GATEWAY_BASE_URL` 与 provider baseUrl 口径改指 `http://moray-gw-proxy:8000`；
+  verify_isolation.bat/.sh 的 B 项目标同步改指代理并新增 sidecar 前置检查（.sh 孪生同步）；
+  设计文档 a/c/d/e/f 节一致性更新。复跑隔离验收 **9/9 全绿**（verify_result_v3.log）
+
+### Tests
+- 新增 8 个测试套件（test_engines / test_zcode_adapter / test_session_state / test_event_stream /
+  test_mvp_e2e / test_runner_audit / test_budget / test_security），回归基线 93 例
+- Day 12 实测：分套件全绿 93/93；整目录单次 discover 存在 1 例已知字母序跨套件数据污染
+  （test_mvp_e2e，单独复跑通过，属测试隔离缺陷，非产品回归）
+- 隔离验收终态 **9/9 全绿**（Day 12 为 8/9，唯一缺口 B 项经边车代理方案（zcode 自主决策、架构师事后追认）于 Day 12-13
+  修复后复跑全 PASS；A×2、B、C1-C6 全过，EXITCODE=0）
+
 ## 3.22.2（2026-09-17）MCP 协议兼容层：11 个本机工具变成标准 MCP Server，外部 AI 可安全调用
 
 ### 目标与边界

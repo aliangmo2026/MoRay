@@ -92,7 +92,7 @@ const ModelsApp = {
           <span id="pullStatusText"></span><span id="pullPercentText"></span>
         </div>
         <!-- [V3 P1.3] 速度与取消 -->
-        <div class="text-[10px] text-text-tertiary mt-0.5 flex justify-between">
+        <div class="text-[10px] text-text-tertiary mt-1 flex justify-between">
           <span id="pullSpeedText"></span>
           <button class="text-danger hover:opacity-80" id="pullCancelBtn" style="display:none">取消下载</button>
         </div>
@@ -154,7 +154,7 @@ function updatePerfUI() {
     const legend = document.getElementById('monitorLegend');
     if (legend) {
       legend.innerHTML = Object.keys(modelColor).map(m =>
-        `<div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full" style="background:${modelColor[m]}"></span><span class="text-[10px] text-text-secondary">${escapeHtml(shortModelName(m))}</span></div>`).join('');
+        `<div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full" style="background:${modelColor[m]}"></span><span class="text-[10px] text-text-secondary">${escapeHtml(shortModelName(m))}</span></div>`).join('');
     }
     // 柱状图
     if (live) live.textContent = data.length ? '实时更新' : '等待请求';
@@ -233,6 +233,12 @@ function startHealthMonitor() {
 /** 设置页应用（重建页面并双向绑定） */
 const SettingsApp = {
   /** 重建设置页面
+   * [断舍离] 内容容器：max-w-2xl(672px) → max-w-4xl(896px) 居中 + 间距 16→20px，宽屏不再拥挤。
+   * ⚠ 容器同时挂了 id="settingsBody"：本函数会整体重建 #page-settings 的 innerHTML，
+   *   而 8 处下游分片（68/69/80/100/110/120/125）靠 `#page-settings .max-w-2xl` 找容器追加各自的
+   *   设置卡。容器换宽度类后那个类选择器就会失效（卡片静默消失），故新增稳定的 id 锚点，
+   *   下游统一改为 `#settingsBody, #page-settings .max-w-2xl` 双选择器：重建后命中 id，
+   *   骨架静态兜底（尚未执行 boot 时）命中旧类名，两条路径都不会落空。
    * @returns {void} */
   build() {
     const page = document.getElementById('page-settings');
@@ -243,8 +249,18 @@ const SettingsApp = {
         <h1 class="text-base font-semibold text-text-primary">设置</h1>
         <span class="text-[10px] text-text-tertiary ml-3">所有配置自动保存到本地 IndexedDB</span>
       </header>
-      <div class="flex-1 overflow-y-auto p-5">
-        <div class="max-w-2xl space-y-4">
+      <div class="flex-1 overflow-y-auto px-6 py-8" id="settingsScrollArea">
+        <!-- [Day21b] 两栏：左=内容区 sticky 导航（替换骨架 #sidebar-settings，项由 buildSideNav 按 DOM 实际卡生成）
+             右=原长卷卡片区。导航是 #settingsBody 的兄弟节点，8 个分片的 appendChild/insertBefore 兜底锚不受影响。 -->
+        <div class="flex items-start gap-5" id="settingsLayout">
+          <nav id="settingsSideNav" aria-label="设置导航"></nav>
+          <div class="max-w-4xl mx-auto space-y-3 flex-1 min-w-0" id="settingsBody">
+
+          <!-- [Day20] 分组标题：基础设置 -->
+          <div class="settings-group-head" data-group="BASE" style="display:flex;align-items:center;gap:8px">
+            <span style="width:3px;height:13px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span>
+            <span style="font-size:13px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.02em">基础设置</span>
+          </div>
 
           <!-- Ollama 服务配置 -->
           <div class="glass-card rounded-xl p-5 border border-line-ghost/60" id="card-model">
@@ -256,7 +272,7 @@ const SettingsApp = {
                 <label class="form-label">服务地址</label>
                 <div class="flex gap-2">
                   <input type="text" id="setOllamaURL" class="form-input" value="${escapeHtml(c.ollamaURL)}" placeholder="http://localhost:11434">
-                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost whitespace-nowrap flex items-center gap-1.5" id="testOllamaBtn">
+                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost whitespace-nowrap flex items-center gap-2" id="testOllamaBtn">
                     <i data-lucide="plug-zap" class="w-3.5 h-3.5"></i>测试连接
                   </button>
                 </div>
@@ -267,17 +283,17 @@ const SettingsApp = {
                   <span class="text-xs text-text-secondary" id="ollamaConnText">未检测</span>
                 </div>
                 <div class="flex items-center gap-2">
-                  <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="refreshModelsBtn">
+                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="refreshModelsBtn">
                     <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>刷新模型
                   </button>
-                  <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="pullModelBtn">
+                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="pullModelBtn">
                     <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>拉取模型
                   </button>
                 </div>
               </div>
-              <div class="space-y-1.5">
+              <div class="space-y-2">
                 <div class="text-xs text-text-tertiary mb-2">已安装模型</div>
-                <div class="space-y-1.5" id="modelListWrap">
+                <div class="space-y-2" id="modelListWrap">
                   <!-- [阶段三] 加载骨架屏 -->
                   <div class="skeleton" style="height:36px;border-radius:8px"></div>
                   <div class="skeleton" style="height:36px;border-radius:8px;opacity:0.7"></div>
@@ -292,6 +308,11 @@ const SettingsApp = {
             <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
               <i data-lucide="globe" class="w-4 h-4 text-brand-violet"></i>OpenAI 兼容 API
             </h3>
+            <!-- [开源友好] 首次使用者的两条路写清楚：本地 Ollama 零 Key 可用；云端只需地址 + Key -->
+            <div class="form-hint" style="margin:-8px 0 12px">
+              首次使用二选一：本机安装 <b>Ollama</b>（无需 Key，模型列表自动探测）；或在此填写任一
+              OpenAI 兼容服务商的接口地址与 API Key（可从「服务商预设」下拉选中自动填地址）。
+            </div>
             <div class="space-y-4">
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">启用（Ollama 不可用时自动作为备用后端）</span>
@@ -327,10 +348,10 @@ const SettingsApp = {
               <div id="proxyModeWrap" style="display:none">
                 <label class="form-label">云端通道（本地后端在线）</label>
                 <div class="flex gap-2">
-                  <button type="button" class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5 justify-center" id="proxyModeBtn" style="flex:1" title="key 只保存在本地后端 server/.env，不进入浏览器">
+                  <button type="button" class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2 justify-center" id="proxyModeBtn" style="flex:1" title="key 只保存在本地后端 server/.env，不进入浏览器">
                     <i data-lucide="shield" class="w-3.5 h-3.5"></i>经本地后端代理
                   </button>
-                  <button type="button" class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5 justify-center" id="directModeBtn" style="flex:1" title="现有方式：key 保存在浏览器本地">
+                  <button type="button" class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2 justify-center" id="directModeBtn" style="flex:1" title="现有方式：key 保存在浏览器本地">
                     <i data-lucide="plug" class="w-3.5 h-3.5"></i>前端直连
                   </button>
                 </div>
@@ -342,21 +363,21 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <button class="text-[10px] text-danger hover:opacity-80" id="clearKeyBtn">清除存储的 API Key</button>
-                <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="testOpenaiBtn">
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="testOpenaiBtn">
                   <i data-lucide="zap" class="w-3.5 h-3.5"></i>测试连接
                 </button>
               </div>
               <!-- [BYOK] 跨域代理帮助 -->
               <details class="rounded-lg bg-surface-panel/60 px-3 py-2">
                 <summary class="text-[10px] text-text-secondary cursor-pointer select-none">浏览器报跨域(CORS)怎么办？</summary>
-                <div class="text-[10px] text-text-tertiary mt-1.5 leading-relaxed">
+                <div class="text-[10px] text-text-tertiary mt-2 leading-relaxed">
                   直连服务商被浏览器跨域拦截时，可部署一个 Cloudflare Worker 透传代理（免费，步骤见 deploy/README.md），
                   然后把"接口地址"按规则替换为代理地址即可，其它设置不变：
                   <code class="block mt-1 break-all">https://你的worker.workers.dev/服务商域名/v1路径</code>
                 </div>
-                <div class="flex gap-1.5 mt-1.5">
-                  <input type="text" id="proxyWorkerHost" class="form-input flex-1" style="font-size:10px;padding:3px 6px" placeholder="你的worker.workers.dev">
-                  <select id="proxyWorkerPreset" class="form-select" style="font-size:10px;padding:3px 6px;width:auto">
+                <div class="flex gap-2 mt-2">
+                  <input type="text" id="proxyWorkerHost" class="form-input flex-1" style="font-size:10px;padding:4px 8px" placeholder="你的worker.workers.dev">
+                  <select id="proxyWorkerPreset" class="form-select" style="font-size:10px;padding:4px 8px;width:auto">
                     <option value="">选服务商</option>
                     ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" data-base="${escapeHtml(p.base)}">${escapeHtml(p.name)}</option>`).join('')}
                   </select>
@@ -374,23 +395,23 @@ const SettingsApp = {
             </h3>
             <!-- [夜间优化4.6] 参数预设 -->
             <div class="flex gap-2 mb-4" id="paramPresets">
-              ${typeof PARAM_PRESETS !== 'undefined' ? PARAM_PRESETS.map(p => `<button type="button" class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost text-text-tertiary hover:text-text-primary" data-param-preset="${p.name}" title="${p.desc}（temp ${p.temp} / top_p ${p.topP}）">${p.name}</button>`).join('') : ''}
+              ${typeof PARAM_PRESETS !== 'undefined' ? PARAM_PRESETS.map(p => `<button type="button" class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost text-text-tertiary hover:text-text-primary" data-param-preset="${p.name}" title="${p.desc}（temp ${p.temp} / top_p ${p.topP}）">${p.name}</button>`).join('') : ''}
             </div>
             <div class="space-y-4">
               <div>
-                <div class="flex justify-between text-xs mb-1.5"><span class="text-text-secondary">Temperature</span><span class="text-text-primary font-mono" id="tempValue">${c.temperature.toFixed(2)}</span></div>
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">Temperature</span><span class="text-text-primary font-mono" id="tempValue">${c.temperature.toFixed(2)}</span></div>
                 <input type="range" min="0" max="2" step="0.05" value="${c.temperature}" id="setTemperature" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div>
-                <div class="flex justify-between text-xs mb-1.5"><span class="text-text-secondary">Top P</span><span class="text-text-primary font-mono" id="topPValue">${c.topP.toFixed(2)}</span></div>
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">Top P</span><span class="text-text-primary font-mono" id="topPValue">${c.topP.toFixed(2)}</span></div>
                 <input type="range" min="0" max="1" step="0.05" value="${c.topP}" id="setTopP" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div>
-                <div class="flex justify-between text-xs mb-1.5"><span class="text-text-secondary">最大生成 Tokens</span><span class="text-text-primary font-mono" id="maxTokValue">${c.maxTokens}</span></div>
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">最大生成 Tokens</span><span class="text-text-primary font-mono" id="maxTokValue">${c.maxTokens}</span></div>
                 <input type="range" min="256" max="16384" step="256" value="${c.maxTokens}" id="setMaxTokens" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div>
-                <div class="flex justify-between text-xs mb-1.5"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${c.contextLimit}</span></div>
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${c.contextLimit}</span></div>
                 <input type="range" min="2048" max="131072" step="2048" value="${c.contextLimit}" id="setContextLimit" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div class="form-row">
@@ -432,16 +453,6 @@ const SettingsApp = {
                 </div>
               </div>
               <div class="flex items-center justify-between">
-                <span class="text-xs text-text-secondary">主题强调色</span>
-                <div class="theme-color-picker">
-                  <div class="theme-color-option ${c.accent === 'cobalt' ? 'active' : ''}" data-accent-set="cobalt" style="background:linear-gradient(135deg,#5B8CFF,#9D7BFF)" title="冷蓝紫"></div>
-                  <div class="theme-color-option ${c.accent === 'cyan' ? 'active' : ''}" data-accent-set="cyan" style="background:linear-gradient(135deg,#3AD6E8,#5B8CFF)" title="青蓝"></div>
-                  <div class="theme-color-option ${c.accent === 'violet' ? 'active' : ''}" data-accent-set="violet" style="background:linear-gradient(135deg,#9D7BFF,#FF6B9D)" title="紫粉"></div>
-                  <div class="theme-color-option ${c.accent === 'green' ? 'active' : ''}" data-accent-set="green" style="background:linear-gradient(135deg,#3FD68F,#3AD6E8)" title="青绿"></div>
-                  <div class="theme-color-option ${c.accent === 'orange' ? 'active' : ''}" data-accent-set="orange" style="background:linear-gradient(135deg,#F2B24C,#FF6B6B)" title="暖橙"></div>
-                </div>
-              </div>
-              <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">消息气泡样式</span>
                 <div class="flex gap-2">
                   <button class="px-3 py-1 rounded-lg text-xs ${c.bubbleStyle !== 'square' ? 'bg-brand-cobalt/15 text-brand-cobalt border border-brand-cobalt/30' : 'text-text-tertiary border border-line-ghost'}" data-bubble-set="round">圆角</button>
@@ -450,7 +461,7 @@ const SettingsApp = {
               </div>
               <div class="flex items-center justify-between">
                 <span class="text-xs text-text-secondary">正文字号</span>
-                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
+                <select id="setFontSize" class="form-select" style="width:auto;padding:4px 12px;font-size:12px">
                   <option value="sm" ${c.fontSize === 'sm' ? 'selected' : ''}>小</option>
                   <option value="md" ${c.fontSize === 'md' ? 'selected' : ''}>标准</option>
                   <option value="lg" ${c.fontSize === 'lg' ? 'selected' : ''}>大</option>
@@ -460,10 +471,16 @@ const SettingsApp = {
                 <span class="text-xs text-text-secondary">减少动效模式</span>
                 <div class="toggle-track ${c.reduceMotion ? 'active' : ''}" id="setReduceMotion"><div class="toggle-thumb"></div></div>
               </div>
+              <!-- [Day24.14] 启动落点开关：localStorage 键 moray_skip_home（'1'/'0'，默认关） -->
+              <div class="flex items-center justify-between">
+                <span class="text-xs text-text-secondary">启动直接进入对话页<span class="block text-[10px] text-text-tertiary mt-1">开启后跳过应用中心首屏，默认打开 MoRay 普通对话</span></span>
+                <div class="toggle-track ${readSkipHomePref() ? 'active' : ''}" id="setSkipHome" title="切换启动首屏：应用中心 / 对话页"><div class="toggle-thumb"></div></div>
+              </div>
               <div class="mt-2 pt-4 border-t border-line-ghost/50">
                 <div class="flex items-center justify-between mb-3">
                   <span class="text-xs text-text-secondary">桌面壁纸</span>
-                  <span class="text-[10px] text-text-tertiary">6 款预设 + 自定义</span>
+                  <!-- [Day22f] 4 项：纯色 + 3 张精选图（原写 3 款精选，加入"纯色"后同步） -->
+                  <span class="text-[10px] text-text-tertiary">4 款精选 + 自定义</span>
                 </div>
                 <div class="wallpaper-picker" id="settingsWallpaperPicker"></div>
               </div>
@@ -507,7 +524,11 @@ const SettingsApp = {
             </div>
           </div>
 
-          <!-- 数据管理 -->
+          <!-- [Day20] 分组标题：系统与数据 -->
+          <div class="settings-group-head" data-group="SYS" style="margin-top:24px;display:flex;align-items:center;gap:8px">
+            <span style="width:3px;height:13px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span>
+            <span style="font-size:13px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.02em">系统与数据</span>
+          </div>
           <div class="glass-card rounded-xl p-5 border border-line-ghost/60" id="card-data">
             <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
               <i data-lucide="database" class="w-4 h-4 text-brand-cobalt"></i>数据管理
@@ -521,24 +542,24 @@ const SettingsApp = {
               <div class="border-t border-line-ghost/40 pt-3 mt-3">
                 <div class="flex items-center justify-between text-xs mb-1">
                   <span class="text-text-secondary">后端同步（SQLite）</span>
-                  <button id="syncToggleBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">开启</button>
+                  <button id="syncToggleBtn" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost">开启</button>
                 </div>
                 <div class="text-[10px] text-text-tertiary mb-2" id="syncInfoText">后端离线，纯前端模式（IndexedDB）</div>
                 <div class="flex flex-wrap gap-2">
-                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="syncNowBtn"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>立即同步</button>
+                  <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="syncNowBtn"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>立即同步</button>
                 </div>
                 <div class="text-[10px] text-text-tertiary mt-2 leading-relaxed" id="syncStatsText"></div>
               </div>
               <div class="flex flex-wrap gap-2 pt-2">
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="exportAllBtn"><i data-lucide="download" class="w-3.5 h-3.5"></i>导出全部数据</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="importAllBtn"><i data-lucide="upload" class="w-3.5 h-3.5"></i>导入数据</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="importChatGPTBtn"><i data-lucide="history" class="w-3.5 h-3.5"></i>导入 ChatGPT 对话</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="restoreBackupBtn"><i data-lucide="archive" class="w-3.5 h-3.5"></i>恢复自动备份</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="errorLogBtn"><i data-lucide="bug" class="w-3.5 h-3.5"></i>错误日志</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-danger/30 text-danger flex items-center gap-1.5" id="clearDataBtn"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i>清除数据</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-danger/30 text-danger flex items-center gap-1.5" id="dangerZoneBtn"><i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>危险操作区</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="clearSamplesBtn"><i data-lucide="eraser" class="w-3.5 h-3.5"></i>清空示例数据</button>
-                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-1.5" id="cleanOrphansBtn" title="清理无归属的孤儿消息（串台残留）"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i>清理孤儿消息</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="exportAllBtn"><i data-lucide="download" class="w-3.5 h-3.5"></i>导出全部数据</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="importAllBtn"><i data-lucide="upload" class="w-3.5 h-3.5"></i>导入数据</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="importChatGPTBtn"><i data-lucide="history" class="w-3.5 h-3.5"></i>导入 ChatGPT 对话</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="restoreBackupBtn"><i data-lucide="archive" class="w-3.5 h-3.5"></i>恢复自动备份</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="errorLogBtn"><i data-lucide="bug" class="w-3.5 h-3.5"></i>错误日志</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-danger/30 text-danger flex items-center gap-2" id="clearDataBtn"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i>清除数据</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-danger/30 text-danger flex items-center gap-2" id="dangerZoneBtn"><i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>危险操作区</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="clearSamplesBtn"><i data-lucide="eraser" class="w-3.5 h-3.5"></i>清空示例数据</button>
+                <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost flex items-center gap-2" id="cleanOrphansBtn" title="清理无归属的孤儿消息（串台残留）"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i>清理孤儿消息</button>
               </div>
               <!-- [批次修复 #4] 存储边界显式说明 -->
               <div class="rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2 text-[10px] text-text-tertiary leading-relaxed mt-2">
@@ -559,8 +580,8 @@ const SettingsApp = {
                 ['⌘/Ctrl + K', '全局命令面板'], ['⌘/Ctrl + 1~6', '切换页面'], ['⌘/Ctrl + F', '搜索会话'],
                 ['⌘/Ctrl + L', '清空输入框'], ['Enter / Shift+Enter', '发送 / 换行'], ['↑ / ↓', '输入历史切换'],
                 ['/', '呼出快捷指令'], ['ESC', '逐级关闭面板']
-              ].map(([k, d]) => `<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/40 last:border-0">
-                <span class="text-text-secondary">${d}</span><kbd class="px-2 py-0.5 font-mono text-[10px] text-text-tertiary bg-surface-floating rounded border border-line-ghost">${k}</kbd>
+              ].map(([k, d]) => `<div class="flex items-center justify-between py-2 border-b border-line-ghost/40 last:border-0">
+                <span class="text-text-secondary">${d}</span><kbd class="px-2 py-1 font-mono text-[10px] text-text-tertiary bg-surface-floating rounded border border-line-ghost">${k}</kbd>
               </div>`).join('')}
             </div>
           </div>
@@ -570,7 +591,7 @@ const SettingsApp = {
             <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
               <i data-lucide="info" class="w-4 h-4 text-brand-cyan"></i>关于 MoRay
             </h3>
-            <button class="btn-ghost w-full px-3 py-2 rounded-lg text-xs border border-line-ghost mb-3 flex items-center gap-1.5 justify-center" id="replayOnboardingBtn">
+            <button class="btn-ghost w-full px-3 py-2 rounded-lg text-xs border border-line-ghost mb-3 flex items-center gap-2 justify-center" id="replayOnboardingBtn">
               <i data-lucide="sparkles" class="w-3.5 h-3.5 text-brand-cobalt"></i>重新查看新手引导
             </button>
             <div class="space-y-2 text-xs text-text-secondary">
@@ -581,14 +602,180 @@ const SettingsApp = {
             </div>
           </div>
 
-        </div>
+          <!-- [Day20] 哨兵：兜底锚（insertBefore lastElementChild 的分片落在此处，静态区保持完整） -->
+          <div id="settingsTailAnchor" aria-hidden="true" style="display:none"></div>
+          </div><!-- /#settingsBody -->
+        </div><!-- /#settingsLayout -->
       </div>`;
     this.bind();
-    // [v3.21.0] 设置页重建后重新挂上「Agent 编排」卡（由任务分派分片提供，幂等）
-    if (window.__taskDispatch && typeof window.__taskDispatch.appendRunSettingsCard === 'function') {
-      try { window.__taskDispatch.appendRunSettingsCard(); } catch (e) { /* 卡挂失败不影响设置页 */ }
+    // [Day23] 同上：设置页重建后重新挂上「执行引擎」卡（part 85 提供，幂等；异步失败静默）
+    if (typeof appendEnginesSettings === 'function') {
+      try { appendEnginesSettings().catch(() => { /* 卡挂失败不影响设置页 */ }); }
+      catch (e) { /* 同步异常同样忽略 */ }
     }
     refreshIcons();
+    // [Day21b] 替换式两栏第一步：隐藏骨架卡片级子导航 #sidebar-settings（只隐藏不删，骨架零改动；
+    // 内联 display 稳压切页脚本对它的 hidden/flex 类切换，无需 !important）
+    const legacyNav = document.getElementById('sidebar-settings');
+    if (legacyNav) legacyNav.style.display = 'none';
+    // [Day21b] 第二步：构建内容区左侧导航（按 DOM 实际卡片动态生成；分片异步追加的卡由 MutationObserver 收编）
+    try { this.buildSideNav(); } catch (e) { console.warn('[MoRay] 设置侧导航构建失败:', e); }
+  },
+
+  /** [Day21b/c] 内容区左侧导航：按 #settingsBody 直接子级 .glass-card 的实际 DOM 动态生成
+   * （无 id 卡自动补 id；分片异步追加/重建的卡由 MutationObserver 收编，导航随卡集合自动重建）。
+   * [Day21c] 项按 GROUP_MAP 分四组渲染（基础设置 / Agent 与工具 / 系统与数据 / 关于），每项带 lucide 图标。
+   * 点击平滑滚动到对应卡；滚动时按「最后一张越过判定线的卡」高亮当前项（root=设置页滚动容器）。
+   * 监听器挂在 build() 新建节点上或随重建 disconnect/去重，设置页重建不会叠加。
+   * @returns {void} */
+  buildSideNav() {
+    const body = document.getElementById('settingsBody');
+    const nav = document.getElementById('settingsSideNav');
+    if (!body || !nav) return;
+    const cards = Array.from(body.querySelectorAll(':scope > .glass-card'));
+    if (!cards.length) return;
+    // 重建前清理上一轮观察器（build() 重建页面后旧节点已随 DOM 丢弃）
+    if (this._sideNavIO) { this._sideNavIO.disconnect(); this._sideNavIO = null; }
+    if (this._sideNavMO) { this._sideNavMO.disconnect(); this._sideNavMO = null; }
+    // 卡名取 h3 首个文本节点（网关/洞察卡的 h3 内嵌状态 span，textContent 会带出实时状态噪声）
+    const labelOf = (h3, i) => {
+      if (h3) for (const nd of h3.childNodes) {
+        if (nd.nodeType === 3 && nd.textContent.trim()) return nd.textContent.trim();
+      }
+      return (h3 && h3.textContent.trim().split('\n')[0].trim()) || ('设置 ' + (i + 1));
+    };
+    cards.forEach((card, i) => {
+      if (!card.id) card.id = 'card-settings-' + (i + 1);
+      card.dataset.sideLabel = labelOf(card.querySelector('h3'), i);
+    });
+    /* [Day21c] 分组表：key 为卡名（h3 首文本节点）。实际卡名可能带后缀，
+       故先精确匹配、再取最长前缀匹配；两者都未命中则归入 basic 并 warning（新增卡不丢导航项）。 */
+    const GROUP_MAP = {
+      'Ollama 本地服务': 'basic', 'OpenAI 兼容 API': 'basic', '生成参数': 'basic', '界面设置': 'basic',
+      '对话设置': 'basic', '数据管理': 'basic', '快捷键': 'basic',
+      'AI 工具': 'agent', '本机 Agent': 'agent', 'API 智能网关': 'agent',
+      '执行引擎': 'agent',
+      '成本与省钱': 'system', '隐私与增强': 'system', '数据洞察': 'system',
+      '关于 MoRay': 'about'
+    };
+    /* [Day21c] 图标表（lucide 名，须存在于 vendor/lucide.min.js v0.468.0）：
+       未命中的项回退到该卡 h3 自带的 data-lucide 图标名，再兜底 circle（不手绘 SVG）。 */
+    const ICON_MAP = {
+      'Ollama 本地服务': 'cpu', 'OpenAI 兼容 API': 'plug', '生成参数': 'sliders', '界面设置': 'palette',
+      '对话设置': 'message-circle', '数据管理': 'database', '快捷键': 'keyboard',
+      'AI 工具': 'wrench', '本机 Agent': 'terminal', 'API 智能网关': 'zap',
+      // [Day23] 执行引擎卡必须显式登记：buildSideNav 的图标回退读 h3 里的 <i data-lucide>，
+      // 而本卡挂载时 refreshIcons 已把 <i> 换成 <svg>，回退必然取空 → 退化成 circle（实测）
+      '执行引擎': 'box',
+      '成本与省钱': 'coins', '隐私与增强': 'shield', '数据洞察': 'bar-chart-2',
+      '关于 MoRay': 'info'
+    };
+    const GROUP_ORDER = [
+      { id: 'basic', title: '基础设置' }, { id: 'agent', title: 'Agent 与工具' },
+      { id: 'system', title: '系统与数据' }, { id: 'about', title: '关于' }
+    ];
+    const matchKey = (label, table) => {
+      if (table[label] != null) return label;
+      let hit = null;
+      Object.keys(table).forEach(k => { if (label.indexOf(k) === 0 && (!hit || k.length > hit.length)) hit = k; });
+      return hit;
+    };
+    const groupOf = {};
+    const iconOf = {};
+    cards.forEach(card => {
+      const label = card.dataset.sideLabel;
+      const gk = matchKey(label, GROUP_MAP);
+      if (!gk) console.warn('[MoRay] 设置导航：未知卡「' + label + '」，已归入基础设置（如需分组请在 GROUP_MAP 登记）');
+      groupOf[card.id] = gk ? GROUP_MAP[gk] : 'basic';
+      const ik = matchKey(label, ICON_MAP);
+      const own = card.querySelector('h3 i[data-lucide]');
+      iconOf[card.id] = ik ? ICON_MAP[ik] : ((own && own.getAttribute('data-lucide')) || 'circle');
+    });
+    nav.innerHTML = GROUP_ORDER.map(g => {
+      const list = cards.filter(c => groupOf[c.id] === g.id);
+      if (!list.length) return '';
+      return `<div class="nav-group" data-group="${g.id}">` +
+        `<div class="nav-group-title">${g.title}</div>` +
+        list.map(card => `<a class="settings-side-item" data-side-target="${escapeHtml(card.id)}"` +
+          ` title="${escapeHtml(card.dataset.sideLabel)}">` +
+          `<i data-lucide="${escapeHtml(iconOf[card.id])}"></i>` +
+          `<span>${escapeHtml(card.dataset.sideLabel)}</span></a>`).join('') +
+        `</div>`;
+    }).join('');
+    // 图标渲染走项目既有安全封装（骨架定义的 refreshIcons → lucide.createIcons，库缺失时静默降级）
+    if (typeof refreshIcons === 'function') refreshIcons();
+    // 点击滚动（composedPath 委托：refreshIcons 重渲染会把被点的节点变成游离节点，closest 会取空）
+    nav.onclick = (e) => {
+      const path = e.composedPath ? e.composedPath() : [];
+      const item = path.find(n => n && n.classList && n.classList.contains('settings-side-item'));
+      if (!item) return;
+      const card = document.getElementById(item.dataset.sideTarget);
+      if (!card) return;
+      this._sideNavSetActive(item.dataset.sideTarget);
+      // 点击后短暂锁定高亮，避免滚动途中被 IntersectionObserver 抢走
+      this._sideNavLock = item.dataset.sideTarget;
+      clearTimeout(this._sideNavLockTimer);
+      this._sideNavLockTimer = setTimeout(() => { this._sideNavLock = null; }, 800);
+      const reduce = !!MoraySettings.get('reduceMotion');
+      card.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+    };
+    // 滚动高亮：当前项 = DOM 序中最后一张「顶边越过判定线（滚动机上沿+140px）」的卡（文档站 spy 惯例），
+    // 滚到底强制最后一项。触发源双通道：IntersectionObserver（频带交叉，含非滚动变化）+ rAF 节流的
+    // scroll 监听（卡顶在频带内穿判定线不触发 IO，须由 scroll 补齐）。滚动监听只装一次，经
+    // _sideNavCompute 蹦床调用最新闭包，防 MutationObserver 重建后拿到过期卡列表。
+    const scroller = document.getElementById('settingsScrollArea');
+    if (scroller) {
+      const computeActive = () => {
+        if (this._sideNavLock) return;
+        const threshold = scroller.getBoundingClientRect().top + 140;
+        let current = cards[0].id;
+        cards.forEach(c => { if (c.getBoundingClientRect().top <= threshold) current = c.id; });
+        if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8) current = cards[cards.length - 1].id;
+        this._sideNavSetActive(current);
+      };
+      this._sideNavCompute = computeActive;
+      if (typeof IntersectionObserver !== 'undefined') {
+        const io = new IntersectionObserver(() => computeActive(), { root: scroller, rootMargin: '0px 0px -60% 0px', threshold: 0 });
+        cards.forEach(c => io.observe(c));
+        this._sideNavIO = io;
+      }
+      if (!scroller.dataset.sideNavScroll) {
+        scroller.dataset.sideNavScroll = '1';
+        let ticking = false;
+        scroller.addEventListener('scroll', () => {
+          if (ticking) return;
+          ticking = true;
+          requestAnimationFrame(() => { ticking = false; if (this._sideNavCompute) this._sideNavCompute(); });
+        }, { passive: true });
+      }
+    }
+    this._sideNavSetActive(cards[0].id);
+    // 分片异步追加/重建卡（成本/网关/工具/本机 Agent/编排工头等）→ 卡集合变化时防抖重建导航
+    if (typeof MutationObserver !== 'undefined') {
+      let tm = null;
+      const mo = new MutationObserver(() => {
+        clearTimeout(tm);
+        tm = setTimeout(() => {
+          if (document.getElementById('settingsBody') !== body) return; // 页面已重建，旧观察器自然失效
+          const sig = Array.from(body.querySelectorAll(':scope > .glass-card')).map(c => c.id).join('|');
+          if (sig !== this._sideNavSig) this.buildSideNav();
+        }, 80);
+      });
+      mo.observe(body, { childList: true });
+      this._sideNavMO = mo;
+    }
+    this._sideNavSig = cards.map(c => c.id).join('|');
+  },
+
+  /** [Day21b] 侧导航高亮指定卡
+   * @param {string} cardId - 目标卡 id
+   * @returns {void} */
+  _sideNavSetActive(cardId) {
+    const nav = document.getElementById('settingsSideNav');
+    if (!nav) return;
+    nav.querySelectorAll('.settings-side-item.active').forEach(i => i.classList.remove('active'));
+    const item = nav.querySelector('[data-side-target="' + cardId + '"]');
+    if (item) item.classList.add('active');
   },
 
   /** 绑定设置页全部控件
@@ -839,10 +1026,6 @@ const SettingsApp = {
       await MoraySettings.set('theme', b.dataset.themeSet);
       this.build();
     }));
-    document.querySelectorAll('[data-accent-set]').forEach(b => b.addEventListener('click', async () => {
-      await MoraySettings.set('accent', b.dataset.accentSet);
-      showNotification('强调色已切换', b.title, 'success', 1200);
-    }));
     document.querySelectorAll('[data-bubble-set]').forEach(b => b.addEventListener('click', async () => {
       await MoraySettings.set('bubbleStyle', b.dataset.bubbleSet);
       this.build();
@@ -851,6 +1034,11 @@ const SettingsApp = {
     on($('setReduceMotion'), 'click', async function () {
       this.classList.toggle('active');
       await MoraySettings.set('reduceMotion', this.classList.contains('active'));
+    });
+    // [Day24.14] 启动落点开关：持久化到 localStorage 键 moray_skip_home（'1'/'0'）
+    on($('setSkipHome'), 'click', function () {
+      this.classList.toggle('active');
+      try { localStorage.setItem('moray_skip_home', this.classList.contains('active') ? '1' : '0'); } catch (e) { /* 存储不可用时本次不持久化 */ }
     });
     this.renderWallpaperPicker();
     // 对话
@@ -888,7 +1076,7 @@ const SettingsApp = {
         <div class="space-y-2">
           <p class="text-xs text-text-tertiary mb-2">按类型清除本地数据，操作不可恢复：</p>
           ${[['conversations', '会话与消息'], ['prompts', '提示词'], ['snippets', '代码片段'], ['documents', '文档与向量'], ['workflows', '工作流']].map(([s, n]) => `
-            <label class="flex items-center gap-2 text-sm text-text-secondary cursor-pointer py-1.5">
+            <label class="flex items-center gap-2 text-sm text-text-secondary cursor-pointer py-2">
               <input type="checkbox" data-clear-store="${s}" class="accent-danger w-3.5 h-3.5">${n}
             </label>`).join('')}
         </div>`, { title: '清除数据', icon: 'trash-2',
@@ -916,11 +1104,26 @@ const SettingsApp = {
   renderWallpaperPicker() {
     const picker = document.getElementById('settingsWallpaperPicker');
     if (!picker) return;
-    const saved = (() => { try { return localStorage.getItem('moray_wallpaper') || 'anime-starry'; } catch (e) { return 'anime-starry'; } })();
-    const walls = [['aurora', '极光', 'wallpaper-aurora'], ['deep-space', '深空', 'wallpaper-deep-space'], ['gradient', '渐变', 'wallpaper-gradient'], ['mountain', '山脉', 'wallpaper-mountain'], ['cyber', '赛博', 'wallpaper-cyber'], ['pure', '纯黑', 'wallpaper-pure'],
-      ['anime-starry', '星夜', 'wallpaper-anime-starry'], ['anime-aurora', '极光动漫', 'wallpaper-anime-aurora'], ['anime-window', '窗边', 'wallpaper-anime-window']];
-    picker.innerHTML = walls.map(([k, n, cls]) => `
-      <div class="wallpaper-option ${cls} ${saved === k ? 'active' : ''}" data-wallpaper="${k}" onclick="switchWallpaper('${k}')"><span class="wallpaper-option-label">${n}</span></div>`).join('') + `
+    // [Day22f] 默认值随 110 的默认壁纸一起改为 'pure'（否则新用户会看到"星夜"被选中、实际却是纯色态）
+    const saved = (() => { try { return localStorage.getItem('moray_wallpaper') || 'pure'; } catch (e) { return 'pure'; } })();
+    /* [断舍离] 只保留 3 张动漫图片壁纸。旧版 6 款暗色预设（aurora/deep-space/gradient/
+       mountain/cyber/pure）的底色全是 #0A0C14 / #070910 一类近黑色，彼此主色差 ≤3/255，
+       肉眼无法区分，只是让界面看起来灰蒙蒙，故从「设置页可选列表」移除。
+       仅动本列表：110_polish.js 的 __WALL_LIST、.wallpaper-* 样式与骨架 switchWallpaper
+       全部保留，老用户已保存的暗色壁纸值照旧生效（向后兼容），只是不再出现在选择器里。 */
+    /* [Day22f] 把「纯色」（pure）作为第一项补回列表：Day22e 把默认壁纸改成 pure 之后，
+       选择器里没有这一项 → 用户一旦选了图片壁纸就再也切不回纯色（单向门，属回归）。
+       它不用图片类名，直接用内联底色 #0a0a0a（与 110 的 [data-wallpaper="pure"] 穿透参数一致：
+       --wall-panel-alpha .96 / --wall-card-alpha .94 铺在这层近黑底上）。
+       选中态沿用既有的 saved === 键名 判断，switchWallpaper('pure') 由骨架函数负责换 attr/类/持久化。 */
+    const walls = [
+      ['pure', '纯色', '', 'background:#0a0a0a'],
+      ['anime-starry', '星夜', 'wallpaper-anime-starry', ''],
+      ['anime-aurora', '极光动漫', 'wallpaper-anime-aurora', ''],
+      ['anime-window', '窗边', 'wallpaper-anime-window', '']
+    ];
+    picker.innerHTML = walls.map(([k, n, cls, st]) => `
+      <div class="wallpaper-option ${cls} ${saved === k ? 'active' : ''}" style="${st}" data-wallpaper="${k}" onclick="switchWallpaper('${k}')"><span class="wallpaper-option-label">${n}</span></div>`).join('') + `
       <div class="wallpaper-option custom-upload" onclick="document.getElementById('customWallpaperInput').click()">
         <i data-lucide="image-plus" class="w-5 h-5"></i><span>自定义</span>
       </div>
@@ -1068,6 +1271,14 @@ function migrateLegacyStorage() {
   } catch (e) { console.warn('[MoRay] storage migration failed:', e); }
 }
 
+/** [Day24.14] 「启动直接进入对话页」偏好（localStorage 直读，键 moray_skip_home）。
+    不走 MoraySettings：这是启动路径上的判定，需要在任何时机无依赖可读；
+    值约定 '1'/'0'（与 MoraySettings.MIRROR_KEYS 的镜像值同构），缺省/损坏 = false。
+    @returns {boolean} */
+function readSkipHomePref() {
+  try { return localStorage.getItem('moray_skip_home') === '1'; } catch (e) { return false; }
+}
+
 async function bootApp() {
   try {
     // [健壮 P0-4] 启动链韧性：每步独立 try-catch，任一模块失败只记录到 ErrorLog，不影响其余绑定
@@ -1099,7 +1310,7 @@ async function bootApp() {
       await cleanupDemoConversations();
       // [缓存根治] 版本升级后首次启动一次性清空旧语义缓存（MoraySettings.lastCacheWipeVersion 记录，只执行一次）
       try {
-        const APP_VERSION = 'v3.22.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
+        const APP_VERSION = 'v3.25.0'; // 版本号升级时同步更新此处（与 CHANGELOG 保持一致）
         localStorage.removeItem('moray_cache_purge_v3_10_10'); // 清理旧的 localStorage 一次性标志（已迁移到 MoraySettings）
         if (MoraySettings.get('lastCacheWipeVersion') !== APP_VERSION) {
           await CacheStore.clear();
@@ -1130,6 +1341,10 @@ async function bootApp() {
         attachAutoPagination(PromptsApp, 50);
         attachAutoPagination(SnippetsApp, 50);
       }
+    });
+    // [Argus 深度研究] 接续刷新前没跑完的研究任务：状态完成时报告仍会自动追加到原会话
+    await runStep('argus-watch', async () => {
+      if (typeof ArgusWatcher !== 'undefined') ArgusWatcher.resumePending();
     });
     await runStep('prompts', async () => { PromptsApp.bindEvents(); await PromptsApp.reload(); });
     await runStep('snippets', async () => { SnippetsApp.bindEvents(); await SnippetsApp.reload(); });
@@ -1184,6 +1399,12 @@ async function bootApp() {
       // [阶段0 本机 Agent] 设置分区 + 顶部轻提示 + 按钮态同步（按钮已由 30_chat 文件尾安装，
       // 但彼时 MoraySettings 未初始化，需在设置就绪后按持久化状态刷新按钮高亮）
       if (typeof appendAgentSettings === 'function') appendAgentSettings();
+      // [Day23] 执行引擎卡：必须排在 appendAgentSettings 之后调用，才能紧跟「本机 Agent」卡落位
+      // （本卡自身幂等且会按锚点复议位置，与 build() 内的那次调用不冲突）
+      if (typeof appendEnginesSettings === 'function') {
+        try { appendEnginesSettings().catch(() => { /* 卡挂失败不影响设置页 */ }); }
+        catch (e) { /* 同步异常同样忽略 */ }
+      }
       if (typeof syncNativeAgentBtn === 'function') syncNativeAgentBtn();
       if (typeof refreshNativeAgentBanner === 'function') refreshNativeAgentBanner();
       // [批次修复 #2] 上次会话开启过本机工具 → 应用 Agent 推荐默认模型（当前模型自检通过则跳过）
@@ -1256,7 +1477,33 @@ async function bootApp() {
       }, true); // 捕获阶段先于第一阶段处理器
     });
 
-    // 12. 欢迎通知：由探测模块在探测完成后生成（状态文案准确，见 110_polish.js probeBackend）
+    // 12. 应用中心（Day24.12）：注入左导航首位入口 + 独立页面 + 7 张生态卡，
+    //     并按「启动直接进入对话页」偏好决定落点（Day24.14：默认仍进应用中心，
+    //     开启开关则跳过首屏直落对话页；mount 的挂载逻辑照常，应用中心仍可达）
+    await runStep('home-apps', async () => {
+      if (window.HomeAppsApp && typeof window.HomeAppsApp.mount === 'function') {
+        window.HomeAppsApp.mount({ landing: readSkipHomePref() ? 'chat' : 'apps' });
+      }
+    });
+
+    // 12.5 [Day24b] ZCode 任务流监控面板（对话页右侧 320px SSE 时间线；纯新增分片，
+    //      仅此一处挂载调用；面板挂 body 不进消息区，挂载失败不影响启动流程）
+    await runStep('zcode-stream', async () => {
+      if (window.MorayZCodeStream && typeof window.MorayZCodeStream.mount === 'function') {
+        window.MorayZCodeStream.mount();
+      }
+    });
+
+    // 12.75 [M4a 2026-10-02] 记忆浏览器（只读版）：左导航「记忆库」页 + memoryRecallEnabled
+    //      开关 + 列表/过滤/刷新；数据源 window.MorayMemory.list（显式报错不静默）。
+    //      不抢启动落点（mount 不切页），挂载失败不影响启动流程（runStep 自兜底）
+    await runStep('memory-browser', async () => {
+      if (window.MorayMemoryBrowser && typeof window.MorayMemoryBrowser.mount === 'function') {
+        window.MorayMemoryBrowser.mount();
+      }
+    });
+
+    // 13. 欢迎通知：由探测模块在探测完成后生成（状态文案准确，见 110_polish.js probeBackend）
   } catch (e) {
     console.error('[MoRay] boot failed:', e);
     if (typeof ErrorLog !== 'undefined') ErrorLog.push('boot', (e && e.stack) ? e.stack : String(e.message || e));
