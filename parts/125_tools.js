@@ -125,11 +125,58 @@ const ToolRegistry = {
       if (name === 'move_file') return '移动 ' + (a.from || '') + ' → ' + (a.to || '');
       if (name === 'list_processes') return '查看进程' + (a.sort === 'pid' ? '（按 PID）' : '（占内存前 ' + (a.limit || 30) + ' 条）');
       if (name === 'system_info') return '读取系统概览（只读）';
+      // [Argus 深度研究] 研究类工具的可读摘要
+      if (name === 'detective_research') return '启动调研「' + String(a.question || '').slice(0, 40) + '」';
+      if (name === 'detective_status') return '查询研究进度 ' + String(a.session_id || '');
       const s = JSON.stringify(a);
       return s.length > 120 ? s.slice(0, 120) + '…' : s;
     } catch (e) {
       return String(JSON.stringify(a)).slice(0, 120);
     }
+  },
+
+  /** 从成功写文件的步骤中提取产物信息（无产物返回 null）
+   * 路径优先取入参（native 工具为工作区相对路径），入参缺失时回退解析结果 JSON；
+   * 仅用于展示层，不做任何文件系统访问（读取由 previewArtifact 走只读工具）。
+   * @param {Object} evt - 步骤事件 {name,args,status,resultFull}
+   * @returns {{path:string, bytes:number|null, action:string}|null} */
+  artifactFromStep(evt) {
+    if (!evt || evt.status !== 'success') return null;
+    if (evt.name !== 'create_file' && evt.name !== 'write_file') return null;
+    const a = evt.args || {};
+    const raw = evt.resultFull != null ? String(evt.resultFull) : '';
+    let data = null;
+    if (raw.charAt(0) === '{') {
+      try { data = JSON.parse(raw); } catch (e) { data = null; }
+    }
+    const path = String((a && a.path) || (data && data.path) || '').trim();
+    if (!path) return null;
+    let bytes = (data && data.bytes != null) ? Number(data.bytes) : null;
+    if (bytes == null && typeof a.content === 'string') bytes = a.content.length;
+    if (bytes != null && (!isFinite(bytes) || bytes < 0)) bytes = null;
+    const action = (data && data.created) ? '新建'
+      : ((data && data.written) ? '写入' : (evt.name === 'create_file' ? '新建' : '写入'));
+    return { path, bytes, action };
+  },
+
+  /** 产物卡片 HTML（成功写文件时替代原始 JSON 结果；原始结果保留在折叠区）
+   * @param {Object} art - artifactFromStep 的返回值
+   * @returns {string} HTML */
+  artifactCardHtml(art) {
+    const path = String((art && art.path) || '');
+    if (!path) return '';
+    const size = art.bytes != null
+      ? (art.bytes >= 1024 ? (art.bytes / 1024).toFixed(1) + ' KB' : art.bytes + ' B')
+      : '';
+    const meta = [art.action || '', size].filter(Boolean).join(' · ');
+    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2">' +
+      '<i data-lucide="file-code" class="w-4 h-4 text-brand-cobalt shrink-0"></i>' +
+      '<div class="min-w-0 flex-1">' +
+      '<div class="text-[11px] text-text-primary font-medium truncate" title="' + escapeHtml(path) + '">' + escapeHtml(path) + '</div>' +
+      (meta ? '<div class="text-[10px] text-text-tertiary">' + escapeHtml(meta) + '</div>' : '') +
+      '</div>' +
+      '<button type="button" data-preview-path="' + escapeHtml(path) + '" class="shrink-0 px-2.5 py-1 rounded-md text-[10px] font-medium text-brand-cobalt bg-brand-cobalt/15 border border-brand-cobalt/25 hover:opacity-90">预览代码</button>' +
+      '</div>';
   },
 
   /** 单步事件 → 步骤卡 HTML（进行中脉冲 / 待审批 / 成功 / 失败(可重试) / 已拒绝
@@ -142,11 +189,15 @@ const ToolRegistry = {
       save_snippet: 'save', run_workflow: 'workflow', get_cost_usage: 'wallet',
       // [阶段0 本机 Agent] 本机工具图标
       list_directory: 'folder', read_file: 'file-text', write_file: 'file-pen-line', run_command: 'terminal',
+      // [Laya v3] ZCode 执行引擎/子智能体
+      zcode_run: 'play', zcode_sub_agent: 'bot',
       // [阶段1 M2] 高价值三工具
       find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen',
       // [3.20 阶段3] 新增本机工具
       create_file: 'file-plus-2', rename_file: 'file-pen', move_file: 'folder-input',
-      list_processes: 'activity', system_info: 'cpu'
+      list_processes: 'activity', system_info: 'cpu',
+      // [Argus 深度研究] 研究工具图标
+      detective_research: 'telescope', detective_status: 'radar'
     };
     const icon = iconMap[evt.name] || 'wrench';
     const label = evt.label || evt.name;
@@ -162,34 +213,40 @@ const ToolRegistry = {
     // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
     // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
     const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
+    const artifact = this.artifactFromStep(evt);
     // [3.20 修复] 这里必须是 let：下面 4 个分支都要对 body 重新赋值，
     // 原来是 const → 每次步骤卡渲染都抛 "Assignment to constant variable"，
     // 进而让 emit() 抛出、Gateway.runWithTools 中断并回退普通流式（工具轮直接失效）
     let body = '';
     if (evt.status === 'error') {
-      body = '<div class="text-[10px] text-danger mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
+      body = '<div class="text-[10px] text-danger mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
     } else if (evt.status === 'denied') {
-      body = '<div class="text-[10px] text-warning mt-1.5">' + escapeHtml(full || '用户拒绝了该操作') + '</div>';
+      body = '<div class="text-[10px] text-warning mt-2">' + escapeHtml(full || '用户拒绝了该操作') + '</div>';
+    } else if (artifact) {
+      // 成功写文件：默认展示产物卡片，原始 JSON 收进折叠区（排查用，不再占屏）
+      body = this.artifactCardHtml(artifact) +
+        (full ? '<details class="mt-2"><summary class="text-[10px] text-text-tertiary cursor-pointer select-none">查看原始结果</summary>' +
+          '<div class="text-[10px] text-text-tertiary mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-full>' + escapeHtml(full) + '</div></details>' : '');
     } else if (full) {
-      body = '<div class="text-[10px] text-text-tertiary mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all" data-tool-full>' + escapeHtml(full) + '</div>';
+      body = '<div class="text-[10px] text-text-tertiary mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all" data-tool-full>' + escapeHtml(full) + '</div>';
     }
     // [批次修复 #7] 重放标记：该步被“重试该步”重放过（仅重新执行工具，不自动改写已生成回复）
     if (evt.replayed) {
       const changedNote = evt.replayed.changed ? '结果与上次不同（已更新）' : '结果与上次一致';
-      body = '<div class="flex items-center gap-1.5 mt-1.5 text-[10px] text-warning"><i data-lucide="rotate-cw" class="w-3 h-3"></i>' +
+      body = '<div class="flex items-center gap-2 mt-2 text-[10px] text-warning"><i data-lucide="rotate-cw" class="w-3 h-3"></i>' +
         '已重放该步（仅重新执行工具，不自动改写已生成回复）· ' + escapeHtml(changedNote) +
         ' · 可点回复右上「重新生成」让模型基于最新结果作答</div>' + body;
     }
     const retry = evt.status === 'error' && evt.name
-      ? '<button data-tool-retry="' + evt.index + '" class="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-warning hover:bg-surface-panel flex items-center gap-1 text-[10px]" title="重新执行本步骤（走完整安全层与审批）"><i data-lucide="rotate-cw" class="w-3 h-3"></i>重试该步</button>'
+      ? '<button data-tool-retry="' + evt.index + '" class="ml-auto shrink-0 rounded-md px-2 py-1 text-text-tertiary hover:text-warning hover:bg-surface-panel flex items-center gap-1 text-[10px]" title="重新执行本步骤（走完整安全层与审批）"><i data-lucide="rotate-cw" class="w-3 h-3"></i>重试该步</button>'
       : '';
     const copyBtn = full && evt.status !== 'error'
-      ? '<button class="tool-step-copy ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-text-tertiary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" data-tool-copy title="复制完整结果" data-full="' + escapeHtml(full) + '"><i data-lucide="copy" class="w-3 h-3"></i>复制</button>'
+      ? '<button class="tool-step-copy ml-auto shrink-0 rounded-md px-2 py-1 text-text-tertiary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" data-tool-copy title="复制完整结果" data-full="' + escapeHtml(full) + '"><i data-lucide="copy" class="w-3 h-3"></i>复制</button>'
       : '';
     const actions = (copyBtn || retry)
       ? '<span class="ml-auto flex items-center gap-1">' + copyBtn + retry + '</span>'
       : '';
-    const open = evt.status === 'running' || evt.status === 'pending' ? ' open' : '';
+    const open = (evt.status === 'running' || evt.status === 'pending' || artifact) ? ' open' : '';
     return '<details class="tool-step rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2" data-tool-step="' + evt.index + '" data-status="' + (evt.status || '') + '" data-ms="' + (evt.ms || 0) + '"' + open + '>' +
       '<summary class="flex items-center gap-2 cursor-pointer list-none text-[11px] select-none">' +
       '<i data-lucide="' + icon + '" class="w-3.5 h-3.5 ' + color + '"></i>' +
@@ -225,7 +282,7 @@ const ToolRegistry = {
       '<i data-lucide="list-tree" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
       '<span data-steps-summary-text>' + escapeHtml(summaryText) + '</span>' +
       '<span class="text-[10px] text-text-tertiary ml-auto" data-steps-hint>展开</span></div>' +
-      '<div class="tool-steps space-y-1.5" style="display:none">' + stepsHtml + '</div></div>';
+      '<div class="tool-steps space-y-2" style="display:none">' + stepsHtml + '</div></div>';
   },
 
   /** [阶段0.5] 全部步骤到终态 → 把时间线折叠为摘要行（不改变 DOM 结构，只切换可见性）
@@ -265,7 +322,7 @@ const ToolRegistry = {
         '<i data-lucide="list-tree" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
         '<span data-steps-summary-text></span>' +
         '<span class="text-[10px] text-text-tertiary ml-auto" data-steps-hint>展开</span></div>' +
-        '<div class="tool-steps space-y-1.5"></div>';
+        '<div class="tool-steps space-y-2"></div>';
       const inner = bubbleEl.querySelector('.ai-msg-inner');
       if (inner) inner.parentElement.insertBefore(wrap, inner); // 最终回复之前
       else bubbleEl.appendChild(wrap);
@@ -348,6 +405,20 @@ const ToolRegistry = {
     if (this.__copyBound) return;
     this.__copyBound = true;
     document.addEventListener('click', (e) => {
+      // 产物卡片 / Laya 摘要：点击路径 → 应用内只读预览。
+      // 用 composedPath 而非 e.target.closest：refreshIcons 会把 <i> 换成 <svg>，
+      // 被点节点可能已游离，closest 会返回 null（本仓库既有踩坑）。
+      const evPath = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+      for (let i = 0; i < evPath.length; i++) {
+        const n = evPath[i];
+        if (n && n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-preview-path')) {
+          e.preventDefault();
+          e.stopPropagation();
+          const p = n.getAttribute('data-preview-path');
+          if (p) previewArtifact(p);
+          return;
+        }
+      }
       // [阶段0.5] 时间线摘要行：展开/收起完整时间线
       const toggle = e.target.closest('[data-steps-toggle]');
       if (toggle) {
@@ -422,6 +493,368 @@ const ToolRegistry = {
     }
   }
 };
+
+/** 文件扩展名 → highlight.js 语言标识（未知返回空串）
+ * @param {string} name - 文件名或路径
+ * @returns {string} 语言标识 */
+function artifactLangForFile(name) {
+  const ext = (String(name || '').split('.').pop() || '').toLowerCase();
+  const langMap = {
+    py: 'python', js: 'javascript', ts: 'typescript', jsx: 'javascript', tsx: 'typescript',
+    json: 'json', html: 'html', htm: 'html', css: 'css', md: 'markdown', markdown: 'markdown', svg: 'xml',
+    yaml: 'yaml', yml: 'yaml', sh: 'bash', bat: 'batch', ps1: 'powershell',
+    txt: 'text', c: 'c', h: 'c', cpp: 'cpp', java: 'java', go: 'go', rs: 'rust', sql: 'sql'
+  };
+  return langMap[ext] || '';
+}
+
+/** 文件扩展名（小写，不含点） */
+function artifactExt(name) {
+  const s = String(name || '');
+  const i = s.lastIndexOf('.');
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : '';
+}
+
+/** 预览分流用的后缀集合（raster 走图片预览；其余图片后缀提示不支持；二进制不尝试文本解码） */
+const ARTIFACT_RASTER_EXTS = { png: 1, jpg: 1, jpeg: 1, gif: 1, webp: 1 };
+const ARTIFACT_IMAGE_EXTS = { png: 1, jpg: 1, jpeg: 1, gif: 1, webp: 1, bmp: 1, ico: 1, avif: 1 };
+const ARTIFACT_BINARY_EXTS = {
+  zip: 1, gz: 1, tar: 1, '7z': 1, rar: 1, exe: 1, dll: 1, bin: 1, pyc: 1, class: 1, jar: 1,
+  pdf: 1, doc: 1, docx: 1, xls: 1, xlsx: 1, ppt: 1, pptx: 1, db: 1, sqlite: 1, sqlite3: 1,
+  woff: 1, woff2: 1, ttf: 1, otf: 1, mp3: 1, mp4: 1, mov: 1, avi: 1, iso: 1
+};
+
+/** 按扩展名/Content-Type 决定预览类型
+ * @param {string} name - 文件名或路径
+ * @param {string} [contentType] - 响应 Content-Type
+ * @returns {'html'|'markdown'|'svg'|'image'|'image-unsupported'|'binary'|'text'} */
+function artifactKindForName(name, contentType) {
+  const ext = artifactExt(name);
+  if (ext === 'html' || ext === 'htm') return 'html';
+  if (ext === 'md' || ext === 'markdown') return 'markdown';
+  if (ext === 'svg') return 'svg';
+  if (ARTIFACT_RASTER_EXTS[ext]) return 'image';
+  if (ARTIFACT_IMAGE_EXTS[ext]) return 'image-unsupported';
+  if (ARTIFACT_BINARY_EXTS[ext]) return 'binary';
+  if (/^image\//i.test(String(contentType || ''))) return 'image';
+  return 'text';
+}
+
+/** 复用一个 object URL（换图/换预览时 revoke 旧的，防泄漏） */
+let __artifactImageUrl = null;
+function artifactObjectUrl(blob) {
+  if (__artifactImageUrl) {
+    try { URL.revokeObjectURL(__artifactImageUrl); } catch (e) { /* 忽略 */ }
+    __artifactImageUrl = null;
+  }
+  __artifactImageUrl = URL.createObjectURL(blob);
+  return __artifactImageUrl;
+}
+
+/** Tab 按钮 HTML（激活态由 mountArtifactTabs 统一设置） */
+function artifactTabButtonHtml(id, label) {
+  return '<button type="button" data-artifact-tab="' + escapeHtml(id) + '" ' +
+    'style="padding:3px 10px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid transparent;' +
+    'background:transparent;color:var(--color-text-secondary,#a3a3a3)">' + escapeHtml(label) + '</button>';
+}
+
+/** 挂载【预览】/【代码】切换（每个模态框独立绑定，无全局状态） */
+function mountArtifactTabs(body, defaultTab) {
+  if (!body) return;
+  const tabs = Array.from(body.querySelectorAll('[data-artifact-tab]'));
+  const panels = Array.from(body.querySelectorAll('[data-artifact-panel]'));
+  const activate = (id) => {
+    tabs.forEach((t) => {
+      const on = t.getAttribute('data-artifact-tab') === id;
+      t.style.background = on ? 'var(--color-brand-cobalt,#2563EB)' : 'transparent';
+      t.style.color = on ? '#fff' : 'var(--color-text-secondary,#a3a3a3)';
+      t.style.borderColor = on ? 'transparent' : 'var(--color-line-ghost,rgba(127,127,127,.28))';
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    panels.forEach((p) => {
+      p.style.display = p.getAttribute('data-artifact-panel') === id ? '' : 'none';
+    });
+  };
+  tabs.forEach((t) => t.addEventListener('click', () => activate(t.getAttribute('data-artifact-tab'))));
+  if (tabs.length) activate(defaultTab || tabs[0].getAttribute('data-artifact-tab'));
+}
+
+/** 统一渲染产物预览体：元信息 + Tab + 预览/代码面板
+ * @param {HTMLElement} body - 模态框 .modal-body
+ * @param {Object} opts - {name, meta, kind, content, imageUrl, lang, code, defaultTab, previewLabel, messageHtml}
+ * @returns {void} */
+function renderArtifactResult(body, opts) {
+  if (!body) return;
+  const o = opts || {};
+  const kind = String(o.kind || 'text');
+  const content = (o.content != null ? String(o.content) : '').replace(/^\uFEFF/, '');
+  if (__artifactImageUrl && kind !== 'image' && kind !== 'svg') {
+    try { URL.revokeObjectURL(__artifactImageUrl); } catch (e) { /* 忽略 */ }
+    __artifactImageUrl = null;
+  }
+  const name = String(o.name || '');
+  const meta = String(o.meta || '');
+  const canPreview = kind === 'html' || kind === 'markdown' || kind === 'svg' ||
+    kind === 'image' || kind === 'image-unsupported' || kind === 'binary' || kind === 'message';
+  const canCode = o.code !== false && (kind === 'html' || kind === 'markdown' || kind === 'svg' || kind === 'text');
+  const defaultTab = o.defaultTab || (canPreview ? 'preview' : 'code');
+  const metaHtml = '<div class="flex items-center gap-2 mb-2 text-[10px] text-text-tertiary">' +
+    '<i data-lucide="file-code" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
+    '<span class="font-mono break-all">' + escapeHtml(name) + '</span>' +
+    (meta ? '<span class="ml-auto shrink-0">' + escapeHtml(meta) + '</span>' : '') +
+    '</div>';
+  const tabHtml = (canPreview && canCode)
+    ? '<div class="flex items-center gap-2 mb-2" style="border-bottom:1px solid var(--color-line-ghost,rgba(127,127,127,.25));padding:2px 0 6px">' +
+      artifactTabButtonHtml('preview', o.previewLabel || '预览') +
+      artifactTabButtonHtml('code', '代码') +
+      '</div>'
+    : '';
+  let previewHtml = '';
+  if (kind === 'html') {
+    previewHtml = '<div data-artifact-frame-host></div>' +
+      '<div class="text-[10px] text-text-tertiary mt-1">HTML 在沙箱 iframe 中运行（sandbox=allow-scripts，无同源权限）</div>';
+  } else if (kind === 'markdown') {
+    previewHtml = '<div class="md-body" style="max-height:60vh;overflow:auto;padding:4px 2px">' +
+      (typeof renderMarkdown === 'function' ? renderMarkdown(content) : escapeHtml(content).replace(/\n/g, '<br>')) +
+      '</div>';
+  } else if (kind === 'svg' || kind === 'image') {
+    const src = String(o.imageUrl || '');
+    previewHtml = src
+      ? '<div style="text-align:center;background:var(--color-bg-app,#0b0e14);border-radius:8px;padding:8px">' +
+        '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(name) + '" style="display:block;margin:0 auto;max-width:100%;max-height:60vh;border-radius:6px">' +
+        '</div>'
+      : '<div class="text-[11px] text-text-tertiary">图片内容不可用</div>';
+  } else if (kind === 'image-unsupported') {
+    previewHtml = '<div class="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning">' +
+      '<div class="font-medium mb-1">该图片暂不支持预览</div>' +
+      '<div class="text-[10px] text-text-tertiary">本机工作区的 PNG/JPG/GIF/WebP 需要后端二进制流接口；SVG 与 ZCode 沙箱图片可直接预览。</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(name) + '</div>' +
+      '</div>';
+  } else if (kind === 'binary') {
+    previewHtml = '<div class="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning">' +
+      '<div class="font-medium mb-1">该文件是二进制格式，暂不支持预览</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(name) + '</div>' +
+      '</div>';
+  } else if (kind === 'message') {
+    previewHtml = String(o.messageHtml || '');
+  }
+  let codeHtml = '';
+  if (canCode) {
+    const lang = o.lang || artifactLangForFile(name);
+    codeHtml = '<pre class="text-[12px] m-0" style="padding:12px 16px;max-height:56vh;overflow:auto">' +
+      '<code' + (lang ? ' class="language-' + escapeHtml(lang) + '"' : '') + '>' + escapeHtml(content) + '</code></pre>';
+  }
+  body.innerHTML = metaHtml + tabHtml +
+    (canPreview ? '<div data-artifact-panel="preview"' + (defaultTab === 'preview' ? '' : ' style="display:none"') + '>' + previewHtml + '</div>' : '') +
+    (canCode ? '<div data-artifact-panel="code"' + (defaultTab === 'code' ? '' : ' style="display:none"') + '>' + codeHtml + '</div>' : '');
+  if (typeof refreshIcons === 'function') refreshIcons();
+  if (kind === 'html') {
+    const host = body.querySelector('[data-artifact-frame-host]');
+    if (host) {
+      const frame = document.createElement('iframe');
+      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.title = name || 'HTML 预览';
+      frame.style.cssText = 'width:100%;height:60vh;border:0;border-radius:8px;background:#fff;display:block';
+      frame.srcdoc = content;
+      host.appendChild(frame);
+    }
+  }
+  if (canCode) {
+    const codePanel = body.querySelector('[data-artifact-panel="code"]');
+    if (codePanel && typeof enhanceCodeBlocks === 'function') enhanceCodeBlocks(codePanel, true);
+  }
+  if (kind === 'markdown') {
+    const previewPanel = body.querySelector('[data-artifact-panel="preview"]');
+    if (previewPanel && typeof enhanceCodeBlocks === 'function') enhanceCodeBlocks(previewPanel, false);
+  }
+  mountArtifactTabs(body, defaultTab);
+  const codeTab = body.querySelector('[data-artifact-tab="code"]');
+  if (codeTab) {
+    codeTab.addEventListener('click', () => {
+      const codeEl = body.querySelector('[data-artifact-panel="code"] pre > code');
+      if (codeEl && window.hljs && !codeEl.dataset.highlighted) {
+        try { window.hljs.highlightElement(codeEl); } catch (e) { /* 忽略 */ }
+      }
+    });
+  }
+  if (typeof refreshIcons === 'function') refreshIcons();
+}
+
+/** 应用内预览写文件产物（只读：复用本机 Agent 的 read_file 端点，不启动外部程序）
+ * 绝对路径先尝试折算到本机 Agent 工作区内；跨工作区/越界/不可读时给出明确提示。
+ * 由步骤卡 [data-preview-path] 与 Laya 摘要的可点击路径共用。
+ * @param {string} rawPath - 卡片/摘要里的文件路径
+ * @returns {Promise<void>} */
+async function previewArtifact(rawPath) {
+  const path = String(rawPath == null ? '' : rawPath).trim();
+  if (!path) return;
+  if (typeof showModal !== 'function') {
+    if (typeof showNotification === 'function') showNotification('无法预览', path, 'warning', 2600);
+    return;
+  }
+  // ZCode 沙箱产物：路径编码为 zcode:<task_id>:<encodeURIComponent(filename)>
+  // （task_id 为后端签发的 32 位 uuid4.hex；文件名取 ZCode 事件里的 basename）
+  const zcodeMatch = /^zcode:([0-9a-f]{32}):(.+)$/i.exec(path);
+  if (zcodeMatch) {
+    let zcodeName = zcodeMatch[2];
+    try { zcodeName = decodeURIComponent(zcodeName); } catch (e) { /* 保留原编码串 */ }
+    return previewZcodeArtifact(zcodeMatch[1], zcodeName);
+  }
+  const box = showModal(
+    '<div class="flex items-center gap-2 text-[11px] text-text-tertiary">' +
+    '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>' +
+    '<span>正在读取</span><span class="font-mono break-all">' + escapeHtml(path) + '</span></div>',
+    { title: '预览产物', icon: 'file-code', wide: true, footer: false }
+  );
+  const body = box ? box.querySelector('.modal-body') : null;
+  const setBody = (html) => {
+    if (!body) return;
+    body.innerHTML = html;
+    if (typeof refreshIcons === 'function') refreshIcons();
+  };
+  try {
+    let rel = path.replace(/^file:\/\/\//i, '').replace(/\\/g, '/');
+    const isAbs = /^[a-zA-Z]:\//.test(rel) || rel.charAt(0) === '/';
+    if (isAbs) {
+      const cfg = (typeof agentBackendConfig === 'function') ? await agentBackendConfig(true) : null;
+      const ws = (cfg && cfg.workspace) ? String(cfg.workspace).replace(/\\/g, '/').replace(/\/+$/, '') : '';
+      if (!ws) throw new Error('无法读取本机 Agent 工作区配置，不能预览绝对路径');
+      const lowRel = rel.toLowerCase(), lowWs = ws.toLowerCase();
+      if (lowRel === lowWs) throw new Error('目标路径是工作区目录，不是文件');
+      if (lowRel.indexOf(lowWs + '/') !== 0) {
+        throw new Error('该文件不在本机 Agent 工作区（' + ws + '）内，应用内预览暂不支持跨工作区路径');
+      }
+      rel = rel.slice(ws.length + 1);
+    }
+    const kind = artifactKindForName(rel, '');
+    if (kind === 'image' || kind === 'image-unsupported') {
+      renderArtifactResult(body, { name: rel, kind: 'image-unsupported', code: false });
+      return;
+    }
+    if (kind === 'binary') {
+      renderArtifactResult(body, { name: rel, kind: 'binary', code: false });
+      return;
+    }
+    const data = await wsFetchTool('read_file', { path: rel, maxBytes: 262144 });
+    const content = (data && data.content != null) ? String(data.content) : '';
+    const size = (data && data.bytes != null) ? Number(data.bytes)
+      : ((data && data.size != null) ? Number(data.size) : content.length);
+    const sizeText = size >= 1024 ? (size / 1024).toFixed(1) + ' KB' : size + ' B';
+    const imageUrl = kind === 'svg'
+      ? artifactObjectUrl(new Blob([content], { type: 'image/svg+xml' }))
+      : null;
+    renderArtifactResult(body, {
+      name: rel,
+      meta: sizeText + (data && data.truncated ? ' · 已截断' : ''),
+      kind,
+      content,
+      imageUrl,
+      lang: artifactLangForFile(rel),
+      defaultTab: (kind === 'html' || kind === 'markdown' || kind === 'svg') ? 'preview' : 'code'
+    });
+  } catch (e) {
+    setBody(
+      '<div class="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">' +
+      '<div class="font-medium mb-1">无法预览该文件</div>' +
+      '<div class="break-all">' + escapeHtml(String((e && e.message) || e)) + '</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(path) + '</div>' +
+      '</div>'
+    );
+  }
+}
+
+/** ZCode 沙箱产物预览：task_id + 顶层文件名 → GET /api/engines/zcode/files/<task_id>/<filename>
+ * 与 125 本机文件预览共用同一个模态框与代码高亮；只读，不执行任何东西。
+ * @param {string} taskId - ZCode 任务 id（32 位 hex）
+ * @param {string} filename - 任务目录顶层文件名
+ * @returns {Promise<void>} */
+async function previewZcodeArtifact(taskId, filename) {
+  const tid = String(taskId || '');
+  const name = String(filename || '');
+  if (!tid || !name) {
+    if (typeof showNotification === 'function') showNotification('无法预览', '缺少 ZCode 任务或文件名', 'warning', 2600);
+    return;
+  }
+  const box = showModal(
+    '<div class="flex items-center gap-2 text-[11px] text-text-tertiary">' +
+    '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>' +
+    '<span>正在读取 ZCode 产物</span><span class="font-mono break-all">' + escapeHtml(name) + '</span></div>',
+    { title: '预览 ZCode 产物', icon: 'file-code', wide: true, footer: false }
+  );
+  const body = box ? box.querySelector('.modal-body') : null;
+  const setBody = (html) => {
+    if (!body) return;
+    body.innerHTML = html;
+    if (typeof refreshIcons === 'function') refreshIcons();
+  };
+  try {
+    const url = agentBackendBase() + '/api/engines/zcode/files/' +
+      encodeURIComponent(tid) + '/' + encodeURIComponent(name);
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); msg = (j && (j.message || j.error)) || msg; } catch (e) { /* 保留 HTTP 码 */ }
+      if (res.status === 413) msg = '文件过大，无法预览（上限 512KB）';
+      throw new Error(msg);
+    }
+    const ct = String(res.headers.get('Content-Type') || '');
+    const kind = artifactKindForName(name, ct);
+    const lengthHeader = Number(res.headers.get('Content-Length'));
+    if (kind === 'image') {
+      const blob = await res.blob();
+      const imageUrl = artifactObjectUrl(blob);
+      const sizeText = blob.size >= 1024 ? (blob.size / 1024).toFixed(1) + ' KB' : blob.size + ' B';
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: sizeText + ' · 任务 ' + tid.slice(0, 8),
+        kind: 'image', imageUrl, code: false
+      });
+      return;
+    }
+    if (kind === 'image-unsupported') {
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: '任务 ' + tid.slice(0, 8),
+        kind: 'image-unsupported', code: false
+      });
+      return;
+    }
+    if (kind === 'binary') {
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: '任务 ' + tid.slice(0, 8),
+        kind: 'binary', code: false
+      });
+      return;
+    }
+    const content = await res.text();
+    const size = (isFinite(lengthHeader) && lengthHeader > 0) ? lengthHeader : content.length;
+    const sizeText = size >= 1024 ? (size / 1024).toFixed(1) + ' KB' : size + ' B';
+    const imageUrl = kind === 'svg'
+      ? artifactObjectUrl(new Blob([content], { type: 'image/svg+xml' }))
+      : null;
+    renderArtifactResult(body, {
+      name: 'ZCode · ' + name,
+      meta: sizeText + ' · 任务 ' + tid.slice(0, 8),
+      kind,
+      content,
+      imageUrl,
+      lang: artifactLangForFile(name),
+      defaultTab: (kind === 'html' || kind === 'markdown' || kind === 'svg') ? 'preview' : 'code'
+    });
+  } catch (e) {
+    setBody(
+      '<div class="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">' +
+      '<div class="font-medium mb-1">无法预览 ZCode 产物</div>' +
+      '<div class="break-all">' + escapeHtml(String((e && e.message) || e)) + '</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">任务 ' + escapeHtml(tid.slice(0, 8)) + ' · ' + escapeHtml(name) + '</div>' +
+      '</div>'
+    );
+  }
+}
+if (typeof window !== 'undefined') window.morayPreviewZcodeArtifact = previewZcodeArtifact;
+if (typeof window !== 'undefined') window.morayPreviewArtifact = previewArtifact;
 
 /** 安全算术求值：仅数字 + - * / % ( ) , 与白名单 Math 函数
  * 词法 + 递归下降解析，禁 eval/Function/任意标识符/字符串执行
@@ -730,40 +1163,40 @@ function renderToolSteps(toolCalls) {
 /** 追加"AI 工具（Function Calling）"设置卡片（幂等，参照 appendCostSettings 模式）
  * @returns {Promise<void>} */
 async function appendToolsSettings() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container || container.querySelector('#toolsSettingsCard')) return;
   const disabled = MoraySettings.get('toolsDisabled') || [];
   const nativeOn = !!MoraySettings.get('nativeToolsEnabled');
   const toolRows = Object.values(ToolRegistry.tools).map(t => {
     // [阶段0] native 工具开关由输入台"本机工具/Agent"统一控制，此处只读展示（不渲染误导性独立开关）
     if (t.native) {
-      return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
+      return '<div class="flex items-center justify-between py-2 border-b border-line-ghost/30 last:border-0">' +
         '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
         ' <span class="font-mono text-[10px] text-text-tertiary">' + t.name + '</span>' +
-        '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span>' +
+        '<span class="ml-1 text-[10px] px-2 py-1 rounded bg-brand-violet/10 text-brand-violet border border-brand-violet/20">本机工具</span>' +
         (t.sideEffect
-          ? '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/25">需审批</span>'
-          : '<span class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-success/10 text-success border border-success/20">只读免审批</span>') +
+          ? '<span class="ml-1 text-[10px] px-2 py-1 rounded bg-warning/10 text-warning border border-warning/25">需审批</span>'
+          : '<span class="ml-1 text-[10px] px-2 py-1 rounded bg-success/10 text-success border border-success/20">只读免审批</span>') +
         '</div>' +
-        '<div class="text-[10px] text-text-tertiary mt-0.5">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
+        '<div class="text-[10px] text-text-tertiary mt-1">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
         '<div class="text-[10px] text-text-tertiary shrink-0 ' + (nativeOn ? 'text-success' : '') + '">' + (nativeOn ? '已由输入台开启' : '由输入台「本机工具」开关控制') + '</div></div>';
     }
     const on = !disabled.includes(t.name);
-    return '<div class="flex items-center justify-between py-1.5 border-b border-line-ghost/30 last:border-0">' +
+    return '<div class="flex items-center justify-between py-2 border-b border-line-ghost/30 last:border-0">' +
       '<div class="flex-1 pr-3"><div class="text-xs text-text-primary">' + escapeHtml(t.label) +
       ' <span class="font-mono text-[10px] text-text-tertiary">' + t.name + '</span></div>' +
-      '<div class="text-[10px] text-text-tertiary mt-0.5">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
+      '<div class="text-[10px] text-text-tertiary mt-1">' + escapeHtml(t.description.length > 90 ? t.description.slice(0, 90) + '…' : t.description) + '</div></div>' +
       '<div class="toggle-track ' + (on ? 'active' : '') + '" data-tool-toggle="' + t.name + '"><div class="toggle-thumb"></div></div></div>';
   }).join('');
   const card = document.createElement('div');
   card.id = 'toolsSettingsCard';
   card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
   card.innerHTML = [
+    '<div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">Agent 与工具</span></div>',
     '<h3 class="text-sm font-semibold text-text-primary mb-2 flex items-center gap-2"><i data-lucide="wrench" class="w-4 h-4 text-brand-violet"></i>AI 工具（Function Calling）</h3>',
-    '<p class="text-[10px] text-text-tertiary mb-3">内置工具闭环：模型可调用时间、计算器、知识库检索、片段保存、工作流与费用查询；仅 OpenAI 兼容后端生效，Ollama 自动跳过。</p>',
+    '<p class="text-[10px] text-text-tertiary mb-3">内置工具闭环：模型可调用时间、计算器、知识库检索、片段保存、工作流与费用查询；仅 OpenAI 兼容后端生效，Ollama 自动跳过。最大工具轮数在「本机 Agent」卡统一设置（全部工具循环共用，1-12）。</p>',
     '<div class="flex items-center gap-4 mb-3">',
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">启用工具调用</span><div class="toggle-track ' + (MoraySettings.get('toolsEnabled') ? 'active' : '') + '" id="setToolsEnabled"><div class="toggle-thumb"></div></div></div>',
-    '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">最大工具轮数</span><input type="number" min="1" max="10" value="' + (MoraySettings.get('toolsMaxRounds') || 3) + '" id="setToolsMaxRounds" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
     '</div>',
     '<div class="text-[10px] text-text-tertiary mb-1">工具开关（关闭总开关时请求体不携带 tools 字段）</div>',
     '<div id="toolsToolRows">' + toolRows + '</div>'
@@ -774,11 +1207,6 @@ async function appendToolsSettings() {
   on(card.querySelector('#setToolsEnabled'), 'click', async function () {
     this.classList.toggle('active');
     await MoraySettings.set('toolsEnabled', this.classList.contains('active'));
-  });
-  on(card.querySelector('#setToolsMaxRounds'), 'change', () => {
-    const v = Math.max(1, Math.min(10, parseInt(card.querySelector('#setToolsMaxRounds').value, 10) || 3));
-    card.querySelector('#setToolsMaxRounds').value = v;
-    MoraySettings.set('toolsMaxRounds', v);
   });
   card.querySelectorAll('[data-tool-toggle]').forEach(t => t.addEventListener('click', async function () {
     this.classList.toggle('active');
@@ -818,28 +1246,28 @@ async function showAgentAuditLog(page) {
   const body = rows.length
     ? '<div class="overflow-auto max-h-[52vh] rounded-lg border border-line-ghost/50"><table class="w-full text-[10px]">' +
       '<thead><tr class="text-text-tertiary bg-surface-panel/70 sticky top-0">' +
-      '<th class="text-left px-2 py-1.5 font-medium">时间</th><th class="text-left px-2 py-1.5 font-medium">工具</th>' +
-      '<th class="text-left px-2 py-1.5 font-medium">参数摘要</th><th class="text-left px-2 py-1.5 font-medium">审批</th>' +
-      '<th class="text-left px-2 py-1.5 font-medium">状态</th><th class="text-right px-2 py-1.5 font-medium">耗时</th></tr></thead><tbody>' +
+      '<th class="text-left px-2 py-2 font-medium">时间</th><th class="text-left px-2 py-2 font-medium">工具</th>' +
+      '<th class="text-left px-2 py-2 font-medium">参数摘要</th><th class="text-left px-2 py-2 font-medium">审批</th>' +
+      '<th class="text-left px-2 py-2 font-medium">状态</th><th class="text-right px-2 py-2 font-medium">耗时</th></tr></thead><tbody>' +
       rows.map(r => {
         const st = statusLabel[r.status] || [r.status, 'text-text-tertiary'];
         return '<tr class="border-t border-line-ghost/40 hover:bg-surface-panel/50">' +
-          '<td class="px-2 py-1.5 text-text-tertiary whitespace-nowrap">' + esc(r.ts) + '</td>' +
-          '<td class="px-2 py-1.5 font-mono text-text-primary whitespace-nowrap">' + esc(r.tool) + '</td>' +
-          '<td class="px-2 py-1.5 text-text-tertiary max-w-[260px] truncate" title="' + esc(r.args_summary) + '">' + esc(r.args_summary) + '</td>' +
-          '<td class="px-2 py-1.5 ' + (r.approved ? 'text-success' : 'text-text-tertiary') + ' whitespace-nowrap">' + (r.approved ? '是' : '否') + '</td>' +
-          '<td class="px-2 py-1.5 ' + st[1] + ' whitespace-nowrap">' + st[0] + '</td>' +
-          '<td class="px-2 py-1.5 text-text-tertiary text-right whitespace-nowrap">' + (r.ms ? r.ms + 'ms' : '—') + '</td></tr>';
+          '<td class="px-2 py-2 text-text-tertiary whitespace-nowrap">' + esc(r.ts) + '</td>' +
+          '<td class="px-2 py-2 font-mono text-text-primary whitespace-nowrap">' + esc(r.tool) + '</td>' +
+          '<td class="px-2 py-2 text-text-tertiary max-w-[260px] truncate" title="' + esc(r.args_summary) + '">' + esc(r.args_summary) + '</td>' +
+          '<td class="px-2 py-2 ' + (r.approved ? 'text-success' : 'text-text-tertiary') + ' whitespace-nowrap">' + (r.approved ? '是' : '否') + '</td>' +
+          '<td class="px-2 py-2 ' + st[1] + ' whitespace-nowrap">' + st[0] + '</td>' +
+          '<td class="px-2 py-2 text-text-tertiary text-right whitespace-nowrap">' + (r.ms ? r.ms + 'ms' : '—') + '</td></tr>';
       }).join('') + '</tbody></table></div>'
     : '<div class="empty-state"><i data-lucide="scroll-text"></i><div class="empty-title">暂无审计记录</div><div class="empty-hint">审计存于本地后端 SQLite；后端离线时无法读取</div></div>';
   const html = '<div class="space-y-2">' +
     '<div class="flex items-center gap-2 text-[10px] text-text-tertiary">' +
     '<span>共 ' + total + ' 条 · 第 ' + page + '/' + totalPages + ' 页</span>' +
-    '<span class="ml-auto flex items-center gap-1.5">' +
-    '<button data-audit-page="prev" class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
-    '<button data-audit-page="next" class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost" ' + (page >= totalPages ? 'disabled' : '') + '>下一页</button>' +
-    '<button data-audit-export class="btn-ghost px-2 py-0.5 rounded-md border border-line-ghost">导出 JSON</button>' +
-    '<button data-audit-clear class="px-2 py-0.5 rounded-md text-[10px] bg-danger/10 text-danger border border-danger/30">清空</button>' +
+    '<span class="ml-auto flex items-center gap-2">' +
+    '<button data-audit-page="prev" class="btn-ghost px-2 py-1 rounded-md border border-line-ghost" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
+    '<button data-audit-page="next" class="btn-ghost px-2 py-1 rounded-md border border-line-ghost" ' + (page >= totalPages ? 'disabled' : '') + '>下一页</button>' +
+    '<button data-audit-export class="btn-ghost px-2 py-1 rounded-md border border-line-ghost">导出 JSON</button>' +
+    '<button data-audit-clear class="px-2 py-1 rounded-md text-[10px] bg-danger/10 text-danger border border-danger/30">清空</button>' +
     '</span></div>' + body + '</div>';
   const box = showModal(html, { title: '本机工具审计日志', icon: 'scroll-text', wide: true, footer: false });
   box.querySelector('[data-audit-page="prev"]')?.addEventListener('click', () => { closeModal(); showAgentAuditLog(page - 1); });
@@ -871,42 +1299,43 @@ async function showAgentAuditLog(page) {
 /** [阶段0] 设置页"本机 Agent"卡：后端连接/工作区根修改/审批策略/最大轮次/审计入口
  * @returns {Promise<void>} */
 async function appendAgentSettings() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container || container.querySelector('#agentSettingsCard')) return;
   const cfg = await agentBackendConfig(true); // 强刷（避免设置页打开时读到陈旧缓存）
   const online = !!cfg;
   const approval = MoraySettings.get('agentApprovalMode') || 'readonly_auto';
-  const rounds = Math.max(1, Math.min(12, parseInt(MoraySettings.get('toolsMaxRounds') || 8, 10) || 8));
+  const rounds = Math.max(1, Math.min(12, parseInt(MoraySettings.get('toolsMaxRounds') || 3, 10) || 3));
   const card = document.createElement('div');
   card.id = 'agentSettingsCard';
   card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
   card.innerHTML = [
+    '<div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">Agent 与工具</span></div>',
     '<h3 class="text-sm font-semibold text-text-primary mb-1 flex items-center gap-2"><i data-lucide="square-terminal" class="w-4 h-4 text-brand-violet"></i>本机 Agent（受控工作区工具）</h3>',
     '<p class="text-[10px] text-text-tertiary mb-3">本机动作由本地后端执行并审计：列目录/读文件自动执行，写文件与只读命令需人工授权；全部操作限制在工作区内，越界/危险后缀/白名单外命令会被安全层拒绝。开关在输入台「本机工具」按钮。</p>',
     online
-      ? '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-success"><span class="beacon-dot success"></span>本地后端已连接 · 版本 ' + escapeHtml(cfg.version || '') + ' · 构建 ' + escapeHtml(cfg.build || '') + '</div>'
-      : '<div class="flex items-center gap-1.5 mb-3 text-[10px] text-warning"><span class="beacon-dot warn-dot"></span>本地后端离线：本机工具不可用（需启动后端，默认 http://127.0.0.1:8000）</div>',
+      ? '<div class="flex items-center gap-2 mb-3 text-[10px] text-success"><span class="beacon-dot success"></span>本地后端已连接 · 版本 ' + escapeHtml(cfg.version || '') + ' · 构建 ' + escapeHtml(cfg.build || '') + '</div>'
+      : '<div class="flex items-center gap-2 mb-3 text-[10px] text-warning"><span class="beacon-dot warn-dot"></span>本地后端离线：本机工具不可用（需启动后端，默认 http://127.0.0.1:8000）</div>',
     '<div class="rounded-lg border border-line-ghost/60 p-3 mb-3">',
     '<div class="flex items-center justify-between mb-2"><span class="text-xs text-text-secondary">工作区根</span>' +
-    (cfg && cfg.fromEnv ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/20">环境变量 MORAY_WORKSPACE 锁定</span>' : '') + '</div>',
+    (cfg && cfg.fromEnv ? '<span class="text-[10px] px-2 py-1 rounded bg-warning/10 text-warning border border-warning/20">环境变量 MORAY_WORKSPACE 锁定</span>' : '') + '</div>',
     '<div class="flex gap-2">',
     '<input type="text" id="agentWorkspaceInput" value="' + escapeHtml(cfg ? cfg.workspace : '') + '" placeholder="D:\\MoRayWorkspace"' + (cfg && cfg.fromEnv ? ' disabled' : '') + ' class="form-input flex-1 font-mono" style="font-size:12px;padding:4px 8px">',
-    '<button id="agentWorkspaceSave" class="btn-ghost px-3 py-1.5 rounded-lg text-[10px] border border-line-ghost" ' + (cfg && cfg.fromEnv ? 'disabled' : '') + '>保存并校验</button>',
+    '<button id="agentWorkspaceSave" class="btn-ghost px-3 py-2 rounded-lg text-[10px] border border-line-ghost" ' + (cfg && cfg.fromEnv ? 'disabled' : '') + '>保存并校验</button>',
     '</div>',
-    (cfg && cfg.fromEnv ? '<div class="text-[10px] text-text-tertiary mt-1.5">环境变量优先于此处设置；如需修改请调整 MORAY_WORKSPACE 后重启后端</div>' : '<div class="text-[10px] text-text-tertiary mt-1.5">修改后立即生效并写入后端（自动创建目录并校验可写；仅影响本机 Agent 工具）</div>'),
+    (cfg && cfg.fromEnv ? '<div class="text-[10px] text-text-tertiary mt-2">环境变量优先于此处设置；如需修改请调整 MORAY_WORKSPACE 后重启后端</div>' : '<div class="text-[10px] text-text-tertiary mt-2">修改后立即生效并写入后端（自动创建目录并校验可写；仅影响本机 Agent 工具）</div>'),
     '</div>',
     '<div class="space-y-2 text-xs">',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审批策略</span>' +
     '<select id="agentApprovalSelect" class="form-select" style="width:auto;padding:4px 8px;font-size:12px">' +
     '<option value="readonly_auto"' + (approval === 'readonly_auto' ? ' selected' : '') + '>只读自动执行（写文件/命令需审批）</option>' +
     '<option value="all"' + (approval === 'all' ? ' selected' : '') + '>全部工具需人工审批</option></select></div>',
-    '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（1-12）</span>' +
-    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 6px;font-size:12px"></div>',
+    '<div class="flex items-center justify-between"><span class="text-text-secondary">最大工具轮数（AI 工具与本机 Agent 共用，1-12）</span>' +
+    '<input type="number" min="1" max="12" value="' + rounds + '" id="agentMaxRoundsInput" class="form-input" style="width:64px;padding:2px 8px;font-size:12px"></div>',
     '<div class="flex items-center justify-between"><span class="text-text-secondary">审计日志（后端 SQLite，含未审批与安全拒绝）</span>' +
-    '<div class="flex items-center gap-1.5">' +
-    '<button id="agentAuditViewBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button>' +
+    '<div class="flex items-center gap-2">' +
+    '<button id="agentAuditViewBtn" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost">查看日志</button>' +
     // [Kernel 阶段1] 飞行记录仪（时间轴）：与审计表格同一数据源（GET /api/agent/log），改视图不改数据
-    '<button id="agentTimelineBtn" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost flex items-center gap-1" title="按天分组的时间轴视图：状态/工具筛选、展开详情、自动刷新">' +
+    '<button id="agentTimelineBtn" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost flex items-center gap-1" title="按天分组的时间轴视图：状态/工具筛选、展开详情、自动刷新">' +
     '<i data-lucide="activity" class="w-3 h-3"></i>飞行记录仪</button>' +
     '</div></div>',
     // [阶段1 M1] 上次 Agent 自检结果
@@ -920,18 +1349,18 @@ async function appendAgentSettings() {
     // [阶段0.5 E] 本会话已信任操作（默认 0=每次都询问；勾选信任后累积；run_command 永不入表）
     '<div class="flex items-center justify-between"><span class="text-text-secondary">已信任操作（本会话，相同工具+参数免重复确认）</span>' +
     '<div class="flex items-center gap-2"><span class="font-mono text-[10px] text-text-tertiary" id="agentTrustedCount">' + agentTrustedCount() + '</span>' +
-    '<button id="agentTrustedClear" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">清除</button></div></div>',
+    '<button id="agentTrustedClear" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost">清除</button></div></div>',
     // [阶段1 M5] Agent 系统提示：查看内置 / 自定义覆盖
     (() => {
       const override = (MoraySettings.get('agentSysPromptOverride') || '').trim();
       const effective = override || PlanTracker.SYSTEM_PROMPT;
       return '<div class="pt-2 mt-2 border-t border-line-ghost/40">' +
-        '<div class="text-xs text-text-secondary mb-1.5">Agent 系统提示（多步任务先列计划、工具时机、工作区边界）</div>' +
+        '<div class="text-xs text-text-secondary mb-2">Agent 系统提示（多步任务先列计划、工具时机、工作区边界）</div>' +
         '<textarea id="agentSysPromptInput" class="form-input w-full font-mono" rows="6" style="font-size:10px;line-height:1.6" placeholder="留空 = 使用内置规范">' + escapeHtml(effective) + '</textarea>' +
-        '<div class="flex items-center gap-2 mt-1.5">' +
-        '<button id="agentSysPromptSave" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">保存覆盖</button>' +
-        '<button id="agentSysPromptReset" class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost">恢复内置</button>' +
-        '<span class="text-[9px] text-text-tertiary">仅在本机工具开启时追加到系统提示</span></div></div>';
+        '<div class="flex items-center gap-2 mt-2">' +
+        '<button id="agentSysPromptSave" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost">保存覆盖</button>' +
+        '<button id="agentSysPromptReset" class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost">恢复内置</button>' +
+        '<span class="text-[10px] text-text-tertiary">仅在本机工具开启时追加到系统提示</span></div></div>';
     })(),
     '<div class="flex items-center justify-between pt-1 border-t border-line-ghost/40"><span class="text-[10px] text-text-tertiary">工具：列目录 / 读文件（自动）；写文件 / 只读命令（审批）。命令白名单：git status/log/diff/branch、python/node/npm --version、where &lt;名&gt;</span></div>',
     '</div>'
@@ -945,7 +1374,7 @@ async function appendAgentSettings() {
   });
   const roundsInput = card.querySelector('#agentMaxRoundsInput');
   on(roundsInput, 'change', async () => {
-    const v = Math.max(1, Math.min(12, parseInt(roundsInput.value, 10) || 8));
+    const v = Math.max(1, Math.min(12, parseInt(roundsInput.value, 10) || 3));
     roundsInput.value = v;
     await MoraySettings.set('toolsMaxRounds', v);
     showNotification('已保存', '最大工具轮数 = ' + v, 'success', 1500);
@@ -1185,7 +1614,7 @@ function agentApproval(def, args, ctx) {
         const newContent = String((args && args.content) || '');
         if (oldContent) {
           writeDiff = buildApprovalDiff(oldContent, newContent, 400) +
-            (pj.data.truncated ? '<div class="text-[9px] text-warning mt-1">原文件超过 64KB，diff 仅基于前 64KB</div>' : '');
+            (pj.data.truncated ? '<div class="text-[10px] text-warning mt-1">原文件超过 64KB，diff 仅基于前 64KB</div>' : '');
         }
       } catch (e) { /* 读不到旧内容（新文件/离线）→ 不渲染 diff */ }
     }
@@ -1195,11 +1624,11 @@ function agentApproval(def, args, ctx) {
     if (def.name === 'write_file') {
       const c = String(args.content || '');
       const diffBlock = writeDiff
-        ? '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">变更预览（- 原内容 / + 新内容）</div>' + writeDiff + '</div>'
+        ? '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-2">变更预览（- 原内容 / + 新内容）</div>' + writeDiff + '</div>'
         : '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">内容预览（前 300 字符）</div>' +
           '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' + (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空内容）</span>') + '</div></div>';
       argCards = '<div class="rounded-lg bg-surface-panel/60 border border-line-ghost/50 p-3">' +
-        '<div class="text-[10px] text-text-tertiary mb-1.5">目标文件（工作区内，相对路径）</div>' +
+        '<div class="text-[10px] text-text-tertiary mb-2">目标文件（工作区内，相对路径）</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
         (args.overwrite === false ? '<div class="text-[10px] text-warning mt-1">仅新建，不覆盖已有文件</div>' : '<div class="text-[10px] text-text-tertiary mt-1">已有同名文件将被覆盖</div>') +
         '</div>' + diffBlock;
@@ -1207,7 +1636,7 @@ function agentApproval(def, args, ctx) {
       // [3.20 阶段3] 新建文件：明确"只新建不覆盖"，并给出内容预览
       const c = String(args.content || '');
       argCards = '<div class="' + cell + '">' +
-        '<div class="text-[10px] text-text-tertiary mb-1.5">新建文件（工作区内，相对路径）</div>' +
+        '<div class="text-[10px] text-text-tertiary mb-2">新建文件（工作区内，相对路径）</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
         '<div class="text-[10px] text-success mt-1">只新建：若同名文件已存在会被拒绝，不会覆盖</div>' +
         '</div>' +
@@ -1218,45 +1647,46 @@ function agentApproval(def, args, ctx) {
     } else if (def.name === 'rename_file' || def.name === 'move_file') {
       // [3.20 阶段3] 移动/重命名：源 → 目标，并提示"目标存在即拒绝"
       argCards = '<div class="' + cell + '">' +
-        '<div class="text-[10px] text-text-tertiary mb-1.5">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mb-2">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
         '<div class="font-mono text-[11px] text-text-tertiary break-all">' + escapeHtml(String(args.from || '')) + '</div>' +
-        '<div class="text-[10px] text-text-tertiary my-0.5">↓</div>' +
+        '<div class="text-[10px] text-text-tertiary my-1">↓</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.to || '')) + '</div>' +
-        '<div class="text-[10px] text-text-tertiary mt-1.5">目标已存在会拒绝，不做静默覆盖；父目录不存在会自动创建</div>' +
+        '<div class="text-[10px] text-text-tertiary mt-2">目标已存在会拒绝，不做静默覆盖；父目录不存在会自动创建</div>' +
         '</div>';
     } else if (def.name === 'run_command') {
       const parts = [String(args.command || '')].concat(Array.isArray(args.args) ? args.args.map(String) : []);
-      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">将执行的只读白名单命令</div>' +
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-2">将执行的只读白名单命令</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">$ ' + escapeHtml(parts.join(' ')) + '</div>' +
-        '<div class="text-[10px] text-text-tertiary mt-1.5">命令只读、15s 超时，在工作区内执行（git status/log/diff/branch、python/node/npm --version、where &lt;命令名&gt;）</div></div>';
+        '<div class="text-[10px] text-text-tertiary mt-2">命令只读、15s 超时，在工作区内执行（git status/log/diff/branch、python/node/npm --version、where &lt;命令名&gt;）</div></div>';
     } else if (def.name === 'edit_file') {
       const oldS = String(args.old_str || '');
       const newS = String(args.new_str || '');
       const diffHtml = (typeof buildApprovalDiff === 'function')
         ? buildApprovalDiff(oldS, newS, 400)
         : '<div class="text-[10px] text-text-primary font-mono whitespace-pre-wrap break-all max-h-40 overflow-auto">' + escapeHtml(oldS.slice(0, 200)) + '</div>';
-      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">编辑目标（工作区内）</div>' +
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-2">编辑目标（工作区内）</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.path || '')) + '</div>' +
         (args.replace_all === true ? '<div class="text-[10px] text-warning mt-1">replace_all：替换文件中全部匹配处</div>' : '<div class="text-[10px] text-text-tertiary mt-1">仅替换唯一匹配处（不唯一将被拒绝）</div>') +
         '</div>' +
-        '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">变更预览（- 原内容 / + 新内容）</div>' + diffHtml + '</div>';
+        '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-2">变更预览（- 原内容 / + 新内容）</div>' + diffHtml + '</div>';
     } else {
-      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1.5">参数</div>' +
+      argCards = '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-2">参数</div>' +
         '<div class="font-mono text-[10px] text-text-primary break-all max-h-24 overflow-auto">' + escapeHtml(JSON.stringify(args || {})) + '</div></div>';
     }
     // [阶段0.5 E] 信任勾选：仅非 run_command 工具提供（命令永远每次审批）；默认不勾选
     const trustRow = def.name !== 'run_command'
       ? '<label class="flex items-start gap-2 pt-1 cursor-pointer select-none">' +
-        '<input type="checkbox" data-agent-trust class="mt-0.5 accent-brand-cobalt">' +
+        '<input type="checkbox" data-agent-trust class="mt-1 accent-brand-cobalt">' +
         '<span class="text-[10px] text-text-tertiary leading-relaxed">本会话对完全相同的工具+参数不再询问（刷新后失效；可在设置→本机 Agent 清除）</span></label>'
       : '';
-    const html = '<div class="space-y-2.5 text-xs">' +
+    const html = '<div class="space-y-3 text-xs">' +
       '<div class="' + cell + '"><div class="text-[10px] text-text-tertiary mb-1">工具（' + (def.sideEffect ? '副作用，需要你授权' : '只读') + '）</div>' +
-      '<div class="flex items-center gap-1.5 font-medium text-text-primary">' +
+      '<div class="flex items-center gap-2 font-medium text-text-primary">' +
       '<i data-lucide="' + (def.name === 'run_command' ? 'terminal' : def.name === 'write_file' ? 'file-pen-line' : 'folder-search') + '" class="w-3.5 h-3.5 text-warning"></i>' +
       escapeHtml(def.label) + ' <span class="font-mono text-[10px] text-text-tertiary">' + def.name + '</span></div></div>' +
       argCards +
       trustRow +
+      '<div class="text-[10px] text-text-tertiary leading-relaxed">提示：授权只在本弹窗内点击「允许一次」才生效；在聊天框输入「同意/授权」不会生效，关闭弹窗或按 ESC 一律视为拒绝。</div>' +
       '<div class="flex gap-2 justify-end pt-1">' +
       '<button data-agent-approve-no class="px-4 py-2 rounded-lg text-[12px] border border-line-ghost text-text-secondary hover:bg-surface-panel">拒绝</button>' +
       '<button data-agent-approve-ok class="px-4 py-2 rounded-lg text-[12px] btn-primary">允许一次</button>' +
@@ -1537,9 +1967,1009 @@ const NATIVE_TOOLS = [
       required: ['steps']
     },
     run(args) { return PlanTracker.submit(args); }
+  },
+  {
+    // [Laya v3] ZCode 执行引擎：运行本地脚本 + 输出捕获 + 预览识别（后端 core/zcode_proxy.py）
+    name: 'zcode_run', label: '运行脚本', native: true, sideEffect: true, timeoutMs: 330000,
+    description: '执行本地磁盘上的代码脚本文件，支持 Python、Node.js 等多语言运行。当用户给出本地文件路径并要求运行、执行、启动脚本时使用，直接传入文件路径即可执行，无需搜索联网。',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: '本地脚本文件的真实路径（须在授权目录或工作区内）' },
+        args: { type: 'string', description: '传给脚本的命令行参数（可省略）' },
+        lang: { type: 'string', description: '运行方式：auto（默认按扩展名）/ python / javascript / batch' }
+      },
+      required: ['file_path']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
+  },
+  {
+    // [Laya v3] ZCode 原生子智能体：按场景注入专用提示词，限定工作目录内自主完成
+    name: 'zcode_sub_agent', label: '派发ZCode子智能体', native: true, sideEffect: true, timeoutMs: 660000,
+    description: '调用本地子智能体完成代码修复、功能开发、排错调试任务。当用户需要修改本地代码、修复bug、开发新功能时使用，工作目录限定在指定路径内，自动完成读写+运行验证全流程。',
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '子任务指令（目标文件路径 + 需求 + 验收标准）' },
+        work_dir: { type: 'string', description: '工作目录真实路径（授权目录内，子智能体不得越界）' },
+        scene: { type: 'string', description: '场景：bug_fix / feature_dev / debug / general（默认 general）' }
+      },
+      required: ['task', 'work_dir']
+    },
+    run(args, ctx) { return agentNativeRun(this, args, ctx); }
   }
 ];
 NATIVE_TOOLS.forEach(t => ToolRegistry.register(t));
+
+/* ============================================================
+   [Argus 深度研究] 研究工具（detective_research / detective_status）
+   - 链路：模型 tool_calls → Gateway.runWithTools → 本工具 run() →
+           同源 POST/GET /api/argus/*（server/app/argus_proxy.py 转发到 8010）
+   - 为什么经后端转发而不是前端直连 8010：Argus 没有 CORS 中间件，页面来自
+           http://127.0.0.1:8000 或 file:// 都是跨源，直连会被浏览器拦；同源转发
+           则 Argus 一行都不用改
+   - 非 native：不进"本机工具/Agent"那道门，随「工具调用」总开关进入 listForRequest，
+           因此描述里必须写清"何时使用"，否则模型不会主动调
+   - sideEffect=false：启动研究只建会话 + 起后台任务，立即返回 session_id，
+           不需要人工审批（审批卡是给写文件/执行命令那类不可逆操作准备的）
+   ============================================================ */
+
+/** Argus 工具通用请求体：同源后端 → Argus。
+ * 后端统一信封 {ok, data|code|message}；失败抛出可读文案，由工具循环作为"工具失败"
+ * 回灌给模型（模型据此如实说明，而不是把超时当成没有能力）。
+ * @param {string} path - /api/argus/... 路径
+ * @param {Object} [opts] - {method, body, signal}
+ * @returns {Promise<Object>} data */
+async function argusToolRun(path, opts) {
+  const o = opts || {};
+  let res;
+  try {
+    res = await fetch(agentBackendBase() + path, {
+      method: o.method || 'GET',
+      headers: o.body ? { 'Content-Type': 'application/json' } : undefined,
+      body: o.body ? JSON.stringify(o.body) : undefined,
+      signal: o.signal || undefined
+    });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    throw new Error('Argus 工具需要本地后端（未连接 127.0.0.1:8000），本次调用未发出');
+  }
+  let j = null;
+  try { j = await res.json(); } catch (e) { /* 兜底 */ }
+  if (!j || j.ok !== true) throw new Error((j && j.message) || ('Argus 接口返回 ' + res.status));
+  return j.data;
+}
+
+/** 报告正文回灌上限：研报可能上万字，截断以免单条 tool 消息撑爆上下文 */
+const ARGUS_REPORT_CHARS = 6000;
+
+/** [Argus] 进度查询去重：session_id → 上次查询时间戳。
+ *
+ * 研究要跑几分钟，而小模型会把"好了吗"问成循环（调一次侦探状态 → 还在跑 → 再调一次…），
+ * 把工具轮刷满、回退普通流式后只能凭记忆编一个 session_id。同一 session 短时间内重复查
+ * 第二次起就在结果里带 ``argusStopAsking``，由工具循环把 detective_status 从后续轮次摘掉
+ * （见 Gateway.runWithTools）。新一轮用户消息会重新问，不受影响。
+ * @type {Object<string,number>} */
+const ARGUS_STATUS_ASKS = {};
+/** 同一 session 两次查询间隔小于这个值即视为工具轮循环（ms） */
+const ARGUS_STATUS_REPEAT_MS = 120000;
+
+/** [Argus] 本会话"最近启动/查询过哪条研究"的记账（上下文感知兜底的判定条件 2）。
+ *
+ * 为什么不直接用 ArgusWatcher._tasks：那张表是**跟踪用**的，超时（30 分钟）/离线/取报告
+ * 失败时会被 _stop 删掉——而用户正是在那些时候按提示回来问"进度如何"，此时跟踪表里
+ * 已经没有条目，兜底就哑了。这张表只回答"这个对话最近碰过哪个 session_id"，TTL 内一直留着。
+ * @type {Object<string,{sid:string,convId:(string|null),question:string,startedAt:number,touchedAt:number}>} */
+const ARGUS_SESSION_LOG = {};
+
+/** [Argus] 登记一条研究会话（detective_research / detective_status 的 run() 都会调）
+ * @param {string} sessionId - Argus 返回的 session_id
+ * @param {string} [question] - 研究问题
+ * @returns {void} */
+function argusNoteSession(sessionId, question) {
+  try {
+    const sid = String(sessionId || '').trim();
+    if (!/^[A-Za-z0-9_-]{6,}$/.test(sid)) return;
+    const prev = ARGUS_SESSION_LOG[sid] || null;
+    const convId = (typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null;
+    ARGUS_SESSION_LOG[sid] = {
+      sid,
+      convId: convId || null,
+      question: String(question || (prev && prev.question) || ''),
+      startedAt: (prev && prev.startedAt) || Date.now(),
+      touchedAt: Date.now()
+    };
+  } catch (e) { /* 记账失败不影响主链路 */ }
+}
+
+/** [Argus] 汇总"已知的研究会话"：本会话记账 + 跟踪表（后者覆盖刷新后续跑的任务）
+ * @returns {Array<Object>} 记录数组（形状见 argusPickActiveSession） */
+function argusSessionRecords() {
+  const rows = Object.keys(ARGUS_SESSION_LOG).map(k => ARGUS_SESSION_LOG[k]);
+  try {
+    const tasks = (typeof ArgusWatcher !== 'undefined' && ArgusWatcher._tasks) ? ArgusWatcher._tasks : null;
+    if (tasks) {
+      Object.keys(tasks).forEach(sid => {
+        const t = tasks[sid] || {};
+        rows.push({
+          sid, convId: t.convId, question: t.question,
+          startedAt: t.startedAt, touchedAt: t.startedAt
+        });
+      });
+    }
+  } catch (e) { /* 跟踪表不可用就只用记账 */ }
+  return rows;
+}
+
+/** [Argus] 两个研究工具定义 */
+const ARGUS_TOOLS = [
+  {
+    name: 'detective_research', label: 'Argus 深度研究',
+    description: '强制优先调用：只要用户要求查资料、做调研、对比产品/价格、了解行业信息（包括提到 "Argus"、"深度研究"、"帮我查一下"），就调用本工具，不要先用自己的记忆回答。调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。返回的 session_id 是研究任务的唯一凭证 —— 只有本工具返回的 id 才是真的。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: "用户的研究问题，比如 'Cursor 价格' 或 'AI编程助手对比'" }
+      },
+      required: ['question']
+    },
+    sideEffect: false, timeoutMs: 30000,
+    async run(args, ctx) {
+      const question = String((args && args.question) || '').trim();
+      if (!question) throw new Error('缺少 question 参数（要研究的问题）');
+      if (ctx && ctx.signal && ctx.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      // 同会话同问题已有研究在跑 → 复用，不再新建（小模型会把本工具连着调好几次，起一堆重复研究）
+      const running = (typeof ArgusWatcher !== 'undefined') ? ArgusWatcher.findRunning(question) : null;
+      if (running) {
+        argusNoteSession(running.sid, question); // 上下文感知兜底：本轮问进度时认得这个 id
+        return {
+          session_id: running.sid, status: 'running', question, reused: true, argusStopAsking: true,
+          note: '这个问题已经有正在进行的 Argus 研究（session_id = ' + running.sid + '）。' +
+            '**不要再调用 detective_research**：把 session_id 告诉用户、说明还需要几分钟即可，' +
+            '报告生成后会自动出现在本轮对话里。'
+        };
+      }
+      const d = await argusToolRun('/api/argus/orchestrate', {
+        method: 'POST', body: { question }, signal: ctx && ctx.signal
+      });
+      // 上下文感知兜底：记下"这次对话刚启动了哪条研究"，下一轮问"进度如何"时由代码直接查
+      argusNoteSession(d.session_id, d.question || question);
+      // [Argus 深度研究] 起完研究就把后半程交给跟踪器：报告一出就自动追加进本会话，
+      // 不依赖模型是否愿意再调一次 detective_status
+      if (typeof ArgusWatcher !== 'undefined') ArgusWatcher.track(d.session_id, { question });
+      return {
+        session_id: d.session_id,
+        status: d.status || 'running',
+        question: d.question || question,
+        // 研究已经在跑，本轮再调本工具没有意义（再调只会起重复研究）
+        argusStopAsking: true,
+        note: '研究已在 Argus 后台启动（session_id = ' + d.session_id + '）。**不要再调用 detective_research**：' +
+          '报告生成后会自动出现在本轮对话里；现在把上面的 session_id 告诉用户、说明研究通常需要几分钟即可。' +
+          '用户主动问进度时才需要 detective_status（带这个 session_id）。'
+      };
+    }
+  },
+  {
+    name: 'detective_status', label: 'Argus 研究进度',
+    description: '强制优先调用：只要用户问某个 Argus 研究任务的进度或结果（"好了吗 / 进度如何 / 查到了什么 / 结果出来没"），就调用本工具查询，不要凭记忆或想象回答。查询 Argus 研究任务的当前状态和进度；报告就绪时会一并返回报告正文与引用，价格/结论/来源只能引用该正文。',
+    parameters: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: '研究任务的 session id' }
+      },
+      required: ['session_id']
+    },
+    sideEffect: false, timeoutMs: 30000,
+    async run(args, ctx) {
+      const sidRaw = String((args && args.session_id) || '').trim();
+      if (!sidRaw) throw new Error('缺少 session_id 参数（detective_research 返回的那个）');
+      // 容错：模型有时会把 "session_id=abc" 或全角字符一起塞进来，只取其中的 id 本体
+      const sid = (sidRaw.match(/[A-Za-z0-9_-]{6,}/) || [sidRaw])[0];
+      if (ctx && ctx.signal && ctx.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      const d = await argusToolRun('/api/argus/status/' + encodeURIComponent(sid), { signal: ctx && ctx.signal });
+      // 上下文感知兜底：查过一次也算"这个对话认得这条研究"，续问同一个 id 时继续命中
+      argusNoteSession(sid, d.question);
+      // 同一 session 短时间内的重复查询 = 小模型的工具轮循环 → 第二次起请工具循环摘掉本工具
+      const asked = ARGUS_STATUS_ASKS[sid] || 0;
+      const repeated = (Date.now() - asked) < ARGUS_STATUS_REPEAT_MS;
+      ARGUS_STATUS_ASKS[sid] = Date.now();
+      const out = {
+        session_id: d.session_id || sid,
+        status: d.status,
+        progress: d.progress,
+        report_ready: !!d.report_ready,
+        question: d.question || ''
+      };
+      if (repeated) out.argusStopAsking = true; // 本轮已问过同一个任务，别再问了
+      // 研究完成 → 顺带取回报告正文：只报"已完成"而说不出结论，对用户没有价值
+      if (d.report_ready) {
+        out.argusStopAsking = true; // 正文已经在手，直接回答用户，不需要再查
+        const r = await argusToolRun('/api/argus/report/' + encodeURIComponent(sid), { signal: ctx && ctx.signal });
+        const md = String(r.markdown || r.body || '');
+        out.report = md.length > ARGUS_REPORT_CHARS ? md.slice(0, ARGUS_REPORT_CHARS) + '\n…（报告过长已截断）' : md;
+        out.report_truncated = md.length > ARGUS_REPORT_CHARS;
+        const cites = Array.isArray(r.citations) ? r.citations : [];
+        out.citations = cites.slice(0, 20);
+        // 报告已经由跟踪器自动贴进对话 → 让模型总结要点，别把几万字正文再抄一遍
+        const autoShown = (typeof ArgusWatcher !== 'undefined')
+          && ArgusWatcher._alreadyShown(sid, (typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null);
+        out.note = autoShown
+          ? '研究已完成，报告正文已经自动出现在本轮对话（"Argus 深度研究"那条消息）。' +
+            '请直接基于它用中文总结关键结论与来源，不要重复粘贴全文。'
+          : '研究已完成。请基于 report 正文用中文回答用户的问题，并按 citations 标注来源；' +
+            '报告过长时说明只呈现了要点（完整报告见 Argus 页面）。';
+      } else {
+        // 还没完成 → 交给跟踪器盯着，出报告时自动贴进对话（用户不必再来问一次）
+        if (d.status !== 'failed' && typeof ArgusWatcher !== 'undefined') ArgusWatcher.track(sid, { question: d.question });
+        out.note = d.status === 'failed'
+          ? '研究失败（Argus 侧报错）。请如实告知用户，不要编造结论。'
+          : '研究仍在进行中，可直接把 progress 告诉用户；报告生成后会自动出现在本轮对话里，稍等即可。';
+      }
+      return out;
+    }
+  }
+];
+ARGUS_TOOLS.forEach(t => ToolRegistry.register(t));
+
+/* ============================================================
+   [Argus 深度研究] 研究任务自动跟踪（轮询状态 → 拉报告 → 追加助手消息）
+   要解决的问题：detective_research 只建会话 + 起后台任务，立即返回 session_id
+   （研究本身要跑几分钟）。此前链路到此为止 —— 模型除了说一句"已启动，请稍后再查"
+   什么也做不了，报告永远回不到对话里；用户必须自己再问一次"好了吗"，而且
+   小模型经常连这一步都不愿意调工具。
+   本跟踪器把后半程补成确定性的代码行为（Argus / Moray 后端零改动，只读既有三个接口）：
+     起研究 → 登记 (session_id, 会话) → 定时 GET /api/argus/status/{sid}
+       → report_ready（或 done/completed）→ GET /api/argus/report/{sid}
+       → data.markdown 作为一条 assistant 消息追加进原会话
+   - 渲染走既有管线（buildMessageEl → renderMarkdown），不新增任何样式；
+   - 完成时若用户正在生成：只**追加本节点**，绝不整表重绘（重绘会丢掉流式气泡）；
+   - 刷新后凭 localStorage 续跑；同一 session_id 只追加一次。
+   [Day24.5] 轮询不再是"后台静默"：每轮把 status.progress / event_count / 已用时长
+   画进输入台上方的一块进度面板（PANEL_ID），超时/断网/取报告失败也**落一条消息**
+   而不是只弹通知。为什么面板挂在消息流之外（#chat-normal 里、输入台之前）：
+   ① 进度是过程信息，不该落库成消息、也不进消息索引；
+   ② 消息区会被 renderMessages 整表重绘，注入进去的节点随时会被抹掉；
+   ③ 终态时报告才作为消息落库（既有行为不变），面板消失。
+   ============================================================ */
+const ArgusWatcher = {
+  /** 轮询起步间隔（ms）：任务书建议 3-5s，取上限——起步就能看到进度在动 */
+  POLL_MS: 4000,
+  /** [Day24.5] 轮询退避档位：{after,ms} = 已跟踪超过 after(ms) 后改用 ms 间隔。
+   * 长任务没必要每 4s 敲一次：15 分钟窗口内约 85 次请求，恒定 4s 要 225 次。 */
+  POLL_STEPS: [
+    { after: 0, ms: 4000 },
+    { after: 2 * 60 * 1000, ms: 8000 },
+    { after: 8 * 60 * 1000, ms: 15000 }
+  ],
+  /** 单个任务最长跟踪时长（ms）：[Day24.5] 30 → 15 分钟（任务书要求）。
+   * 超时只停"自动取报告"，Argus 后台的研究不受影响；ARGUS_SESSION_LOG 的保鲜期
+   * （60 分钟）宽于它，所以用户按提示问「进度如何」照样能命中状态兜底并重新开始跟踪。 */
+  MAX_WAIT_MS: 15 * 60 * 1000,
+  /** 连续失败上限：后端没起/断网时不能无限重试 */
+  MAX_FAILS: 6,
+  /** 刷新后续跑用的 localStorage 键 */
+  STORE_KEY: 'moray_argus_watch',
+  /** 报告消息在气泡头部显示的"模型名"（这不是某次模型推理，别显示成 qwen…） */
+  LABEL: 'Argus 深度研究',
+  /** [Day24.5] 进度面板的 DOM id（挂在 #chat-normal 内、输入台之前） */
+  PANEL_ID: 'argusProgressPanel',
+
+  /** 在跟踪的任务
+   * @type {Object<string,{convId:(string|null),question:string,startedAt:number,fails:number,reportedAt:number,progress:string,eventCount:number}}> */
+  _tasks: {},
+  /** 定时器句柄 @type {Object<string,number>} */
+  _timers: {},
+  /** 秒表定时器句柄（只在面板存在时跑，面板消失即自停） @type {number} */
+  _panelTimer: 0,
+  /** 面板当前展示的 session_id @type {string} */
+  _panelSid: '',
+
+  /** 登记研究任务并开始轮询（同一 session_id 重复登记幂等）
+   * @param {string} sessionId - Argus 研究会话 id（detective_research 返回的那个）
+   * @param {Object} [opts] - {convId, question, startedAt}
+   * @returns {boolean} 是否已开始跟踪 */
+  track(sessionId, opts) {
+    try {
+      const sid = String(sessionId || '').trim();
+      if (!sid || !/^[A-Za-z0-9_-]{6,}$/.test(sid)) return false;
+      const o = opts || {};
+      const prev = this._tasks[sid];
+      if (prev && prev.reportedAt) return false; // 这条会话的报告已经展示过
+      const activeId = (typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null;
+      const convId = o.convId || (prev && prev.convId) || activeId || null;
+      if (!convId) return false; // 没有归属会话：报告无处可放（不做无主追加）
+      if (this._alreadyShown(sid, convId)) return false;
+      this._tasks[sid] = {
+        convId,
+        question: String(o.question || (prev && prev.question) || ''),
+        startedAt: Number(o.startedAt || (prev && prev.startedAt)) || Date.now(),
+        fails: 0,
+        reportedAt: 0,
+        progress: String(o.progress || (prev && prev.progress) || ''),
+        eventCount: Number(o.eventCount || (prev && prev.eventCount)) || 0
+      };
+      this._persist();
+      this._schedule(sid, 1500); // 首次稍等，避开刚返回的那次请求
+      this._panelPaint(); // [Day24.5] 立刻亮出进度面板，别让用户对着空气等
+      console.log('[MoRay] Argus 研究跟踪已启动 session=' + sid);
+      return true;
+    } catch (e) {
+      console.warn('[MoRay] Argus 跟踪登记失败:', e);
+      return false;
+    }
+  },
+
+  /** 找同一会话里仍在跑、且问题相同/相近的研究任务。
+   *
+   * 为什么需要：detective_research 的描述写着"强制优先调用"，而 7B 级小模型会把工具轮
+   * 刷满——实测一次"用 Argus 查一下 Cursor 价格"被连着调了 7 次，起了 7 个同一个问题的
+   * 研究（各自都会出一份报告）。重复起研究对用户没有任何价值，所以在**前端**兜住：
+   * 同会话同问题已有任务在跑就复用那个 session_id，不再新建。
+   * @param {string} question - 本次要研究的问题
+   * @param {string} [convId] - 会话 id（缺省取当前会话）
+   * @returns {{sid:string,question:string,startedAt:number}|null} 命中的在跑任务 */
+  findRunning(question, convId) {
+    try {
+      const q = this._normQuestion(question);
+      if (!q) return null;
+      const cid = convId || ((typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null);
+      let found = null;
+      Object.keys(this._tasks).forEach(sid => {
+        const t = this._tasks[sid];
+        if (!t || t.reportedAt) return;
+        if (cid && t.convId && t.convId !== cid) return;
+        const tq = this._normQuestion(t.question);
+        // 相等或互相包含即视为同一件事（"Cursor 价格" vs "Cursor 价格查询"）
+        if (tq === q || tq.indexOf(q) >= 0 || q.indexOf(tq) >= 0) {
+          if (!found || t.startedAt < found.startedAt) found = { sid, question: t.question, startedAt: t.startedAt };
+        }
+      });
+      return found;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  /** 问题归一化（忽略大小写、空白与标点）
+   * @param {string} s - 原始问题
+   * @returns {string} */
+  _normQuestion(s) {
+    return String(s || '').toLowerCase().replace(/[\s，。,.、!！?？:：;；"'“”‘’()（）[\]【】]+/g, '');
+  },
+
+  /** 在消息索引 + 当前消息表里扫一遍（报告去重与提示去重共用）
+   * @param {string|null} convId - 会话 id
+   * @param {Function} pred - (msg)=>boolean
+   * @returns {boolean} 命中任一即 true */
+  _scanMessages(convId, pred) {
+    try {
+      const lists = [];
+      const idx = (typeof AppState !== 'undefined' && AppState._convMsgIndex) ? AppState._convMsgIndex : null;
+      if (idx && convId && idx[convId]) lists.push(idx[convId]);
+      if (typeof AppState !== 'undefined' && Array.isArray(AppState.messages)) lists.push(AppState.messages);
+      return lists.some(list => list.some(m => {
+        try { return !!(m && pred(m)); } catch (e) { return false; }
+      }));
+    } catch (e) {
+      return false;
+    }
+  },
+
+  /** 该 session 的报告是否已经作为消息存在（防刷新/重复登记导致的双份报告）
+   * [Day24.5] 提示类消息（argusNotice）不算报告：超时/断网提示过之后，
+   * 研究真出了报告仍然必须能贴进来。
+   * @param {string} sid - session_id
+   * @param {string|null} convId - 会话 id
+   * @returns {boolean} */
+  _alreadyShown(sid, convId) {
+    return this._scanMessages(convId, m => m.argusSessionId === sid && !m.argusNotice);
+  },
+
+  /** 同一 session 是否已经贴过同原因的提示（超时/断网/取报告失败）——反复重试时不刷屏
+   * @param {string} sid - session_id
+   * @param {string} reason - timeout | offline | error
+   * @param {string|null} convId - 会话 id
+   * @returns {boolean} */
+  _noticeShown(sid, reason, convId) {
+    return this._scanMessages(convId, m => m.argusSessionId === sid && m.argusNotice === reason);
+  },
+
+  /** 当前该用的轮询间隔：按已跟踪时长退避（见 POLL_STEPS）
+   * @param {number} elapsedMs - 已跟踪时长（ms）
+   * @returns {number} 间隔（ms） */
+  _intervalFor(elapsedMs) {
+    const e = Math.max(0, Number(elapsedMs) || 0);
+    let ms = this.POLL_MS;
+    (this.POLL_STEPS || []).forEach(s => { if (s && e >= s.after) ms = s.ms; });
+    return ms;
+  },
+
+  /** 安排下一次轮询（同一 sid 只保留一个定时器；缺省按退避档位计时）
+   * @param {string} sid - session_id
+   * @param {number} [delay] - 延迟（ms；省略即取退避档位）
+   * @returns {void} */
+  _schedule(sid, delay) {
+    if (this._timers[sid]) clearTimeout(this._timers[sid]);
+    const task = this._tasks[sid] || {};
+    const step = this._intervalFor(Date.now() - (task.startedAt || Date.now()));
+    const wait = Math.max(300, Number(delay) || step);
+    this._timers[sid] = setTimeout(() => {
+      delete this._timers[sid];
+      this._poll(sid).catch(e => console.warn('[MoRay] Argus 轮询异常:', e));
+    }, wait);
+  },
+
+  /** 轮询一次状态：running 继续等（顺带刷新进度面板）；done/completed → 取报告；failed → 如实告知
+   * @param {string} sid - session_id
+   * @returns {Promise<void>} */
+  async _poll(sid) {
+    const task = this._tasks[sid];
+    if (!task || task.reportedAt) return;
+    if (Date.now() - task.startedAt > this.MAX_WAIT_MS) { await this._stopNotice(sid, 'timeout'); return; }
+    let d = null;
+    try {
+      d = await argusToolRun('/api/argus/status/' + encodeURIComponent(sid));
+    } catch (e) {
+      task.fails = (task.fails || 0) + 1;
+      task.progress = '查询进度失败（' + task.fails + '/' + this.MAX_FAILS + '）：' +
+        String((e && e.message) || e).slice(0, 80);
+      this._persist();
+      this._panelPaint();
+      if (task.fails >= this.MAX_FAILS) { await this._stopNotice(sid, 'offline', String((e && e.message) || e)); return; }
+      this._schedule(sid, this.POLL_MS * Math.min(task.fails, 3)); // 退避重试
+      return;
+    }
+    task.fails = 0;
+    const status = String((d && d.status) || '').toLowerCase();
+    // [Day24.5] 每轮的真实进度都存在任务上，由面板重绘（不落库、不进消息流）
+    const prog = String((d && d.progress) || '').trim();
+    if (prog) task.progress = prog;
+    const evts = Number((d && d.event_count) || 0);
+    if (evts) task.eventCount = evts;
+    if (status === 'failed' || status === 'error') { await this._deliverFailure(sid, d); return; }
+    if ((d && d.report_ready) || status === 'done' || status === 'completed') {
+      task.progress = '研究完成，正在取报告…';
+      this._panelPaint();
+      await this._deliver(sid);
+      return;
+    }
+    if (!task.progress) task.progress = '研究进行中…';
+    this._panelPaint();
+    this._schedule(sid);
+  },
+
+  /** 终态成功：拉报告正文并追加为助手消息
+   * @param {string} sid - session_id
+   * @returns {Promise<void>} */
+  async _deliver(sid) {
+    const task = this._tasks[sid];
+    if (!task || task.reportedAt) return;
+    let r = null;
+    try {
+      r = await argusToolRun('/api/argus/report/' + encodeURIComponent(sid));
+    } catch (e) {
+      // 状态说完成、报告接口却报错：再等两轮，仍失败就交代清楚，别静默消失
+      task.fails = (task.fails || 0) + 1;
+      task.progress = '报告读取失败（' + task.fails + '/3），重试中…';
+      this._panelPaint();
+      if (task.fails >= 3) { await this._stopNotice(sid, 'error', String((e && e.message) || e)); return; }
+      this._schedule(sid);
+      return;
+    }
+    const md = String((r && (r.markdown || r.body)) || '').trim();
+    if (!md) {
+      // 还查不到报告正文（ready=false）：再等一轮；确认为空则如实说明
+      if (!r || r.ready !== true) { this._schedule(sid); return; }
+      await this._emit(sid, '> ⚠️ Argus 研究已完成，但报告正文为空（session_id: `' + sid + '`）。');
+      return;
+    }
+    await this._emit(sid, md);
+  },
+
+  /** 终态失败：追加一条简短说明（不编造结论，也不让用户干等）
+   * @param {string} sid - session_id
+   * @param {Object} d - 状态响应
+   * @returns {Promise<void>} */
+  async _deliverFailure(sid, d) {
+    const task = this._tasks[sid];
+    if (!task || task.reportedAt) return;
+    const progress = String((d && d.progress) || '').trim();
+    await this._emit(sid, '> ⚠️ Argus 研究任务失败：' + (progress || 'Argus 侧报错') +
+      '（session_id: `' + sid + '`）。可以重新发起一次研究。');
+  },
+
+  /** 追加一条助手消息（报告正文 / 提示说明），并写库
+   * @param {string} sid - session_id
+   * @param {string} content - Markdown 正文
+   * @param {Object} [opts] - {notice:'timeout'|'offline'|'error'}
+   *   notice 非空表示这是"跟踪没走完"的提示消息而不是报告：打 argusNotice 标记
+   *   （既不占用"报告已展示"的判定，见 _alreadyShown；也用于同原因去重），
+   *   且**不设 reportedAt / 不自动收尾** —— 收尾要带原因（弹对应通知），见 _stopNotice。
+   * @returns {Promise<void>} */
+  async _emit(sid, content, opts) {
+    const o = opts || {};
+    const task = this._tasks[sid] || {};
+    const convId = task.convId ||
+      ((typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null);
+    if (!convId) { this._stop(sid, 'no-conv'); return; }
+    const active = !!(typeof AppState !== 'undefined' && AppState.activeConv && AppState.activeConv.id === convId);
+    const prevMsg = active && Array.isArray(AppState.messages) && AppState.messages.length
+      ? AppState.messages[AppState.messages.length - 1] : null;
+    const msg = {
+      id: uid('msg'), conversationId: convId, role: 'assistant', content,
+      model: this.LABEL, createdAt: Date.now(), tokens: 0, stats: null, feedback: 0,
+      citations: [], think: false,
+      argusSessionId: sid, argusAuto: true, argusQuestion: task.question || ''
+    };
+    // [Day24.5] 提示类消息（超时/断网/取报告失败）打标记：不占"报告已展示"的判定，
+    // 同原因不重复贴（见 _noticeShown），也不会挡住后续真报告的自动贴入
+    if (o.notice) msg.argusNotice = String(o.notice);
+    // _convMsgIndex 在启动时由 rebuildMsgIndex 建好；这里兜一下空值，避免异常状态下追加失败
+    if (!AppState._convMsgIndex) AppState._convMsgIndex = {};
+    (AppState._convMsgIndex[convId] = AppState._convMsgIndex[convId] || []).push(msg);
+    if (active) AppState.messages.push(msg);
+    try {
+      if (typeof persistMessage === 'function') await persistMessage(msg);
+    } catch (e) { console.warn('[MoRay] Argus 报告落库失败:', e); }
+    if (active) this._paint(msg, prevMsg);
+    else if (typeof showNotification === 'function') {
+      const conv = ((AppState.conversations || []).find(c => c.id === convId)) || null;
+      showNotification(o.notice ? 'Argus 研究跟踪已停止' : 'Argus 研究报告已生成',
+        '已追加到会话「' + ((conv && conv.title) || '未命名') + '」',
+        o.notice ? 'warning' : 'info', 5000);
+    }
+    if (typeof renderSessionList === 'function') renderSessionList();
+    if (typeof updateTokenMeter === 'function') updateTokenMeter();
+    if (o.notice) { this._panelPaint(); return; } // 提示消息不设 reportedAt、不在此收尾
+    task.reportedAt = Date.now();
+    this._stop(sid, 'done');
+  },
+
+  /** 把消息节点追加到消息区（复用既有渲染：buildMessageEl → renderMarkdown）
+   * @param {Object} msg - 消息对象
+   * @param {Object|null} prevMsg - 追加前的最后一条消息（用于时间分隔线）
+   * @returns {void} */
+  _paint(msg, prevMsg) {
+    const box = document.getElementById('chatMessagesNormal');
+    if (!box) { if (typeof renderMessages === 'function') renderMessages(); return; }
+    const nearBottom = this._nearBottom(box);
+    box.classList.remove('hidden');
+    if (typeof removeWelcomeView === 'function') removeWelcomeView();
+    // 与既有渲染一致：与上一条消息间隔 >5 分钟才画时间分隔线
+    if (prevMsg && msg.createdAt - (prevMsg.createdAt || 0) > 5 * 60 * 1000) {
+      const sep = document.createElement('div');
+      sep.className = 'time-separator';
+      sep.innerHTML = '<span>' + new Date(msg.createdAt).toLocaleString('zh-CN',
+        { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) + '</span>';
+      box.appendChild(sep);
+    }
+    box.appendChild(buildMessageEl(msg, true));
+    refreshIcons();
+    if (MoraySettings.get('autoScroll') && nearBottom) scrollToMsgBottom();
+  },
+
+  /** 追加前判断用户是否贴着底部（贴底才自动滚动，翻旧消息时不打扰）
+   * @param {HTMLElement} box - 消息容器
+   * @returns {boolean} */
+  _nearBottom(box) {
+    try {
+      const sp = box.parentElement;
+      if (!sp) return true;
+      return (sp.scrollHeight - sp.scrollTop - sp.clientHeight) < 160;
+    } catch (e) {
+      return true;
+    }
+  },
+
+  /** 结束跟踪并清掉定时器
+   * @param {string} sid - session_id
+   * @param {string} reason - done | timeout | offline | error | no-conv
+   * @param {string} [detail] - 失败原因（写日志）
+   * @returns {void} */
+  _stop(sid, reason, detail) {
+    if (this._timers[sid]) { clearTimeout(this._timers[sid]); delete this._timers[sid]; }
+    const task = this._tasks[sid];
+    delete this._tasks[sid];
+    this._persist();
+    this._panelPaint(); // [Day24.5] 收尾即收起/改画面板（还有别的任务在跟踪就继续显示）
+    if (reason === 'done') return;
+    console.warn('[MoRay] Argus 跟踪结束(' + reason + ') session=' + sid, detail || '');
+    // 中途放弃必须给用户一个交代：否则"等报告"这件事悄无声息地没了
+    if (typeof showNotification === 'function') {
+      if (reason === 'timeout') {
+        showNotification('Argus 研究仍在进行', '已跟踪 ' + Math.round(this.MAX_WAIT_MS / 60000) +
+          ' 分钟仍未出报告，先停止自动取报告；稍后问我"进度如何"即可。', 'info', 7000);
+      } else if (reason === 'offline') {
+        showNotification('Argus 跟踪中断', '连不上本地后端，已停止自动取报告：' +
+          String(detail || '').slice(0, 60), 'warning', 7000);
+      } else if (reason === 'error') {
+        showNotification('Argus 报告拉取失败', '研究已完成但报告读取失败：' +
+          String(detail || '').slice(0, 60), 'warning', 7000);
+      }
+    }
+  },
+
+  /** [Day24.5] 中途放弃要**留痕**：先在会话里追加一条说明消息，再按原因收尾。
+   *
+   * 为什么不能只弹通知：用户此刻可能切到了别的会话 / 别的页面，7 秒的通知他看不到，
+   * 切回来又什么都没有——"报告会自己回来"这件事就悄无声息地没了（验收第 4 条要的
+   * 正是这个交代）。同原因的提示只贴一次（反复重试/反复问进度不刷屏）。
+   * @param {string} sid - session_id
+   * @param {string} reason - timeout | offline | error
+   * @param {string} [detail] - 失败原因（进正文与日志）
+   * @returns {Promise<void>} */
+  async _stopNotice(sid, reason, detail) {
+    const task = this._tasks[sid];
+    if (!task) return;
+    const why = detail ? '（' + String(detail).slice(0, 80) + '）' : '';
+    const tail = '（session_id: `' + sid + '`）。稍后问「进度如何」可继续查询，' +
+      '报告就绪时仍会自动回到本对话。';
+    const body = reason === 'timeout'
+      ? '> ⏱️ Argus 研究已跟踪 ' + Math.round(this.MAX_WAIT_MS / 60000) +
+        ' 分钟仍未出报告，已停止自动取报告（研究本身可能仍在 Argus 后台跑）。' + tail
+      : reason === 'offline'
+        ? '> ⚠️ 连续 ' + this.MAX_FAILS + ' 次查不到研究状态，已停止自动取报告' + why + '。' + tail
+        : '> ⚠️ 研究已完成，但报告读取连续失败' + why + '。' + tail;
+    if (this._noticeShown(sid, reason, task.convId)) {
+      // 同原因提示已经贴过（后端反复断、用户反复问）→ 不刷屏，但收尾与通知照旧
+      this._stop(sid, reason, detail);
+      return;
+    }
+    await this._emit(sid, body, { notice: reason });
+    this._stop(sid, reason, detail); // _emit 的提示分支不会收尾，这里带上原因收尾
+  },
+
+  /** 持久化在跟踪的任务（刷新后续跑；隐私模式下不写盘）
+   * @returns {void} */
+  _persist() {
+    try {
+      if (typeof isPrivacyMode === 'function' && isPrivacyMode()) return;
+      const rows = Object.keys(this._tasks).map(sid => Object.assign({ sid }, this._tasks[sid]));
+      localStorage.setItem(this.STORE_KEY, JSON.stringify(rows));
+    } catch (e) { /* 存储不可用不影响本次会话内跟踪 */ }
+  },
+
+  /** 启动时接续未完成的任务（刷新/重开页面后报告照样会自动出现）
+   * @returns {number} 接续的任务数 */
+  resumePending() {
+    let rows = [];
+    try { rows = JSON.parse(localStorage.getItem(this.STORE_KEY) || '[]') || []; } catch (e) { rows = []; }
+    if (!Array.isArray(rows)) return 0;
+    const now = Date.now();
+    let n = 0;
+    rows.forEach(r => {
+      const sid = r && r.sid ? String(r.sid) : '';
+      if (!sid || !/^[A-Za-z0-9_-]{6,}$/.test(sid)) return;
+      if (r.reportedAt) return;
+      if (now - (Number(r.startedAt) || 0) > this.MAX_WAIT_MS) return; // 超期不再续跑
+      if (this.track(sid, {
+        convId: r.convId, question: r.question, startedAt: r.startedAt,
+        progress: r.progress, eventCount: r.eventCount
+      })) n++;
+    });
+    this._persist(); // 回写：过期的条目就此清掉
+    if (n) console.log('[MoRay] Argus 续跑 ' + n + ' 个未完成研究任务');
+    return n;
+  },
+
+  /* ---------- [Day24.5] 进度面板：确定性轮询的可见层 ----------
+     位置：#chat-normal 内、输入台 wrapper 之前（JS 动态插入，不进消息流）。
+     为什么不进消息流：① 进度是过程信息，不该落库成消息；② 消息区会被
+     renderMessages 整表重绘，注入的节点随时被抹掉；③ 终态才由 _emit 贴报告。
+     每次轮询结束调用一次 _panelPaint()，它自己处理"该显示谁/该不该收起"。 */
+
+  /** 面板宿主：对话页 + 输入台的插入锚点
+   * @returns {{chat:HTMLElement,dockWrap:(HTMLElement|null)}|null} */
+  _panelHost() {
+    const chat = document.getElementById('chat-normal') || document.getElementById('page-chat');
+    if (!chat) return null;
+    const dock = document.getElementById('coreInputContainer');
+    const dockWrap = (dock && dock.parentElement && dock.parentElement.parentElement === chat)
+      ? dock.parentElement : null;
+    return { chat, dockWrap };
+  },
+
+  /** 当前会话该显示哪条跟踪任务（取最近启动的一条；没有则 null）
+   * 只说"当前会话"：跨会话的进度不该出现在别人的对话页上（那种情况走通知）。
+   * @returns {string} session_id；无则空串 */
+  _panelPick() {
+    try {
+      const activeId = (typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null;
+      let best = '', bestAt = -1;
+      Object.keys(this._tasks).forEach(sid => {
+        const t = this._tasks[sid];
+        if (!t || t.reportedAt) return;
+        if (activeId && t.convId && t.convId !== activeId) return;
+        const at = Number(t.startedAt) || 0;
+        if (at > bestAt) { bestAt = at; best = sid; }
+      });
+      return best;
+    } catch (e) {
+      return '';
+    }
+  },
+
+  /** 建面板骨架（幂等；已存在且还在文档里就直接复用）
+   * @returns {HTMLElement|null} */
+  _panelEnsure() {
+    let el = document.getElementById(this.PANEL_ID);
+    if (el && el.isConnected) return el;
+    const host = this._panelHost();
+    if (!host) return null;
+    el = document.createElement('div');
+    el.id = this.PANEL_ID;
+    el.className = 'argus-progress';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    el.innerHTML = [
+      '<div class="argus-progress-head">',
+      '<span class="argus-progress-icon"><i data-lucide="radar" class="w-3.5 h-3.5"></i></span>',
+      '<span class="argus-progress-title">Argus 研究进行中</span>',
+      '<span class="argus-progress-question" data-argus-q></span>',
+      '<span class="argus-progress-more" data-argus-more></span>',
+      '<span class="argus-progress-meta" data-argus-meta></span>',
+      '</div>',
+      '<div class="argus-progress-text" data-argus-text>已启动，正在获取进度…</div>',
+      '<div class="argus-progress-bar"><span class="argus-progress-bar-fill"></span></div>'
+    ].join('');
+    if (host.dockWrap) host.chat.insertBefore(el, host.dockWrap);
+    else host.chat.appendChild(el);
+    // 图标只在这里换一次（refreshIcons 会把 <i> 换成 <svg>，之后所有更新都改文本节点）
+    if (typeof refreshIcons === 'function') refreshIcons();
+    return el;
+  },
+
+  /** 收起面板（连同秒表；轮询不受影响，报告该来还是会来）
+   * @returns {void} */
+  _panelClear() {
+    if (this._panelTimer) { clearInterval(this._panelTimer); this._panelTimer = 0; }
+    this._panelSid = '';
+    const el = document.getElementById(this.PANEL_ID);
+    if (el && el.parentElement) el.parentElement.removeChild(el);
+  },
+
+  /** 按当前跟踪状态重绘面板（无任务/不在本会话 → 收起）
+   * @returns {void} */
+  _panelPaint() {
+    try {
+      const sid = this._panelPick();
+      if (!sid) { this._panelClear(); return; }
+      const task = this._tasks[sid] || {};
+      const box = this._panelEnsure();
+      if (!box) return;
+      this._panelSid = sid;
+      const q = box.querySelector('[data-argus-q]');
+      if (q) {
+        const full = String(task.question || '研究任务');
+        q.textContent = full.length > 42 ? full.slice(0, 42) + '…' : full;
+        q.title = full;
+      }
+      const txt = box.querySelector('[data-argus-text]');
+      if (txt) {
+        const line = String(task.progress || '已启动，正在获取进度…');
+        if (txt.textContent !== line) txt.textContent = line;
+      }
+      const more = box.querySelector('[data-argus-more]');
+      if (more) {
+        const n = Object.keys(this._tasks).filter(k => {
+          const t = this._tasks[k];
+          return t && !t.reportedAt && (!task.convId || t.convId === task.convId);
+        }).length;
+        more.textContent = n > 1 ? '（+' + (n - 1) + ' 条并行）' : '';
+      }
+      this._panelMeta();
+      if (!this._panelTimer) {
+        // 秒表：只有面板活着的时候跑，面板一收就自停（零后台开销）
+        this._panelTimer = setInterval(() => {
+          if (!document.getElementById(this.PANEL_ID)) { clearInterval(this._panelTimer); this._panelTimer = 0; return; }
+          this._panelMeta();
+        }, 1000);
+      }
+    } catch (e) { /* 面板失败不影响轮询与报告投递 */ }
+  },
+
+  /** 刷新面板右侧元信息（已用时长 + 事件数）
+   * @returns {void} */
+  _panelMeta() {
+    try {
+      const sid = this._panelSid;
+      const task = sid ? this._tasks[sid] : null;
+      if (!task) return;
+      const el = document.getElementById(this.PANEL_ID);
+      const meta = el ? el.querySelector('[data-argus-meta]') : null;
+      if (!meta) return;
+      const sec = Math.max(0, Math.floor((Date.now() - (Number(task.startedAt) || Date.now())) / 1000));
+      const mm = Math.floor(sec / 60), ss = sec % 60;
+      const time = mm + ':' + (ss < 10 ? '0' : '') + ss;
+      meta.textContent = time + (task.eventCount ? ' · 事件 ' + task.eventCount : '');
+    } catch (e) { /* 忽略 */ }
+  }
+};
+
+/** [Argus 深度研究] 显式点名 Argus 的请求 → 直接给出研究问题（否则 null）。
+ *
+ * 为什么需要它：需求 2.1 的闭环是"模型返回 tool_calls → 我们执行"，这对大模型没问题，
+ * 但实测本机 7B 级模型（qwen2.5:7b）在"帮我查一下 X"这类请求上经常跳过工具调用、
+ * 直接把 System Prompt 里描述的结果（"已启动研究任务，session_id=…"）背出来，
+ * 编出一个不存在的 id（3 次里 2 次如此；换个措辞又变成 0/4）——这是模型能力问题，
+ * 光靠提示词按不住。所以**只在用户明确点名 Argus 时**由代码直接发起，
+ * 其余"调研/查资料"类请求仍走模型自主调用（工具描述里已写明优先调用）。
+ *
+ * 触发条件（2026-09-21 收紧，见 argusShouldLaunchResearch）：**提到 "Argus" 只是必要条件**，
+ * 还要含动作词白名单里的词、且不是"你认识 / 是什么 / 介绍 / 了解"这类问法、也不是在问进度。
+ * 此前只判 "argus" 出现过，结果"你认识 Argus 吗"这种闲聊也会起一个研究任务。
+ * @param {Array} messages - 本次请求的消息数组
+ * @returns {string|null} 研究问题 */
+function argusExplicitQuestion(messages) {
+  try {
+    const lastUser = (() => {
+      const list = Array.isArray(messages) ? messages : [];
+      for (let i = list.length - 1; i >= 0; i--) {
+        const m = list[i];
+        if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) return m.content.trim();
+      }
+      return null;
+    })();
+    // [Argus 触发收紧] 否决层 + 动作词白名单 + 排除进度询问，三道门都在纯函数里（有单测）。
+    // 仅仅出现 "Argus" 不再构成触发理由。
+    if (!argusShouldLaunchResearch(lastUser)) return null;
+    // 去掉"用 Argus"这类外壳（含常见前置词组合），再剥离开头的请求动词，留下真正的研究问题。
+    // 清完太短（≤1 字）就退回原话——宁可问得啰嗦，也不要问一个空问题。
+    let s = lastUser.replace(/(?:用|使用|通过|让|叫|请|帮我|麻烦|给我|替我)*\s*argus\s*(?:深度研究|研究|调研)?/gi, ' ');
+    for (let i = 0; i < 3; i++) {
+      const before = s;
+      s = s.replace(/^\s*(?:帮我|请|麻烦|你|去|给我|替我)?\s*(?:查一下|查一查|查查|查|搜一下|搜一搜|搜搜|搜|搜索|调研一下|调研|研究一下|研究|了解一下|了解|看看|看)\s*(?:一下|下|个)?\s*/i, '');
+      if (s === before) break;
+    }
+    s = s.replace(/^[：:，,、\s]+|[：:，,。!！?？\s]+$/g, '')
+      .replace(/^(?:一下|下|个)\s*/, '')
+      .trim();
+    return s.length > 1 ? s : lastUser;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ============================================================
+   [Argus 深度研究] 上下文感知兜底：问进度时由代码直接查状态
+   要解决的问题：用户拿到 session_id 后紧接着问"进度如何"，qwen2.5:7b 不会去调
+   detective_status，只用"研究正在进行中，请稍候"这类废话敷衍（实测）。
+   与"显式点名 Argus"那条兜底同一思路：**判断不由模型做**——命中条件由代码判定，
+   代码直接调接口，把真实进度作为 role:"tool" 回灌，模型只负责用自然语言转述。
+   两个条件必须同时满足：
+     1) 最后一条用户消息在问进度/状态/结果（argusAsksProgress）；
+     2) 当前对话里有一条"最近碰过、还没出报告"的研究会话（argusPickActiveSession）。
+   条件 2 决定这条兜底不会外溢：没有任何研究在跑的对话里，命中率恒为 0。
+
+   本段是**纯函数**（无 DOM、无网络、无全局状态），测试直接从这两个标记之间
+   取出来跑：见 argus/tests/test_moray_argus_progress_fallback.py。
+   ============================================================ */
+
+/* @argus-progress-fallback:pure:begin */
+
+/** [Argus] 进度询问关键词（判定条件 1）。刻意只收"问这个任务怎么样了"的说法，
+ * 不做通用意图识别——"状态/进度"这类词单独出现时的误命中由条件 2 兜住。
+ * @type {RegExp} */
+const ARGUS_PROGRESS_RE = /进度|进展|状态|怎么样了|怎么样子|怎样了|如何了|好了吗|好了没|好了没有|完了吗|完成了吗|完成了没|完成没有|搞定了吗|出来了吗|出来了没|出来没|结果出来|有结果|结束了吗|还要多久|得多久|多久|跑到哪|到哪了|到哪一步|查到什么|查到了吗|查到了什么|什么情况/;
+
+/** [Argus] 研究会话记录的保鲜期（ms）：超过这个时长就不再认它是"当前在跑的研究"。
+ * 取得比 ArgusWatcher.MAX_WAIT_MS（30 分钟）宽一倍，让"跟踪已超时、用户按提示回来
+ * 问进度"这条路径也能命中（见 ARGUS_SESSION_LOG 的注释）。 */
+const ARGUS_SESSION_TTL_MS = 60 * 60 * 1000;
+
+/** [Argus] 取最后一条有正文的用户消息
+ * @param {Array} messages - 消息数组
+ * @returns {string} 无则空串 */
+function argusLastUserText(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) return m.content.trim();
+  }
+  return '';
+}
+
+/** [Argus] 这条用户消息是不是在问研究进度（判定条件 1）
+ * @param {string} text - 用户消息正文
+ * @returns {boolean} */
+function argusAsksProgress(text) {
+  return ARGUS_PROGRESS_RE.test(String(text || ''));
+}
+
+/** [Argus 触发] 动作词白名单：只有"Argus + 明确的动作词"才算让它干活。
+ * @type {RegExp} */
+const ARGUS_ACTION_RE = /查|搜|搜索|研究|找|对比|浏览|调研|进度|状态/;
+
+/** [Argus 触发] 定义/疑问句式：出现这些词就是在**问 Argus 是什么**，不是在给它派活。
+ * 注意 ``了解`` / ``介绍`` 也在列——它们不是动作词白名单里的词，出现即不触发。
+ * @type {RegExp} */
+const ARGUS_VETO_RE = /你认识|认不认识|是什么|什么是|啥是|介绍一下|介绍下|介绍|了解一下|了解下|了解/;
+
+/** [Argus 触发] 存在动作词
+ * @param {string} text - 用户消息正文
+ * @returns {boolean} */
+function argusHasActionWord(text) {
+  return ARGUS_ACTION_RE.test(String(text || ''));
+}
+
+/** [Argus 触发] 否决函数：这条消息**禁止**触发研究。
+ *
+ * 为什么单列一层："你认识 Argus 吗"曾是真实误触发（用户只是问一句，系统却起了
+ * 一个研究任务）。这个判断刻意放在最前面——只要命中定义/疑问句式就直接否决，
+ * 不再看别的条件，免得后面任何一条规则把结论翻回去。
+ * @param {string} text - 用户消息正文
+ * @returns {boolean} true = 不许触发 */
+function shouldNotTriggerArgus(text) {
+  const s = String(text || '');
+  if (!s || !/argus/i.test(s)) return false;
+  return ARGUS_VETO_RE.test(s);
+}
+
+/** [Argus 触发] 这条用户消息该不该由代码直接发起研究——三道门同时放行才行：
+ *   1) 提到 Argus（否则跟它无关）；
+ *   2) 没被 shouldNotTriggerArgus 否决（"是什么 / 你认识 / 介绍 / 了解"这类问法）；
+ *   3) 含动作词白名单里的词（查 / 搜索 / 研究 / 找 / 对比 / 浏览 / 调研 / 进度 / 状态）；
+ *   4) 不是在问进度——问进度交给状态兜底，起新研究只会多出一堆重复任务。
+ * **仅仅出现 "Argus" 不再构成任何触发理由**（这就是本条修正要解决的问题）。
+ * @param {string} text - 最后一条用户消息
+ * @returns {boolean} true = 由代码发起研究 */
+function argusShouldLaunchResearch(text) {
+  const s = String(text || '');
+  if (!/argus/i.test(s)) return false;
+  if (shouldNotTriggerArgus(s)) return false;
+  if (!argusHasActionWord(s)) return false;
+  if (argusAsksProgress(s)) return false;
+  return true;
+}
+
+/** [Argus] 挑出"当前对话最近一次在跑的研究"（判定条件 2）。
+ * 记录形状 {sid|session_id, convId, touchedAt|startedAt}；归属会话不符、无时间戳、
+ * 或超过保鲜期的一律不算——宁可漏触发，也不要跨会话串进度、或把一小时前的老任务
+ * 当成"刚才那条"。
+ * @param {Object|Array} records - 记录表（对象按 sid 索引，或记录数组）
+ * @param {string|null} convId - 当前会话 id
+ * @param {number} now - 当前时间戳（ms）
+ * @returns {string|null} session_id；不满足返回 null */
+function argusPickActiveSession(records, convId, now) {
+  try {
+    if (!convId) return null;
+    const rows = Array.isArray(records)
+      ? records
+      : Object.keys(records || {}).map(k => records[k]);
+    const t = Number(now) || Date.now();
+    let best = null, bestAt = -1;
+    rows.forEach(r => {
+      if (!r || typeof r !== 'object') return;
+      const sid = String(r.sid || r.session_id || '').trim();
+      if (!/^[A-Za-z0-9_-]{6,}$/.test(sid)) return;
+      if (String(r.convId || '') !== String(convId)) return;
+      const at = Number(r.touchedAt || r.startedAt) || 0;
+      if (!at || (t - at) > ARGUS_SESSION_TTL_MS) return;
+      if (at > bestAt) { bestAt = at; best = sid; }
+    });
+    return best;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** [Argus] 上下文感知兜底的判定入口：两个条件同时满足才返回 session_id。
+ * 这是"要不要由代码替模型查一次状态"的唯一判据，Gateway.runWithTools 照此执行。
+ * @param {Array} messages - 本次请求的消息数组
+ * @param {Object|Array} records - 已知的研究会话记录（argusSessionRecords() 的产物）
+ * @param {string|null} convId - 当前会话 id
+ * @param {number} [now] - 当前时间戳（缺省取 Date.now()）
+ * @returns {string|null} 要查的 session_id；不该兜底返回 null */
+function argusProgressFallbackSession(messages, records, convId, now) {
+  try {
+    if (!argusAsksProgress(argusLastUserText(messages))) return null;
+    return argusPickActiveSession(records, convId, Number(now) || Date.now());
+  } catch (e) {
+    return null;
+  }
+}
+
+/* @argus-progress-fallback:pure:end */
 
 /* ============================================================
    [阶段1 M3] 计划-执行编排（复用现有 Agent Loop 与 onToolStep 时间线）
@@ -1553,13 +2983,16 @@ const PlanTracker = {
   /** [阶段1 M5] 内置 Agent 系统提示（设置→本机 Agent 可自定义覆盖）
    * @type {string} */
   SYSTEM_PROMPT: [
+    '- 【工具调用强制规则】\n1. 指令中出现「调用xx工具」「使用xx工具」的明确格式时，直接调用对应工具执行任务，禁止触发搜索、联网等其他工具，无需额外推理。\n2. 指令包含本地磁盘路径（C:\\、D:\\ 等）+ 代码文件后缀（.py/.js/.go 等）+ 运行/执行/启动/跑 等关键词时，优先调用 zcode_run 工具执行代码，禁止调用搜索工具。\n3. 代码修改、bug修复、功能开发类需求，优先匹配 file + zcode 系列工具，不触发通用搜索。',
     '# 本机 Agent 工作规范（受控工作区内操作）',
     '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；rename_file 重命名；move_file 移动；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
-    '- 工作区边界：所有 path 都必须是相对工作区根的路径；你无法访问工作区以外的任何文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。',
+    '- 工作区边界：所有 path 都必须是相对工作区根的路径；默认无法访问工作区以外的文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。例外：授权目录（D:\\MoRay\\config\\authorized_paths.json 内的 C:/D: 盘目录）允许按真实路径直接读写，不受工作区根限制。',
     '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
     '- 授权与拒绝：create_file / write_file / edit_file / rename_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
     '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
-    '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。'
+    '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。',
+    '- 【本地代码开发模式】支持读写用户授权的本地目录（C/D 盘均可），所有文件操作优先使用真实路径；执行文件操作前默认路径已通过授权校验，直接调用 file 工具即可；若返回"路径未授权"错误，告知用户将目录添加到 D:\\MoRay\\config\\authorized_paths.json 配置中；代码运行、文件修改严格基于用户真实目录结构，操作完成后自动同步回原路径。',
+    '- 【全栈代码开发默认规则 · 全能力版】\n1. 核心执行原则：用户给出本地文件路径+开发/修改/排查/运行需求后，自动多步执行直到任务闭环，中途不得停止。标准执行链路：读取目标文件 → 分析需求 → 增量修改 → 写回原文件 → 自动调用执行引擎验证 → 提取运行结果/预览资源 → 输出最终结论。全程无需用户额外指令，不向用户输出工具调用步骤、底层路径映射、中间调试信息。\n2. 文件读写规则：直接使用用户提供的原始磁盘路径调用 file 工具，不得擅自修改、拼接路径。修改前必须先读取文件确认内容与结构，仅修改需求涉及的代码片段，禁止全量覆盖无关内容。修改完成后自动调用 file 工具将变更写回原文件，无需用户确认保存。涉及多文件操作时，按依赖顺序逐个处理，全部完成后统一汇总。\n3. ZCode 执行引擎调度规则：代码修改完成后，若涉及可运行逻辑，自动调用 zcode 工具执行对应脚本验证。运行成功：提取核心输出结果；运行报错：返回完整堆栈，自动排查修复，最多迭代修复 3 轮。自动识别输出中的服务端口、生成图片、静态页面、导出文件，提取对应的预览链接或文件路径一并返回。涉及依赖缺失的报错，自动确认后安装对应依赖，重新运行验证。\n4. 子智能体调度规则：单文件修复、单功能开发、独立bug排查类任务，直接派发 ZCode 子智能体自主完成全流程。跨文件重构、架构级改动、多模块联动类复杂任务，拆解为独立子任务后，逐个派发子智能体执行，统一校验汇总。子智能体严格限定在指定工作目录内执行，不得越界操作。\n5. 输出规范：最终仅输出四类核心信息：修改点说明、运行结果、预览链接/生成文件、最终结论。不输出内部步骤编号、工具调用过程、底层实现细节。报错场景同步输出根因分析与修复方案，不堆砌无效日志。'
   ].join('\n'),
 
   /** 当前会话活动计划 @type {null|{steps:Array, startedAt:number}} */
@@ -1650,22 +3083,22 @@ const PlanTracker = {
     const rows = this.current.steps.map((s, i) => {
       const [label, color, pulse] = stMap[s.status] || stMap.todo;
       const icon = stIcon[s.status] || 'circle';
-      return '<div class="plan-step-row flex items-center gap-2 py-0.5 px-1' + (s.status === 'running' ? ' running' : '') + '">' +
+      return '<div class="plan-step-row flex items-center gap-2 py-1 px-1' + (s.status === 'running' ? ' running' : '') + '">' +
         '<span class="font-mono text-[10px] text-text-tertiary w-4">' + (i + 1) + '.</span>' +
         '<i data-lucide="' + icon + '" class="w-3 h-3 ' + color + (s.status === 'running' ? ' animate-spin' : '') + '"></i>' +
         '<span class="text-[11px] ' + color + (pulse ? ' ' + pulse : '') + ' shrink-0">' + label + '</span>' +
         '<span class="text-[11px] text-text-primary truncate flex-1">' + escapeHtml(s.title) + '</span>' +
-        (s.tool ? '<span class="font-mono text-[9px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
+        (s.tool ? '<span class="font-mono text-[10px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
         '</div>';
     }).join('');
     const doneN = this.current.steps.filter(s => s.status === 'done').length;
     const html = '<div class="plan-card rounded-lg bg-surface-panel/60 border border-brand-violet/25 px-3 py-2 my-2" data-plan-card>' +
-      '<div class="plan-head flex items-center gap-1.5 mb-1" data-plan-toggle title="点击折叠/展开计划">' +
+      '<div class="plan-head flex items-center gap-2 mb-1" data-plan-toggle title="点击折叠/展开计划">' +
       '<i data-lucide="list-checks" class="w-3.5 h-3.5 text-brand-violet"></i>' +
       '<span class="text-[11px] font-medium text-text-primary">任务计划</span>' +
       '<span class="text-[10px] text-text-tertiary ml-auto">' + doneN + '/' + this.current.steps.length + ' 完成</span>' +
       '<i data-lucide="chevron-down" class="w-3 h-3 text-text-tertiary"></i></div>' +
-      '<div class="plan-steps space-y-0.5">' + rows + '</div></div>';
+      '<div class="plan-steps space-y-1">' + rows + '</div></div>';
     let wrap = el.querySelector('.tool-steps-wrap');
     const box = el.querySelector('[data-plan-card]');
     if (box) box.outerHTML = html;
@@ -1697,16 +3130,16 @@ const PlanTracker = {
       const stMap = { todo: '待办', running: '进行中', done: '完成', failed: '失败', skipped: '已跳过' };
       const rows = plan.steps.map((s, i) => {
         const color = { todo: 'text-text-tertiary', running: 'text-brand-cyan', done: 'text-success', failed: 'text-danger', skipped: 'text-warning' }[s.status] || 'text-text-tertiary';
-        return '<div class="flex items-center gap-2 py-0.5">' +
+        return '<div class="flex items-center gap-2 py-1">' +
           '<span class="font-mono text-[10px] text-text-tertiary w-4">' + (i + 1) + '.</span>' +
           '<span class="text-[11px] ' + color + '">' + (stMap[s.status] || s.status || '待办') + '</span>' +
           '<span class="text-[11px] text-text-primary truncate flex-1">' + escapeHtml(s.title || '') + '</span>' +
-          (s.tool ? '<span class="font-mono text-[9px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
+          (s.tool ? '<span class="font-mono text-[10px] text-text-tertiary shrink-0">' + escapeHtml(s.tool) + '</span>' : '') +
           '</div>';
       }).join('');
       const doneN = plan.steps.filter(s => s.status === 'done').length;
       html = '<div class="plan-card rounded-lg bg-surface-panel/60 border border-brand-violet/25 px-3 py-2 my-2" data-plan-card>' +
-        '<div class="flex items-center gap-1.5 mb-1"><i data-lucide="list-checks" class="w-3.5 h-3.5 text-brand-violet"></i>' +
+        '<div class="flex items-center gap-2 mb-1"><i data-lucide="list-checks" class="w-3.5 h-3.5 text-brand-violet"></i>' +
         '<span class="text-[11px] font-medium text-text-primary">任务计划</span>' +
         '<span class="text-[10px] text-text-tertiary ml-auto">' + doneN + '/' + plan.steps.length + ' 完成</span></div>' + rows + '</div>';
     } finally {
@@ -1752,14 +3185,14 @@ function ensureWsSidebar() {
   bar = document.createElement('div');
   bar.id = 'wsSidebar';
   bar.innerHTML = '<div class="ws-resize-handle" title="拖拽调整宽度"></div>' +
-    '<div class="flex items-center gap-1.5 mb-1.5">' +
+    '<div class="flex items-center gap-2 mb-2">' +
     '<i data-lucide="folder-tree" class="w-3.5 h-3.5 text-brand-violet"></i>' +
     '<span class="text-[11px] font-medium text-text-primary">工作区</span>' +
-    '<span class="text-[9px] text-text-tertiary">只读</span>' +
+    '<span class="text-[10px] text-text-tertiary">只读</span>' +
     '<button data-ws-sidebar-refresh class="ml-auto text-text-tertiary hover:text-brand-cyan" title="刷新" aria-label="刷新文件树"><i data-lucide="refresh-cw" class="w-3 h-3"></i></button>' +
     '<button data-ws-sidebar-collapse class="text-text-tertiary hover:text-brand-cyan" title="收起侧栏（可从顶部提示条再打开）" aria-label="收起侧栏"><i data-lucide="chevrons-right" class="w-3.5 h-3.5"></i></button></div>' +
-    '<div class="ws-tree-list rounded-lg border border-line-ghost/50 p-1.5 flex-1 overflow-auto text-[11px]"></div>' +
-    '<div class="ws-tree-preview hidden rounded-lg border border-line-ghost/50 p-2 bg-surface-panel/40 mt-1.5 max-h-48 overflow-auto text-[10px]"></div>';
+    '<div class="ws-tree-list rounded-lg border border-line-ghost/50 p-2 flex-1 overflow-auto text-[11px]"></div>' +
+    '<div class="ws-tree-preview hidden rounded-lg border border-line-ghost/50 p-2 bg-surface-panel/40 mt-2 max-h-48 overflow-auto text-[10px]"></div>';
   (document.getElementById('page-chat') || document.body).appendChild(bar);
   bar.querySelector('[data-ws-sidebar-refresh]').addEventListener('click', () => { if (__wsTree) __wsTree.dirCache = {}; wsTreeRender(); });
   bar.querySelector('[data-ws-sidebar-collapse]').addEventListener('click', () => toggleWsSidebar(false));
@@ -1782,7 +3215,7 @@ function ensureWsSidebar() {
   if (!document.getElementById('wsSidebarStyle')) {
     const st = document.createElement('style');
     st.id = 'wsSidebarStyle';
-    st.textContent = '#wsSidebar{position:fixed;top:74px;right:14px;bottom:158px;width:292px;z-index:26;display:flex;flex-direction:column;padding:10px;border-radius:12px;background:rgba(15,18,28,.94);border:1px solid rgba(120,140,180,.25);box-shadow:0 8px 28px rgba(0,0,0,.4)}' +
+    st.textContent = '#wsSidebar{position:fixed;top:74px;right:14px;bottom:158px;width:292px;z-index:26;display:flex;flex-direction:column;padding:12px;border-radius:12px;background:rgba(15,18,28,.94);border:1px solid rgba(120,140,180,.25);box-shadow:0 8px 28px rgba(0,0,0,.4)}' +
       '#wsSidebar.collapsed{display:none}' +
       '[data-theme="light"] #wsSidebar{background:rgba(247,249,252,.96);border-color:rgba(90,110,150,.25)}';
     document.head.appendChild(st);
@@ -1855,11 +3288,11 @@ async function wsTreeRenderDir(dirPath, depth) {
     const hl = __wsTree.highlight === rel ? ' ring-1 ring-brand-cyan bg-brand-cyan/10' : '';
     const typeIcon = isDir ? (expanded ? 'folder-open' : 'folder') : wsFileTypeIcon(it.name);
     const sizeText = isDir ? '' : (' · ' + (it.size >= 1024 ? (it.size / 1024).toFixed(1) + 'KB' : it.size + 'B'));
-    html += '<div class="ws-tree-row flex items-center gap-1.5 py-1 rounded px-1 hover:bg-surface-panel cursor-pointer' + hl + '" style="padding-left:' + (depth * 14 + 4) + 'px" data-ws-path="' + escapeHtml(rel) + '" data-ws-type="' + it.type + '" title="' + escapeHtml(rel) + '">' +
+    html += '<div class="ws-tree-row flex items-center gap-2 py-1 rounded px-1 hover:bg-surface-panel cursor-pointer' + hl + '" style="padding-left:' + (depth * 14 + 4) + 'px" data-ws-path="' + escapeHtml(rel) + '" data-ws-type="' + it.type + '" title="' + escapeHtml(rel) + '">' +
       (isDir ? '<i data-lucide="chevron-right" class="ws-caret w-2.5 h-2.5 text-text-tertiary' + (expanded ? ' open' : '') + '"></i>' : '<span class="w-2.5"></span>') +
       '<i data-lucide="' + typeIcon + '" class="w-3.5 h-3.5 ' + (isDir ? 'text-brand-cobalt' : 'text-text-tertiary') + '"></i>' +
       '<span class="text-text-primary truncate">' + escapeHtml(it.name) + '</span>' +
-      '<span class="text-[9px] text-text-tertiary shrink-0">' + sizeText + '</span></div>';
+      '<span class="text-[10px] text-text-tertiary shrink-0">' + sizeText + '</span></div>';
     if (isDir && expanded) html += await wsTreeRenderDir(rel, depth + 1);
   }
   return html;
@@ -1995,13 +3428,13 @@ function buildApprovalDiff(oldText, newText, maxLines) {
   let html = '';
   let skip = 0;
   ops.forEach((o, k) => {
-    if (!keep[k]) { skip++; if (skip === 1) html += '<div class="text-[9px] text-text-tertiary px-1">⋯</div>'; return; }
+    if (!keep[k]) { skip++; if (skip === 1) html += '<div class="text-[10px] text-text-tertiary px-1">⋯</div>'; return; }
     skip = 0;
     const cls = o.t === '-' ? 'text-danger bg-danger/10' : o.t === '+' ? 'text-success bg-success/10' : 'text-text-tertiary';
     html += '<div class="font-mono text-[10px] whitespace-pre-wrap break-all px-1 ' + cls + '">' + escapeHtml((o.t === ' ' ? '  ' : o.t) + o.line) + '</div>';
   });
   if (!html) html = '<div class="text-[10px] text-text-tertiary px-1">（内容无差异）</div>';
-  return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-1.5 max-h-44 overflow-auto">' + html + '</div>';
+  return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-2 max-h-44 overflow-auto">' + html + '</div>';
 }
 
 /** [阶段1.6 M3] 载入示例工作区：写入 3 个中文自洽示例文件（notes/a.txt、notes/b.txt、todo.md）。
@@ -2038,7 +3471,8 @@ async function loadSampleWorkspace() {
  * @returns {string} 本机可用的推荐模型名（无则空串） */
 function agentRecommendedModel() {
   if (typeof AI === 'undefined' || !Array.isArray(AI.models)) return '';
-  const wish = ['qwen2.5:7b', 'qwen3.5:9b', 'qwen3.5:4b'];
+  // [2026-10-01 U-7-1] 首推模型从 qwen2.5:7b 改为 qwen3.5:9b（更强）；qwen2.5:7b 降为末位兜底
+  const wish = ['qwen3.5:9b', 'qwen3.5:4b', 'qwen2.5:7b'];
   for (const w of wish) {
     const hit = (AI.models || []).find(m => m.name === w || String(m.name || '').indexOf(w) === 0);
     if (hit) return hit.name;
@@ -2051,6 +3485,8 @@ function agentRecommendedModel() {
  * @returns {void} */
 function agentApplyRecommendedModel() {
   try {
+    // [2026-10-01 U-7-1] 用户手选过模型后，不再自动覆盖
+    if (typeof AppState !== 'undefined' && AppState.activeConv && AppState.activeConv.userPickedModel === true) return;
     const sc = MoraySettings.get('agentSelfCheck');
     const cur = (typeof activeModelName === 'function') ? activeModelName() : MoraySettings.get('defaultModel');
     if (sc && sc.ok === true && sc.model === cur) return; // 自检通过 → 维持原默认
@@ -2060,7 +3496,7 @@ function agentApplyRecommendedModel() {
       try {
         if (typeof syncInputModelLabel === 'function') syncInputModelLabel();
         if (typeof updateStatusBar === 'function') updateStatusBar();
-        showNotification('Agent 默认模型已切换', rec + '（真机实测工具调用最稳 3/3）；仍可在输入台手动切换', 'info', 4500);
+        showNotification('Agent 默认模型已切换', rec + '（Agent 推荐模型）；仍可在输入台手动切换', 'info', 4500);
       } catch (e) { /* 忽略 */ }
     }).catch(() => {});
   } catch (e) { /* 忽略 */ }

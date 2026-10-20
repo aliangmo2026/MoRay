@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<!-- [UI 2.0 步骤8] 首屏预置浅色壳主题：webview 加载前不再吃 :root 的深色令牌导致闪黑；
+     renderer.js 读到 guest 的 data-theme 后会覆盖为 light/dark -->
+<html lang="zh-CN" data-shell-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src http://127.0.0.1:*; img-src 'self' data: http://127.0.0.1:*;" />
+  <title>MoRay 全生态工作台</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ===================== 自定义标题栏 ===================== -->
+  <header class="titlebar">
+    <div class="titlebar-drag">
+      <span class="titlebar-logo">M</span>
+      <span class="titlebar-text">MoRay 全生态工作台</span>
+    </div>
+    <div class="titlebar-controls">
+      <button id="btn-min" class="win-btn" title="最小化">
+        <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1" y="5.5" width="10" height="1" fill="currentColor"/></svg>
+      </button>
+      <button id="btn-max" class="win-btn" title="最大化/还原">
+        <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" fill="none" stroke="currentColor"/></svg>
+      </button>
+      <button id="btn-close" class="win-btn win-close" title="关闭（最小化到托盘）">
+        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M1.5 1.5 L10.5 10.5 M10.5 1.5 L1.5 10.5" stroke="currentColor" stroke-width="1.1"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===================== 主体：侧边栏 + 标签页 ===================== -->
+  <div class="workspace">
+
+    <!-- 左侧导航 -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <div class="brand-name">MoRay</div>
+          <div class="brand-sub">全生态工作台</div>
+        </div>
+      </div>
+
+      <!-- 导航项由 renderer.js 动态生成 -->
+      <nav id="nav" class="nav"></nav>
+
+      <!-- 底部：重启全部服务 -->
+      <div class="sidebar-footer">
+        <button id="btn-restart" class="restart-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          <span>重启全部服务</span>
+        </button>
+        <div class="sidebar-tip">关闭窗口将最小化到托盘</div>
+      </div>
+    </aside>
+
+    <!-- 右侧标签区 -->
+    <main class="main">
+      <div id="tabs" class="tabs"></div>
+      <div id="views" class="views"></div>
+      <div id="empty-hint" class="empty-hint">
+        <div class="empty-icon">
+          <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+            <rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/>
+          </svg>
+        </div>
+        <div class="empty-title">从左侧选择一个组件</div>
+        <div class="empty-sub">原始网页将在标签页中原样显示，不做任何改动</div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===================== 启动遮罩 ===================== -->
+  <div id="splash" class="splash">
+    <div class="splash-card">
+      <div class="splash-spinner"></div>
+      <div class="splash-title">MoRay 正在启动后端服务…</div>
+      <div id="splash-list" class="splash-list"></div>
+      <button id="btn-enter" class="splash-enter" hidden>进入工作台</button>
+      <button id="btn-retry" class="splash-enter" hidden>重试</button>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

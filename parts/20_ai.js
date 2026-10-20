@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
    模块：任务二 MorayAI 后端对接层 / 设置系统 / UI 基础组件
    ============================================================ */
 
@@ -64,7 +64,9 @@ const MoraySettings = {
     // [统一人民币体系 v3.6] 定价与预算仅存于 CostEngine（PRICE_TABLE/priceOverrides）与 costBudgetCNY
     priceOverrides: {},            // 用户价格覆盖 {model: {input, output, cacheHit}}（¥/百万token）
     pauseAPI: false,               // 预算触顶后暂停云端 API
-    requestTimeout: 30,            // 请求超时（秒）
+    requestTimeout: 120,           // 请求超时（秒）
+    toolRoundTimeout: 180,         // [2026-10-03 27B挂死修复] 工具轮每轮模型调用超时（秒）
+    bonsai2ReasoningEffort: 'low', // [2026-10-03 27B挂死修复] bonsai2-27b 推理强度（low/medium/xhigh）
     // ---- [工具调用] Function Calling ----
     toolsEnabled: false,           // 工具调用总开关（默认关：请求体不含 tools，链路与之前完全一致）
     toolsDisabled: [],             // 独立禁用的工具名列表
@@ -72,7 +74,6 @@ const MoraySettings = {
     // ---- [阶段0 本机 Agent] 本机工具（受控工作区文件操作，需本地后端） ----
     nativeToolsEnabled: false,     // 本机工具/Agent 开关（输入台显式开启；开启后才进入 listForRequest）
     agentApprovalMode: 'readonly_auto', // 审批策略：readonly_auto=只读工具自动执行 | all=全部工具需人工审批
-    agentWorkspaceHint: '',        // 最近一次探测到的工作区根（仅展示缓存，权威在工作区在后端）
     // ---- [V3] 体验打磨 ----
     autoNaming: true,              // AI 自动命名会话
     namingStyle: '简洁',            // 命名风格：简洁 | 专业 | 活泼
@@ -191,6 +192,14 @@ const MoraySettings = {
 
 /* ===================== [任务二] MorayAI — 后端对接层 ===================== */
 
+/** [开源友好] 未检测到任何模型后端时的统一提示：说清"两条路"、给出可点的位置，
+ * 不含任何本机绝对路径或服务商私有信息（首次运行的用户只看这一句就够）。
+ * @type {string} */
+const NO_BACKEND_HINT = '未检测到可用的模型后端（请先配置模型）。二选一：' +
+  '① 本机运行 Ollama（默认 http://localhost:11434）后在「设置 → 模型」点「重新检测」；' +
+  '② 在「设置 → OpenAI 兼容 API」填写服务商接口地址与 API Key（也可把 Key 写进后端 ' +
+  'server/.env 并选择「经本地后端代理」，Key 不经过浏览器）。详见 server/.env.example。';
+
 /**
  * MorayAI — Ollama / OpenAI 兼容 API 客户端。
  * - 自动探测后端：优先 Ollama，其次 OpenAI 兼容
@@ -216,11 +225,20 @@ class MorayAI {
   get openaiBase() { return (MoraySettings.get('openaiBaseURL') || '').replace(/\/+$/, ''); }
 
   /** [P0] 默认模型为空时自动选定首个可用模型，并刷新输入台标签（仅探测成功后调用）
+   * [2026-10-03 路由修复] 判定专用模型不作默认模型：/api/tags 第 0 位恰是 moray-laya-final，
+   * 不过滤会把 defaultModel 钉死在判定模型上（输出恒为 JSON，做聊天必幻觉身份）。
+   * 过滤正则与 100_gateway 的 isJudgeOnlyModel 同一口径（/^moray-laya-/，即 110 选择器
+   * “判定专用”标注范围）。
+   * 优先级：qwen3.5:9b（本机主力聊天模型，与 server config.OLLAMA_MODEL 默认一致）>
+   * 过滤后首个 > models[0]（全为判定模型时的原行为保底，绝不空选、不抛错打断探测链路）。
    * @returns {Promise<void>} */
   async autoSelectDefaultModel() {
     const cur = MoraySettings.get('defaultModel');
     if (!cur && this.models && this.models.length) {
-      await MoraySettings.set('defaultModel', this.models[0].name);
+      const chattable = this.models.filter(m => m && m.name && !/^moray-laya-/.test(m.name));
+      const hasPreferred = this.models.some(m => m && m.name === 'qwen3.5:9b');
+      const pick = hasPreferred ? 'qwen3.5:9b' : (chattable.length ? chattable[0].name : this.models[0].name);
+      await MoraySettings.set('defaultModel', pick);
       if (typeof syncInputModelLabel === 'function') syncInputModelLabel();
     }
   }
@@ -276,6 +294,7 @@ class MorayAI {
         this.__lastDetectMs = this.__lastTagsMs;
         const data = await res.json();
         this.models = (data.models || []).map(m => ({ name: m.name, size: m.size, details: m.details || {}, modifiedAt: m.modified_at }));
+        this.models.push({ name: "bonsai2-27b", size: 7206168928, details: { family: "bonsai2", parameter_size: "27B", quantization_level: "PQ2_0" }, modifiedAt: "" });
         this.backend = 'ollama';
         this.health = 'ok';
         // [P0] 默认模型为空时自动选定首个模型
@@ -355,6 +374,66 @@ class MorayAI {
       const top_p = opts.top_p != null ? opts.top_p : MoraySettings.get('topP');
       const max_tokens = opts.max_tokens != null ? opts.max_tokens : MoraySettings.get('maxTokens');
 
+      if (opts.model === 'bonsai2-27b') {
+        // [Bonsai2] 走 MoRay 后端代理到本地 llama-server
+        const proxyUrl = (location.origin.startsWith('http') ? location.origin : '') + '/api/llm/chat';
+        const res = await fetch(proxyUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          // [2026-10-01 U-7-3] 修正历史遗留的模型名错误：此前借道云端模型名 deepseek-flash，
+          // provider 缺省回落全局 ollama → Ollama 报 model not found。显式声明 provider=custom_27b
+          // + 真实模型名，走 llm_proxy 的 27B 分支（8080，流式/非流式均原生支持）。
+          // [2026-10-03 27B挂死修复] reasoning_effort 同非流式分支（服务端模板缺省 xhigh）。
+          body: JSON.stringify({ provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: true, temperature, reasoning_effort: this._bonsai2ReasoningEffort() })
+        });
+        if (!res.ok || !res.body) throw self._normalizeError(res.status, await res.text().catch(() => ''));
+        // [2026-10-01 U-7-1] 此前 return res.body 裸流：onChunk 永不触发（无流式渲染）、
+        // 消费端读 result.stats.tokens 崩溃。与上方 OpenAI 代理分支同端点同格式（/api/llm/chat）：
+        // SSE 聚合 state 后 _finish 返回 {content, reasoning, stats}，四个消费方形状统一。
+        const breader = res.body.getReader();
+        const bdecoder = new TextDecoder();
+        let bbuf = '';
+        while (true) {
+          const { done, value } = await breader.read();
+          if (done) break;
+          bbuf += bdecoder.decode(value, { stream: true });
+          const blines = bbuf.split('\n');
+          bbuf = blines.pop();
+          for (const bline of blines) {
+            const bt = bline.trim();
+            if (!bt.startsWith('data:')) continue;
+            const bpayload = bt.slice(5).trim();
+            if (bpayload === '[DONE]') return self._finish(state, startedAt, firstChunkAt, 0, 0);
+            let bj = null;
+            try { bj = JSON.parse(bpayload); } catch (e) { continue; }
+            // 代理错误帧（后端转发的上游错误）→ 抛出友好消息
+            if (bj && bj.ok === false) throw new Error((bj.message || 'Bonsai2 代理错误') + (bj.code ? '（' + bj.code + '）' : ''));
+            if (!bj) continue;
+            if (!firstChunkAt) firstChunkAt = performance.now();
+            if (bj.usage) {
+              const bdet = bj.usage.prompt_tokens_details || {};
+              state.cachedTokens = bdet.cached_tokens || 0;
+              if (bj.usage.prompt_tokens) state.promptTokens = bj.usage.prompt_tokens;
+              if (bj.usage.completion_tokens) state.completionTokens = bj.usage.completion_tokens;
+            }
+            // [路由透明化] 接口在流式分片里带回真实命中模型（后端对不受支持的名字会静默兜底改写）
+            if (bj.model) state.servedModel = String(bj.model);
+            const bdelta = bj.choices && bj.choices[0] && bj.choices[0].delta || {};
+            const bthink = bdelta.reasoning_content || bdelta.reasoning || '';
+            const bpiece = bdelta.content || '';
+            if (bpiece) state.content += bpiece;
+            if (bthink) state.reasoning += bthink;
+            // [阶段1 M1] Bonsai2 流式 tool_calls 增量聚合（27B 真机实测支持 tool_use）
+            if (bdelta.tool_calls && bdelta.tool_calls.length) {
+              accToolCallDeltas(state.toolAcc, bdelta.tool_calls);
+            }
+            if ((bpiece || bthink) && opts.onChunk) opts.onChunk({ content: bpiece, reasoning: bthink, done: false });
+          }
+        }
+        state.toolCalls = accToolCallsFinalize(state.toolAcc);
+        return self._finish(state, startedAt, firstChunkAt, 0, 0);
+      }
       if (self.backend === 'ollama') {
         // ---- Ollama /api/chat（NDJSON 流）----
         const res = await fetch(self.ollamaURL + '/api/chat', {
@@ -413,21 +492,26 @@ class MorayAI {
         // [M2] 经本地后端代理：key 存于 server/.env，浏览器请求仅到 127.0.0.1（无 key 泄漏）
         const proxyUrl = self._useProxy();
         if (proxyUrl) {
+          const pbody = {
+            model,
+            messages: opts.messages,
+            stream: true,
+            temperature, top_p, max_tokens,
+            think: opts.think
+          };
+          // [Day24.11] 预算桶：按对话隔离（无对话上下文时不带该字段，后端回落 default）
+          const psid = self._budgetSessionId(opts);
+          if (psid) pbody.session_id = psid;
           const pres = await fetch(proxyUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal,
-            body: JSON.stringify({
-              model,
-              messages: opts.messages,
-              stream: true,
-              temperature, top_p, max_tokens,
-              think: opts.think
-            })
+            body: JSON.stringify(pbody)
           });
           if (!pres.ok || !pres.body) {
             let msg = '云端代理请求失败（' + pres.status + '）';
-            try { const j = await pres.json(); if (j && j.message) msg = j.message; } catch (e) { /* 保留默认 */ }
+            // [Day24.11b] 读链 message(新契约人话) → msg(老熔断体) → error(兜底码)；429 熔断体此前只落通用文案
+            try { const j = await pres.json(); if (j) msg = j.message || j.msg || j.error || msg; } catch (e) { /* 保留默认 */ }
             throw new Error(msg);
           }
           const preader = pres.body.getReader();
@@ -456,6 +540,8 @@ class MorayAI {
                 if (pj.usage.prompt_tokens) state.promptTokens = pj.usage.prompt_tokens;
                 if (pj.usage.completion_tokens) state.completionTokens = pj.usage.completion_tokens;
               }
+              // [路由透明化] 接口在流式分片里带回真实命中模型（后端对不受支持的名字会静默兜底改写）
+              if (pj.model) state.servedModel = String(pj.model);
               const pdelta = pj.choices && pj.choices[0] && pj.choices[0].delta || {};
               const pthink = pdelta.reasoning_content || pdelta.reasoning || '';
               const ppiece = pdelta.content || '';
@@ -524,7 +610,7 @@ class MorayAI {
         }
         return self._finish(state, startedAt, firstChunkAt, 0, 0);
       }
-      throw new Error('没有可用的 AI 后端。请在设置中配置 Ollama 或 OpenAI 兼容 API。');
+      throw new Error(NO_BACKEND_HINT);
     })();
 
     return { controller, promise };
@@ -572,11 +658,46 @@ class MorayAI {
     });
   }
 
+  /** [2026-10-03 27B挂死修复] bonsai2-27b 推理强度取值：设置缺省 low，非法值回 low。
+   * 27B 服务端模板只接受 low/medium/xhigh（缺省 xhigh——热模型实测 5.3 t/s 下超长 think
+   * 是单轮数分钟的放大器），其余取值服务端会 raise_exception。
+   * @returns {'low'|'medium'|'xhigh'} */
+  _bonsai2ReasoningEffort() {
+    const v = String(MoraySettings.get('bonsai2ReasoningEffort') || 'low');
+    return ['low', 'medium', 'xhigh'].includes(v) ? v : 'low';
+  }
+
   /** 非流式聊天（流式失败时回退）
    * @param {Object} opts - 同 chatStream
    * @returns {Promise<{content:string, reasoning:string, stats:Object}>} 结果 */
   async chat(opts) {
     const temperature = opts.temperature != null ? opts.temperature : MoraySettings.get('temperature');
+    if (opts.model === 'bonsai2-27b') {
+      // [Bonsai2] 走 MoRay 后端代理
+      const proxyUrl = (location.origin.startsWith('http') ? location.origin : '') + '/api/llm/chat';
+      // [2026-10-03 27B挂死修复] reasoning_effort：27B 服务端模板缺省 xhigh（think 超长，
+      // 热模型 5.3 t/s 下单轮数分钟），默认压到 low；枚举只有 low/medium/xhigh（模板 raise 保护）
+      const reasoningEffort = this._bonsai2ReasoningEffort();
+      // [2026-10-01 U-7-3] 修正历史遗留的模型名错误（同流式分支）：显式 provider=custom_27b
+      // + 真实模型名，走 llm_proxy 的 27B 分支；_non_stream 返回 {ok,content,reasoning,tool_calls}
+      // 与下方读取形状一致。
+      const body = { provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: false, temperature, reasoning_effort: reasoningEffort };
+      // [修复 2026-10-20] tools 对任何模型分支都必须透传：此前 27B 分支漏带，路由切到 27B
+      // 时上游拿不到工具清单 → 模型发不出 tool_calls，只能纯聊天反问路径/代码
+      if (opts.tools && opts.tools.length > 0) {
+        body.tools = opts.tools;
+        if (opts.tool_choice) body.tool_choice = opts.tool_choice;
+      }
+      const res = await fetch(proxyUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: opts.signal, // [2026-10-03 27B挂死修复] 工具轮超时/用户停止可真正中止 fetch
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
+      const j = await res.json();
+      return { content: j.content || '', reasoning: j.reasoning || '', toolCalls: j.tool_calls || [], promptTokens: 0, stats: { tokPerSec: null, ms: 0, tokens: 0, promptTokens: 0 } };
+    }
     if (this.backend === 'ollama') {
       const obody = {
         model: opts.model,
@@ -588,10 +709,15 @@ class MorayAI {
         options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
       };
       // [阶段0] Ollama 原生 tools：请求体带 tools 才下发（无 tools 的旧请求行为完全一致）
-      if (opts.tools && opts.tools.length) obody.tools = opts.tools;
+      // [修复 2026-10-20] tool_choice 与 27B 分支对齐，同批透传
+      if (opts.tools && opts.tools.length) {
+        obody.tools = opts.tools;
+        if (opts.tool_choice) obody.tool_choice = opts.tool_choice;
+      }
       const res = await fetch(this.ollamaURL + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: opts.signal, // [2026-10-03 27B挂死修复] 同 bonsai2 分支：可中止
         body: JSON.stringify(obody)
       });
       if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
@@ -623,20 +749,27 @@ class MorayAI {
         };
         // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
         if (opts.tools && opts.tools.length) pbody.tools = opts.tools;
+        // [Day24.11] 预算桶：按对话隔离（与流式同一取值规则；无对话上下文时不带该字段）
+        const psid = this._budgetSessionId(opts);
+        if (psid) pbody.session_id = psid;
         const pres = await fetch(proxyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: opts.signal, // [2026-10-03 27B挂死修复] 同 bonsai2 分支：可中止
           body: JSON.stringify(pbody)
         });
         if (!pres.ok) {
           let msg = '云端代理请求失败（' + pres.status + '）';
-          try { const j = await pres.json(); if (j && j.message) msg = j.message; } catch (e) { /* 保留默认 */ }
+          // [Day24.11b] 与流式同一读链：message → msg → error（429 熔断体/常规错误体/老后端全覆盖）
+          try { const j = await pres.json(); if (j) msg = j.message || j.msg || j.error || msg; } catch (e) { /* 保留默认 */ }
           throw new Error(msg);
         }
         const pj = await pres.json();
         return {
           content: pj.content || '',
           reasoning: pj.reasoning || '',
+          // [路由透明化] 非流式接口统一结构里的真实命中模型（未透出时空串）
+          servedModel: pj.model || '',
           // [阶段1 M1] 代理统一结构 tool_calls 经 sanitize 容错（空调用过滤/截断补全）
           toolCalls: sanitizeToolCalls(pj.tool_calls),
           promptTokens: (pj.usage && pj.usage.prompt_tokens) || 0,
@@ -653,6 +786,7 @@ class MorayAI {
       const res = await fetch(this.openaiBase + '/chat/completions', {
         method: 'POST',
         headers: this._openaiHeaders(),
+        signal: opts.signal, // [2026-10-03 27B挂死修复] 同 bonsai2 分支：可中止
         body: JSON.stringify(body)
       });
       if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
@@ -665,7 +799,7 @@ class MorayAI {
         stats: { tokPerSec: null, ms: 0, tokens: (j.usage && j.usage.completion_tokens) || 0 }
       };
     }
-    throw new Error('没有可用的 AI 后端');
+    throw new Error(NO_BACKEND_HINT);
   }
 
   /** Ollama embeddings（不可用时抛错，由调用方回退到本地哈希向量）
@@ -777,6 +911,22 @@ class MorayAI {
     } catch (e) { return null; }
   }
 
+  /** [Day24.11] 预算桶 session_id：让后端熔断把 LLM 调用计入「本对话」，而不是所有调用方共享的 default 桶。
+   * 取值优先级：调用方显式 opts.sessionId > 当前打开的对话 id（AppState.activeConv.id）。
+   * 前缀 "conv:" 把对话桶与 Argus 研究任务的 session_id（ArgusWatcher 的 sid）分开，两套 id 永不撞桶。
+   * 无对话上下文（对比页/工作流等）时返回空串 → 请求体不带该字段，后端回落 default 桶（与改动前行为一致）。
+   * @param {Object} opts - chatStream/chat 的入参
+   * @returns {string} session_id，无则空串 */
+  _budgetSessionId(opts) {
+    try {
+      const explicit = (opts && opts.sessionId) ? String(opts.sessionId).trim() : '';
+      if (explicit) return explicit;
+      const conv = (typeof AppState !== 'undefined' && AppState) ? AppState.activeConv : null;
+      const cid = (conv && conv.id) ? String(conv.id).trim() : '';
+      return cid ? 'conv:' + cid : '';
+    } catch (e) { return ''; }
+  }
+
   /** 统一错误转换：状态码 + 原始文本 -> 友好错误
    * @param {number} status - HTTP状态码
    * @param {string} body - 响应体
@@ -784,11 +934,16 @@ class MorayAI {
   _normalizeError(status, body) {
     let detail = '';
     try { const j = JSON.parse(body); detail = j.error || j.message || ''; } catch (e) { detail = (body || '').slice(0, 160); }
+    if (typeof detail === 'object' && detail) detail = detail.message || JSON.stringify(detail);
+    // [开源友好] 模型名相关错误补一句"怎么办"：首次使用者看到上游英文原文无从下手
+    const modelHint = /model/i.test(String(detail))
+      ? '（模型名可能不被该接口接受：请在输入台切换模型，或在「设置 → OpenAI 兼容 API」清空「默认模型」交给服务端兜底）'
+      : '';
     if (status === 401) return new Error('API Key 无效或已过期（401）' + (detail ? '：' + detail : ''));
-    if (status === 400) return new Error('请求参数错误（400）' + (detail ? '：' + detail : '。请检查模型名是否有效'));
-    if (status === 404) return new Error('接口或模型不存在（404）' + (detail ? '：' + detail : '。请检查模型名拼写'));
+    if (status === 400) return new Error('请求参数错误（400）' + (detail ? '：' + detail : '。请检查模型名是否有效') + modelHint);
+    if (status === 404) return new Error('接口或模型不存在（404）' + (detail ? '：' + detail : '。请检查模型名拼写') + modelHint);
     if (status === 500) return new Error('后端服务错误（500）' + (detail ? '：' + detail : ''));
-    return new Error('请求失败（' + status + '）' + (detail ? '：' + detail : ''));
+    return new Error('请求失败（' + status + '）' + (detail ? '：' + detail : '') + modelHint);
   }
 
   /** 汇总生成统计
@@ -814,6 +969,8 @@ class MorayAI {
       reasoning: state.reasoning,
       // [阶段1 M1] 流式 tool_calls 聚合结果（无工具调用时为 null，向后兼容）
       toolCalls: state.toolCalls || null,
+      // [路由透明化] 服务端实际应答的模型名（仅接口透出时有值；未透出为空串，展示层自行兜底）
+      servedModel: state.servedModel || '',
       stats: { tokPerSec, ms: Math.round(totalMs), firstMs: firstChunkAt ? Math.round(firstChunkAt - startedAt) : null, tokens: completionTokens, cachedTokens: state.cachedTokens, promptTokens: state.promptTokens || est.tokens }
     };
   }

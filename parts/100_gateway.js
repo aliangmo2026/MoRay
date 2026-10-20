@@ -320,13 +320,28 @@ function isLocalModelName(name) {
   return false;
 }
 
-/** 当前后端真正可用的“本地模型”名数组（去重保序） */
+/** [2026-10-03 路由修复] 判定专用模型不参与聊天路由。moray-laya-* 全系（fast/final=1.5B
+ * 底座换决策 SYSTEM；v1.1=决策 JSON 样本 LoRA 合并产物）输出恒为结构化 JSON，做主聊天必然
+ * 幻觉身份（真机实测“我是 GitHub Actions 辅助工具/阿里云编程助手”）。与 110_polish 选择器
+ * judgeTag 同一正则同一口径：凡标“判定专用”的不进路由候选集；用户手动选择不受影响
+ * （_userPicked 短路发生在候选集之前，对照验收通过）。
+ * @param {string} n - 模型名
+ * @returns {boolean} 是否判定专用模型 */
+function isJudgeOnlyModel(n) {
+  return /^moray-laya-/.test(String(n || ''));
+}
+
+/** 当前后端真正可用的“本地模型”名数组（去重保序；[2026-10-03 路由修复] 排除判定专用模型）
+ * 本函数是路由候选集唯一源头：TaskRouter.route 启发式与 Gateway.route 的驻留亲和/本地优先
+ * 均经 routingEligibleLocalNames() 消费，此处过滤即三分支全覆盖（候选数组尾部 unsized 追加
+ * 曾使 complex 任务命中 moray-laya-fast，根因即此）。
+ * @returns {string[]} 模型名数组 */
 function localModelNames() {
   const seen = {};
   const out = [];
   (AI.models || []).forEach(m => {
     const n = m && m.name;
-    if (n && isLocalModelName(n) && !seen[n]) { seen[n] = true; out.push(n); }
+    if (n && isLocalModelName(n) && !isJudgeOnlyModel(n) && !seen[n]) { seen[n] = true; out.push(n); }
   });
   return out;
 }
@@ -547,7 +562,10 @@ const TaskRouter = {
         const why = type === 'simple' ? '最小本地模型'
           : type === 'complex' ? '参数量最大本地模型'
           : '居中模型';
-        return { model, fallbacks: sorted.filter(n => n !== model).slice(0, 1), reason: `${type}任务 → ${why} ${label}${coolingNote}` };
+        const rest = sorted.filter(n => n !== model);
+        // [2026-10-03 fallback修复] 备选首选取“主选之外参数量最大”（complex 主选=最大时即参数量次大），
+        // 不再取升序最小；slice(-1) 对空/单元素余集自然退化为 []/唯一项，不越界。
+        return { model, fallbacks: rest.slice(-1), reason: `${type}任务 → ${why} ${label}${coolingNote}` };
       }
     }
     if (elig.cooling.length && !localAvailable.length) {
@@ -1076,7 +1094,9 @@ Gateway.chatStream = function (opts) {
     const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') &&
       (AI.backend === 'openai' || AI.backend === 'ollama') &&
       typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
-    if (canCache) {
+    // [修复 2026-10-20] 工具轮绝不读缓存：命中会直接回放无 tools 的旧答案，绕过
+    // runWithTools（写侧本就只在 !useTools 落缓存，见下方 save；读侧此前缺同一道闸）
+    if (canCache && !useTools) {
       try {
         const exact = await GatewayCache.lookupExact(GatewayCache.requestHash(effective));
         // [修复] 必须返回回放的 promise（否则外层会把 {controller,promise} 句柄当作结果）
@@ -1106,11 +1126,18 @@ Gateway.chatStream = function (opts) {
       if (typeof origChunk === 'function') origChunk.apply(this, args);
     };
     let abortWasTimeout = false;
+    // [2026-10-03 27B挂死修复] 超时改为 abort 本次尝试的私有 controller，不再 abort 外层：
+    // 此前 abort 外层后，fallback 流的 abort 监听是后挂的（对已 aborted 的 signal 挂 listener
+    // 永不触发）→ fallback 流既杀不掉也超时不了，"停止生成"同样失效。
     const attemptFn = (model) => {
-      const timeoutMs = (MoraySettings.get('requestTimeout') || 30) * 1000;
-      const timer = setTimeout(() => { abortWasTimeout = true; controller.abort('timeout'); }, timeoutMs);
+      const timeoutMs = (MoraySettings.get('requestTimeout') || 120) * 1000;
+      const attemptCtl = new AbortController();
+      const timer = setTimeout(() => { abortWasTimeout = true; attemptCtl.abort('timeout'); }, timeoutMs);
+      // 外层已中止（用户点停止）→ 直接中止本次尝试；尚未中止才挂联动监听
+      if (controller.signal.aborted) attemptCtl.abort();
+      else controller.signal.addEventListener('abort', () => { try { attemptCtl.abort(); } catch (e) { /* 忽略 */ } }, { once: true });
       const stream = AI.chatStream(Object.assign({}, effective, { model }));
-      controller.signal.addEventListener('abort', () => { try { stream.controller.abort(); } catch (e) { /* 忽略 */ } }, { once: true });
+      attemptCtl.signal.addEventListener('abort', () => { try { stream.controller.abort(); } catch (e) { /* 忽略 */ } }, { once: true });
       stream.promise.finally(() => clearTimeout(timer)).catch(() => {});
       return stream.promise;
     };
@@ -1238,22 +1265,124 @@ Gateway.chatStream = function (opts) {
 Gateway.runWithTools = async function (opts, onToolStep) {
   const model = opts.model;
   const tools = ToolRegistry.listForRequest();
-  // [阶段0] 轮次默认 8、上限 12（设置页本机 Agent 分区与 AI 工具卡可调）
-  const maxRounds = Math.max(1, Math.min(12, MoraySettings.get('toolsMaxRounds') || 8));
+  // [阶段0][S-1 收敛] 全部工具循环（AI Function Calling 与本机 Agent）共用本入口；
+  // 唯一设置项 = 设置页「本机 Agent」卡"最大工具轮数"。默认 3（DEFAULTS toolsMaxRounds），上限 12。
+  const maxRounds = Math.max(1, Math.min(12, MoraySettings.get('toolsMaxRounds') || 3));
   const msgs = (opts.messages || []).map(m => Object.assign({}, m));
   const steps = [];
+  // [Argus 深度研究] 本轮"已够用"的工具：工具可在结果里声明 argusStopAsking，
+  // 声明后从后续轮次的工具表里摘掉它。原因：小模型会对同一个研究任务反复调
+  // detective_status（"好了吗"→"还在跑"→再问…），把轮数刷满后回退普通流式，
+  // 而普通流式没有工具返回、只能凭记忆编一个 session_id 给用户。
+  const exhaustedTools = new Set();
   let promptTotal = 0, completionTotal = 0;
   let costTotal = 0, savedTotal = 0, baselineTotal = 0;
   const emit = (evt) => { steps[evt.index] = Object.assign({}, evt); if (onToolStep) onToolStep(Object.assign({}, evt)); };
 
+  // [Argus 深度研究] 显式点名 Argus 时由代码直接发起研究（不依赖模型是否愿意调工具）。
+  // 背景：7B 级本机模型会跳过工具调用、直接编一个 session_id（实测 2/3、甚至 0/4），
+  // 把"研究到底起没起"这种事交给模型判断，用户会拿到假 id。
+  // 命中条件极窄（最后一条用户消息含 "argus"），其余请求完全不受影响。
+  // 之后模型会看到 role:"tool" 的真实结果，据此如实作答。
+  try {
+    const explicitQ = (typeof argusExplicitQuestion === 'function' && !opts.noTools)
+      ? argusExplicitQuestion(msgs) : null;
+    if (explicitQ && tools.some(t => t.function && t.function.name === 'detective_research')) {
+      const idx = steps.length;
+      const args = { question: explicitQ };
+      emit({ index: idx, name: 'detective_research', label: 'Argus 深度研究', args, status: 'running', ms: 0, resultPreview: '' });
+      const t0 = performance.now();
+      const res = await ToolRegistry.run('detective_research', args, { model, signal: opts.signal });
+      const ms = Math.round(performance.now() - t0);
+      const denied = !!(res.ok && res.data && res.data.denied);
+      emit({
+        index: idx, name: 'detective_research', label: 'Argus 深度研究', args,
+        status: denied ? 'denied' : (res.ok ? 'success' : 'error'), ms,
+        resultPreview: res.ok ? JSON.stringify(res.data) : res.error,
+        resultFull: (res.ok ? JSON.stringify(res.data) : ('错误：' + res.error)).slice(0, 10000)
+      });
+      const callId = 'call_argus_auto_' + idx;
+      const argStr = JSON.stringify(args);
+      msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: callId, type: 'function', function: { name: 'detective_research', arguments: argStr } }] });
+      msgs.push({ role: 'tool', tool_call_id: callId, name: 'detective_research', content: res.ok ? JSON.stringify(res.data).slice(0, 4000) : ('错误：' + res.error) });
+    }
+  } catch (e) {
+    // 预发起失败不阻断主链路：模型仍可自行调用工具，或如实说明失败
+    console.warn('[MoRay] Argus 预发起失败:', e);
+  }
+
+  // [Argus 深度研究] 上下文感知兜底：用户刚拿到 session_id 紧接着问"进度如何"时，
+  // 由代码直接查状态。背景同上面那条——qwen2.5:7b 实测不会自己调 detective_status，
+  // 只会用"研究正在进行中，请稍候"敷衍（工具描述的"强制优先调用"按不住）。
+  // 两个条件同时满足才触发，判据全在 argusProgressFallbackSession 里（纯函数，有单测）：
+  //   最后一条用户消息在问进度 + 本对话最近启动过一条研究（active session，1 小时内）。
+  // 命中后把真实进度作为 role:"tool" 回灌，模型只负责转述给用户。
+  // 上面那条"显式点名"已发起研究时不再兜底（同一轮里问得多半是刚起的那条，重复查没意义）。
+  try {
+    if (!opts.noTools && typeof argusProgressFallbackSession === 'function') {
+      const explicitNow = (typeof argusExplicitQuestion === 'function') ? argusExplicitQuestion(msgs) : null;
+      const convId = (typeof AppState !== 'undefined' && AppState.activeConv) ? AppState.activeConv.id : null;
+      const fbSid = explicitNow ? null : argusProgressFallbackSession(msgs, argusSessionRecords(), convId);
+      if (fbSid && tools.some(t => t.function && t.function.name === 'detective_status')) {
+        const idx = steps.length;
+        const args = { session_id: fbSid };
+        const label = (ToolRegistry.get('detective_status') || {}).label || 'Argus 研究进度';
+        emit({ index: idx, name: 'detective_status', label, args, status: 'running', ms: 0, resultPreview: '' });
+        const t0 = performance.now();
+        const res = await ToolRegistry.run('detective_status', args, { model, signal: opts.signal });
+        const ms = Math.round(performance.now() - t0);
+        // argusStopAsking 只给工具循环看，回灌给模型与步骤卡之前先摘掉（同主循环的约定）
+        const stopAsking = !!(res.ok && res.data && typeof res.data === 'object' && res.data.argusStopAsking);
+        let shown = res.data;
+        if (stopAsking) { shown = Object.assign({}, res.data); delete shown.argusStopAsking; }
+        emit({
+          index: idx, name: 'detective_status', label, args,
+          status: res.ok ? 'success' : 'error', ms,
+          resultPreview: res.ok ? JSON.stringify(shown) : res.error,
+          resultFull: (res.ok ? JSON.stringify(shown) : ('错误：' + res.error)).slice(0, 10000)
+        });
+        const callId = 'call_argus_status_auto_' + idx;
+        msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: callId, type: 'function', function: { name: 'detective_status', arguments: JSON.stringify(args) } }] });
+        msgs.push({ role: 'tool', tool_call_id: callId, name: 'detective_status', content: res.ok ? JSON.stringify(shown).slice(0, 4000) : ('错误：' + res.error) });
+      }
+    }
+  } catch (e) {
+    // 兜底失败不阻断主链路：模型仍可自行调用工具，或如实说明查不到
+    console.warn('[MoRay] Argus 进度兜底失败:', e);
+  }
+
   for (let round = 0; round < maxRounds; round++) {
     if (opts.signal && opts.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
     let r;
+    // [2026-10-03 27B挂死修复] 每轮模型调用加超时（toolRoundTimeout，默认 180s）：
+    // 27B 本地实测 5.3 t/s + 默认 xhigh 长篇 think 时单轮可拖数分钟，此前裸 await 无限等
+    // 且"停止生成"杀不掉非流式 fetch。请求挂私有 roundCtl：超时/外层中止都走它。
+    const roundSec = Math.max(10, parseInt(MoraySettings.get('toolRoundTimeout') || 180, 10) || 180);
+    const roundCtl = new AbortController();
+    let roundTimedOut = false;
+    const roundTimer = setTimeout(() => { roundTimedOut = true; roundCtl.abort(); }, roundSec * 1000);
+    const onOuterAbortRound = () => { if (!roundCtl.signal.aborted) roundCtl.abort(); };
+    if (opts.signal) {
+      if (opts.signal.aborted) onOuterAbortRound();
+      else opts.signal.addEventListener('abort', onOuterAbortRound, { once: true });
+    }
     try {
-      r = await AI.chat(Object.assign({}, opts, { model, messages: msgs, tools }));
+      // [Argus 深度研究] 已被声明"够用"的工具不再下发给模型（见 exhaustedTools）
+      const toolsThisRound = exhaustedTools.size
+        ? tools.filter(t => !exhaustedTools.has(t.function && t.function.name))
+        : tools;
+      r = await AI.chat(Object.assign({}, opts, { model, messages: msgs, tools: toolsThisRound, signal: roundCtl.signal }));
     } catch (e) {
+      // [2026-10-03 27B挂死修复] 超时产生的 AbortError 必须转普通 Error：原样上抛会被
+      // 上层判成用户主动中止（isUserAbort）→ 熔断不记、工具兜底不触发、回退链不可达
+      if (e && e.name === 'AbortError' && roundTimedOut) {
+        throw new Error('工具轮模型响应超时（' + roundSec + ' 秒/轮），已转入回退链路');
+      }
       // 后端不支持 tools / 网络失败 → 抛给上层走现有重试/降级/普通流式
       throw e;
+    } finally {
+      clearTimeout(roundTimer);
+      if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbortRound);
     }
     const pt = r.promptTokens || 0;
     const ct = (r.stats && r.stats.tokens) || 0;
@@ -1326,14 +1455,23 @@ Gateway.runWithTools = async function (opts, onToolStep) {
         if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort);
       }
       const ms = Math.round(performance.now() - t0);
+      // [Argus 深度研究] 工具在结果里声明"本轮调用到此够用"（argusStopAsking）：
+      // 该标记只给工具循环看，回灌给模型与步骤卡前先摘掉，免得变成模型眼里的一个参数。
+      const stopAsking = !!(res.ok && res.data && typeof res.data === 'object' && res.data.argusStopAsking);
+      let shown = res.data;
+      if (stopAsking) {
+        shown = Object.assign({}, res.data);
+        delete shown.argusStopAsking;
+        exhaustedTools.add(name);
+      }
       // [阶段0] 用户拒绝（data.denied）：步骤卡显示"已拒绝"，回灌内容让模型如实回应
-      const denied = !!(res.ok && res.data && res.data.denied);
+      const denied = !!(res.ok && shown && shown.denied);
       const stepStatus = denied ? 'denied' : (res.ok ? 'success' : 'error');
-      const preview = res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : res.error;
-      const resultFull = (res.ok ? (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)) : ('错误：' + res.error)).slice(0, 10000);
+      const preview = res.ok ? (typeof shown === 'string' ? shown : JSON.stringify(shown)) : res.error;
+      const resultFull = (res.ok ? (typeof shown === 'string' ? shown : JSON.stringify(shown)) : ('错误：' + res.error)).slice(0, 10000);
       emit({ index: idx, name, label, args, status: stepStatus, ms, resultPreview: preview || '', resultFull });
       msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: callId, type: 'function', function: { name, arguments: fn.arguments || '{}' } }] });
-      msgs.push({ role: 'tool', tool_call_id: callId, name, content: res.ok ? JSON.stringify(res.data).slice(0, 4000) : ('错误：' + res.error) });
+      msgs.push({ role: 'tool', tool_call_id: callId, name, content: res.ok ? JSON.stringify(shown).slice(0, 4000) : ('错误：' + res.error) });
     }
   }
   throw new Error('工具调用轮数超过上限（' + maxRounds + '），已回退普通流式');
@@ -1364,16 +1502,16 @@ function renderGatewayHealth() {
   if (!wrap) return;
   const st = HealthMonitor.state;
   wrap.innerHTML = `
-    <span class="flex items-center gap-1.5"><span class="beacon-dot ${HealthMonitor.dotClass(st.ollama.status)}"></span>
+    <span class="flex items-center gap-2"><span class="beacon-dot ${HealthMonitor.dotClass(st.ollama.status)}"></span>
       <span class="text-[10px] text-text-tertiary">Ollama ${st.ollama.status}${st.ollama.latency ? ' ' + st.ollama.latency + 'ms' : ''}</span></span>
-    <span class="flex items-center gap-1.5"><span class="beacon-dot ${HealthMonitor.dotClass(st.openai.status)}"></span>
+    <span class="flex items-center gap-2"><span class="beacon-dot ${HealthMonitor.dotClass(st.openai.status)}"></span>
       <span class="text-[10px] text-text-tertiary">OpenAI ${st.openai.status}${st.openai.latency ? ' ' + st.openai.latency + 'ms' : ''}</span></span>`;
 }
 
 /** 追加"API 智能网关"设置卡片（含缓存管理/路由/用量仪表盘）
  * @returns {Promise<void>} */
 async function appendGatewaySettings() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container || container.querySelector('#gatewaySettingsCard')) { renderGatewayHealth(); return; }
   const c = MoraySettings.get();
   const cacheStats = await GatewayCache.stats();
@@ -1395,6 +1533,7 @@ async function appendGatewaySettings() {
   card.id = 'gatewaySettingsCard';
   card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
   card.innerHTML = `
+    <div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">Agent 与工具</span></div>
     <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
       <i data-lucide="zap" class="w-4 h-4 text-brand-cyan"></i>API 智能网关
       <div class="ml-auto flex items-center gap-3" id="gatewayHealthDots"></div>
@@ -1404,7 +1543,7 @@ async function appendGatewaySettings() {
     <!-- 缓存管理 -->
     <div class="rounded-lg border border-line-ghost p-4 mb-4">
       <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-medium text-text-primary flex items-center gap-1.5"><i data-lucide="database-zap" class="w-3.5 h-3.5 text-brand-cobalt"></i>请求缓存</span>
+        <span class="text-xs font-medium text-text-primary flex items-center gap-2"><i data-lucide="database-zap" class="w-3.5 h-3.5 text-brand-cobalt"></i>请求缓存</span>
         <div class="toggle-track ${c.cacheEnabled !== false ? 'active' : ''}" id="setCacheEnabled"><div class="toggle-thumb"></div></div>
       </div>
       <div class="grid grid-cols-4 gap-2 mb-3 text-center">
@@ -1419,7 +1558,7 @@ async function appendGatewaySettings() {
           const hr = (d.hits + d.queries) ? Math.round(d.hits / (d.hits + d.queries) * 100) : 0;
           return `<div class="flex-1 flex flex-col items-center gap-1" title="${day}：命中 ${d.hits}/${d.hits + d.queries}">
             <div style="width:100%;max-width:26px;height:${Math.max(4, hr * 0.32)}px;background:linear-gradient(180deg,var(--color-brand-cyan),var(--color-brand-cobalt));border-radius:3px"></div>
-            <span class="text-[9px] text-text-tertiary">${day.slice(5)}</span></div>`;
+            <span class="text-[10px] text-text-tertiary">${day.slice(5)}</span></div>`;
         }).join('') || '<span class="text-[10px] text-text-tertiary">暂无数据，命中后显示近7天命中率</span>'}
       </div>
       <div class="space-y-2 text-xs">
@@ -1439,10 +1578,10 @@ async function appendGatewaySettings() {
           </div></div>
         <div class="flex items-center justify-between pt-2 border-t border-line-ghost/50">
           <div class="flex gap-2">
-            <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="cacheExportBtn">导出</button>
-            <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="cacheImportBtn">导入</button>
+            <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="cacheExportBtn">导出</button>
+            <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="cacheImportBtn">导入</button>
           </div>
-          <button class="px-2.5 py-1 rounded-lg text-[10px] bg-danger/10 text-danger border border-danger/30" id="cacheClearBtn">清空缓存</button>
+          <button class="px-3 py-1 rounded-lg text-[10px] bg-danger/10 text-danger border border-danger/30" id="cacheClearBtn">清空缓存</button>
         </div>
       </div>
     </div>
@@ -1450,7 +1589,7 @@ async function appendGatewaySettings() {
     <!-- 智能路由 -->
     <div class="rounded-lg border border-line-ghost p-4 mb-4">
       <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-medium text-text-primary flex items-center gap-1.5"><i data-lucide="git-branch" class="w-3.5 h-3.5 text-brand-violet"></i>智能路由（按任务复杂度选模型）</span>
+        <span class="text-xs font-medium text-text-primary flex items-center gap-2"><i data-lucide="git-branch" class="w-3.5 h-3.5 text-brand-violet"></i>智能路由（按任务复杂度选模型）</span>
         <div class="toggle-track ${c.routingEnabled !== false ? 'active' : ''}" id="setRoutingEnabled"><div class="toggle-thumb"></div></div>
       </div>
       <div class="space-y-2 text-xs">
@@ -1463,7 +1602,7 @@ async function appendGatewaySettings() {
         <div class="flex items-center justify-between pt-2">
           <span class="text-text-secondary">降级重试上限</span>
           <input type="number" min="1" max="5" value="${MoraySettings.get('routingFallbacks') || 2}" id="setRoutingFallbacks" class="form-input" style="width:64px;padding:4px 8px;font-size:12px">
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="viewFallbackLogBtn">降级日志</button>
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="viewFallbackLogBtn">降级日志</button>
         </div>
         <div class="flex gap-4 pt-2 border-t border-line-ghost/50">
           <div class="flex-1"><div class="text-[10px] text-text-tertiary mb-1">任务类型分布</div>
@@ -1477,6 +1616,10 @@ async function appendGatewaySettings() {
       <div class="flex items-center justify-between pt-2 border-t border-line-ghost/50">
         <span class="text-text-secondary">复用已驻留本地模型（亲和）</span>
         <div class="toggle-track ${c.routingPreferLoaded !== false ? 'active' : ''}" id="setRoutingPreferLoaded"><div class="toggle-thumb"></div></div>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="text-text-secondary">本地优先（未命中亲和时切最小本地模型）</span>
+        <div class="toggle-track ${c.routingLocalFirst ? 'active' : ''}" id="setRoutingLocalFirst"><div class="toggle-thumb"></div></div>
       </div>
       <div class="flex items-center justify-between">
         <span class="text-text-secondary">失败熔断冷却（秒，10-600）</span>
@@ -1502,8 +1645,8 @@ async function appendGatewaySettings() {
     <!-- 用量与预算 -->
     <div class="rounded-lg border border-line-ghost p-4">
       <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-medium text-text-primary flex items-center gap-1.5"><i data-lucide="gauge" class="w-3.5 h-3.5 text-warning"></i>用量与预算</span>
-        <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="usageExportBtn">导出报表</button>
+        <span class="text-xs font-medium text-text-primary flex items-center gap-2"><i data-lucide="gauge" class="w-3.5 h-3.5 text-warning"></i>用量与预算</span>
+        <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="usageExportBtn">导出报表</button>
       </div>
       <div class="grid grid-cols-3 gap-2 mb-3 text-center">
         <div class="rounded-lg bg-surface-panel/60 py-2"><div class="text-sm font-mono text-text-primary">${((today.prompt + today.completion) / 1000).toFixed(1)}k</div><div class="text-[10px] text-text-tertiary">今日 tokens</div></div>
@@ -1518,7 +1661,13 @@ async function appendGatewaySettings() {
             <button class="text-[10px] text-brand-cobalt hover:text-brand-cyan" id="gotoCostCardBtn">设置预算</button>
           </div></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">请求超时（秒）</span>
-          <input type="number" min="10" max="120" value="${c.requestTimeout || 30}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
+          <input type="number" min="10" max="300" value="${c.requestTimeout || 120}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
+        <div class="flex items-center justify-between"><span class="text-text-secondary">工具轮超时（秒，单轮模型调用）</span>
+          <input type="number" min="60" max="300" value="${c.toolRoundTimeout || 180}" id="setToolRoundTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
+        <div class="flex items-center justify-between"><span class="text-text-secondary">27B 推理强度（bonsai2-27b）</span>
+          <select id="setBonsai2Reasoning" class="form-input" style="width:90px;padding:4px 8px;font-size:12px">
+            ${['low', 'medium', 'xhigh'].map(v => `<option value="${v}" ${((c.bonsai2ReasoningEffort || 'low') === v) ? 'selected' : ''}>${v}</option>`).join('')}
+          </select></div>
         ${c.pauseAPI ? `<div class="flex items-center justify-between rounded-lg bg-danger/10 border border-danger/30 px-3 py-2">
           <span class="text-[11px] text-danger">云端 API 已暂停</span>
           <button class="text-[10px] text-text-secondary underline" id="resumeCloudBtn">恢复</button></div>` : ''}
@@ -1551,6 +1700,7 @@ async function appendGatewaySettings() {
   });
   on($('setRoutingEnabled'), 'click', async function () { this.classList.toggle('active'); await MoraySettings.set('routingEnabled', this.classList.contains('active')); });
   on($('setRoutingPreferLoaded'), 'click', async function () { this.classList.toggle('active'); await MoraySettings.set('routingPreferLoaded', this.classList.contains('active')); });
+  on($('setRoutingLocalFirst'), 'click', async function () { this.classList.toggle('active'); await MoraySettings.set('routingLocalFirst', this.classList.contains('active')); });
   on($('setCircuitBreakerCooldownSec'), 'change', () => {
     const v = Math.max(10, Math.min(600, parseInt($('setCircuitBreakerCooldownSec').value, 10) || 90));
     $('setCircuitBreakerCooldownSec').value = v;
@@ -1585,7 +1735,10 @@ async function appendGatewaySettings() {
     const costCard = document.getElementById('costSettingsCard');
     if (costCard) { costCard.scrollIntoView({ behavior: 'smooth', block: 'start' }); costCard.style.boxShadow = '0 0 0 2px rgba(91,140,255,0.35)'; setTimeout(() => { costCard.style.boxShadow = ''; }, 900); }
   });
-  on($('setRequestTimeout'), 'change', () => MoraySettings.set('requestTimeout', parseInt($('setRequestTimeout').value, 10) || 30));
+  on($('setRequestTimeout'), 'change', () => MoraySettings.set('requestTimeout', parseInt($('setRequestTimeout').value, 10) || 120));
+  // [2026-10-03 27B挂死修复] 工具轮每轮超时（60-300s，默认 180）+ 27B 推理强度（low/medium/xhigh）
+  on($('setToolRoundTimeout'), 'change', () => MoraySettings.set('toolRoundTimeout', Math.max(60, Math.min(300, parseInt($('setToolRoundTimeout').value, 10) || 180))));
+  on($('setBonsai2Reasoning'), 'change', () => MoraySettings.set('bonsai2ReasoningEffort', $('setBonsai2Reasoning').value));
   // [体检] 降级重试上限输入框真实绑定（原无绑定，属死输入框）
   on($('setRoutingFallbacks'), 'change', () => {
     const v = Math.max(1, Math.min(5, parseInt($('setRoutingFallbacks').value, 10) || 2));

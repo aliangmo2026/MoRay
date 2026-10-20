@@ -1,0 +1,843 @@
+/* ============================================================
+ * MoRay 全生态工作台 - 深色磨砂样式 (style.css)
+ * 仅负责“外壳”：标题栏 / 侧边栏 / 标签页 / 启动遮罩。
+ * 标签页内是 webview 原样加载的现有网页，不注入任何样式。
+ * ============================================================ */
+
+:root {
+  /* 基础色板 */
+  --bg: #1b1b20;
+  --sidebar-bg: rgba(28, 28, 34, 0.72);
+  --panel-bg: rgba(36, 36, 44, 0.72);
+  --titlebar-bg: rgba(24, 24, 29, 0.60);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  /* [壳主题联动 2026-10-13] 叠层通道色：hover/描边/斑马纹的 rgba 通道，浅色块翻转成黑叠层 */
+  --overlay-rgb: 255, 255, 255;
+  /* [壳主题联动 2026-10-13] 壳内自带页面底色（标签条 / 日志与 Laya 控制台 / 启动遮罩 / 日志正文色） */
+  --tabs-bg: rgba(24, 24, 29, 0.5);
+  --console-bg: rgba(18, 18, 22, 0.92);
+  --splash-scrim: rgba(20, 20, 25, 0.82);
+  --splash-card-bg: rgba(40, 40, 48, 0.9);
+  --log-text: #c8c8d0;
+
+  /* 文字 */
+  --text: #e7e7ec;
+  --text-sub: #9a9aa6;
+  --text-dim: #6f6f7a;
+
+  /* 强调色与状态色（品牌橙对齐工作台 --color-brand: #E5734A，渐变深档 #D9663B） */
+  --accent: #E5734A;
+  --accent-soft: rgba(229, 115, 74, 0.16);
+  --ok: #37c871;
+  --warn: #f5b942;
+  --err: #e5534b;
+
+  --titlebar-h: 38px;
+  --sidebar-w-collapsed: 48px;   /* 收起宽度：仅图标 + 状态灯 */
+  --sidebar-w-expanded: 200px;   /* 展开宽度：完整文字 + 按钮 */
+  --sidebar-anim: 0.2s ease;     /* 展开/收起过渡时长 */
+}
+
+/* ===================== [壳主题联动 2026-10-13] 浅色令牌 =====================
+   触发：renderer.js 轮询读 moray guest 的 data-theme，写壳的 html[data-shell-theme]。
+   主色板对齐内部 parts/135_ui_polish.js 的 html[data-theme="light"] 浅色系；
+   叠层通道（--overlay-rgb）由白翻黑，各处 alpha 保持不变。 */
+html[data-shell-theme="light"] {
+  --bg: #f6f8fa;
+  --sidebar-bg: rgba(255, 255, 255, 0.72);
+  --panel-bg: rgba(255, 255, 255, 0.72);
+  --titlebar-bg: rgba(255, 255, 255, 0.72);
+  --border: #d0d7de;
+  --border-strong: #afb8c1;
+
+  --text: #1f2328;
+  --text-sub: #59636e;
+  --text-dim: #8b949e;
+
+  /* 状态色对齐内部浅色档（黄/绿在浅底上的可读性） */
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+
+  --overlay-rgb: 0, 0, 0;
+  --tabs-bg: rgba(0, 0, 0, 0.04);
+  --console-bg: #ffffff;
+  --splash-scrim: rgba(246, 248, 250, 0.75);
+  --splash-card-bg: rgba(255, 255, 255, 0.92);
+  --log-text: #24292f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  font-size: 13px;
+  user-select: none;
+}
+
+/* ===================== 自定义标题栏 ===================== */
+
+.titlebar {
+  height: var(--titlebar-h);
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  background: var(--titlebar-bg);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;   /* 整块可拖动 */
+}
+
+.titlebar-drag {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 14px;
+}
+
+.titlebar-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #E5734A, #D9663B);
+  color: #fff;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.titlebar-text {
+  color: var(--text-sub);
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+
+.titlebar-controls {
+  display: flex;
+  -webkit-app-region: no-drag; /* 按钮区域不参与拖动 */
+}
+
+.win-btn {
+  width: 46px;
+  border: 0;
+  background: transparent;
+  color: var(--text-sub);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.win-btn:hover {
+  background: rgba(var(--overlay-rgb), 0.08);
+  color: var(--text);
+}
+
+.win-close:hover {
+  background: #e5534b;
+  color: #fff;
+}
+
+/* ===================== 主体布局 ===================== */
+
+.workspace {
+  display: flex;
+  height: calc(100% - var(--titlebar-h));
+}
+
+/* ===================== 侧边栏 ===================== */
+
+.sidebar {
+  width: var(--sidebar-w-collapsed); /* 默认收起 48px */
+  flex-shrink: 0;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 4px 12px;        /* 收起时左右内边距收窄，给图标居中 */
+  overflow: hidden;              /* 收起时裁掉超出的文字，防止溢出 */
+  transition: width var(--sidebar-anim),
+              padding var(--sidebar-anim);  /* 宽度/内边距 0.2s 平滑过渡 */
+}
+
+/* 展开状态（JS 在 mouseenter 时加 .expanded） */
+.sidebar.expanded {
+  width: var(--sidebar-w-expanded);
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 0 14px;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #E5734A, #D9663B);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 800;
+  color: #fff;
+}
+
+.brand-name {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 品牌文字区（未加 class，用结构选择器命中）：
+   收起时淡出，展开时淡入，配合侧边栏宽度过渡 */
+.sidebar-brand > div:not(.brand-mark) {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.sidebar.expanded .sidebar-brand > div:not(.brand-mark) {
+  opacity: 1;
+}
+
+/* 导航项 */
+.nav {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 9px 5px;         /* 收起时紧凑内边距，正好容纳图标+状态灯 */
+  border-radius: 8px;
+  color: var(--text-sub);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, padding 0.2s ease, gap 0.2s ease;
+}
+
+/* 展开后：恢复宽松间距，留出文字位置 */
+.sidebar.expanded .nav-item {
+  gap: 10px;
+  padding: 9px 10px;
+}
+
+.nav-item:hover {
+  background: rgba(var(--overlay-rgb), 0.06);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-label {
+  flex: 1;
+  min-width: 0;               /* 允许收缩到 0，收起时不挤占图标/状态灯 */
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 0;                 /* 收起时文字淡出 */
+  transition: opacity 0.15s ease;
+}
+
+.sidebar.expanded .nav-label {
+  opacity: 1;
+}
+
+/* 状态指示灯：绿=运行中 / 黄=启动中 / 红=失败 */
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-dim);
+  position: relative;
+}
+
+.status-dot.running {
+  background: var(--ok);
+  box-shadow: 0 0 6px rgba(55, 200, 113, 0.7);
+}
+
+.status-dot.starting {
+  background: var(--warn);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.status-dot.failed {
+  background: var(--err);
+  box-shadow: 0 0 6px rgba(229, 83, 75, 0.6);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* 侧边栏底部 */
+.sidebar-footer {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 收起时隐藏底部（含「重启全部服务」按钮与提示文字），展开后自动恢复 */
+.sidebar:not(.expanded) .sidebar-footer {
+  display: none;
+}
+
+.restart-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: rgba(var(--overlay-rgb), 0.04);
+  color: var(--text-sub);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.restart-btn:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.restart-btn.busy {
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+.sidebar-tip {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ===================== 右侧主区域 ===================== */
+
+.main {
+  flex: 1;
+  position: relative;        /* 作为空状态提示（.empty-hint）的定位父级，
+                                防止其脱离定位后铺满整个窗口、盖住侧边栏 */
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  min-width: 0;
+}
+
+/* 标签栏 */
+.tabs {
+  height: 38px;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--tabs-bg);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.tabs:empty {
+  display: none;
+}
+
+.tab {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-radius: 8px 8px 0 0;
+  color: var(--text-sub);
+  cursor: pointer;
+  max-width: 200px;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  background: rgba(var(--overlay-rgb), 0.05);
+}
+
+.tab.active {
+  background: var(--panel-bg);
+  color: var(--text);
+}
+
+.tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tab-close {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.tab-close:hover {
+  background: rgba(var(--overlay-rgb), 0.12);
+  color: var(--text);
+}
+
+/* webview 容器：绝对定位铺满，只有当前标签可见 */
+.views {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.webview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: none;            /* 未激活：隐藏 */
+  background: #fff;
+}
+
+.webview.active {
+  /* 关键：必须是 flex（<webview> 的 UA 默认样式就是 display:flex）。
+     元素内部有一个 iframe，只有 flex 下才会被拉伸到完整高度；
+     若写成 display:block，内部 iframe 会退回默认 150px 高，
+     表现为页面只剩顶部一小条。 */
+  display: flex;
+}
+
+/* 空状态提示 */
+.empty-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-dim);
+}
+
+.empty-hint.hidden {
+  display: none;
+}
+
+.empty-icon {
+  opacity: 0.5;
+  margin-bottom: 6px;
+}
+
+.empty-title {
+  font-size: 14px;
+  color: var(--text-sub);
+}
+
+.empty-sub {
+  font-size: 12px;
+}
+
+/* ===================== 启动遮罩 ===================== */
+
+.splash {
+  position: fixed;
+  inset: 0;
+  background: var(--splash-scrim);
+  backdrop-filter: blur(18px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.splash.hidden {
+  display: none;
+}
+
+.splash-card {
+  width: 380px;
+  padding: 30px 30px 26px;
+  border-radius: 14px;
+  background: var(--splash-card-bg);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+.splash-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgba(var(--overlay-rgb), 0.12);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.splash-title {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.splash-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.splash-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.splash-item .status-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.splash-enter {
+  margin-top: 4px;
+  padding: 8px 22px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.splash-enter:hover {
+  background: var(--accent);
+}
+
+.splash-enter.busy {
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+/* ===================== 滚动条 ===================== */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--overlay-rgb), 0.12);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--overlay-rgb), 0.2);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------------- 日志中心（内置页面） ---------------- */
+.log-view {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  background: var(--console-bg);
+}
+.log-view.active { display: flex; }
+
+.log-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.log-svc-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.log-svc-btn:hover { color: var(--text); border-color: var(--border-strong); }
+.log-svc-btn.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.log-body {
+  flex: 1;
+  margin: 0;
+  padding: 12px 16px;
+  overflow: auto;
+  font-family: "Cascadia Code", "Consolas", "Microsoft YaHei Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--log-text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ============ [L7.7 加性] Laya 调试面板（复用日志中心的令牌与观感） ============ */
+.laya-dbg-icon { font-size: 15px; line-height: 17px; text-align: center; color: var(--warn); }
+
+.laya-debug-view {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--console-bg);
+  overflow: hidden;
+}
+.laya-debug-view.active { display: flex; }
+
+.laya-dbg-bar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; }
+.laya-dbg-base {
+  flex: 0 0 240px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+.laya-dbg-label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-sub); font-size: 12px; }
+.laya-dbg-retry {
+  width: 52px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+.laya-dbg-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.laya-dbg-btn:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
+.laya-dbg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.laya-dbg-btn.primary { background: rgba(245, 185, 66, 0.15); border-color: rgba(245, 185, 66, 0.5); color: var(--warn); }
+.laya-dbg-btn.danger { border-color: rgba(229, 83, 75, 0.45); color: var(--err); }
+.laya-dbg-btn.small { padding: 4px 10px; font-size: 11px; color: var(--text-sub); }
+.laya-dbg-state { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.laya-dbg-state.run { color: var(--warn); }
+.laya-dbg-state.ok { color: var(--ok); }
+.laya-dbg-state.fail { color: var(--err); }
+.laya-dbg-state.warn { color: var(--text-sub); }
+
+.laya-dbg-goal {
+  flex-shrink: 0;
+  width: 100%;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.laya-dbg-cols { display: flex; gap: 10px; flex: 1; min-height: 0; }
+.laya-dbg-col {
+  flex: 0 0 300px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(var(--overlay-rgb), 0.02);
+}
+.laya-dbg-col.grow { flex: 1; }
+.laya-dbg-col-title {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.laya-dbg-plan { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.laya-dbg-hint { color: var(--text-dim); font-size: 11px; }
+.laya-dbg-step {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--panel-bg);
+}
+.laya-dbg-step-head { display: flex; align-items: center; gap: 8px; }
+.laya-dbg-step-no {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: rgba(var(--overlay-rgb), 0.08);
+  color: var(--text);
+  font-size: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.laya-dbg-step-tool { font-size: 10px; padding: 1px 8px; border-radius: 999px; }
+.laya-dbg-step-tool.tool-file { background: rgba(91,140,255,0.15); color: #5b8cff; }
+.laya-dbg-step-tool.tool-iris { background: rgba(157,123,255,0.15); color: #9d7bff; }
+.laya-dbg-step-tool.tool-zcode { background: rgba(58,214,232,0.15); color: #3ad6e8; }
+.laya-dbg-step-tool.tool-argus { background: rgba(245,185,66,0.15); color: var(--warn); }
+.laya-dbg-step-desc { margin-top: 4px; font-size: 12px; color: var(--text); word-break: break-all; }
+
+.laya-dbg-log {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 8px 10px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.laya-dbg-line { margin: 0; }
+.laya-dbg-line.ev { color: #5b8cff; }
+.laya-dbg-line.step { color: #5b8cff; }
+.laya-dbg-line.res { color: var(--text); }
+.laya-dbg-line.check { color: var(--warn); }
+.laya-dbg-line.final { color: var(--ok); font-weight: 600; }
+.laya-dbg-line.fail { color: var(--err); }
+.laya-dbg-line.err { color: var(--err); font-weight: 600; }
+.laya-dbg-line.warn { color: var(--warn); }
+
+.laya-dbg-foot { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
+
+/* ===================== [UI 2.0 步骤7] 壳视觉同步：玻璃标题栏 =====================
+   壳的主题开关是 renderer.js 写入的 html[data-shell-theme]（不是 data-theme）；
+   任务书里的 html[data-theme="dark"] 在壳内永远不匹配，且全局 :root !important
+   会把暗色主题一起钉成浅色，故改为两套 data-shell-theme 令牌覆盖。
+   注：标题栏位于 shell body 之上、webview 之外，backdrop-filter 模糊的是壳层底色，
+   不是标签页内容（webview 不能穿透到标题栏后方）。 */
+html[data-shell-theme="light"] {
+  --bg: #f4f5f8;
+  --titlebar-bg: rgba(244, 245, 248, 0.80);
+  --text: #1d1d1f;
+}
+html[data-shell-theme="dark"] {
+  --bg: #121215;
+  --titlebar-bg: rgba(18, 18, 21, 0.80);
+}
+.titlebar {
+  color: var(--text);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+  backdrop-filter: blur(24px) saturate(1.2);
+  -webkit-backdrop-filter: blur(24px) saturate(1.2);
+}
+html[data-shell-theme="dark"] .titlebar {
+  border-bottom-color: rgba(255, 255, 255, 0.05);
+}
+html[data-shell-theme="light"] .win-btn:hover { background: rgba(0, 0, 0, 0.05); }
+html[data-shell-theme="dark"] .win-btn:hover { background: rgba(255, 255, 255, 0.10); }
+
+/* ===================== [UI 2.0 最后补丁] 壳品牌色对齐蓝 + 重启按钮整形 =====================
+   注意：重启按钮属于壳（index.html #btn-restart.restart-btn），不在网页端；
+   网页端任务书里的 #restartAllServices / #app > aside .restart-btn 均不存在，故在此落地。 */
+html[data-shell-theme] {
+  --accent: #2f7cf6 !important;
+  /* 壳内 4 处 hover 底用 --accent-soft（nav/重启/日志等），不覆盖会留橙色 */
+  --accent-soft: rgba(47, 124, 246, 0.16) !important;
+}
+/* 两处 M 标：标题栏小标 + 侧栏品牌块（.brand-mark，任务书未列但同为 "M"） */
+.titlebar-logo,
+.brand-mark {
+  background: linear-gradient(135deg, #2f7cf6, #1d4ed8) !important;
+  box-shadow: 0 2px 8px rgba(47, 124, 246, 0.30) !important;
+  color: #ffffff !important;
+}
+/* 展开态正常胶囊；收起态仍由 .sidebar:not(.expanded) .sidebar-footer 隐藏 */
+.sidebar .restart-btn {
+  width: auto !important;
+  min-width: 140px !important;
+  height: 36px !important;
+  padding: 0 16px !important;
+  border-radius: 999px !important;
+  background: rgba(var(--overlay-rgb), 0.04) !important;
+  border: none !important;
+  box-shadow: none !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  flex-shrink: 0 !important;
+  white-space: nowrap !important;
+}
+.sidebar .restart-btn svg {
+  flex-shrink: 0;
+}
+html[data-shell-theme="dark"] .sidebar .restart-btn {
+  background: rgba(255, 255, 255, 0.08) !important;
+}

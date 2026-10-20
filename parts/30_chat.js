@@ -96,7 +96,7 @@ function renderSessionList() {
            data-conv-id="${c.id}" data-title="${escapeHtml(c.title || '')}" draggable="true"
            title="模型：${escapeHtml(shortModelName(c.model))}">
         <div class="flex items-center justify-between">
-          <div class="session-title flex items-center gap-1.5 truncate">${escapeHtml(c.title || '新对话')}${c.unread ? '<span class="unread-dot"></span>' : ''}</div>
+          <div class="session-title flex items-center gap-2 truncate">${escapeHtml(c.title || '新对话')}${c.unread ? '<span class="unread-dot"></span>' : ''}</div>
           <div class="session-item-actions">
             <button class="session-item-action" data-op="move" title="移动到项目" onclick="showMoveToGroupMenu(event, this)"><i data-lucide="folder-input" class="w-3 h-3"></i></button>
             <button class="session-item-action ${c.pinned ? 'active-pin' : ''}" data-op="pin" title="${c.pinned ? '取消置顶' : '置顶'}"><i data-lucide="pin" class="w-3 h-3"></i></button>
@@ -117,7 +117,7 @@ function renderSessionList() {
     const pinned = filtered.filter(c => c.pinned);
     const rest = filtered.filter(c => !c.pinned);
     if (pinned.length) {
-      html += `<div class="text-[10px] text-text-tertiary px-2 py-1.5 font-semibold uppercase tracking-wider">置顶</div>`;
+      html += `<div class="text-[10px] text-text-tertiary px-2 py-2 font-semibold uppercase tracking-wider">置顶</div>`;
       pinned.forEach(c => { html += itemHtml(c); });
     }
     rest.forEach(c => { html += itemHtml(c); });
@@ -130,7 +130,7 @@ function renderSessionList() {
     const order = ['置顶', '今天', '昨天', '7天内', '更早'];
     order.forEach(g => {
       if (!groups[g] || !groups[g].length) return;
-      html += `<div class="text-[10px] text-text-tertiary px-2 py-1.5 ${g !== '置顶' ? 'mt-2' : ''} font-semibold uppercase tracking-wider">${g}</div>`;
+      html += `<div class="text-[10px] text-text-tertiary px-2 py-2 ${g !== '置顶' ? 'mt-2' : ''} font-semibold uppercase tracking-wider">${g}</div>`;
       groups[g].forEach(c => { html += itemHtml(c); });
     });
   }
@@ -256,8 +256,10 @@ function syncInputModelLabel() {
   // [显示统一] 有“实际生效模型”（本次回复/回退后的权威）优先展示它；否则回退会话选择/默认模型
   const m = activeModelName() || currentConvModel();
   // [v3.15.13] 统一展示完整模型名（本地含 :tag），不再丢 tag
-  label.textContent = m ? preciseModelName(m) : '选择模型';
-  if (wrap) wrap.title = m ? m : '未检测到模型，请先在设置中配置后端';
+  // [Day22b] 顶栏那行"模型 · 本地优先/云端"小字已下线，模型身份随模型名并入这一行显示
+  const local = (typeof isLocalModelName === 'function') && isLocalModelName(m);
+  label.textContent = m ? (preciseModelName(m) + ' · ' + (local ? '本地优先' : '云端')) : '选择模型';
+  if (wrap) wrap.title = m ? (m + (local ? '（本地模型 · 数据不出本机）' : '（云端模型 · 请求会离开本机）')) : '未检测到模型，请先在设置中配置后端';
   // [深度思考] 与模型标签同类时机刷新三态按钮
   if (typeof refreshThinkModeBtn === 'function') refreshThinkModeBtn();
 }
@@ -333,7 +335,7 @@ function installThinkModeBtn() {
   if (!document.getElementById('thinkModeBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'thinkModeBtnStyle';
-    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(91,140,255,.15);color:#5B8CFF;box-shadow:inset 0 0 0 1px rgba(91,140,255,.3)}.think-mode-btn.think-off{opacity:.4}';
+    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(229,115,74,.15);color:#E5734A;box-shadow:inset 0 0 0 1px rgba(229,115,74,.3)}.think-mode-btn.think-off{opacity:.4}';
     document.head.appendChild(st);
   }
   refreshIcons();
@@ -359,7 +361,7 @@ function installNativeAgentToggle() {
   if (!document.getElementById('nativeAgentBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'nativeAgentBtnStyle';
-    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(157,123,255,.15);color:#9D7BFF;box-shadow:inset 0 0 0 1px rgba(157,123,255,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
+    st.textContent = '.native-agent-btn{position:relative}.native-agent-btn .native-agent-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px;display:none}.native-agent-btn.native-on{background:rgba(229,115,74,.15);color:#E5734A;box-shadow:inset 0 0 0 1px rgba(229,115,74,.35)}.native-agent-btn.native-on .native-agent-tag{display:inline}';
     document.head.appendChild(st);
   }
   syncNativeAgentBtn();
@@ -416,7 +418,7 @@ async function toggleNativeAgent() {
         localStorage.setItem('moray_native_first_note', '1');
         showModal(
           '<div class="space-y-2 text-xs text-text-secondary leading-relaxed">' +
-          '<div class="flex items-center gap-1.5 text-text-primary font-medium"><i data-lucide="shield-check" class="w-4 h-4 text-brand-violet"></i>本机 Agent 默认关闭是为了安全</div>' +
+          '<div class="flex items-center gap-2 text-text-primary font-medium"><i data-lucide="shield-check" class="w-4 h-4 text-brand-violet"></i>本机 Agent 默认关闭是为了安全</div>' +
           '<p>开启后，模型可在受控工作区内调用工具；每次工具执行受以下保护：</p>' +
           '<ul class="list-disc pl-4 space-y-1">' +
           '<li>工作区隔离与路径越界防护（只许相对路径，符号链接/危险后缀/非白名单命令均被拒绝）</li>' +
@@ -448,29 +450,29 @@ async function refreshNativeAgentBanner() {
   if (!banner) {
     banner = document.createElement('div');
     banner.id = 'nativeAgentBanner';
-    banner.className = 'native-agent-banner text-[10px] text-text-tertiary flex items-center gap-2 px-3 py-1.5 mx-3 mt-2 rounded-lg border border-line-ghost/50 bg-surface-panel/50';
+    banner.className = 'native-agent-banner text-[10px] text-text-tertiary flex items-center gap-2 px-3 py-2 mx-3 mt-2 rounded-lg border border-line-ghost/50 bg-surface-panel/50';
     const anchor = content.querySelector('#chatMessagesNormal');
     content.insertBefore(banner, anchor || content.firstChild);
   }
   const ok = !!cfg;
   banner.innerHTML = ok
     ? '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-success)"></span>本机工具已开启 · 工作区 <span class="font-mono text-text-secondary">' + escapeHtml(cfg.workspace || '') + '</span><span class="text-text-tertiary">（写文件与只读命令需你授权）</span>' +
-      '<span class="ml-auto flex items-center gap-1.5 shrink-0">' +
-      '<button data-agent-selfcheck-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="检测当前模型能否触发工具调用"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
-      '<button data-ws-sample-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="载入示例工作区（notes/a.txt、notes/b.txt、todo.md，不覆盖已有文件）"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
-      '<button data-ws-tree-btn class="text-[10px] px-2 py-0.5 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="查看工作区文件树（只读）"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
+      '<span class="ml-auto flex items-center gap-2 shrink-0">' +
+      '<button data-agent-selfcheck-btn class="text-[10px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="检测当前模型能否触发工具调用"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
+      '<button data-ws-sample-btn class="text-[10px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="载入示例工作区（notes/a.txt、notes/b.txt、todo.md，不覆盖已有文件）"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
+      '<button data-ws-tree-btn class="text-[10px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel flex items-center gap-1" title="查看工作区文件树（只读）"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
       '</span>'
     : '<span class="beacon-dot" style="width:6px;height:6px;background:var(--color-warning)"></span>本机工具已开启，但本地后端离线 —— ' + escapeHtml(agentOfflineReason()) +
-      '<span class="ml-auto flex items-center gap-1.5 shrink-0">' +
-      '<button data-agent-selfcheck-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
-      '<button data-ws-sample-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
-      '<button data-ws-tree-btn class="agent-offline text-[10px] px-2 py-0.5 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
+      '<span class="ml-auto flex items-center gap-2 shrink-0">' +
+      '<button data-agent-selfcheck-btn class="agent-offline text-[10px] px-2 py-1 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="shield-check" class="w-3 h-3"></i>自检</button>' +
+      '<button data-ws-sample-btn class="agent-offline text-[10px] px-2 py-1 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="sparkles" class="w-3 h-3"></i>示例</button>' +
+      '<button data-ws-tree-btn class="agent-offline text-[10px] px-2 py-1 rounded-md border border-line-ghost/40 text-text-tertiary opacity-50 flex items-center gap-1" title="' + escapeHtml(agentOfflineReason()) + '"><i data-lucide="folder-tree" class="w-3 h-3"></i>文件树</button>' +
       '</span>';
   // [阶段1.6 M3] 当前模型自检未通过 → 输入台上方一行温和提示（不打断输入）
   const selfCheck = MoraySettings.get('agentSelfCheck');
   const curModel = (typeof activeModelName === 'function') ? activeModelName() : '';
   if (ok && selfCheck && selfCheck.ok === false && curModel && selfCheck.model === curModel) {
-    banner.innerHTML += '<div class="w-full text-[10px] text-warning mt-1 flex items-center gap-1.5">' +
+    banner.innerHTML += '<div class="w-full text-[10px] text-warning mt-1 flex items-center gap-2">' +
       '<i data-lucide="alert-triangle" class="w-3 h-3"></i>该模型（' + escapeHtml(curModel) + '）工具调用偶发失败（自检未通过），Agent 任务建议 qwen2.5:7b，或点「自检」复测</div>';
   }
   refreshIcons();
@@ -536,21 +538,68 @@ async function cleanOrphanMessages() {
   return orphans.length;
 }
 
-/** 删除会话（带确认）
+/** [删除修复] 按列表可见顺序排列会话（与 renderSessionList 排序规则一致：
+ * 排除归档 → 置顶优先 → 手动 order / 更新时间倒序）。返回新数组，不改动 AppState。
+ * @returns {Array} 排序后的会话列表 */
+function visibleSessionOrder() {
+  return AppState.conversations
+    .filter(c => !c.archived)
+    .sort((a, b) => (b.pinned - a.pinned) || ((b.order || b.updatedAt) - (a.order || a.updatedAt)));
+}
+
+/** [删除修复] 从持久层真正删除会话记录（IndexedDB 会话 + 其全部消息；后端同步由 DB 包装层负责）
+ * 失败重试一次；仍失败如实提示，不回滚已完成的列表移除。
+ * @param {string} convId - 会话ID
+ * @returns {Promise<boolean>} 是否删除成功 */
+async function purgeConversationRecord(convId) {
+  if (!convId) return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await DB.deleteConversation(convId);
+      return true;
+    } catch (e) {
+      if (attempt === 1) {
+        console.error('[MoRay] 删除会话持久化失败:', convId, e);
+        showNotification('删除未完成', '本地记录删除失败，刷新后该会话可能再次出现', 'error', 3500);
+      }
+    }
+  }
+  return false;
+}
+
+/** 删除会话（带确认）——先摘内存并立即重绘（会话马上从列表消失），再落持久层，最后按需切换/新建
  * @param {string} convId - 会话ID
  * @returns {Promise<void>} */
 async function deleteConversationById(convId) {
-  const conv = AppState.conversations.find(c => c.id === convId);
-  showConfirm('删除会话', `确定删除会话「${conv ? conv.title : ''}」？该会话的全部消息将一并删除。`, async () => {
-    await DB.deleteConversation(convId);
-    AppState.conversations = AppState.conversations.filter(c => c.id !== convId);
-    delete AppState._convMsgIndex[convId];
-    if (AppState.activeConv && AppState.activeConv.id === convId) {
+  const idx = AppState.conversations.findIndex(c => c.id === convId);
+  if (idx < 0) return;
+  const conv = AppState.conversations[idx];
+  showConfirm('删除会话', `确定删除会话「${conv.title || '新对话'}」？该会话的全部消息将一并删除。`, async () => {
+    const wasActive = !!(AppState.activeConv && AppState.activeConv.id === convId);
+    // 1) 先从数据源摘除并重绘：不等写库结果，被删会话必须立刻从左侧列表消失
+    AppState.conversations.splice(idx, 1);
+    if (AppState._convMsgIndex) delete AppState._convMsgIndex[convId];
+    if (wasActive) {
+      // 不再停留在已删除的会话上下文里
       AppState.activeConv = null;
       AppState.messages = [];
       renderMessages();
-      if (AppState.conversations.length) await openConversation(AppState.conversations[0].id);
-      else showWelcomeView();
+    }
+    renderSessionList();
+    // 2) 从 IndexedDB 真正删掉这条记录（含该会话的全部消息）
+    await purgeConversationRecord(convId);
+    // 3) 删的是当前会话 → 切到列表里第一个其他会话；列表已空则新建空白对话
+    if (wasActive) {
+      const next = visibleSessionOrder()[0];
+      if (next) await openConversation(next.id);
+      else await createNewConversation();
+    }
+    // 下次启动的恢复目标不得再指向已删除的会话
+    if (MoraySettings.get('activeConversationId') === convId) {
+      try {
+        const p = MoraySettings.set('activeConversationId', (AppState.activeConv && AppState.activeConv.id) || '');
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (e) { /* 忽略：仅影响下次启动恢复哪个会话 */ }
     }
     renderSessionList();
     // [模型同步] 删除会话后刷新输入台模型名
@@ -568,7 +617,7 @@ function renameConversation(convId) {
   const item = document.querySelector(`.session-item[data-conv-id="${convId}"] .session-title`);
   if (!item) return;
   const old = conv.title || '';
-  item.innerHTML = `<input type="text" value="${escapeHtml(old)}" style="width:100%;background:var(--color-surface-card);border:1px solid rgba(91,140,255,0.5);border-radius:6px;padding:2px 6px;font-size:12px;color:var(--color-text-primary);outline:none">`;
+  item.innerHTML = `<input type="text" value="${escapeHtml(old)}" style="width:100%;background:var(--color-surface-card);border:1px solid rgba(229, 115, 74,0.5);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--color-text-primary);outline:none">`;
   const input = item.querySelector('input');
   input.focus(); input.select();
   const commit = async () => {
@@ -746,22 +795,41 @@ function thinkingVisible() {
 }
 
 /** 消息操作条 HTML（[P2] 供 buildMessageEl 与流式完成就地渲染复用）
+ * [Day22a] 分两级：主操作（复制 / 重新生成 / 删除）常显，其余 8 项收进 .msg-actions-more ——
+ *   悬停操作栏时由 135 §22.4 横向展开。**不删按钮**：这 8 项在对话页的唯一入口就是这里
+ *   （右键菜单只覆盖 copy/edit/regenerate/branch/delete），删掉即功能回归。
+ *   按钮顺序只影响呈现，事件委托与 handleMsgAction 都按 data-op 派发，与顺序无关。
  * @param {Object} msg - 消息对象
  * @returns {string} HTML */
 function msgActionsHtml(msg) {
   return `<div class="msg-actions">
-    <button class="msg-action-btn" data-op="copy" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="regenerate" title="重新生成"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="saveSnippet" title="保存为片段"><i data-lucide="bookmark" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn ${msg.starred ? 'active' : ''}" data-op="star" title="收藏"><i data-lucide="star" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="quote" title="引用回复"><i data-lucide="reply" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="forward" title="转发到新会话"><i data-lucide="forward" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn ${msg.feedback === 1 ? 'active' : ''}" data-op="like" title="点赞"><i data-lucide="thumbs-up" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn ${msg.feedback === -1 ? 'active' : ''}" data-op="dislike" title="点踩"><i data-lucide="thumbs-down" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="branch" title="从此分支"><i data-lucide="git-branch" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="edit" title="编辑重发"><i data-lucide="edit-3" class="w-3.5 h-3.5"></i></button>
-    <button class="msg-action-btn" data-op="delete" title="删除"><i data-lucide="trash-2" class="w-3.5 h-3.5 text-danger"></i></button>
+    <div class="msg-actions-main">
+      <button class="msg-action-btn" data-op="copy" title="复制"><i data-lucide="copy" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="regenerate" title="重新生成"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="delete" title="删除"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+    </div>
+    <div class="msg-actions-more">
+      <button class="msg-action-btn" data-op="saveSnippet" title="保存为片段"><i data-lucide="bookmark" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn ${msg.starred ? 'active' : ''}" data-op="star" title="收藏"><i data-lucide="star" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="quote" title="引用回复"><i data-lucide="reply" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="forward" title="转发到新会话"><i data-lucide="forward" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn ${msg.feedback === 1 ? 'active' : ''}" data-op="like" title="点赞"><i data-lucide="thumbs-up" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn ${msg.feedback === -1 ? 'active' : ''}" data-op="dislike" title="点踩"><i data-lucide="thumbs-down" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="branch" title="从此分支"><i data-lucide="git-branch" class="w-4 h-4"></i></button>
+      <button class="msg-action-btn" data-op="edit" title="编辑重发"><i data-lucide="edit-3" class="w-4 h-4"></i></button>
+    </div>
   </div>`;
+}
+
+/** [U-6-1] ZCode 执行卡的降级摘要（92 缺位/渲染异常时，buildMessageEl 用它兜底） */
+function zcodeExecFallbackText(msg) {
+  const ex = (msg && msg.execution) || {};
+  const stMap = { running: '执行中', success: '已完成', failed: '失败' };
+  const parts = ['ZCode 任务 ' + (stMap[ex.status] || ex.status || '未知')];
+  if (ex.taskId) parts.push('task ' + String(ex.taskId).slice(0, 8));
+  if (Array.isArray(ex.changedFiles) && ex.changedFiles.length) parts.push(ex.changedFiles.length + ' 个文件已更改');
+  if (ex.error) parts.push(String(ex.error).slice(0, 80));
+  return parts.join(' · ');
 }
 
 /** 渲染单条消息 DOM
@@ -774,13 +842,41 @@ function buildMessageEl(msg, animate) {
   wrap.dataset.msgId = msg.id;
   const time = clockTime(msg.createdAt);
 
+  // [U-6-1] ZCode 执行卡：kind='zcode-execution' 的消息渲染为对话流内执行卡片。
+  // 状态全部来自 msg.execution（IndexedDB 持久化），重建路径零闭包依赖；渲染器由 92 提供
+  // （window.morayRenderExecutionCard，内部自带直播重绑与快照降级），缺失/异常时退化为文本摘要。
+  // 老消息（无 kind 字段）不受影响，走原有 user/assistant 分支。
+  if (msg.kind === 'zcode-execution') {
+    wrap.innerHTML = `
+      <div class="msg-avatar" aria-hidden="true"><i data-lucide="terminal" class="w-3.5 h-3.5"></i></div>
+      <div class="max-w-[85%] group msg-ai-body">
+        <div class="flex items-center gap-2 mb-1 flex-wrap">
+          <span class="beacon-dot"></span>
+          <span class="text-[10px] text-text-tertiary msg-meta-line">ZCode 执行 · ${time}</span>
+        </div>
+        <div class="rounded-xl px-4 py-3 bg-surface-card border border-line-ghost/60 msg-bubble__ai-box">
+          <div class="zcode-exec-host"></div>
+          ${msgActionsHtml(msg)}
+        </div>
+      </div>`;
+    const execHost = wrap.querySelector('.zcode-exec-host');
+    let rendered = false;
+    if (typeof window.morayRenderExecutionCard === 'function') {
+      try { window.morayRenderExecutionCard(msg, wrap); rendered = true; }
+      catch (e) { console.warn('[MoRay] 执行卡渲染失败:', e); }
+    }
+    if (!rendered) execHost.textContent = zcodeExecFallbackText(msg);
+    refreshIcons();
+    return wrap;
+  }
+
   if (msg.role === 'user') {
     wrap.innerHTML = `
       <div class="max-w-[75%]">
         <div class="text-[10px] text-text-tertiary text-right mb-1">你 · ${time}</div>
         <div class="rounded-xl px-4 py-3 bg-brand-cobalt/14 border border-brand-cobalt/20 msg-bubble__user-box">
           <div class="md-body user-msg-content"></div>
-          ${(msg.attachments && msg.attachments.length) ? `<div class="flex gap-1.5 flex-wrap mt-2">${msg.attachments.map(a => `<img src="${a.dataUrl}" alt="${escapeHtml(a.name || '图片')}" class="w-20 h-20 object-cover rounded-lg border border-line-ghost">`).join('')}</div>` : ''}
+          ${(msg.attachments && msg.attachments.length) ? `<div class="flex gap-2 flex-wrap mt-2">${msg.attachments.map(a => `<img src="${a.dataUrl}" alt="${escapeHtml(a.name || '图片')}" class="w-20 h-20 object-cover rounded-lg border border-line-ghost">`).join('')}</div>` : ''}
         </div>
         <div class="msg-timestamp text-[10px] text-text-tertiary right-0 mt-1 flex items-center justify-end gap-1">
           ${(msg.attachments && msg.attachments.length) ? '<span class="local-only-badge" title="图片附件仅保存在本机浏览器 IndexedDB，清除浏览器数据或更换设备将丢失">仅存本机</span>' : ''}
@@ -792,10 +888,13 @@ function buildMessageEl(msg, animate) {
     enhanceCodeBlocks(content, false);
   } else {
     wrap.innerHTML = `
-      <div class="max-w-[85%] group">
+      <div class="msg-avatar" aria-hidden="true"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i></div>
+      <div class="max-w-[85%] group msg-ai-body">
         <div class="flex items-center gap-2 mb-1 flex-wrap">
           <span class="beacon-dot"></span>
-          <span class="text-[10px] text-text-tertiary">${escapeHtml(preciseModelName(msg.model))} · ${time}</span>
+          <!-- [Day22a] 信息行 11px 由 135 §22.2 覆盖 .msg-meta-line 达成；类名 text-[10px] 必须保留 ——
+               finalizeAssistantUI 以 el.querySelector('.text-\\[10px\\]') 取头部节点回写模型名/时间，换名即静默失效。 -->
+          <span class="text-[10px] text-text-tertiary msg-meta-line">${escapeHtml(preciseModelName(msg.model))} · ${time}</span>
           ${typeof renderCostPills === 'function' ? renderCostPills(msg) : ''}
         </div>
         ${(typeof renderToolSteps === 'function') ? renderToolSteps(msg.toolCalls) : ''}
@@ -803,7 +902,7 @@ function buildMessageEl(msg, animate) {
         <div class="rounded-xl px-4 py-3 bg-surface-card border border-line-ghost/60 msg-bubble__ai-box">
           <div class="ai-msg-inner"></div>
           ${msgActionsHtml(msg)}
-          ${msg.stats ? `<div class="text-[10px] text-text-tertiary mt-1.5 flex items-center gap-2">
+          ${msg.stats ? `<div class="text-[10px] text-text-tertiary mt-2 flex items-center gap-2">
             ${msg.stats.tokPerSec ? `<span class="compare-stat"><i data-lucide="zap" class="w-3 h-3 inline"></i> ${msg.stats.tokPerSec} tok/s</span>` : ''}
             ${msg.stats.ms ? `<span class="compare-stat">用时 ${(msg.stats.ms / 1000).toFixed(1)}s</span>` : ''}
             ${msg.stats.tokens ? `<span class="compare-stat">${msg.stats.tokens} tokens</span>` : ''}
@@ -814,6 +913,89 @@ function buildMessageEl(msg, animate) {
   }
   refreshIcons();
   return wrap;
+}
+
+/** [路由透明化] 气泡底部“实际模型 / 路由原因”小字（纯展示，不参与任何路由与请求决策）
+ * 实际模型：优先取接口返回的 servedModel（后端做模型名兜底后服务端真正应答的模型），
+ *   接口未透出该字段时退回本次请求模型，两者都没有才显示“未知模型”。
+ * 路由原因：接口未定义 route_reason 字段，这里由两处**已有**信息拼装，不要求后端新增字段 ——
+ *   ① 请求模型 ≠ 实际应答模型（服务端模型名兜底/归一，前端凭响应即可判定，恒显示）；
+ *   ② 前端路由链路 msg.routeReason（选型与失败切换轨迹，默认折叠为“路由详情”胶囊，
+ *      routingDebug 打开时平铺，沿用既有行为）。
+ * @param {Object} msg - 消息对象
+ * @returns {string} HTML 片段 */
+function routeDetailHtml(msg) {
+  const requested = String((msg && msg.model) || '').trim();
+  const served = String((msg && msg.servedModel) || '').trim();
+  const trace = String((msg && msg.routeReason) || '').trim();
+  const actual = served || requested;
+  const backendNote = (served && requested && served !== requested)
+    ? '服务端模型名兜底/归一（请求 ' + requested + ' → 实际 ' + served + '）'
+    : '';
+  let html = '<div class="route-reason-note mt-2 flex items-center gap-1 flex-wrap text-[10px] text-text-tertiary">'
+    + '<i data-lucide="route" class="w-3 h-3"></i>'
+    + '<span>实际模型：' + escapeHtml(actual ? preciseModelName(actual) : '未知模型') + '</span>';
+  if (backendNote) html += '<span>· 路由原因：' + escapeHtml(backendNote) + '</span>';
+  if (trace && MoraySettings.get('routingDebug')) html += '<span>· 路由原因：' + escapeHtml(trace) + '</span>';
+  else if (trace) {
+    html += '<details style="display:inline-block"><summary style="cursor:pointer;font-size:10px;color:var(--color-text-tertiary);border:1px solid var(--color-line-ghost);border-radius:999px;padding:1px 8px">路由详情</summary>'
+      + '<div style="font-size:10px;color:var(--color-text-tertiary);margin-top:4px">' + escapeHtml(trace) + '</div></details>';
+  }
+  return html + '</div>';
+}
+
+/** [M5-P2 2026-10-06] 气泡底部"记忆召回"胶囊（纯展示，不参与任何召回与请求决策）：
+ * 与 routeDetailHtml 的"路由详情"并列的独立 details 胶囊，同在 !streaming 时渲染。
+ * 展开列出本次发送时 /api/memory/recall 的命中明细，回答三问——
+ *   反哺了哪几条：排名 ≤ injectedCount 标"已注入"（进了 system prompt 的【长期记忆】块）；
+ *   从哪几条原料来：tags 内 basis 原料 memory_id（反思回写时埋入，32 位 hex）；
+ *   为什么被选中：排名 + score（后端 bm25×时间衰减×weight，score DESC 即排名序）。
+ * 数据源 msg.memoryRecall = {items, injectedCount}（buildRequestMessages 召回后挂上，
+ * persistMessage 整对象落库，历史消息重载可复现）。无召回数据（总闸关/未命中/旧消息）返回 ''。
+ * @param {Object} msg - 消息对象
+ * @returns {string} HTML 片段 */
+function memoryRecallHtml(msg) {
+  const rec = msg && msg.memoryRecall;
+  if (!rec || !Array.isArray(rec.items) || !rec.items.length) return '';
+  const injected = Math.max(0, parseInt(rec.injectedCount, 10) || 0);
+  const isBasis = (t) => /^[0-9a-f]{32}$/i.test(String(t || ''));
+  const pill = 'display:inline-block;margin:1px 4px 1px 0;padding:0 6px;border:1px solid var(--color-line-ghost);border-radius:999px;font-size:10px;color:var(--color-text-tertiary)';
+  const rows = rec.items.map(function (it, i) {
+    const rank = i + 1;
+    const tags = Array.isArray(it.tags) ? it.tags : [];
+    const plain = tags.filter(function (t) { return t && !isBasis(t); });
+    const basis = tags.filter(isBasis);
+    let row = '<div style="margin-top:6px;padding-top:6px;border-top:1px dashed var(--color-line-ghost)">'
+      + '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0">'
+      + '<span style="' + pill + '">#' + rank + (rank <= injected ? ' · 已注入' : ' · 未注入') + '</span>'
+      + '<span style="' + pill + '">score ' + escapeHtml(String(it.score)) + '</span>'
+      + '<span style="' + pill + '">' + escapeHtml(String(it.kind || '-')) + ' / ' + escapeHtml(String(it.source || '-')) + '</span>'
+      + plain.map(function (t) { return '<span style="' + pill + '">' + escapeHtml(t) + '</span>'; }).join('')
+      + '</div>'
+      + '<div style="margin-top:3px">' + escapeHtml(String(it.content || '').slice(0, 80)) + (String(it.content || '').length > 80 ? '…' : '') + '</div>';
+    if (basis.length) {
+      row += '<div style="margin-top:3px">原料 memory_id：' + basis.map(function (u) {
+        return '<span style="font-family:ui-monospace,monospace;font-size:10px;color:var(--color-text-tertiary)">' + escapeHtml(u) + '</span>';
+      }).join('、') + '</div>';
+    }
+    return row + '</div>';
+  }).join('');
+  return '<details class="mt-2" style="display:inline-block;max-width:100%">'
+    + '<summary style="cursor:pointer;font-size:10px;color:var(--color-text-tertiary);border:1px solid var(--color-line-ghost);border-radius:999px;padding:1px 8px">'
+    + '<i data-lucide="brain" class="w-3 h-3 inline"></i>记忆召回 ' + rec.items.length + ' 条 · 注入 ' + injected + '</summary>'
+    + '<div style="font-size:10px;color:var(--color-text-tertiary);margin-top:4px;max-width:560px">' + rows + '</div>'
+    + '</details>';
+}
+
+/** [2026-10-01 U-6-3] 裸 JSON 防御：识别"模型把工具调用 JSON 当聊天正文返回"的形态
+ * （典型：判定专用模型 moray-laya-final 输出 {"name":"detective_research","arguments":{...}}）。
+ * 规则按 U-6-3 任务书：正文以 {"name"/"tool_call"/"tool_calls"/"function": 开头 且全文 <1000 字符。
+ * @param {string} content - 消息正文
+ * @returns {boolean} 是否命中（命中则 fillAssistantBody 渲染友好提示而非裸 JSON） */
+const BARE_TOOL_CALL_RE = /^\s*\{\s*"(?:name|tool_call|tool_calls|function)"\s*:/;
+function isBareToolCallJson(content) {
+  const s = String(content || '');
+  return s.length > 0 && s.length < 1000 && BARE_TOOL_CALL_RE.test(s);
 }
 
 /** 填充 AI 消息主体（思考面板 + 正文 + 引用来源）
@@ -843,7 +1025,7 @@ function fillAssistantBody(el, msg, streaming) {
       `<span class="citation-chip" data-doc-id="${escapeHtml(c.docId)}" data-chunk-idx="${c.chunkIdx}" title="相关度 ${((c.score || 0) * 100).toFixed(1)}%${c.meta ? ' · ' + escapeHtml(c.meta) : ''}"><i data-lucide="file-text" class="w-3 h-3"></i>${escapeHtml(c.docName)} · 第${(typeof c.chunkIdx === 'number' ? c.chunkIdx : 0) + 1}段</span>`).join('');
     html += `<div class="mt-2 pt-2 border-t border-line-ghost/50" data-rag-sources>`
       + `<div class="text-[10px] text-text-tertiary mb-1">引用来源</div>${chips}`
-      + `<div class="rag-source-annot text-[11px] text-text-secondary mt-1.5" data-rag-annot>${msg.citations.map(ann).join(' ')}</div>`
+      + `<div class="rag-source-annot text-[11px] text-text-secondary mt-2" data-rag-annot>${msg.citations.map(ann).join(' ')}</div>`
       + `</div>`;
   }
   // [V2] 缓存命中标签
@@ -857,8 +1039,12 @@ function fillAssistantBody(el, msg, streaming) {
   // [深度思考] 可解释性：auto 档自动开启思考时，在消息底部展示一行 tertiary 小字（含路由去向）
   if (msg.thinkAuto && msg.think) {
     const route = msg.routedTo ? ' · 路由到 ' + shortModelName(msg.routedTo) : '';
-    html += `<div class="mt-1.5 flex items-center gap-1 text-[10px] text-text-tertiary think-note"><i data-lucide="sparkles" class="w-3 h-3"></i>复杂任务 · 已自动开启深度思考${route}</div>`;
+    html += `<div class="mt-2 flex items-center gap-1 text-[10px] text-text-tertiary think-note"><i data-lucide="sparkles" class="w-3 h-3"></i>复杂任务 · 已自动开启深度思考${route}</div>`;
   }
+  // [路由透明化] 气泡最底部：实际命中模型 / 路由原因（流式期间不显示，生成完成后才出现）
+  if (!streaming) html += routeDetailHtml(msg);
+  // [M5-P2 2026-10-06] 记忆召回胶囊：与"路由详情"并列的独立 details（流式期间不显示，时序一致）
+  if (!streaming) html += memoryRecallHtml(msg);
   el.innerHTML = html;
   enhanceCodeBlocks(el, false);
   refreshIcons();
@@ -1067,6 +1253,63 @@ async function sendUserMessage() {
   const raw = input ? input.value.trim() : '';
   if (!raw && !AppState.attachments.length) return;
 
+  // [Day24.13] Argus 模式：/exit 退出（放在一切发送守卫之前——未配模型也能退出模式）
+  if (window.MorayArgusMode && window.MorayArgusMode.isActive() && /^\/exit\s*$/i.test(raw)) {
+    if (input) { input.value = ''; input.style.height = 'auto'; }
+    window.MorayArgusMode.exit('slash');
+    return;
+  }
+
+  // [阶段3b] /订阅 命令：登记 Argus 周期复查订阅（走 8010 链路，与主 LLM 无关）。
+  // 刻意排在模型/后端检查之前：没配模型也能订阅；也排在 Argus 模式
+  // launchResearch 之前（那在函数更下方），研究模式下 /订阅 依然可用。
+  // 只传 question：user_id/interval_hours 由后端定死（单用户、24h MVP）。
+  if (raw === '/订阅' || raw.startsWith('/订阅 ')) {
+    const question = raw.slice(4).trim();
+    if (input) { input.value = ''; input.style.height = 'auto'; }
+    if (!question) {
+      showNotification('用法：/订阅', '例如「/订阅 帮我盯着 XXX 的价格」，默认每 24 小时复查一次', 'warning', 6000);
+      return;
+    }
+    // file:// 直开时相对 fetch 无效，一律走 MorayBackend.origin
+    const subBase = (window.MorayBackend && window.MorayBackend.origin) || '';
+    try {
+      const resp = await fetch(subBase + '/api/argus/subscriptions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question })
+      });
+      const j = await resp.json().catch(() => null);
+      // showNotification 走 innerHTML，问题文本回显前转义尖括号
+      const qEcho = question.slice(0, 30).replace(/[<>&]/g, '·') + (question.length > 30 ? '…' : '');
+      if (j && j.ok) {
+        showNotification('✅ 已订阅', '「' + qEcho + '」每 24 小时复查一次，异动会推送到「🔔 Argus 订阅通知」对话', 'success', 5000);
+      } else {
+        showNotification('❌ 订阅失败', (j && (j.message || j.code)) || ('后端返回 ' + resp.status), 'error', 6000);
+      }
+    } catch (e) {
+      showNotification('❌ 订阅失败', (e && e.message) || '无法发出请求（MoRay 后端是否在运行？）', 'error', 6000);
+    }
+    return;
+  }
+
+  // [开源友好] 发送前拦截：未检测到任何模型后端（无本地 Ollama、无云端 Key）
+  // 不再把请求发出去换一句"没有可用的 AI 后端"，而是给一句可执行的引导并落到设置页；
+  // 输入框内容保留，用户配好模型后可直接重发。
+  if (AI.backend === 'none') {
+    showNotification('请先配置模型',
+      '二选一：① 本机运行 Ollama（默认 localhost:11434）后点设置里的「重新检测」；' +
+      '② 在「设置 → OpenAI 兼容 API」填写服务商接口地址与 API Key。详见 server/.env.example。',
+      'warning', 8000);
+    const navBtn = document.querySelector('.nav-icon-btn[data-page="settings"]');
+    if (navBtn) navBtn.click();
+    setTimeout(() => {
+      const anchor = document.getElementById('setOpenaiBase');
+      if (anchor && anchor.closest) anchor.closest('.glass-card').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 300);
+    return;
+  }
+
   // [P0] 发送前拦截：后端可用但模型为空 → 不发请求（避免 400 model is required），弹模型列表
   if (AI.backend !== 'none' && typeof currentConvModel === 'function' && !currentConvModel()) {
     showNotification('未选择模型', '已为你打开模型列表，请选择一个模型', 'warning', 2600);
@@ -1129,6 +1372,14 @@ async function sendUserMessage() {
   if ((AppState.attachments || []).length && typeof isVisionModel === 'function' && !isVisionModel(conv.model || MoraySettings.get('defaultModel'))) {
     showNotification('模型可能不支持图片', `「${shortModelName(conv.model || '默认模型')}」疑似无视觉能力，图片可能被忽略。可换用 llava/gpt-4o 等视觉模型`, 'warning', 4500);
   }
+  // [Day24.13] Argus 模式：绕过主 LLM，直接发起 detective_research（不走 generateAssistantReply）。
+  // 用户消息此刻已落库并渲染；进度面板与报告自动贴入由 125 的 ArgusWatcher 链路承接。
+  // 刻意排在 metaDirectAnswer 之前：模式激活时任何消息都视为研究问题。
+  if (window.MorayArgusMode && window.MorayArgusMode.isActive()) {
+    await window.MorayArgusMode.launchResearch(conv, content);
+    if (typeof ChatAttachments !== 'undefined') ChatAttachments.clear();
+    return;
+  }
   // [v3.15.13] 模型身份元问题：metaDirectAnswer 开启时前端确定性直答，不调用 LLM
   if (MoraySettings.get('metaDirectAnswer') !== false &&
       typeof isModelMetaQuestion === 'function' &&
@@ -1168,10 +1419,57 @@ async function buildRequestMessages(conv, extraContext) {
   if (typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().some(t => t.function.name === 'query_knowledge_base')) {
     kbCite = '【知识库引用】使用 query_knowledge_base 的结果回答时，请在对应结论后标注来源，格式为 [来源：文档名·第N段]（N 用工具返回的 segment 字段）；未命中知识库时如实说明，不要编造文档内容。';
   }
-  if (sys || kbCite) msgs.push({ role: 'system', content: kbCite ? (sys ? sys + '\n\n' + kbCite : kbCite) : sys });
-  // [批次修复 #6] 短问候短路：新会话首条 ≤8 字符的纯问候（无引用/附件）→ 系统提示追加精简约束
+  // [M3b 2026-10-02] 长期记忆召回（MemoryBridge）：总闸 MoraySettings.memoryRecallEnabled
+  // 默认关；recall 内部 <3 字符不发请求、800ms 超时、任何失败 fail-open 返回 ''。
+  // query 取本会话最后一条用户消息（发送时序上即本次原句；后端 _fts_expr 自做 CJK 滑窗，
+  // 前端不预处理）。_userMsgs/_lastUserText 自短问候判定处上移至此，值语义不变。
   const _userMsgs = (AppState.messages || []).filter(m => m.conversationId === conv.id && m.role === 'user');
   const _lastUserText = _userMsgs.length ? String((_userMsgs[_userMsgs.length - 1] || {}).content || '').trim() : '';
+  let memoryNote = '';
+  // [M5-P2 2026-10-06] 召回可观测：优先 recallWithItems（单次 API 调用 limit=10，前 3 注入、
+  // 全量 items 供"记忆召回"胶囊；关闸/失败 fail-open 同旧路径），旧 recallForPrompt 作降级兜底。
+  let memoryRecallDebug = null;
+  if (typeof window.MorayMemory !== 'undefined') {
+    if (typeof window.MorayMemory.recallWithItems === 'function') {
+      const memRecall = await window.MorayMemory.recallWithItems(_lastUserText);
+      memoryNote = memRecall.promptText;
+      if (memRecall.items && memRecall.items.length) {
+        memoryRecallDebug = { items: memRecall.items, injectedCount: memRecall.injectedCount };
+      }
+    } else {
+      memoryNote = await window.MorayMemory.recallForPrompt(_lastUserText);
+    }
+  }
+  // 数组附带属性：随返回值传给调用方；JSON.stringify(数组) 自动丢弃 → 不会进请求体
+  msgs.memoryRecallDebug = memoryRecallDebug;
+  // [Argus 深度研究] 能力通告（红线 R2 的最简版兜底）：工作台已接入 Argus 研究模块，
+  // 这里无条件把这件事告诉模型，杜绝"我没有 Argus 这个工具"这类否认。
+  // 两种形态——工具调用开着时直接点名 detective_research，并把"先调工具"写成硬约束：
+  // 小模型（实测 qwen2.5:7b）在只看到"拿到 session_id 就告诉用户"时，会跳过工具调用
+  // 直接编一个 id 出来（例如 "session_id 为 123456"），用户拿着假 id 去查必然查不到，
+  // 所以这里必须把"先调用、id 只能来自工具返回、不许编造"放在同一条规则里。
+  // 关着时（本次请求不带 tools）也保留说明，让模型给出正确的启动路径而不是假装已经启动。
+  const argusHasTool = typeof ToolRegistry !== 'undefined' &&
+    ToolRegistry.listForRequest().some(t => t.function.name === 'detective_research');
+  const argusNote = argusHasTool
+    ? '【Argus 深度研究】遇到"查资料 / 做调研 / 对比产品价格 / 了解行业信息"的请求时，你的第一个动作必须是调用 detective_research 工具（参数 question = 用户的问题），不要先回答、也不要先解释你打算做什么。\n' +
+      '· 如果对话里已经有一条 detective_research 的工具返回（系统可能已替你发起），就直接用它返回的 session_id，不要重复调用。\n' +
+      '· session_id 只能来自工具返回。在本轮没有工具返回之前，绝对不要说"已启动研究任务"，也不要写出任何 id —— 编造的 id 会让用户去查一个不存在的任务。\n' +
+      '· 拿到工具返回的 session_id 后，再告诉用户"已启动研究任务"并给出这个 id，说明研究需要几分钟；报告生成后系统会**自动把它贴进本轮对话**，所以不要让用户"稍后再来问一次"（用户想主动问也可以，那时再调 detective_status）。\n' +
+      '· detective_research 一轮里只调用一次：已经拿到 session_id 之后（或返回里出现 reused:true），立刻停止调用它并直接回答用户，重复调用只会起一堆重复研究。\n' +
+      '· 之后凡是问那个研究的进度或结果（"好了吗 / 进度如何 / 查到了什么"），必须先调用 detective_status（参数 session_id = 上面那个 id）拿真实状态，不允许凭记忆或想象回答：还在跑就如实说还在进行中，报告就绪就基于它返回的报告正文作答。\n' +
+      '· 报告里的价格、结论、来源只能引用工具返回的正文；正文里没有的，一个字都不要编（包括"约 X 元/月"这类看似合理的数字和 [来源：…] 标记）。'
+    : '【Argus 深度研究】本工作台已接入 Argus 深度研究模块（研究接口 http://127.0.0.1:8010/api/argus/orchestrate），' +
+      '但本次请求未启用工具调用，你无法直接启动研究。当用户要求查资料/做调研/对比产品价格时，' +
+      '如实说明"已接入 Argus 深度研究，但需要在设置里开启「工具调用」后我才能直接启动"，' +
+      '不要回答"我没有 Argus 这个工具"，也不要编造 session_id 或研究结论。';
+  // 组装 system 消息：**顺序有意义** —— argusNote 放最后。
+  // 小模型对长 system prompt 里靠后的指令更敏感；此前 argusNote 排在 kbCite 之前，
+  // 末尾被"知识库引用"那段落了脚，实测 qwen2.5:7b 会跳过工具调用、直接编一个 session_id。
+  const sysParts = [sys, kbCite, memoryNote, argusNote].filter(Boolean);
+  if (sysParts.length) msgs.push({ role: 'system', content: sysParts.join('\n\n') });
+  // [批次修复 #6] 短问候短路：新会话首条 ≤8 字符的纯问候（无引用/附件）→ 系统提示追加精简约束
+  // [M3b 2026-10-02] _userMsgs/_lastUserText 已上移至 sysParts 组装前（记忆召回需要 query），此处不再重复定义
   const _isShortGreet = _userMsgs.length === 1 && _lastUserText.length <= 8 && !extraContext &&
     !(AppState.attachments || []).length &&
     /^(你?好|您好|在吗|嗨|hi|hello|hey|哈喽|早上好|下午好|晚上好|谢谢|嗯|哦|ok|好的|再见|bye)[!！。.~～\s]*$/i.test(_lastUserText);
@@ -1186,11 +1484,13 @@ async function buildRequestMessages(conv, extraContext) {
   if (strayCount) console.warn('[MoRay] 越界/无主消息残留（已剔除不发送）:', strayCount, '条 → 当前 conv', conv.id);
   let history = rawAll.filter(m => m.conversationId === conv.id).slice(-limit);
   // [路由修复] 过滤空 content 消息（user/assistant 均滤）：历史不允许携带空消息；
-  // 仅含图片附件的合法用户消息以附件为准保留，不得被当空消息误删
+  // 仅含图片附件的合法用户消息以附件为准保留，不得被当空消息误删；
+  // [历史断片修复 2026-10-20] 带 toolCalls 的无正文助手消息同样保留（重建时会序列化为工具轮记录，不再整轮蒸发）
   history = history.filter(m => {
     const hasContent = String(m.content || '').trim().length > 0;
     const hasAttachments = !!(m.attachments && m.attachments.length);
-    return hasContent || hasAttachments;
+    const hasToolCalls = !!(m.toolCalls && m.toolCalls.length);
+    return hasContent || hasAttachments || hasToolCalls;
   });
   // [P0 治本] 发送前最终自检：理论上已无越界，双重保险 + 控制台可见请求规模
   const leaked = history.filter(m => m.conversationId !== conv.id || !m.conversationId);
@@ -1256,7 +1556,23 @@ async function buildRequestMessages(conv, extraContext) {
   const kept = picked.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
   const sysSaved = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(rawSys).savedTokens : 0;
   conv.__lastCompressionSaved = Math.max(0, sysSaved + (totalHistory - kept));
-  picked.forEach(m => msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+  // [历史断片修复 2026-10-20] 回发历史时重建工具轮：上一轮的代码常活在 toolCalls（步骤卡）的 args 里，
+  // 仅序列化 role/content 会让模型"忘记自己写过什么"（实探：create_file 被拒后反问"需要写入什么内容"）。
+  // 工具名+执行状态+参数（单条截断 2000 字符防爆 token）追加进正文；content 为空时该重建块即占位。
+  picked.forEach(m => {
+    let text = m.content || '';
+    if (m.toolCalls && m.toolCalls.length) {
+      text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
+      m.toolCalls.forEach(tc => {
+        let argStr = '';
+        try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
+        if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
+        const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
+        text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
+      });
+    }
+    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+  });
   if (extraContext && extraContext.text) {
     msgs.push({ role: 'system', content: extraContext.text });
   }
@@ -1312,16 +1628,19 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   el.className = 'msg-bubble flex justify-start msg-enter';
   el.dataset.msgId = assistantMsg.id;
   el.innerHTML = `
-    <div class="max-w-[85%]">
+    <div class="msg-avatar" aria-hidden="true"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i></div>
+    <div class="max-w-[85%] msg-ai-body">
       <div class="flex items-center gap-2 mb-1">
         <span class="beacon-dot"></span>
-        <!-- [小补丁] 占位头部：精确模型名（含 :b 后缀）+ 按 think 决策显示 思考中/正在生成 -->
-        <span class="text-[10px] text-text-tertiary">${escapeHtml(preciseModelName(model))} · <span class="gen-status-text">${(think === true && isThinkingModel(model)) ? '思考中' : '正在生成'}</span></span>
+        <!-- [小补丁] 占位头部：精确模型名（含 :b 后缀）+ 按 think 决策显示 思考中/正在生成
+             [Day22a] 头像/信息行与 buildMessageEl 的 AI 分支结构保持一致（否则流式完成前后会跳版）；
+             text-[10px] 类名同样必须保留（finalizeAssistantUI 取头部节点用）。 -->
+        <span class="text-[10px] text-text-tertiary msg-meta-line">${escapeHtml(preciseModelName(model))} · <span class="gen-status-text">${(think === true && isThinkingModel(model)) ? '思考中' : '正在生成'}</span></span>
       </div>
       <div class="rounded-xl px-4 py-3 bg-surface-card border border-line-ghost/60 msg-bubble__ai-box">
         <div class="ai-msg-inner"></div>
         <div class="stream-actions flex items-center gap-2 mt-2">
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 stop-gen-btn">
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1 stop-gen-btn">
             <i data-lucide="square" class="w-3 h-3"></i>停止生成
           </button>
         </div>
@@ -1361,7 +1680,30 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     return;
   }
 
+  /* [停止缝修复 2026-10-03] 停止按钮绑定在上方，但真实生成控制器要等 chatStream 返回
+   * 才写入 genController——buildRequestMessages（RAG 召回/历史压缩，秒级）窗口内点击
+   * 此前只置 aborted 标志、genController 仍为 null、窗口结束 fetch 照常发出、底层照烧。
+   * 现在用早期控制器占住 genController：窗口结束见 aborted 即不发请求（停止=无请求）；
+   * 真实控制器产生后再联动（对齐 100_gateway attemptFn 的 abort 联动形态），防御接线。 */
+  const earlyCtl = new AbortController();
+  AppState.genController = earlyCtl;
+
   const requestMessages = await buildRequestMessages(conv, extraContext);
+  // [M5-P2 2026-10-06] 召回明细挂到本条 AI 消息（routeReason 同款挂法；persistMessage 走
+  // DB.putMessage 整对象落库，历史消息重渲染时胶囊可复现）。无召回（关闸/未命中）不挂字段。
+  if (requestMessages.memoryRecallDebug) assistantMsg.memoryRecall = requestMessages.memoryRecallDebug;
+
+  if (aborted || earlyCtl.signal.aborted) {
+    // 窗口期已点停止：不发起任何生成请求，直接按"已停止"收尾
+    AppState.genController = null;
+    typingEl.remove();
+    assistantMsg.content += '\n\n*[已停止生成]*';
+    persistMessage(assistantMsg).catch(() => {});
+    fillAssistantBody(inner, assistantMsg, false);
+    showNotification('已停止', '生成已终止', 'info', 1500);
+    finalizeAssistantUI(el, assistantMsg);
+    return;
+  }
   // [小补丁] auto 档在 requestMessages 就绪后补齐 classify 决策并回写占位消息（on/off 已提前定）
   if (thinkMode === 'auto') {
     // [深度思考] 统一决策入口（qwen3.5 auto 默认 false 逻辑已并入 decideThinkFor）
@@ -1471,6 +1813,10 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       }
     }
   });
+  /* [停止缝修复] 早期控制器 → 真实控制器联动：chatStream 已发起 fetch 但 genController
+   * 尚未换绑的同步窗口里，若早期信号已 aborted（或随后有人经旧引用 abort），直接传导。 */
+  if (earlyCtl.signal.aborted) { try { controller.abort(); } catch (e) { /* 忽略 */ } }
+  else earlyCtl.signal.addEventListener('abort', () => { try { controller.abort(); } catch (e) { /* 忽略 */ } }, { once: true });
   AppState.generating = true;
   AppState.genController = controller;
   // [3.20 阶段2] 清空知识库来源收集器：保证上一轮的来源不会串到本轮
@@ -1503,6 +1849,8 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       // [路由修复] 回写实际命中模型（自动路由分流后气泡精确显示，含 :4b/:9b 后缀）
       if (result._routed.model) assistantMsg.model = result._routed.model;
     }
+    // [路由透明化] 接口返回的真实命中模型（后端把不受支持的模型名静默兜底改写时，它与路由模型不同）
+    if (result.servedModel) assistantMsg.servedModel = String(result.servedModel);
     // [工具调用] 持久化工具步骤（旧消息无此字段 → 正常显示，向后兼容）
     if (result._toolSteps) assistantMsg.toolCalls = result._toolSteps;
     // [3.20 阶段2] 知识库来源标注：把 query_knowledge_base 本轮登记的来源并入消息引用
@@ -1593,27 +1941,9 @@ function finalizeAssistantUI(el, msg) {
   if (header) {
     // [路由修复] 气泡头部精确显示实际模型（含 :4b/:9b），不再只显示家族名
     header.textContent = `${preciseModelName(msg.model)} · ${clockTime(msg.createdAt)}`;
-    // [路由修复] 有路由决策时在 meta 区下方展示一行 reason 小字（无路由信息不显示）
-    if (msg.routeReason) {
-      const metaWrap = header.parentElement;
-      const parent = metaWrap ? metaWrap.parentElement : null;
-      if (parent) {
-        let note = parent.querySelector('.route-reason-note');
-        if (!note) {
-          note = document.createElement('div');
-          note.className = 'route-reason-note';
-          parent.insertBefore(note, metaWrap.nextSibling);
-        }
-        // [v3.15.13] 默认折叠成“路由详情”小胶囊；routingDebug 开启时才平铺完整链路
-        if (MoraySettings.get('routingDebug')) {
-          note.className = 'route-reason-note text-[10px] text-text-tertiary mt-0.5';
-          note.textContent = msg.routeReason;
-        } else {
-          note.className = 'route-reason-note mt-0.5';
-          note.innerHTML = '<details style="display:inline-block"><summary style="cursor:pointer;font-size:10px;color:var(--color-text-tertiary);border:1px solid var(--color-line-ghost);border-radius:999px;padding:1px 8px">路由详情</summary><div style="font-size:10px;color:var(--color-text-tertiary);margin-top:4px">' + escapeHtml(msg.routeReason) + '</div></details>';
-        }
-      }
-    }
+    // [路由透明化] 实际模型/路由原因改由 fillAssistantBody 在气泡底部统一渲染（见 routeDetailHtml）：
+    // 原先在此处插入的 .route-reason-note 会命中消息体内已渲染的那一份并被覆盖，故不再重复插入；
+    // 移到消息体后，重开会话的历史消息同样能看到实际模型与路由详情。
   }
   // [v3.15.13] 统一收尾：所有结束路径清理流式光标/打字指示，避免残留青色竖条
   el.querySelectorAll('.stream-cursor, .typing-indicator').forEach(n => n.remove());
@@ -1819,9 +2149,9 @@ async function exportConversation(format) {
         </button>
       </div>
       <div class="mt-3 pt-3 border-t border-line-ghost/50 flex gap-4 text-xs text-text-secondary">
-        <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" id="expOptTime" class="accent-brand-cobalt w-3.5 h-3.5">含时间戳</label>
-        <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" id="expOptModel" class="accent-brand-cobalt w-3.5 h-3.5">含模型信息</label>
-        <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" id="expOptStarred" class="accent-brand-cobalt w-3.5 h-3.5">仅导出收藏消息</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="expOptTime" class="accent-brand-cobalt w-3.5 h-3.5">含时间戳</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="expOptModel" class="accent-brand-cobalt w-3.5 h-3.5">含模型信息</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="expOptStarred" class="accent-brand-cobalt w-3.5 h-3.5">仅导出收藏消息</label>
       </div>`, { title: '导出会话', icon: 'download', footer: false });
     // [V2 优化1] 导出选项
     const opts = {
@@ -1861,12 +2191,12 @@ async function exportConversation(format) {
     }
     const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>${escapeHtml(conv.title)}</title>
 <style>body{font-family:system-ui,sans-serif;background:#0A0C14;color:#E8ECF5;max-width:820px;margin:0 auto;padding:32px 20px}
-h1{font-size:22px}.msg{margin:18px 0}.who{font-size:12px;color:#616C82;margin-bottom:6px}
-.bubble{padding:14px 16px;border-radius:12px;line-height:1.7;font-size:14px}
-.user .bubble{background:rgba(91,140,255,0.14);border:1px solid rgba(91,140,255,0.2)}
-.assistant .bubble{background:#1A1F30;border:1px solid #262C3E}
+h1{font-size:22px}.msg{margin:16px 0}.who{font-size:12px;color:#616C82;margin-bottom:8px}
+.bubble{padding:16px 16px;border-radius:12px;line-height:1.7;font-size:14px}
+.user .bubble{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08)}
+.assistant .bubble{background:#161616;border:1px solid rgba(255,255,255,0.08)}
 pre{background:#0D1119;padding:12px;border-radius:8px;overflow-x:auto;font-size:13px}
-code{font-family:ui-monospace,monospace}a{color:#5B8CFF}table{border-collapse:collapse}th,td{border:1px solid #262C3E;padding:6px 10px}</style>
+code{font-family:ui-monospace,monospace}a{color:var(--brand)}table{border-collapse:collapse}th,td{border:1px solid var(--border);padding:8px 12px}</style>
 </head><body><h1>${escapeHtml(conv.title)}</h1>${body}</body></html>`;
     downloadText(fname + '.html', html, 'text/html;charset=utf-8');
   } else if (format === 'json') {
@@ -1929,7 +2259,7 @@ function openChatSettings() {
     <div class="form-row">
       <div class="flex items-center justify-between">
         <div><div class="text-xs text-text-primary">上下文用量</div><div class="text-[10px] text-text-tertiary">清理较早消息可释放上下文空间</div></div>
-        <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="convTrimBtn">清理较早消息</button>
+        <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="convTrimBtn">清理较早消息</button>
       </div>
     </div>`,
     {
@@ -2088,4 +2418,420 @@ else installThinkModeBtn();
 if (typeof installNativeAgentToggle === 'function') {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installNativeAgentToggle);
   else installNativeAgentToggle();
+}
+
+/* ===================== [Day22a] 输入工具栏"AI 工具"开关 + 顶栏模型状态小字 ===================== */
+
+/** [Day22a] 输入工具栏"AI 工具（Function Calling）"开关：与深度思考 / 本机工具同族，
+ * 控制 toolsEnabled —— 内置工具（时间/计算器/知识库/片段/工作流/费用）进入 listForRequest 的总门。
+ * 语义与设置页「AI 工具」卡的"启用工具调用"开关完全一致（关掉即请求体不携带 tools 字段），
+ * 不额外联动 nativeToolsEnabled：那会让同一开关在设置页与工具栏表现不一致。
+ * 插入锚点 = 骨架静态的代码模式按钮，使工具行读作「附件 → 工具 → 模式/开关」。
+ * @returns {void} */
+function installToolsToggle() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar || document.getElementById('toolsToggleBtn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'toolsToggleBtn';
+  btn.type = 'button';
+  btn.className = 'input-toolbar-btn tools-toggle-btn';
+  btn.setAttribute('aria-label', 'AI 工具');
+  btn.innerHTML = '<i data-lucide="wrench" class="w-4 h-4"></i>';
+  on(btn, 'click', toggleToolsEnabled);
+  const anchor = document.getElementById('codeModeBtn') || toolbar.querySelector('.input-toolbar-divider');
+  if (anchor) toolbar.insertBefore(btn, anchor);
+  else toolbar.appendChild(btn);
+  syncToolsToggleBtn();
+  refreshIcons();
+}
+
+/** 同步"AI 工具"开关态（激活底色 + 提示文案）
+ * @returns {void} */
+function syncToolsToggleBtn() {
+  const btn = document.getElementById('toolsToggleBtn');
+  if (!btn) return;
+  const on = MoraySettings.get('toolsEnabled') === true;
+  btn.classList.toggle('tools-on', on);
+  btn.title = on
+    ? 'AI 工具已开启：模型可调用内置工具（时间/计算器/知识库检索/片段/工作流/费用；需 OpenAI 兼容后端，Ollama 自动跳过）。点击关闭'
+    : 'AI 工具（默认关）：开启后请求体携带 tools 字段，模型可调用内置工具。点击开启';
+}
+
+/** 点击切换 AI 工具总开关
+ * @returns {Promise<void>} */
+async function toggleToolsEnabled() {
+  const next = !(MoraySettings.get('toolsEnabled') === true);
+  await MoraySettings.set('toolsEnabled', next);
+  syncToolsToggleBtn();
+  showNotification(next ? 'AI 工具已开启' : 'AI 工具已关闭',
+    next ? '模型可调用内置工具（需 OpenAI 兼容后端）' : '请求不再携带 tools 字段',
+    next ? 'success' : 'info', 2000);
+}
+
+/** [Day22b] 顶栏模型小字下线：模型身份（本地优先/云端）改随模型名显示在输入台模型行
+ * （见 syncInputModelLabel 写入的 .input-model-name），顶栏不再挤这行小字。
+ * 保留同名函数是给可能存在的调用点做兼容：它们现在只做"移除"，不会再装回来。
+ * @returns {void} */
+function removeChatHeaderStatus() {
+  const el = document.getElementById('chatHeaderStatus');
+  if (el) el.remove();
+}
+
+/** [Day22b] 原安装函数 → 改为移除（幂等，供既有调用点沿用）
+ * @returns {void} */
+function installChatHeaderStatus() { removeChatHeaderStatus(); }
+
+/** [Day22b] 原自愈刷新 → 改为移除（幂等，供既有调用点沿用）
+ * @returns {void} */
+function syncChatHeaderStatus() { removeChatHeaderStatus(); }
+
+/** 把"顶栏小字下线"挂到既有"显示统一"链路上：syncInputModelLabel 已在启动 / 切换会话 / 新建删除 /
+ * 手选模型 / 默认模型变更 / 后端重检后被调用（见该函数自身注释），包装它即可全覆盖这些时机。
+ * 包装不改原逻辑（原函数照常执行并返回），与 executeCommand / toggleCodeMode 的既有包装手法一致。 */
+(function wrapSyncInputModelLabelForHeader() {
+  if (typeof syncInputModelLabel !== 'function' || syncInputModelLabel.__day22aWrapped) return;
+  const orig = syncInputModelLabel;
+  syncInputModelLabel = function () {
+    const r = orig.apply(this, arguments);
+    try { removeChatHeaderStatus(); } catch (e) { /* 顶栏小字移除失败不影响模型标签 */ }
+    return r;
+  };
+  syncInputModelLabel.__day22aWrapped = true;
+})();
+
+/* ===================== [Day22b] 对话页空状态：输入台居中 + 快捷入口行 + 工具栏分组 ===================== */
+
+/** 空状态欢迎语文案（骨架静态文案在 HTML 里，不在允许改动范围，故由 JS 覆盖） @type {string} */
+const EMPTY_STATE_TITLE = '你好，我是 MoRay。今天想研究什么？';
+
+/** 空状态布局（幂等）：欢迎语一句话 + 输入台上移与其同轴 + 快捷入口移到输入框下方 12px。
+ * 判定空状态 = #welcomeScreen 存在（骨架静态欢迎页与 30_chat 动态重建两条路径同源，都有该 id）；
+ * 布局本身由 135 §23 的 `#chat-normal:has(#welcomeScreen)` 规则完成，本函数只做三件 CSS 做不到的事：
+ * ① 覆盖欢迎语文案（骨架 HTML 不改）；② 把 .welcome-suggestions 从欢迎页移进输入台底部容器
+ * （CSS 无法跨父节点移位）；③ 清掉上一轮遗留的行。
+ * @returns {void} */
+function applyEmptyStateLayout() {
+  const welcome = document.getElementById('welcomeScreen');
+  const chatNormal = document.getElementById('chat-normal');
+  const dock = chatNormal ? chatNormal.lastElementChild : null;
+  const inDock = dock && !!dock.querySelector('#coreInputContainer');
+  const existing = document.getElementById('welcomeQuickRow');
+  if (!welcome || !inDock) {           // 非空状态（或有消息）：确保不留残行
+    if (existing) existing.remove();
+    return;
+  }
+  const title = welcome.querySelector('.welcome-title');
+  if (title && title.textContent !== EMPTY_STATE_TITLE) title.textContent = EMPTY_STATE_TITLE;
+  const sugg = welcome.querySelector('.welcome-suggestions');
+  if (existing && sugg && existing !== sugg) sugg.remove();            // 欢迎页重建过：丢弃新的，保留已就位的那行
+  else if (sugg && !existing) { sugg.id = 'welcomeQuickRow'; dock.appendChild(sugg); }
+  if (typeof refreshIcons === 'function') refreshIcons();
+}
+
+/** 空状态清理：消息出现时把快捷入口行一并移除（欢迎页本体由 removeWelcomeView 负责）
+ * @returns {void} */
+function clearEmptyStateLayout() {
+  const row = document.getElementById('welcomeQuickRow');
+  if (row) row.remove();
+}
+
+/** 把空状态布局挂到既有的欢迎页显示/隐藏链路上（70 / 95 / 125 的调用点都走这两个全局函数，
+ * 包装后全覆盖；包装不改原逻辑，原函数照常执行并返回）
+ * @returns {void} */
+(function wrapWelcomeForEmptyState() {
+  if (typeof showWelcomeView === 'function' && !showWelcomeView.__day22bWrapped) {
+    const origShow = showWelcomeView;
+    showWelcomeView = function () {
+      const r = origShow.apply(this, arguments);
+      try { applyEmptyStateLayout(); } catch (e) { /* 空状态布局失败不影响欢迎页 */ }
+      return r;
+    };
+    showWelcomeView.__day22bWrapped = true;
+  }
+  if (typeof removeWelcomeView === 'function' && !removeWelcomeView.__day22bWrapped) {
+    const origRemove = removeWelcomeView;
+    removeWelcomeView = function () {
+      const r = origRemove.apply(this, arguments);
+      try { clearEmptyStateLayout(); } catch (e) { /* 清理失败不影响消息显示 */ }
+      return r;
+    };
+    removeWelcomeView.__day22bWrapped = true;
+  }
+})();
+
+/** [第一屏v1] 欢迎页副标题下方一行「上次来过是 X」。
+ * 数据：IndexedDB messages 全库最新一条（数值 createdAt，字符串兜底 Date.parse）——不走 LLM、后端、memory_bank。
+ * 为何取全库而非当前会话：欢迎页只在当前会话 0 条消息时出现，若按当前会话读则永远为空、这行永不可见；
+ * 「上次来过」本意是上一次使用时间，故取全库最新一条；无任何消息或读取失败仍直接 return 不显示。
+ * 静态骨架版与动态版互斥、共用 #welcomeScreen（showWelcomeView 有 id 存在即早退），按 id 取当前挂载的那个。
+ * @returns {Promise<void>} */
+async function attachLastVisitLine() {
+  try {
+    const all = await DB._tx('messages', 'readonly', tx => tx.objectStore('messages').getAll());
+    if (!all || !all.length) return;
+    let t = 0;
+    for (const m of all) {
+      const ts = (typeof m.createdAt === 'number') ? m.createdAt : Date.parse(m.createdAt);
+      if (ts > t) t = ts;
+    }
+    if (!t) return;
+    const diff = Date.now() - t;
+    if (diff < 0) return;
+    let label;
+    if (diff < 60000) label = '刚刚';
+    else if (diff < 3600000) label = Math.floor(diff / 60000) + ' 分钟前';
+    else if (diff < 86400000) label = Math.floor(diff / 3600000) + ' 小时前';
+    else if (diff < 604800000) label = Math.floor(diff / 86400000) + ' 天前';
+    else { const d = new Date(t); label = (d.getMonth() + 1) + ' 月 ' + d.getDate() + ' 日'; }
+    const welcome = document.getElementById('welcomeScreen');
+    if (!welcome) return;
+    const prev = document.getElementById('welcomeLastVisit');
+    if (prev) prev.remove();
+    const sub = welcome.querySelector('.welcome-subtitle');
+    if (!sub) return;
+    sub.insertAdjacentHTML('afterend',
+      '<div id="welcomeLastVisit" style="opacity:0.55;font-size:13px;margin-top:10px;letter-spacing:0.3px;">上次来过是 ' + label + '</div>');
+    /* [窗户v1.2] 「陪伴天数」行：复用刚读到的 messages 全表 all（零新增 DB 读取），取最小 createdAt 算天数；
+     * 文案每天固定：new Date().toDateString() 字符码累加做 seed，% 5 从 5 条文案例池选一条；
+     * all 为空在函数开头已早退（整行不显示）；days=0 由 Math.max(1, ...) 兜底为 1；先去旧 #welcomeCompanyDays 防叠加；
+     * 插在 .welcome-subtitle 的 afterend——afterend 后插者靠前，故代码落在「上次来过」插入之后，
+     * 最终顺序为：陪伴天数 → 上次来过 → 上次你在做。*/
+    const staleCompany = document.getElementById('welcomeCompanyDays');
+    if (staleCompany) staleCompany.remove();
+    let firstCreatedAt = Infinity;
+    for (const m of all) {
+      const ts = (typeof m.createdAt === 'number') ? m.createdAt : Date.parse(m.createdAt);
+      if (ts && ts < firstCreatedAt) firstCreatedAt = ts;
+    }
+    if (firstCreatedAt !== Infinity) {
+      const days = Math.max(1, Math.floor((Date.now() - firstCreatedAt) / 86400000));
+      const seedStr = new Date().toDateString();
+      let seed = 0;
+      for (let i = 0; i < seedStr.length; i++) seed += seedStr.charCodeAt(i);
+      const pool = [
+        `你已经陪我走过 ${days} 天`,
+        `我们已经认识 ${days} 天了`,
+        `第 ${days} 天，你好`,
+        `你在这里 ${days} 天了`,
+        `又见面了，第 ${days} 天`,
+      ];
+      sub.insertAdjacentHTML('afterend',
+        '<div id="welcomeCompanyDays" style="opacity:0.6;font-size:14px;margin-top:10px;letter-spacing:0.3px;">' + pool[seed % 5] + '</div>');
+    }
+    /* [窗户v1.3] 第一行下再补一行「👋 上次你在做：X」：复用刚读到的 messages 全表 all（零新增 DB 读取），
+     * 取 role==='user' 中从新到旧第一条通过寒暄过滤的（实现为单遍扫描：通过者里 createdAt 最大者，严格等价）；
+     * 过滤：内容去首尾空白、换行转空格后为空或不足 6 字 → 跳过（空即长度 0，被此规则覆盖）；以纯寒暄词开头（chitchatRe）→ 跳过；
+     * 全部不通过 → lastUser 为 null、doingText 为空，整行不显示（沿用 v1.1 隐藏机制）；先去旧 #welcomeLastDoing 防叠加；
+     * 通过者截前 20 字加省略号——纯 IndexedDB 渲染，不走 LLM。 */
+    const staleDoing = document.getElementById('welcomeLastDoing');
+    if (staleDoing) staleDoing.remove();
+    const chitchatRe = /^(你好|您好|早上好|中午好|晚上好|下午好|嗨|hi|hello|在吗|在不在|谢谢|多谢|好的|ok|嗯|嗯嗯|哦|早|晚安|再见|拜拜|哈喽|哈啰)[\s，。！？!?.,、；;：:]*$/i;
+    /* [窗户v2] 问题句识别：短问句（<30 字）以问句尾字（吗/呢/吧/?/？）结尾、且不含强任务动词 → 元问题而非“在做的事”，滤之。
+     * /^.{0,28}[吗呢吧?？]$/ 等价于「以问尾字结尾且总长 ≤29（<30）」；含动词即视为任务句放行（如「为什么…？帮我查一下」）。 */
+    const questionRe = /^.{0,28}[吗呢吧?？]$/;
+    const taskVerbRe = /(写|改|修|查|建|删|加|跑|执行|帮我|实现|优化|调试)/;
+    let lastUser = null; let lastUserT = 0;
+    for (const m of all) {
+      if (m.role !== 'user') continue;
+      const ts = (typeof m.createdAt === 'number') ? m.createdAt : Date.parse(m.createdAt);
+      if (!(ts > lastUserT)) continue;
+      const txt = (typeof m.content === 'string') ? m.content.trim().replace(/[\r\n]/g, ' ') : '';
+      if (txt.length < 6 || chitchatRe.test(txt)) continue;
+      if (questionRe.test(txt) && !taskVerbRe.test(txt)) continue;
+      lastUserT = ts; lastUser = m;
+    }
+    const doingText = (lastUser && typeof lastUser.content === 'string')
+      ? lastUser.content.trim().replace(/[\r\n]/g, ' ') : '';
+    if (doingText) {
+      const doingClip = doingText.length > 20 ? doingText.slice(0, 20) + '…' : doingText;
+      const visitEl = document.getElementById('welcomeLastVisit');
+      if (visitEl) visitEl.insertAdjacentHTML('afterend',
+        '<div id="welcomeLastDoing" style="opacity:0.55;font-size:13px;margin-top:6px;letter-spacing:0.3px;">👋 上次你在做：' + escapeHtml(doingClip) + '</div>');
+    }
+  } catch (e) { /* 第一屏行失败不影响欢迎页 */ }
+}
+
+/** [认识你 v1] 欢迎页顶部问候行「你好，X」：与 attachLastVisitLine 并列的独立行——
+ * 不依赖 messages 全表（首启 0 消息、三行整体早退时也要能显示）。
+ * 数据源=记忆库 preference 行（MeetYou 弹窗写入，content 形如「用户的名字是：X」），
+ * 取 tags 含 'name' 的最新一条（list 为 created_at DESC → 首条命中即最新，改名即换新）。
+ * 锚点确定性：#welcomeCompanyDays 已存在 → 对其 beforebegin（插在三行最顶）；
+ * 不存在 → 对 .welcome-subtitle afterend——与 attachLastVisitLine 的执行先后无关。
+ * 幂等：先 remove 旧 #welcomeHello 防叠加。
+ * 失败边界：后端不可达/无 identity 行/解析失败 → 静默不显示（fail-open，绝不阻塞欢迎页）。
+ * @returns {Promise<void>} */
+async function attachHelloLine() {
+  try {
+    const welcome = document.getElementById('welcomeScreen');
+    if (!welcome) return;
+    const sub = welcome.querySelector('.welcome-subtitle');
+    if (!sub) return;
+    if (typeof MorayMemory === 'undefined' || !MorayMemory || typeof MorayMemory.list !== 'function') return;
+    const data = await MorayMemory.list({ limit: 200 });
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    let nameRow = null;
+    for (const it of items) {
+      if (!it || it.kind !== 'preference') continue;
+      const tg = Array.isArray(it.tags) ? it.tags : [];
+      if (tg.indexOf('name') === -1) continue;
+      nameRow = it;   // list 按 created_at DESC 返回 → 首条命中即最新
+      break;
+    }
+    if (!nameRow) return;
+    const m = String(nameRow.content || '').match(/^用户的名字是[:：]\s*(.+)$/);
+    const name = (m && m[1]) ? m[1].trim() : '';
+    if (!name) return;
+    const stale = document.getElementById('welcomeHello');
+    if (stale) stale.remove();
+    const anchor = document.getElementById('welcomeCompanyDays') || sub;
+    anchor.insertAdjacentHTML(anchor === sub ? 'afterend' : 'beforebegin',
+      '<div id="welcomeHello" style="opacity:0.7;font-size:14px;margin-top:10px;letter-spacing:0.3px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;" title="点此改名">你好，' + escapeHtml(name) + '<i data-lucide="pencil" class="w-3 h-3" style="opacity:.5;vertical-align:middle;"></i></div>');
+    // [窗户v3] 改名入口：直绑 click（不走委托——refreshIcons 会把 <i> 换成 <svg>，委托的 closest() 会游离失效）。
+    // 已有弹窗激活时不覆盖（同 maybeAsk 护栏）；_fetchPrefill 失败返回 null → ask 退化首启形态（fail-open）。
+    const helloEl = document.getElementById('welcomeHello');
+    if (helloEl) {
+      helloEl.addEventListener('click', () => {
+        try {
+          const ov = document.getElementById('modalOverlay');
+          if (ov && ov.classList.contains('active')) return;
+          const pfP = (typeof MeetYou !== 'undefined' && MeetYou && typeof MeetYou._fetchPrefill === 'function')
+            ? MeetYou._fetchPrefill() : Promise.resolve(null);
+          Promise.resolve(pfP).then(pf => { try { MeetYou.ask(pf); } catch (e) { /* 忽略 */ } })
+            .catch(() => { try { MeetYou.ask(); } catch (e) { /* 忽略 */ } });
+        } catch (e) { /* 改名入口失败不影响欢迎页 */ }
+      });
+      if (typeof refreshIcons === 'function') refreshIcons();   // [窗户v3] 注入带图标 HTML 后必须补扫，否则 pencil 不渲染
+    }
+  } catch (e) { /* 问候行失败不影响欢迎页 */ }
+}
+
+/** [窗户v2.1] 欢迎页记忆引用行「📌 它记得你……」：与 attachHelloLine 并列的独立行——
+ * 不依赖 messages 全表。数据源=记忆库 preference 行（MeetYou 弹窗写入），取 tags 同时含 'identity' 与
+ * （'usage' 或 'style'）、且不含 'name'（名字已由「你好，X」展示）的最新一条；list 为 created_at DESC → 首条命中即最新。
+ * 解析：content 形如「用户的主要用途是：X」「用户偏好的回答风格是：X」→ 通用取首个冒号后的 X，
+ * 按 tags 分模板渲染：usage →「📌 它记得你主要用 MoRay 做：X」；style →「📌 它记得你偏好：X的回答」。
+ * 锚点：#welcomeHello afterend（“你好，X”下方）；无 → #welcomeCompanyDays beforebegin；再无 → .welcome-subtitle afterend。
+ * 幂等：先 remove 旧 #welcomeRemember 防叠加。
+ * 失败边界：后端不可达/无合规行/解析失败 → 静默不显示（fail-open，绝不阻塞欢迎页）。
+ * @returns {Promise<void>} */
+async function attachRememberLine() {
+  try {
+    const welcome = document.getElementById('welcomeScreen');
+    if (!welcome) return;
+    if (typeof MorayMemory === 'undefined' || !MorayMemory || typeof MorayMemory.list !== 'function') return;
+    const data = await MorayMemory.list({ limit: 200 });
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    let prefRow = null; let prefKind = '';
+    for (const it of items) {
+      if (!it || it.kind !== 'preference') continue;
+      const tg = Array.isArray(it.tags) ? it.tags : [];
+      if (tg.indexOf('identity') === -1) continue;
+      if (tg.indexOf('usage') === -1 && tg.indexOf('style') === -1) continue;
+      if (tg.indexOf('name') !== -1) continue;
+      prefRow = it;   // list 按 created_at DESC 返回 → 首条命中即最新
+      prefKind = (tg.indexOf('usage') !== -1) ? 'usage' : 'style';   // MeetYou 两类互斥；并含时 usage 优先
+      break;
+    }
+    if (!prefRow) return;
+    const m = String(prefRow.content || '').match(/^[^:：]{1,30}[:：]\s*(.+)$/);
+    const said = (m && m[1]) ? m[1].trim() : '';
+    if (!said) return;
+    /* [窗户v2.1] 按 tags 分模板：usage 直引原文（做：X）；style 把风格词嵌回短句（偏好：X的回答）。 */
+    const saidHtml = (prefKind === 'usage')
+      ? '📌 它记得你主要用 MoRay 做：' + escapeHtml(said)
+      : '📌 它记得你偏好：' + escapeHtml(said) + '的回答';
+    const stale = document.getElementById('welcomeRemember');
+    if (stale) stale.remove();
+    const hello = document.getElementById('welcomeHello');
+    const company = document.getElementById('welcomeCompanyDays');
+    const sub = welcome.querySelector('.welcome-subtitle');
+    if (!hello && !company && !sub) return;
+    const lineHtml = '<div id="welcomeRemember" style="opacity:0.6;font-size:13px;margin-top:6px;letter-spacing:0.3px;">' + saidHtml + '</div>';
+    if (hello) hello.insertAdjacentHTML('afterend', lineHtml);
+    else if (company) company.insertAdjacentHTML('beforebegin', lineHtml);
+    else sub.insertAdjacentHTML('afterend', lineHtml);
+  } catch (e) { /* 记忆引用行失败不影响欢迎页 */ }
+}
+
+/** [第一屏v1] 挂在 Day22b 包装链之后再包一层 showWelcomeView：原函数照常执行并返回，fire-and-forget 补行 */
+(function wrapWelcomeForLastVisit() {
+  if (typeof showWelcomeView === 'function' && !showWelcomeView.__lastVisitWrapped) {
+    const origShow = showWelcomeView;
+    showWelcomeView = function () {
+      const r = origShow.apply(this, arguments);
+      // [认识你 v1] 问候行串在 attachLastVisitLine 之后（.then 链仍 fire-and-forget，不改其逻辑）：
+      // 等 #welcomeCompanyDays 插入完成，attachHelloLine 的 beforebegin 锚点才落在三行最顶
+      // [窗户v2.1] 记忆引用行再串在 attachHelloLine 之后：主锚 #welcomeHello 须等问候行落定才存在，
+      // 退化锚点（.welcome-subtitle afterend）也不会与问候行抢同一位（串行保证插入顺序可预期）
+      try { attachLastVisitLine().catch(() => {}).then(() => { attachHelloLine().catch(() => {}).then(() => { attachRememberLine().catch(() => {}); }); }); } catch (e) { /* 问候行失败不影响欢迎页 */ }
+      return r;
+    };
+    showWelcomeView.__lastVisitWrapped = true;
+  }
+})();
+
+/** 工具栏图标分三组（附件 / 工具 / 输入模式）：只重排既有按钮顺序，不增删节点、不动事件绑定。
+ * 骨架顺序是 附件 · 图片 · 代码 · 麦克风，运行时又插入了 工具/思考/本机，混在一起；
+ * 目标顺序按任务书：附件(附件·图片) → 工具(代码·思考·工具·本机) → 输入模式(麦克风)，
+ * 组间 8px 间距由 135 §23 的 margin 规则给出（组内沿用骨架 2px gap）。
+ * 幂等：顺序已对就不动 DOM，避免与后到的按钮注入互相打架。
+ * @returns {void} */
+function installToolbarGroups() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar) return;
+  const divider = toolbar.querySelector('.input-toolbar-divider');
+  if (!divider || divider.parentNode !== toolbar) return;   // 结构不在预期（分隔线是插入锚点）→ 不动
+  const want = ['attachImageBtn', 'attachImageBtn2', 'codeModeBtn', 'thinkModeBtn', 'toolsToggleBtn', 'nativeAgentBtn', 'voiceInputBtn']
+    .map(id => document.getElementById(id)).filter(Boolean);
+  if (want.length < 2) return;
+  const cur = Array.from(toolbar.children).filter(el => el.classList && el.classList.contains('input-toolbar-btn') && want.includes(el));
+  if (cur.length === want.length && cur.every((el, i) => el === want[i])) return;
+  want.forEach(btn => toolbar.insertBefore(btn, divider));
+  if (typeof refreshIcons === 'function') refreshIcons();
+}
+
+/** 工具栏子节点集变化时补一次分组（按钮由多处分片按需注入/移除，插完即重排）
+ * @returns {void} */
+function watchToolbarGroups() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar || typeof MutationObserver === 'undefined' || toolbar.dataset.day22bWatch) return;
+  toolbar.dataset.day22bWatch = '1';
+  let scheduled = false;
+  const mo = new MutationObserver(() => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      try { installToolbarGroups(); } catch (e) { /* 重排失败不影响工具栏可用 */ }
+    });
+  });
+  mo.observe(toolbar, { childList: true });
+}
+
+// [Day22a] 输入工具栏"AI 工具"开关（同工具栏、同装载时机；幂等）
+if (typeof installToolsToggle === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installToolsToggle);
+  else installToolsToggle();
+}
+
+// [Day22a] 顶栏模型状态小字（幂等；须在 bootApp 首次调用 syncInputModelLabel 之前就位）
+if (typeof installChatHeaderStatus === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installChatHeaderStatus);
+  else installChatHeaderStatus();
+}
+
+// [Day22b] 空状态布局：骨架里那份静态欢迎页不经 showWelcomeView，须在启动时补一次（幂等）
+if (typeof applyEmptyStateLayout === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyEmptyStateLayout);
+  else applyEmptyStateLayout();
+}
+
+// [Day22b] 工具栏三组重排：等各分片把运行时按钮插完后再排一次（幂等），并监听后续增删
+if (typeof installToolbarGroups === 'function') {
+  const runToolbarGroups = () => { try { installToolbarGroups(); watchToolbarGroups(); } catch (e) { /* 分组失败不影响工具栏 */ } };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', runToolbarGroups);
+  else runToolbarGroups();
+  // 分片按需注入（深度思考/本机工具/AI 工具）可能在 DOMContentLoaded 之后，补两拍
+  setTimeout(runToolbarGroups, 600);
+  setTimeout(runToolbarGroups, 2000);
 }

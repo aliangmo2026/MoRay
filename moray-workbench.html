@@ -5387,12 +5387,14 @@ html[data-theme] body, html[data-theme] aside, html[data-theme] main, html[data-
   --color-success: #4ade80;
   --color-warning: #fbbf24;
   --color-error: #ef4444;
-  /* —— 几何：圆角（卡片 8 / 控件 6 / 小标签 4）——
+  /* —— 几何：圆角（[UI 2.0] 卡片 16 / 控件 12 / 小标签 4）——
      命名避开 Tailwind 的 --radius-xs..4xl 标尺，防止全局工具类被改写 */
   --radius-chip: 4px;
-  --radius-control: 6px;
-  --radius-card: 8px;
-  --radius-popover: 8px;
+  --radius-control: 12px;
+  --radius-card: 16px;
+  --radius-popover: 12px;
+  /* —— [UI 2.0] 毛玻璃模糊半径（唯一消费方：135 三栏玻璃规则） —— */
+  --backdrop-blur: 24px;
   /* —— 阴影：唯一允许的下拉菜单投影 —— */
   --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.5);
   /* —— 排版 —— */
@@ -5404,6 +5406,21 @@ html[data-theme] body, html[data-theme] aside, html[data-theme] main, html[data-
   /* [A-3b] --space-page / --space-card / --space-card-lg / --space-card-gap、--height-listitem、
      --width-sidebar 已删：--space-card-gap 的消费方（86_home_apps）回退值 12px 与令牌值一致，
      其余零引用 */
+}
+/* [UI 2.0] 浅色覆盖：随 html[data-theme="light"] 生效，与 135 浅色块同值
+   （文件头"同名令牌与 135 一致"约定的浅色侧；此前本层无浅色块，注入面板在浅色主题下
+   一直沿用深色值——本轮补齐后 memory_browser / 86_home_apps / 88 / 91 / 92 面板随主题翻转） */
+html[data-theme="light"] {
+  --color-bg-app: #f4f5f7;
+  --color-bg-panel: rgba(255, 255, 255, 0.7);
+  --color-bg-card: rgba(255, 255, 255, 0.85);
+  --color-bg-hover: rgba(0, 0, 0, 0.04);
+  --color-bg-bubble: rgba(255, 255, 255, 0.9);
+  --color-border: rgba(0, 0, 0, 0.04);
+  --color-border-strong: rgba(0, 0, 0, 0.08);
+  --color-text-primary: #1d1d1f;
+  --color-text-secondary: #86868b;
+  --color-text-tertiary: #8b949e;
 }
 `;
   document.head.appendChild(el);
@@ -7021,14 +7038,21 @@ class MorayAI {
       // [2026-10-03 27B挂死修复] reasoning_effort：27B 服务端模板缺省 xhigh（think 超长，
       // 热模型 5.3 t/s 下单轮数分钟），默认压到 low；枚举只有 low/medium/xhigh（模板 raise 保护）
       const reasoningEffort = this._bonsai2ReasoningEffort();
+      // [2026-10-01 U-7-3] 修正历史遗留的模型名错误（同流式分支）：显式 provider=custom_27b
+      // + 真实模型名，走 llm_proxy 的 27B 分支；_non_stream 返回 {ok,content,reasoning,tool_calls}
+      // 与下方读取形状一致。
+      const body = { provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: false, temperature, reasoning_effort: reasoningEffort };
+      // [修复 2026-10-20] tools 对任何模型分支都必须透传：此前 27B 分支漏带，路由切到 27B
+      // 时上游拿不到工具清单 → 模型发不出 tool_calls，只能纯聊天反问路径/代码
+      if (opts.tools && opts.tools.length > 0) {
+        body.tools = opts.tools;
+        if (opts.tool_choice) body.tool_choice = opts.tool_choice;
+      }
       const res = await fetch(proxyUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: opts.signal, // [2026-10-03 27B挂死修复] 工具轮超时/用户停止可真正中止 fetch
-        // [2026-10-01 U-7-3] 修正历史遗留的模型名错误（同流式分支）：显式 provider=custom_27b
-        // + 真实模型名，走 llm_proxy 的 27B 分支；_non_stream 返回 {ok,content,reasoning,tool_calls}
-        // 与下方读取形状一致。
-        body: JSON.stringify({ provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: false, temperature, reasoning_effort: reasoningEffort })
+        body: JSON.stringify(body)
       });
       if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
       const j = await res.json();
@@ -7045,7 +7069,11 @@ class MorayAI {
         options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
       };
       // [阶段0] Ollama 原生 tools：请求体带 tools 才下发（无 tools 的旧请求行为完全一致）
-      if (opts.tools && opts.tools.length) obody.tools = opts.tools;
+      // [修复 2026-10-20] tool_choice 与 27B 分支对齐，同批透传
+      if (opts.tools && opts.tools.length) {
+        obody.tools = opts.tools;
+        if (opts.tool_choice) obody.tool_choice = opts.tool_choice;
+      }
       const res = await fetch(this.ollamaURL + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -10891,11 +10919,13 @@ async function buildRequestMessages(conv, extraContext) {
   if (strayCount) console.warn('[MoRay] 越界/无主消息残留（已剔除不发送）:', strayCount, '条 → 当前 conv', conv.id);
   let history = rawAll.filter(m => m.conversationId === conv.id).slice(-limit);
   // [路由修复] 过滤空 content 消息（user/assistant 均滤）：历史不允许携带空消息；
-  // 仅含图片附件的合法用户消息以附件为准保留，不得被当空消息误删
+  // 仅含图片附件的合法用户消息以附件为准保留，不得被当空消息误删；
+  // [历史断片修复 2026-10-20] 带 toolCalls 的无正文助手消息同样保留（重建时会序列化为工具轮记录，不再整轮蒸发）
   history = history.filter(m => {
     const hasContent = String(m.content || '').trim().length > 0;
     const hasAttachments = !!(m.attachments && m.attachments.length);
-    return hasContent || hasAttachments;
+    const hasToolCalls = !!(m.toolCalls && m.toolCalls.length);
+    return hasContent || hasAttachments || hasToolCalls;
   });
   // [P0 治本] 发送前最终自检：理论上已无越界，双重保险 + 控制台可见请求规模
   const leaked = history.filter(m => m.conversationId !== conv.id || !m.conversationId);
@@ -10961,7 +10991,23 @@ async function buildRequestMessages(conv, extraContext) {
   const kept = picked.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
   const sysSaved = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(rawSys).savedTokens : 0;
   conv.__lastCompressionSaved = Math.max(0, sysSaved + (totalHistory - kept));
-  picked.forEach(m => msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+  // [历史断片修复 2026-10-20] 回发历史时重建工具轮：上一轮的代码常活在 toolCalls（步骤卡）的 args 里，
+  // 仅序列化 role/content 会让模型"忘记自己写过什么"（实探：create_file 被拒后反问"需要写入什么内容"）。
+  // 工具名+执行状态+参数（单条截断 2000 字符防爆 token）追加进正文；content 为空时该重建块即占位。
+  picked.forEach(m => {
+    let text = m.content || '';
+    if (m.toolCalls && m.toolCalls.length) {
+      text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
+      m.toolCalls.forEach(tc => {
+        let argStr = '';
+        try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
+        if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
+        const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
+        text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
+      });
+    }
+    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+  });
   if (extraContext && extraContext.text) {
     msgs.push({ role: 'system', content: extraContext.text });
   }
@@ -21204,6 +21250,17 @@ window.MorayArgusMode = MorayArgusMode;
       'white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,"Courier New",monospace}',
       '.mzs-files-head{color:#4ADE80;font-weight:600;margin-top:4px}',
       '.mzs-file-ops{color:#666;font-size:10px;flex-shrink:0}',
+      /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
+      '.mzs-artifact-card{display:flex;align-items:center;gap:8px;margin-top:6px;padding:7px 9px;',
+      'border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      '.mzs-artifact-icon{flex-shrink:0;font-size:13px;line-height:1}',
+      '.mzs-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+      'color:#DBEAFE;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:11px}',
+      '.mzs-artifact-meta{flex-shrink:0;color:#93C5FD;font-size:10px}',
+      '.mzs-artifact-open{flex-shrink:0;padding:3px 9px;border:1px solid rgba(96,165,250,.5);border-radius:6px;',
+      'background:rgba(96,165,250,.16);color:#BFDBFE;font-size:10px;line-height:1.4;cursor:pointer;font-family:inherit}',
+      '.mzs-artifact-open:hover{background:rgba(96,165,250,.26)}',
+      '.mzs-artifact-card[hidden],.mzs-file[hidden],.mzs-preview[hidden]{display:none}',
       '.mzs-file-more{margin-top:4px;background:transparent;border:none;color:#60A5FA;',
       'font-size:11px;cursor:pointer;padding:0;font-family:inherit}'
     ].join('');
@@ -21537,9 +21594,9 @@ window.MorayArgusMode = MorayArgusMode;
 
   /** [Day24b-c] done 摘要小节：浅灰描边、无底色、无圆角。
       [2026-10-01 U-5] File 单行 → 完整改动文件清单（changedFiles）：
-      「N 个文件已更改」+ 每行 文件名 (M 次操作) + ▸ 预览（每行自带独立预览容器，
-      路径存 data-file-path）；清单 >5 个折叠其余行，点「展开全部」补显；
-      无 Write/Edit 事件则整块不出现。 */
+      「N 个文件已更改」+ 每行蓝色产物卡（文件名 + 操作次数 + 预览代码）；
+      路径编码为 zcode:<task_id>:<filename>，点击走 125 的全局预览模态框；
+      清单 >5 个折叠其余行，点「展开全部」补显；无 Write/Edit 事件则整块不出现。 */
   function renderDoneSection(obj) {
     const usage = obj.usage || {};
     const meta = [];
@@ -21557,12 +21614,16 @@ window.MorayArgusMode = MorayArgusMode;
       changedFiles.forEach(function (entry, fp) {
         idx += 1;
         const folded = idx > 5;
-        html += '<div class="mzs-file"' + (folded ? ' hidden' : '') + '>' +
-          '<span class="mzs-mono" title="' + esc(fp) + '">' + esc(basename(fp)) + '</span>' +
-          '<span class="mzs-file-ops">(' + entry.count + ' 次操作)</span>' +
-          '<button type="button" class="mzs-preview-btn" title="预览文件内容">▸ 预览</button>' +
-          '</div>' +
-          '<div class="mzs-preview" data-file-path="' + esc(fp) + '" hidden></div>';
+        const name = basename(fp);
+        const zcodePath = taskId
+          ? 'zcode:' + String(taskId) + ':' + encodeURIComponent(name)
+          : '';
+        html += '<div class="mzs-artifact-card"' + (folded ? ' hidden' : '') + '>' +
+          '<span class="mzs-artifact-icon">📄</span>' +
+          '<span class="mzs-artifact-path" title="' + esc(fp) + '">' + esc(name) + '</span>' +
+          '<span class="mzs-artifact-meta">(' + entry.count + ' 次操作)</span>' +
+          (zcodePath ? '<button type="button" class="mzs-artifact-open" data-preview-path="' + esc(zcodePath) + '">预览代码</button>' : '') +
+          '</div>';
       });
       if (changedFiles.size > 5) {
         html += '<button type="button" class="mzs-file-more">展开全部（共 ' + changedFiles.size + ' 个）</button>';
@@ -21595,7 +21656,7 @@ window.MorayArgusMode = MorayArgusMode;
   function expandAllFiles(btn) {
     const section = btn.closest('.mzs-section');
     if (!section) return;
-    const nodes = section.querySelectorAll('.mzs-file[hidden], .mzs-preview[hidden]');
+    const nodes = section.querySelectorAll('.mzs-artifact-card[hidden], .mzs-file[hidden], .mzs-preview[hidden]');
     for (let i = 0; i < nodes.length; i++) nodes[i].removeAttribute('hidden');
     if (btn.parentNode) btn.parentNode.removeChild(btn);
   }
@@ -23024,7 +23085,9 @@ window.MorayArgusMode = MorayArgusMode;
           '（' + fmtBytes(d.size != null ? d.size : d.content.length) + '）';
       }
       if (tool === 'file' && d.written != null) {
-        return '已写入 ' + (d.path ? '`' + mdPlain(String(d.path)) + '`' : '') + '（' + d.written + ' 字符）';
+        return '已写入 ' + (d.path
+          ? '<a href="#" data-preview-path="' + attr(String(d.path)) + '" style="color:var(--brand-cobalt,#60a5fa);text-decoration:underline;cursor:pointer" title="点击在应用内预览">' + esc(String(d.path)) + '</a>'
+          : '') + '（' + d.written + ' 字符）';
       }
       if (Array.isArray(d.results)) {
         return '搜索「' + mdPlain(String(d.query || '')) + '」完成，共 ' +
@@ -23431,6 +23494,13 @@ window.MorayArgusMode = MorayArgusMode;
       '.zcode-exec-card .zec-file{display:flex;align-items:baseline;gap:6px;min-width:0;padding:2px 0;font-size:11px}',
       '.zcode-exec-card .zec-mono{font-family:ui-monospace,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
       '.zcode-exec-card .zec-file-ops{color:var(--color-text-tertiary,#666);font-size:10px;flex-shrink:0}',
+      /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
+      '.zcode-exec-card .zec-artifact-card{display:flex;align-items:center;gap:8px;margin:4px 0;padding:6px 9px;border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      '.zcode-exec-card .zec-artifact-icon{flex-shrink:0;font-size:12px;line-height:1}',
+      '.zcode-exec-card .zec-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-primary,#E0E0E0);font-family:ui-monospace,Consolas,monospace;font-size:11px}',
+      '.zcode-exec-card .zec-artifact-meta{flex-shrink:0;color:var(--color-text-tertiary,#8a8a8a);font-size:10px}',
+      '.zcode-exec-card .zec-artifact-open{flex-shrink:0;padding:2px 8px;border:1px solid rgba(96,165,250,.5);border-radius:6px;background:rgba(96,165,250,.16);color:var(--color-brand-cobalt,#2563EB);font-size:10px;line-height:1.5;cursor:pointer;font-family:inherit}',
+      '.zcode-exec-card .zec-artifact-open:hover{background:rgba(96,165,250,.26)}',
       '.zcode-exec-card .zec-resp{margin-top:6px;padding-top:6px;border-top:1px dashed var(--color-line-ghost,rgba(127,127,127,.25));color:var(--color-text-secondary,#a3a3a3);font-size:11px;word-break:break-word}',
       '.zcode-exec-card .zec-err{margin-top:6px;border-left:2px solid #F87171;color:#F87171;padding:4px 0 4px 10px;font-size:11px;word-break:break-all}',
       '.zcode-exec-card .zec-note{margin-top:6px;color:var(--color-text-tertiary,#8a8a8a);font-size:10px}'
@@ -23640,8 +23710,16 @@ window.MorayArgusMode = MorayArgusMode;
     if (ex.changedFiles && ex.changedFiles.length) {
       h.push('<div class="zec-files"><div class="zec-files-head">' + ex.changedFiles.length + ' 个文件已更改</div>');
       ex.changedFiles.forEach(function (f) {
-        h.push('<div class="zec-file"><span class="zec-mono" title="' + attr(f.path) + '">' +
-          esc(zcodeBasename(f.path)) + '</span><span class="zec-file-ops">(' + f.count + ' 次操作)</span></div>');
+        var fname = zcodeBasename(f.path);
+        var zcodePath = ex.taskId
+          ? 'zcode:' + String(ex.taskId) + ':' + encodeURIComponent(fname)
+          : '';
+        h.push('<div class="zec-artifact-card">' +
+          '<span class="zec-artifact-icon">📄</span>' +
+          '<span class="zec-artifact-path" title="' + attr(f.path) + '">' + esc(fname) + '</span>' +
+          '<span class="zec-artifact-meta">(' + f.count + ' 次操作)</span>' +
+          (zcodePath ? '<button type="button" class="zec-artifact-open" data-preview-path="' + attr(zcodePath) + '">预览代码</button>' : '') +
+          '</div>');
       });
       h.push('</div>');
     }
@@ -25978,7 +26056,9 @@ Gateway.chatStream = function (opts) {
     const useTools = !!(!opts.noTools && MoraySettings.get('toolsEnabled') &&
       (AI.backend === 'openai' || AI.backend === 'ollama') &&
       typeof ToolRegistry !== 'undefined' && ToolRegistry.listForRequest().length > 0);
-    if (canCache) {
+    // [修复 2026-10-20] 工具轮绝不读缓存：命中会直接回放无 tools 的旧答案，绕过
+    // runWithTools（写侧本就只在 !useTools 落缓存，见下方 save；读侧此前缺同一道闸）
+    if (canCache && !useTools) {
       try {
         const exact = await GatewayCache.lookupExact(GatewayCache.requestHash(effective));
         // [修复] 必须返回回放的 promise（否则外层会把 {controller,promise} 句柄当作结果）
@@ -30339,6 +30419,50 @@ const ToolRegistry = {
     }
   },
 
+  /** 从成功写文件的步骤中提取产物信息（无产物返回 null）
+   * 路径优先取入参（native 工具为工作区相对路径），入参缺失时回退解析结果 JSON；
+   * 仅用于展示层，不做任何文件系统访问（读取由 previewArtifact 走只读工具）。
+   * @param {Object} evt - 步骤事件 {name,args,status,resultFull}
+   * @returns {{path:string, bytes:number|null, action:string}|null} */
+  artifactFromStep(evt) {
+    if (!evt || evt.status !== 'success') return null;
+    if (evt.name !== 'create_file' && evt.name !== 'write_file') return null;
+    const a = evt.args || {};
+    const raw = evt.resultFull != null ? String(evt.resultFull) : '';
+    let data = null;
+    if (raw.charAt(0) === '{') {
+      try { data = JSON.parse(raw); } catch (e) { data = null; }
+    }
+    const path = String((a && a.path) || (data && data.path) || '').trim();
+    if (!path) return null;
+    let bytes = (data && data.bytes != null) ? Number(data.bytes) : null;
+    if (bytes == null && typeof a.content === 'string') bytes = a.content.length;
+    if (bytes != null && (!isFinite(bytes) || bytes < 0)) bytes = null;
+    const action = (data && data.created) ? '新建'
+      : ((data && data.written) ? '写入' : (evt.name === 'create_file' ? '新建' : '写入'));
+    return { path, bytes, action };
+  },
+
+  /** 产物卡片 HTML（成功写文件时替代原始 JSON 结果；原始结果保留在折叠区）
+   * @param {Object} art - artifactFromStep 的返回值
+   * @returns {string} HTML */
+  artifactCardHtml(art) {
+    const path = String((art && art.path) || '');
+    if (!path) return '';
+    const size = art.bytes != null
+      ? (art.bytes >= 1024 ? (art.bytes / 1024).toFixed(1) + ' KB' : art.bytes + ' B')
+      : '';
+    const meta = [art.action || '', size].filter(Boolean).join(' · ');
+    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2">' +
+      '<i data-lucide="file-code" class="w-4 h-4 text-brand-cobalt shrink-0"></i>' +
+      '<div class="min-w-0 flex-1">' +
+      '<div class="text-[11px] text-text-primary font-medium truncate" title="' + escapeHtml(path) + '">' + escapeHtml(path) + '</div>' +
+      (meta ? '<div class="text-[10px] text-text-tertiary">' + escapeHtml(meta) + '</div>' : '') +
+      '</div>' +
+      '<button type="button" data-preview-path="' + escapeHtml(path) + '" class="shrink-0 px-2.5 py-1 rounded-md text-[10px] font-medium text-brand-cobalt bg-brand-cobalt/15 border border-brand-cobalt/25 hover:opacity-90">预览代码</button>' +
+      '</div>';
+  },
+
   /** 单步事件 → 步骤卡 HTML（进行中脉冲 / 待审批 / 成功 / 失败(可重试) / 已拒绝
    * 摘要行：完整可读入参 + 耗时 + 状态；展开区：完整结果或真实错误，不撑爆会话）
    * @param {Object} evt - {index, name, label, args, status, resultPreview, ms, resultFull}
@@ -30373,6 +30497,7 @@ const ToolRegistry = {
     // [阶段0.5] 展开区内容：完整结果优先（不截断文本，CSS 限高滚动不撑爆会话）；
     // 失败步骤显示后端真实错误 + "重试该步"（重新执行同一工具，走完整审批/安全层）
     const full = evt.resultFull != null ? String(evt.resultFull) : (evt.resultPreview != null ? String(evt.resultPreview) : '');
+    const artifact = this.artifactFromStep(evt);
     // [3.20 修复] 这里必须是 let：下面 4 个分支都要对 body 重新赋值，
     // 原来是 const → 每次步骤卡渲染都抛 "Assignment to constant variable"，
     // 进而让 emit() 抛出、Gateway.runWithTools 中断并回退普通流式（工具轮直接失效）
@@ -30381,6 +30506,11 @@ const ToolRegistry = {
       body = '<div class="text-[10px] text-danger mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-err>' + escapeHtml(full || '未知错误') + '</div>';
     } else if (evt.status === 'denied') {
       body = '<div class="text-[10px] text-warning mt-2">' + escapeHtml(full || '用户拒绝了该操作') + '</div>';
+    } else if (artifact) {
+      // 成功写文件：默认展示产物卡片，原始 JSON 收进折叠区（排查用，不再占屏）
+      body = this.artifactCardHtml(artifact) +
+        (full ? '<details class="mt-2"><summary class="text-[10px] text-text-tertiary cursor-pointer select-none">查看原始结果</summary>' +
+          '<div class="text-[10px] text-text-tertiary mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono" data-tool-full>' + escapeHtml(full) + '</div></details>' : '');
     } else if (full) {
       body = '<div class="text-[10px] text-text-tertiary mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all" data-tool-full>' + escapeHtml(full) + '</div>';
     }
@@ -30400,7 +30530,7 @@ const ToolRegistry = {
     const actions = (copyBtn || retry)
       ? '<span class="ml-auto flex items-center gap-1">' + copyBtn + retry + '</span>'
       : '';
-    const open = evt.status === 'running' || evt.status === 'pending' ? ' open' : '';
+    const open = (evt.status === 'running' || evt.status === 'pending' || artifact) ? ' open' : '';
     return '<details class="tool-step rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2" data-tool-step="' + evt.index + '" data-status="' + (evt.status || '') + '" data-ms="' + (evt.ms || 0) + '"' + open + '>' +
       '<summary class="flex items-center gap-2 cursor-pointer list-none text-[11px] select-none">' +
       '<i data-lucide="' + icon + '" class="w-3.5 h-3.5 ' + color + '"></i>' +
@@ -30559,6 +30689,20 @@ const ToolRegistry = {
     if (this.__copyBound) return;
     this.__copyBound = true;
     document.addEventListener('click', (e) => {
+      // 产物卡片 / Laya 摘要：点击路径 → 应用内只读预览。
+      // 用 composedPath 而非 e.target.closest：refreshIcons 会把 <i> 换成 <svg>，
+      // 被点节点可能已游离，closest 会返回 null（本仓库既有踩坑）。
+      const evPath = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+      for (let i = 0; i < evPath.length; i++) {
+        const n = evPath[i];
+        if (n && n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-preview-path')) {
+          e.preventDefault();
+          e.stopPropagation();
+          const p = n.getAttribute('data-preview-path');
+          if (p) previewArtifact(p);
+          return;
+        }
+      }
       // [阶段0.5] 时间线摘要行：展开/收起完整时间线
       const toggle = e.target.closest('[data-steps-toggle]');
       if (toggle) {
@@ -30633,6 +30777,368 @@ const ToolRegistry = {
     }
   }
 };
+
+/** 文件扩展名 → highlight.js 语言标识（未知返回空串）
+ * @param {string} name - 文件名或路径
+ * @returns {string} 语言标识 */
+function artifactLangForFile(name) {
+  const ext = (String(name || '').split('.').pop() || '').toLowerCase();
+  const langMap = {
+    py: 'python', js: 'javascript', ts: 'typescript', jsx: 'javascript', tsx: 'typescript',
+    json: 'json', html: 'html', htm: 'html', css: 'css', md: 'markdown', markdown: 'markdown', svg: 'xml',
+    yaml: 'yaml', yml: 'yaml', sh: 'bash', bat: 'batch', ps1: 'powershell',
+    txt: 'text', c: 'c', h: 'c', cpp: 'cpp', java: 'java', go: 'go', rs: 'rust', sql: 'sql'
+  };
+  return langMap[ext] || '';
+}
+
+/** 文件扩展名（小写，不含点） */
+function artifactExt(name) {
+  const s = String(name || '');
+  const i = s.lastIndexOf('.');
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : '';
+}
+
+/** 预览分流用的后缀集合（raster 走图片预览；其余图片后缀提示不支持；二进制不尝试文本解码） */
+const ARTIFACT_RASTER_EXTS = { png: 1, jpg: 1, jpeg: 1, gif: 1, webp: 1 };
+const ARTIFACT_IMAGE_EXTS = { png: 1, jpg: 1, jpeg: 1, gif: 1, webp: 1, bmp: 1, ico: 1, avif: 1 };
+const ARTIFACT_BINARY_EXTS = {
+  zip: 1, gz: 1, tar: 1, '7z': 1, rar: 1, exe: 1, dll: 1, bin: 1, pyc: 1, class: 1, jar: 1,
+  pdf: 1, doc: 1, docx: 1, xls: 1, xlsx: 1, ppt: 1, pptx: 1, db: 1, sqlite: 1, sqlite3: 1,
+  woff: 1, woff2: 1, ttf: 1, otf: 1, mp3: 1, mp4: 1, mov: 1, avi: 1, iso: 1
+};
+
+/** 按扩展名/Content-Type 决定预览类型
+ * @param {string} name - 文件名或路径
+ * @param {string} [contentType] - 响应 Content-Type
+ * @returns {'html'|'markdown'|'svg'|'image'|'image-unsupported'|'binary'|'text'} */
+function artifactKindForName(name, contentType) {
+  const ext = artifactExt(name);
+  if (ext === 'html' || ext === 'htm') return 'html';
+  if (ext === 'md' || ext === 'markdown') return 'markdown';
+  if (ext === 'svg') return 'svg';
+  if (ARTIFACT_RASTER_EXTS[ext]) return 'image';
+  if (ARTIFACT_IMAGE_EXTS[ext]) return 'image-unsupported';
+  if (ARTIFACT_BINARY_EXTS[ext]) return 'binary';
+  if (/^image\//i.test(String(contentType || ''))) return 'image';
+  return 'text';
+}
+
+/** 复用一个 object URL（换图/换预览时 revoke 旧的，防泄漏） */
+let __artifactImageUrl = null;
+function artifactObjectUrl(blob) {
+  if (__artifactImageUrl) {
+    try { URL.revokeObjectURL(__artifactImageUrl); } catch (e) { /* 忽略 */ }
+    __artifactImageUrl = null;
+  }
+  __artifactImageUrl = URL.createObjectURL(blob);
+  return __artifactImageUrl;
+}
+
+/** Tab 按钮 HTML（激活态由 mountArtifactTabs 统一设置） */
+function artifactTabButtonHtml(id, label) {
+  return '<button type="button" data-artifact-tab="' + escapeHtml(id) + '" ' +
+    'style="padding:3px 10px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid transparent;' +
+    'background:transparent;color:var(--color-text-secondary,#a3a3a3)">' + escapeHtml(label) + '</button>';
+}
+
+/** 挂载【预览】/【代码】切换（每个模态框独立绑定，无全局状态） */
+function mountArtifactTabs(body, defaultTab) {
+  if (!body) return;
+  const tabs = Array.from(body.querySelectorAll('[data-artifact-tab]'));
+  const panels = Array.from(body.querySelectorAll('[data-artifact-panel]'));
+  const activate = (id) => {
+    tabs.forEach((t) => {
+      const on = t.getAttribute('data-artifact-tab') === id;
+      t.style.background = on ? 'var(--color-brand-cobalt,#2563EB)' : 'transparent';
+      t.style.color = on ? '#fff' : 'var(--color-text-secondary,#a3a3a3)';
+      t.style.borderColor = on ? 'transparent' : 'var(--color-line-ghost,rgba(127,127,127,.28))';
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    panels.forEach((p) => {
+      p.style.display = p.getAttribute('data-artifact-panel') === id ? '' : 'none';
+    });
+  };
+  tabs.forEach((t) => t.addEventListener('click', () => activate(t.getAttribute('data-artifact-tab'))));
+  if (tabs.length) activate(defaultTab || tabs[0].getAttribute('data-artifact-tab'));
+}
+
+/** 统一渲染产物预览体：元信息 + Tab + 预览/代码面板
+ * @param {HTMLElement} body - 模态框 .modal-body
+ * @param {Object} opts - {name, meta, kind, content, imageUrl, lang, code, defaultTab, previewLabel, messageHtml}
+ * @returns {void} */
+function renderArtifactResult(body, opts) {
+  if (!body) return;
+  const o = opts || {};
+  const kind = String(o.kind || 'text');
+  const content = (o.content != null ? String(o.content) : '').replace(/^\uFEFF/, '');
+  if (__artifactImageUrl && kind !== 'image' && kind !== 'svg') {
+    try { URL.revokeObjectURL(__artifactImageUrl); } catch (e) { /* 忽略 */ }
+    __artifactImageUrl = null;
+  }
+  const name = String(o.name || '');
+  const meta = String(o.meta || '');
+  const canPreview = kind === 'html' || kind === 'markdown' || kind === 'svg' ||
+    kind === 'image' || kind === 'image-unsupported' || kind === 'binary' || kind === 'message';
+  const canCode = o.code !== false && (kind === 'html' || kind === 'markdown' || kind === 'svg' || kind === 'text');
+  const defaultTab = o.defaultTab || (canPreview ? 'preview' : 'code');
+  const metaHtml = '<div class="flex items-center gap-2 mb-2 text-[10px] text-text-tertiary">' +
+    '<i data-lucide="file-code" class="w-3.5 h-3.5 text-brand-cobalt"></i>' +
+    '<span class="font-mono break-all">' + escapeHtml(name) + '</span>' +
+    (meta ? '<span class="ml-auto shrink-0">' + escapeHtml(meta) + '</span>' : '') +
+    '</div>';
+  const tabHtml = (canPreview && canCode)
+    ? '<div class="flex items-center gap-2 mb-2" style="border-bottom:1px solid var(--color-line-ghost,rgba(127,127,127,.25));padding:2px 0 6px">' +
+      artifactTabButtonHtml('preview', o.previewLabel || '预览') +
+      artifactTabButtonHtml('code', '代码') +
+      '</div>'
+    : '';
+  let previewHtml = '';
+  if (kind === 'html') {
+    previewHtml = '<div data-artifact-frame-host></div>' +
+      '<div class="text-[10px] text-text-tertiary mt-1">HTML 在沙箱 iframe 中运行（sandbox=allow-scripts，无同源权限）</div>';
+  } else if (kind === 'markdown') {
+    previewHtml = '<div class="md-body" style="max-height:60vh;overflow:auto;padding:4px 2px">' +
+      (typeof renderMarkdown === 'function' ? renderMarkdown(content) : escapeHtml(content).replace(/\n/g, '<br>')) +
+      '</div>';
+  } else if (kind === 'svg' || kind === 'image') {
+    const src = String(o.imageUrl || '');
+    previewHtml = src
+      ? '<div style="text-align:center;background:var(--color-bg-app,#0b0e14);border-radius:8px;padding:8px">' +
+        '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(name) + '" style="display:block;margin:0 auto;max-width:100%;max-height:60vh;border-radius:6px">' +
+        '</div>'
+      : '<div class="text-[11px] text-text-tertiary">图片内容不可用</div>';
+  } else if (kind === 'image-unsupported') {
+    previewHtml = '<div class="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning">' +
+      '<div class="font-medium mb-1">该图片暂不支持预览</div>' +
+      '<div class="text-[10px] text-text-tertiary">本机工作区的 PNG/JPG/GIF/WebP 需要后端二进制流接口；SVG 与 ZCode 沙箱图片可直接预览。</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(name) + '</div>' +
+      '</div>';
+  } else if (kind === 'binary') {
+    previewHtml = '<div class="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning">' +
+      '<div class="font-medium mb-1">该文件是二进制格式，暂不支持预览</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(name) + '</div>' +
+      '</div>';
+  } else if (kind === 'message') {
+    previewHtml = String(o.messageHtml || '');
+  }
+  let codeHtml = '';
+  if (canCode) {
+    const lang = o.lang || artifactLangForFile(name);
+    codeHtml = '<pre class="text-[12px] m-0" style="padding:12px 16px;max-height:56vh;overflow:auto">' +
+      '<code' + (lang ? ' class="language-' + escapeHtml(lang) + '"' : '') + '>' + escapeHtml(content) + '</code></pre>';
+  }
+  body.innerHTML = metaHtml + tabHtml +
+    (canPreview ? '<div data-artifact-panel="preview"' + (defaultTab === 'preview' ? '' : ' style="display:none"') + '>' + previewHtml + '</div>' : '') +
+    (canCode ? '<div data-artifact-panel="code"' + (defaultTab === 'code' ? '' : ' style="display:none"') + '>' + codeHtml + '</div>' : '');
+  if (typeof refreshIcons === 'function') refreshIcons();
+  if (kind === 'html') {
+    const host = body.querySelector('[data-artifact-frame-host]');
+    if (host) {
+      const frame = document.createElement('iframe');
+      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.title = name || 'HTML 预览';
+      frame.style.cssText = 'width:100%;height:60vh;border:0;border-radius:8px;background:#fff;display:block';
+      frame.srcdoc = content;
+      host.appendChild(frame);
+    }
+  }
+  if (canCode) {
+    const codePanel = body.querySelector('[data-artifact-panel="code"]');
+    if (codePanel && typeof enhanceCodeBlocks === 'function') enhanceCodeBlocks(codePanel, true);
+  }
+  if (kind === 'markdown') {
+    const previewPanel = body.querySelector('[data-artifact-panel="preview"]');
+    if (previewPanel && typeof enhanceCodeBlocks === 'function') enhanceCodeBlocks(previewPanel, false);
+  }
+  mountArtifactTabs(body, defaultTab);
+  const codeTab = body.querySelector('[data-artifact-tab="code"]');
+  if (codeTab) {
+    codeTab.addEventListener('click', () => {
+      const codeEl = body.querySelector('[data-artifact-panel="code"] pre > code');
+      if (codeEl && window.hljs && !codeEl.dataset.highlighted) {
+        try { window.hljs.highlightElement(codeEl); } catch (e) { /* 忽略 */ }
+      }
+    });
+  }
+  if (typeof refreshIcons === 'function') refreshIcons();
+}
+
+/** 应用内预览写文件产物（只读：复用本机 Agent 的 read_file 端点，不启动外部程序）
+ * 绝对路径先尝试折算到本机 Agent 工作区内；跨工作区/越界/不可读时给出明确提示。
+ * 由步骤卡 [data-preview-path] 与 Laya 摘要的可点击路径共用。
+ * @param {string} rawPath - 卡片/摘要里的文件路径
+ * @returns {Promise<void>} */
+async function previewArtifact(rawPath) {
+  const path = String(rawPath == null ? '' : rawPath).trim();
+  if (!path) return;
+  if (typeof showModal !== 'function') {
+    if (typeof showNotification === 'function') showNotification('无法预览', path, 'warning', 2600);
+    return;
+  }
+  // ZCode 沙箱产物：路径编码为 zcode:<task_id>:<encodeURIComponent(filename)>
+  // （task_id 为后端签发的 32 位 uuid4.hex；文件名取 ZCode 事件里的 basename）
+  const zcodeMatch = /^zcode:([0-9a-f]{32}):(.+)$/i.exec(path);
+  if (zcodeMatch) {
+    let zcodeName = zcodeMatch[2];
+    try { zcodeName = decodeURIComponent(zcodeName); } catch (e) { /* 保留原编码串 */ }
+    return previewZcodeArtifact(zcodeMatch[1], zcodeName);
+  }
+  const box = showModal(
+    '<div class="flex items-center gap-2 text-[11px] text-text-tertiary">' +
+    '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>' +
+    '<span>正在读取</span><span class="font-mono break-all">' + escapeHtml(path) + '</span></div>',
+    { title: '预览产物', icon: 'file-code', wide: true, footer: false }
+  );
+  const body = box ? box.querySelector('.modal-body') : null;
+  const setBody = (html) => {
+    if (!body) return;
+    body.innerHTML = html;
+    if (typeof refreshIcons === 'function') refreshIcons();
+  };
+  try {
+    let rel = path.replace(/^file:\/\/\//i, '').replace(/\\/g, '/');
+    const isAbs = /^[a-zA-Z]:\//.test(rel) || rel.charAt(0) === '/';
+    if (isAbs) {
+      const cfg = (typeof agentBackendConfig === 'function') ? await agentBackendConfig(true) : null;
+      const ws = (cfg && cfg.workspace) ? String(cfg.workspace).replace(/\\/g, '/').replace(/\/+$/, '') : '';
+      if (!ws) throw new Error('无法读取本机 Agent 工作区配置，不能预览绝对路径');
+      const lowRel = rel.toLowerCase(), lowWs = ws.toLowerCase();
+      if (lowRel === lowWs) throw new Error('目标路径是工作区目录，不是文件');
+      if (lowRel.indexOf(lowWs + '/') !== 0) {
+        throw new Error('该文件不在本机 Agent 工作区（' + ws + '）内，应用内预览暂不支持跨工作区路径');
+      }
+      rel = rel.slice(ws.length + 1);
+    }
+    const kind = artifactKindForName(rel, '');
+    if (kind === 'image' || kind === 'image-unsupported') {
+      renderArtifactResult(body, { name: rel, kind: 'image-unsupported', code: false });
+      return;
+    }
+    if (kind === 'binary') {
+      renderArtifactResult(body, { name: rel, kind: 'binary', code: false });
+      return;
+    }
+    const data = await wsFetchTool('read_file', { path: rel, maxBytes: 262144 });
+    const content = (data && data.content != null) ? String(data.content) : '';
+    const size = (data && data.bytes != null) ? Number(data.bytes)
+      : ((data && data.size != null) ? Number(data.size) : content.length);
+    const sizeText = size >= 1024 ? (size / 1024).toFixed(1) + ' KB' : size + ' B';
+    const imageUrl = kind === 'svg'
+      ? artifactObjectUrl(new Blob([content], { type: 'image/svg+xml' }))
+      : null;
+    renderArtifactResult(body, {
+      name: rel,
+      meta: sizeText + (data && data.truncated ? ' · 已截断' : ''),
+      kind,
+      content,
+      imageUrl,
+      lang: artifactLangForFile(rel),
+      defaultTab: (kind === 'html' || kind === 'markdown' || kind === 'svg') ? 'preview' : 'code'
+    });
+  } catch (e) {
+    setBody(
+      '<div class="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">' +
+      '<div class="font-medium mb-1">无法预览该文件</div>' +
+      '<div class="break-all">' + escapeHtml(String((e && e.message) || e)) + '</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">' + escapeHtml(path) + '</div>' +
+      '</div>'
+    );
+  }
+}
+
+/** ZCode 沙箱产物预览：task_id + 顶层文件名 → GET /api/engines/zcode/files/<task_id>/<filename>
+ * 与 125 本机文件预览共用同一个模态框与代码高亮；只读，不执行任何东西。
+ * @param {string} taskId - ZCode 任务 id（32 位 hex）
+ * @param {string} filename - 任务目录顶层文件名
+ * @returns {Promise<void>} */
+async function previewZcodeArtifact(taskId, filename) {
+  const tid = String(taskId || '');
+  const name = String(filename || '');
+  if (!tid || !name) {
+    if (typeof showNotification === 'function') showNotification('无法预览', '缺少 ZCode 任务或文件名', 'warning', 2600);
+    return;
+  }
+  const box = showModal(
+    '<div class="flex items-center gap-2 text-[11px] text-text-tertiary">' +
+    '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>' +
+    '<span>正在读取 ZCode 产物</span><span class="font-mono break-all">' + escapeHtml(name) + '</span></div>',
+    { title: '预览 ZCode 产物', icon: 'file-code', wide: true, footer: false }
+  );
+  const body = box ? box.querySelector('.modal-body') : null;
+  const setBody = (html) => {
+    if (!body) return;
+    body.innerHTML = html;
+    if (typeof refreshIcons === 'function') refreshIcons();
+  };
+  try {
+    const url = agentBackendBase() + '/api/engines/zcode/files/' +
+      encodeURIComponent(tid) + '/' + encodeURIComponent(name);
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); msg = (j && (j.message || j.error)) || msg; } catch (e) { /* 保留 HTTP 码 */ }
+      if (res.status === 413) msg = '文件过大，无法预览（上限 512KB）';
+      throw new Error(msg);
+    }
+    const ct = String(res.headers.get('Content-Type') || '');
+    const kind = artifactKindForName(name, ct);
+    const lengthHeader = Number(res.headers.get('Content-Length'));
+    if (kind === 'image') {
+      const blob = await res.blob();
+      const imageUrl = artifactObjectUrl(blob);
+      const sizeText = blob.size >= 1024 ? (blob.size / 1024).toFixed(1) + ' KB' : blob.size + ' B';
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: sizeText + ' · 任务 ' + tid.slice(0, 8),
+        kind: 'image', imageUrl, code: false
+      });
+      return;
+    }
+    if (kind === 'image-unsupported') {
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: '任务 ' + tid.slice(0, 8),
+        kind: 'image-unsupported', code: false
+      });
+      return;
+    }
+    if (kind === 'binary') {
+      renderArtifactResult(body, {
+        name: 'ZCode · ' + name,
+        meta: '任务 ' + tid.slice(0, 8),
+        kind: 'binary', code: false
+      });
+      return;
+    }
+    const content = await res.text();
+    const size = (isFinite(lengthHeader) && lengthHeader > 0) ? lengthHeader : content.length;
+    const sizeText = size >= 1024 ? (size / 1024).toFixed(1) + ' KB' : size + ' B';
+    const imageUrl = kind === 'svg'
+      ? artifactObjectUrl(new Blob([content], { type: 'image/svg+xml' }))
+      : null;
+    renderArtifactResult(body, {
+      name: 'ZCode · ' + name,
+      meta: sizeText + ' · 任务 ' + tid.slice(0, 8),
+      kind,
+      content,
+      imageUrl,
+      lang: artifactLangForFile(name),
+      defaultTab: (kind === 'html' || kind === 'markdown' || kind === 'svg') ? 'preview' : 'code'
+    });
+  } catch (e) {
+    setBody(
+      '<div class="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">' +
+      '<div class="font-medium mb-1">无法预览 ZCode 产物</div>' +
+      '<div class="break-all">' + escapeHtml(String((e && e.message) || e)) + '</div>' +
+      '<div class="mt-2 text-[10px] text-text-tertiary font-mono break-all">任务 ' + escapeHtml(tid.slice(0, 8)) + ' · ' + escapeHtml(name) + '</div>' +
+      '</div>'
+    );
+  }
+}
+if (typeof window !== 'undefined') window.morayPreviewZcodeArtifact = previewZcodeArtifact;
+if (typeof window !== 'undefined') window.morayPreviewArtifact = previewArtifact;
 
 /** 安全算术求值：仅数字 + - * / % ( ) , 与白名单 Math 函数
  * 词法 + 递归下降解析，禁 eval/Function/任意标识符/字符串执行
@@ -31464,6 +31970,7 @@ function agentApproval(def, args, ctx) {
       escapeHtml(def.label) + ' <span class="font-mono text-[10px] text-text-tertiary">' + def.name + '</span></div></div>' +
       argCards +
       trustRow +
+      '<div class="text-[10px] text-text-tertiary leading-relaxed">提示：授权只在本弹窗内点击「允许一次」才生效；在聊天框输入「同意/授权」不会生效，关闭弹窗或按 ESC 一律视为拒绝。</div>' +
       '<div class="flex gap-2 justify-end pt-1">' +
       '<button data-agent-approve-no class="px-4 py-2 rounded-lg text-[12px] border border-line-ghost text-text-secondary hover:bg-surface-panel">拒绝</button>' +
       '<button data-agent-approve-ok class="px-4 py-2 rounded-lg text-[12px] btn-primary">允许一次</button>' +
@@ -33990,10 +34497,10 @@ function installUi6Layout() {
   /* 圆角语义别名（骨架 --radius-xs..2xl 保持不动，避免与 Tailwind rounded-* 取值分裂） */
   --radius-bubble: 8px;
   --radius-bubble-tail: 4px;
-  --radius-input: 6px;
+  --radius-input: 16px; /* [UI 2.0 步骤2] 6 → 16：输入台大圆角（与 --radius-card 观感对齐） */
   --radius-item: 6px;
   --radius-pop: 8px;
-  --radius-btn: 6px;
+  --radius-btn: 12px; /* [UI 2.0] 6 → 12：按钮大圆角（与 00_theme --radius-control 对齐） */
   /* [A-3b] --space-1..8 已删：全站零消费方的死令牌 */
   /* 过渡：统一 200ms ease */
   --transition-fast: 200ms ease;
@@ -34024,18 +34531,19 @@ function installUi6Layout() {
 }
 /* 浅色覆盖写在后（html[data-theme] 权重 (0,1,1) > :root 的 (0,1,0)，深色不会被抢回） */
 html[data-theme="light"] {
-  --bg-app: #f6f8fa;
-  --bg-panel: #ffffff;
-  --bg-card: #ffffff;
+  /* [UI 2.0] 浅色新体系：偏冷浅灰底 + 半透明白面板 + 极淡描边 + Apple 灰字 */
+  --bg-app: #f4f5f7;
+  --bg-panel: rgba(255, 255, 255, 0.7);
+  --bg-card: rgba(255, 255, 255, 0.85);
   --bg-elevated: #ffffff;
   --bg-hover: #f0f3f6;
   --bg-active: #e6eaee;
   --bg-code: #f0f3f6;
-  --border: #d0d7de;
-  --border-hover: #afb8c1;
-  --border-subtle: #e6eaee;
-  --text-primary: #1f2328;
-  --text-secondary: #59636e;
+  --border: rgba(0, 0, 0, 0.04);
+  --border-hover: rgba(0, 0, 0, 0.10);
+  --border-subtle: rgba(0, 0, 0, 0.03);
+  --text-primary: #1d1d1f;
+  --text-secondary: #86868b;
   --text-tertiary: #8b949e;
   --text-inverse: #ffffff;
   --brand: #E5734A;
@@ -34079,15 +34587,16 @@ html[data-theme="light"] {
   --shadow-card: none;
 }
 html[data-theme="light"] {
-  --color-surface-void: #f6f8fa;
-  --color-surface-deep: #f6f8fa;
-  --color-surface-panel: #ffffff;
-  --color-surface-card: #ffffff;
+  /* [UI 2.0] 与 0 节浅色新体系同调（void/deep 随 --bg-app，面板/卡片半透明，线随 --border） */
+  --color-surface-void: #f4f5f7;
+  --color-surface-deep: #f4f5f7;
+  --color-surface-panel: rgba(255, 255, 255, 0.7);
+  --color-surface-card: rgba(255, 255, 255, 0.85);
   --color-surface-floating: #ffffff;
   --color-surface-hover: #f0f3f6;
-  --color-line-ghost: #d0d7de;
-  --color-text-primary: #1f2328;
-  --color-text-secondary: #59636e;
+  --color-line-ghost: rgba(0, 0, 0, 0.06);
+  --color-text-primary: #1d1d1f;
+  --color-text-secondary: #86868b;
   --color-text-tertiary: #8b949e;
   --color-code-bg: #f0f3f6;
   --color-brand-cobalt: #E5734A;
@@ -34104,12 +34613,13 @@ html[data-theme="light"] {
 body { background-color: var(--bg-app); color: var(--text-primary); }
 #app { background-color: var(--bg-app); }
 /* 侧栏毛玻璃（浅色单独一套）：壁纸模式下 110 的档位规则权重更高，由 --wall-blur 统一到 20px
-   [A-1.5] 中栏拆出：全局导航是唯一侧栏（毛玻璃面板），中栏降级为内容辅助区
-   （透明底=与内容区同色，仅留 --border-subtle 极淡分隔，去掉毛玻璃的"独立面板"感） */
+   [UI 2.0] 三栏全部毛玻璃化（对齐 WorkBuddy 原型三栏玻璃）：blur 走 --backdrop-blur 令牌（24px），
+   无壁纸闸门——本段规则始终生效；中栏沿用 [A-1.5] 的 flex 定宽结构，仅底色从透明改为半透明白。
+   内层卡片/气泡不加 blur（§9 已有 none 守卫，防嵌套掉帧） */
 #app > aside.bg-surface-deep {
   background-color: rgba(17, 17, 17, 0.85);
-  -webkit-backdrop-filter: blur(20px) saturate(1.15);
-  backdrop-filter: blur(20px) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.15);
+  backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.15);
   border-right-color: var(--border);
 }
 #middleSidebar {
@@ -34117,12 +34627,23 @@ body { background-color: var(--bg-app); color: var(--text-primary); }
   border-right-color: var(--border-subtle);
 }
 html[data-theme="light"] #app > aside.bg-surface-deep {
-  background-color: rgba(255, 255, 255, 0.85);
+  background-color: rgba(255, 255, 255, 0.65);
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
+  backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
   border-right-color: var(--border);
 }
 html[data-theme="light"] #middleSidebar {
-  background-color: transparent;
+  background-color: rgba(255, 255, 255, 0.5);
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
+  backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
   border-right-color: var(--border-subtle);
+}
+/* [UI 2.0] 主内容区玻璃底（浅色）：main 的 padding box == 视口剩余区域，
+   其内唯一的 position:fixed 元素 #wsSidebar 锚点偏移为 0（侦察已验），可安全加 blur */
+html[data-theme="light"] main.bg-surface-void {
+  background-color: rgba(255, 255, 255, 0.45);
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
+  backdrop-filter: blur(var(--backdrop-blur, 20px)) saturate(1.2);
 }
 /* 壁纸模式：三栏模糊统一 20px（110 用 --wall-blur 消费，改这一个变量即可） */
 #app[data-wallpaper] { --wall-blur: 20px; }
@@ -34790,13 +35311,19 @@ html[data-theme="dark"] #app:not(:is([data-wallpaper="anime-starry"], [data-wall
 }
 html[data-theme="dark"] #app:not([data-wallpaper]) { background-image: none !important; }
 html[data-theme="dark"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) aside.bg-surface-deep {
-  background-color: rgba(17, 17, 17, 0.85) !important;
+  /* [UI 2.0 步骤2] 拆封印：0.85 实色 → 0.55 半透 + blur（深色档略厚保对比度） */
+  background-color: rgba(17, 17, 17, 0.55) !important;
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
+  backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
   border-right-color: var(--border) !important;
 }
 /* [A-1.5] #middleSidebar 已从本组摘除：中栏非壁纸态走上面的透明底 + --border-subtle 分隔，
    不再吃 0.85 面板底（否则 !important 会压过降级规则，双栏并排感复发） */
 html[data-theme="dark"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) main.bg-surface-void {
-  background-color: var(--bg-app) !important; background-image: none !important;
+  /* [UI 2.0 步骤2] 拆封印：不透明 --bg-app → 0.55 半透 + blur（对称处理，原为 var(--bg-app) 实底） */
+  background-color: rgba(10, 10, 10, 0.55) !important; background-image: none !important;
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
+  backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
 }
 html[data-theme="dark"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) .glass-card,
 html[data-theme="dark"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) main .bg-surface-card {
@@ -34809,13 +35336,19 @@ html[data-theme="light"] #app:not(:is([data-wallpaper="anime-starry"], [data-wal
 }
 html[data-theme="light"] #app:not([data-wallpaper]) { background-image: none !important; }
 html[data-theme="light"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) aside.bg-surface-deep {
-  background-color: rgba(255, 255, 255, 0.85) !important;
+  /* [UI 2.0 步骤2] 拆封印：0.85 实色 → 0.45 半透 + blur（任务书指定值） */
+  background-color: rgba(255, 255, 255, 0.45) !important;
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
+  backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
   background-image: none !important;
   border-right-color: var(--border) !important;
 }
 /* [A-1.5] #middleSidebar 已从本组摘除（同深色侧注释） */
 html[data-theme="light"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) main.bg-surface-void {
-  background-color: var(--bg-app) !important; background-image: none !important;
+  /* [UI 2.0 步骤2] 拆封印：不透明 --bg-app → 0.45 半透 + blur（与浅色侧栏同值成对） */
+  background-color: rgba(255, 255, 255, 0.45) !important; background-image: none !important;
+  -webkit-backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
+  backdrop-filter: blur(var(--backdrop-blur, 24px)) saturate(1.2) !important;
 }
 html[data-theme="light"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) .glass-card,
 html[data-theme="light"] #app:not(:is([data-wallpaper="anime-starry"], [data-wallpaper="anime-aurora"], [data-wallpaper="anime-window"], [data-wallpaper="custom"])) main .bg-surface-card {
@@ -34957,10 +35490,10 @@ html[data-theme="light"] .wallpaper-option.custom-upload { border-color: var(--b
 .glass-card, .glass-card.p-4, .glass-card.p-5, .glass-card.p-6, .glass-card.p-8 { padding: 20px 16px; }
 /* 输入框/下拉/文本域圆角统一 6px（骨架以元素限定选择器定义半径，双类 .x.x 特异性 (0,2,0) 顺序无关稳压） */
 .form-input.form-input, .form-select.form-select, .form-textarea.form-textarea { border-radius: 6px; }
-/* 按钮圆角统一 6px：只命中声明了 rounded-lg 的 button（rounded-full 圆形钮/胶囊钮天然不在选择器内） */
-button.rounded-lg, .btn-ghost.btn-ghost { border-radius: 6px; }
-/* 卡片圆角统一 8px（与 Day19 --radius-card 令牌同值，双类压过 rounded-xl/2xl 工具类） */
-.glass-card, .glass-card.rounded-xl, .glass-card.rounded-lg, .glass-card.rounded-2xl { border-radius: 8px; }
+/* 按钮圆角：[UI 2.0] 字面量 6px → --radius-btn 令牌（12px），只命中声明了 rounded-lg 的 button（rounded-full 圆形钮/胶囊钮天然不在选择器内） */
+button.rounded-lg, .btn-ghost.btn-ghost { border-radius: var(--radius-btn, 12px); }
+/* 卡片圆角：[UI 2.0] 字面量 8px → --radius-card 令牌（16px），双类压过 rounded-xl/2xl 工具类的职责不变 */
+.glass-card, .glass-card.rounded-xl, .glass-card.rounded-lg, .glass-card.rounded-2xl { border-radius: var(--radius-card, 16px); }
 
 /* ---------- 19) [Day20] 对话页视觉重心（架构师授权：快捷按钮边框改灰，不碰 JS 逻辑） ----------
    橙色只留给「新建对话」（橙底白字，Day19 令牌已达标）与发送键；快捷建议卡边框去橙归灰，
@@ -35592,6 +36125,446 @@ body[data-mid-collapsed="1"] #page-knowledge > #knowledgeTabBar { padding-left: 
   padding-right: 28px;   /* = pr-7 原意；清除钮占 8~20px，留 8px 空隙 */
   border-bottom-color: var(--color-line-ghost, rgba(255,255,255,.08));
 }
+
+/* ---------- 34) [UI 2.0 步骤3] 输入台换肤：WorkBuddy 形态 ----------
+   形态来源：根目录 ai-workbench-tailwind-orange.html L176-216（玻璃面板 32px 大圆角、
+   文本域在上、工具行在下、胶囊模型选择器、42px 圆形渐变发送键、右对齐字数）。
+   颜色按拍板走 MoRay 品牌橙（--brand #E5734A / --brand-hover #D9663B），不引入 Tailwind CDN。
+   压盖策略（沿用 §24 的特异性战）：本节位于 135 样式字符串末尾，与 §24/§4 同档时后置胜；
+   浅色/深色各用主题前缀升一档；深色背景要压过 §25 的 :not 长链 (2,5,1)，故用双 id 提到 (3,1,1)。
+   双 id 只用于背景/描边/阴影；聚焦与代码模式紧随其后用同档规则补回品牌描边，功能态不丢。
+   文本域只加 min-height，不动 rows（30_chat 的 input 监听仍用内联 height 自动增高）。 */
+
+/* 34.0 工具行分隔线对齐原型（h-[18px] mx-2）；放在节首承接注释后可能丢失的首条规则 */
+#coreInputContainer .input-toolbar-divider { height: 18px !important; margin: 0 8px !important; }
+
+/* 34.1 形状层（跨主题）：32px 大圆角 + 玻璃模糊 + 过渡。背景色不在此层，避免无 data-theme 时闪白 */
+html #app #coreInputContainer,
+html #coreInputContainer.core-input {
+  border-radius: 32px !important;
+  background-image: none !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  transition: border-color 200ms ease, background-color 300ms ease, box-shadow 300ms ease;
+}
+
+/* 34.2 浅色玻璃：65% 白填充 + 白色高光描边 + 悬浮阴影（(2,1,1) 压过 §24 的 (2,0,1)） */
+html[data-theme="light"] #app #coreInputContainer,
+html[data-theme="light"] #coreInputContainer.core-input {
+  border: 1px solid rgba(255, 255, 255, 0.40) !important;
+  background-color: rgba(255, 255, 255, 0.65) !important;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.60) !important;
+}
+
+/* 34.3 深色玻璃：65% 深灰填充（双 id 压 §25 的不透明 #1c1c1c） */
+html[data-theme="dark"] #app #coreInputContainer#coreInputContainer,
+html[data-theme="dark"] #coreInputContainer#coreInputContainer.core-input {
+  border: 1px solid rgba(255, 255, 255, 0.10) !important;
+  background-color: rgba(30, 30, 30, 0.65) !important;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+/* 34.4 功能态：聚焦/代码模式必须压过 34.3 的双 id，否则深色下聚焦边框不橙 */
+html #app #coreInputContainer#coreInputContainer:focus-within,
+html #coreInputContainer#coreInputContainer.core-input:focus-within {
+  border-color: var(--brand) !important;
+}
+html #app #coreInputContainer#coreInputContainer.code-mode-active {
+  border-color: var(--brand-text) !important;
+}
+
+/* 34.5 文本域：透明无框、15px/1.6、初始 72px（rows 不动，内联 height 自动增高保留） */
+#chatInputNormal {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  font-size: 15px !important;
+  line-height: 1.6 !important;
+  min-height: 72px !important;
+}
+
+/* 34.6 工具行：去背景/去上边框（原型工具行与输入区同面板） */
+#coreInputContainer .input-toolbar {
+  background: transparent !important;
+  border-top: none !important;
+}
+@media (max-width: 1023px) {
+  #coreInputContainer > .input-toolbar { margin-top: 8px !important; }
+}
+
+/* 34.7 模型选择器：胶囊化（浅色白 80% / 深色白 10%） */
+#coreInputContainer .input-toolbar-model {
+  border-radius: 999px !important;
+  background: rgba(255, 255, 255, 0.80) !important;
+  border: 1px solid rgba(0, 0, 0, 0.06) !important;
+  padding: 4px 12px !important;
+  gap: 7px !important;
+}
+#coreInputContainer .input-toolbar-model:hover { background: #ffffff !important; }
+html[data-theme="dark"] #coreInputContainer .input-toolbar-model {
+  background: rgba(255, 255, 255, 0.10) !important;
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+html[data-theme="dark"] #coreInputContainer .input-toolbar-model:hover {
+  background: rgba(255, 255, 255, 0.16) !important;
+}
+
+/* 34.8 工具按钮：34px 圆角 11px（原型 icon-btn） */
+#coreInputContainer .input-toolbar-btn {
+  width: 34px !important; height: 34px !important; border-radius: 11px !important;
+}
+
+/* 34.9 发送键：42px 渐变圆钮。width/height 不加 !important：
+   125_tools 的工具忙碌态会写内联 width:auto + padding 显示"工具执行中…"，重要声明会压死它 */
+#coreInputContainer > .input-toolbar .ui6-send,
+#coreInputContainer button[onclick*="sendChatMessage"] {
+  width: 42px;
+  height: 42px;
+  min-width: 42px;
+  border-radius: 999px !important;
+  background-image: linear-gradient(135deg, var(--brand), var(--brand-hover)) !important;
+  color: var(--brand-on) !important;
+  border: none !important;
+  box-shadow: 0 4px 12px rgba(229, 115, 74, 0.30) !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+#coreInputContainer > .input-toolbar .ui6-send:hover,
+#coreInputContainer button[onclick*="sendChatMessage"]:hover {
+  background-image: linear-gradient(135deg, var(--brand-hover), var(--brand)) !important;
+  box-shadow: 0 6px 16px rgba(229, 115, 74, 0.40) !important;
+  transform: translateY(-2px) scale(1.05) !important;
+}
+
+/* 34.10 字数统计：tabular-nums、弱化右对齐 */
+#coreInputContainer .input-stats,
+#coreInputContainer > .input-toolbar .input-stats-left { font-variant-numeric: tabular-nums; }
+#coreInputContainer .input-stats { color: var(--text-tertiary) !important; margin-right: 12px; }
+
+/* 34.11 桌面端把模型胶囊并回工具行（原型为同一行左组）；纯 order，不改 DOM。
+   margin-bottom 14px 与工具行 padding-bottom 对齐，避免胶囊与 42px 发送键错位 */
+@media (min-width: 1024px) {
+  #coreInputContainer > .ui6-input-row { padding: 12px 8px 2px !important; }
+  #coreInputContainer > .input-toolbar-model { order: 2; margin: 0 8px 14px 20px !important; }
+  #coreInputContainer > .input-toolbar { order: 2; flex: 1 1 auto; padding: 0 20px 14px 0 !important; margin-top: 0 !important; }
+  #coreInputContainer > .input-toolbar .input-toolbar-divider { order: -1; }
+  #coreInputContainer > .input-stats { order: 4; }
+}
+
+/* ---------- 35) [UI 2.0 步骤4] 紧凑输入台 + 三栏玻璃化 ----------
+   35.1 输入台压扁：textarea 72 → 44px，重排各层 padding。任务书给的
+        #coreInputContainer { padding:12px 20px 8px 20px } 不能字面落地——容器本身无 padding，
+        内层 §34.11 已按原型留边（行 8px + 内层 px-4 = 24px 左距、工具栏右 20px），
+        再加 20px 会把文字左距推到 44px、面板反而变高；故容器 padding 归零，
+        只在子层收紧（行 8px、工具栏右/下 16/10、胶囊左 16）。
+   35.2 侧栏玻璃化权重：左栏被 §11 的 :not 长链 (1,6,2) !important 钉住，中栏被 110 的
+        --wall-panel-alpha 0.96（pure 态）涂成实色；本节用 #app#app 提到 (2,*,*)、
+        #middleSidebar 提到 (3,*,*) 才压得住。背景图一并清掉，避免壁纸层叠色。 */
+
+/* 35.1 输入台紧凑化 */
+#chatInputNormal {
+  min-height: 44px !important;
+  padding-top: 12px !important;
+  padding-bottom: 4px !important;
+}
+#coreInputContainer { padding: 0 !important; }
+
+/* 35.2 左侧栏 + 中栏：半透明玻璃（浅色 35% 白 / 深色 35% 深灰）。
+   两个选择器分别覆盖 aside 与 #middleSidebar；border 只改颜色时保留原细线观感 */
+html[data-theme="light"] #app#app > aside.bg-surface-deep,
+html[data-theme="light"] #app#app > aside#middleSidebar {
+  background-color: rgba(255, 255, 255, 0.35) !important;
+  background-image: none !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  border-right: 1px solid rgba(0, 0, 0, 0.04) !important;
+}
+html[data-theme="dark"] #app#app > aside.bg-surface-deep,
+html[data-theme="dark"] #app#app > aside#middleSidebar {
+  background-color: rgba(20, 20, 20, 0.35) !important;
+  background-image: none !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+
+/* 35.3 选中会话卡片：浅色改用半透明白，避免实色盖住玻璃 */
+html[data-theme="light"] .session-item.active {
+  background: rgba(255, 255, 255, 0.6) !important;
+}
+
+/* 35.4 桌面端同步收紧 §34.11 的留白（不改 order/DOM）；胶囊 margin-bottom 与工具栏
+   padding-bottom 取同值，保持与 42px 发送键垂直居中 */
+@media (min-width: 1024px) {
+  #coreInputContainer > .ui6-input-row { padding: 8px 8px 0 !important; }
+  #coreInputContainer > .input-toolbar-model { margin: 0 8px 10px 16px !important; }
+  #coreInputContainer > .input-toolbar { padding: 0 16px 10px 0 !important; }
+}
+/* 窄屏堆叠态才需要把工具行从输入行下方拉开一点点；桌面端与胶囊同一行，不能加 top margin */
+@media (max-width: 1023px) {
+  #coreInputContainer > .input-toolbar { margin-top: 4px !important; }
+}
+
+/* ---------- 36) [UI 2.0 步骤5] 高级淡彩光晕底（纯色态） ----------
+   36.1 作用域：只落在 data-wallpaper="pure"（或未设置）的 #app 上。
+        任务书原始选择器 html[data-theme] #app 会连图片壁纸一起覆盖——background-image
+        !important 会盖掉 110 的 url(wallpapers/wp*.jpg)，等于废掉星夜/极光/窗边；
+        故显式收窄到纯色态，图片壁纸仍走原规则。
+   36.2 权重：#app#app 提到 (2,2,1)，压过 §11 的 #app:not(...) (1,2,1) !important 底色。
+   36.3 光晕直接画在 #app 上（它自带 relative/overflow），项目里没有独立遮罩层。 */
+
+html[data-theme="light"] #app#app[data-wallpaper="pure"],
+html[data-theme="light"] #app#app:not([data-wallpaper]) {
+  background-color: #f4f5f8 !important;
+  background-image:
+    radial-gradient(circle at 15% 50%, rgba(200, 215, 255, 0.4), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(255, 230, 210, 0.4), transparent 40%),
+    radial-gradient(circle at 50% 80%, rgba(240, 240, 245, 0.6), transparent 50%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="dark"] #app#app[data-wallpaper="pure"],
+html[data-theme="dark"] #app#app:not([data-wallpaper]) {
+  background-color: #121215 !important;
+  background-image:
+    radial-gradient(circle at 15% 50%, rgba(40, 50, 90, 0.4), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(90, 50, 40, 0.3), transparent 40%),
+    radial-gradient(circle at 50% 80%, rgba(20, 20, 25, 0.8), transparent 50%) !important;
+  background-attachment: fixed !important;
+}
+
+/* 36.4 纯色态若未来出现独立遮罩层（当前骨架无 .wallpaper-layer / #wallpaperContainer），
+   一律透明让光晕透出；现有 DOM 不匹配，属防御性空规则 */
+#app[data-wallpaper="pure"] .wallpaper-layer,
+#app[data-wallpaper="pure"] #wallpaperContainer {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* ---------- 37) [UI 2.0 步骤6] 去边框化与纯净化 ----------
+   37.1 竖线：§35 用 html[data-theme=...] #app#app > aside... (2,2,2)/(3,1,2) !important
+        写了 border-right；这里必须同档后置才压得动（低权重的 #app > aside 会被 §35 反压）。
+   37.2 顶栏：真实结构是 .page-panel > header（border-b 半透明线），任务书猜的
+        #app > header / .top-bar / .tab-bar / #tabsContainer 在项目里都不存在；
+        中栏 .sidebar-panel > header 同理去线，展开时与主区一致。
+   37.3 顶部"Tab 栏"真身是 .mode-segment（普通对话/多模型对比分段器），去容器底色，
+        active 药丸保留（否则失去当前模式指示）。
+   37.4 快捷指令按钮真身是 #chatNormalContent .welcome-suggestion（不是 suggestion/quick 类）；
+        按真实类名精准替换，禁用 [class*=quick] 通配以免误伤其他按钮。 */
+
+/* 37.1 侧栏/主区去竖线；主区用极淡投影替代边框 */
+html[data-theme] #app#app > aside.bg-surface-deep,
+html[data-theme] #app#app > aside#middleSidebar {
+  border-right: none !important;
+  border-left: none !important;
+}
+#app > main { border-right: none !important; border-left: none !important; }
+html[data-theme="light"] #app > main { box-shadow: -4px 0 16px rgba(0, 0, 0, 0.02) !important; }
+html[data-theme="dark"] #app > main { box-shadow: -4px 0 16px rgba(0, 0, 0, 0.20) !important; }
+
+/* 37.2 顶部 header / 中栏面板头：去底色、去分界线 */
+#app .page-panel > header,
+#middleSidebar .sidebar-panel > header {
+  background: transparent !important;
+  border-bottom: none !important;
+  box-shadow: none !important;
+}
+
+/* 37.3 顶部分段器去容器底色（active 药丸保留） */
+#app .mode-segment {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* 37.4 输入台模型胶囊：纯文字化（去 §34.7 的白底与描边）。
+   暗色 §34.7 是 (1,2,0)，必须同档后置才压得住 */
+html[data-theme="light"] #coreInputContainer .input-toolbar-model,
+html[data-theme="dark"] #coreInputContainer .input-toolbar-model {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+#coreInputContainer .input-toolbar-model:hover {
+  background: rgba(0, 0, 0, 0.04) !important;
+}
+html[data-theme="dark"] #coreInputContainer .input-toolbar-model:hover {
+  background: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* 37.5 快捷指令：玻璃底 + 微投影，去硬边框。
+   真身：30_chat 把欢迎页的 .welcome-suggestions 搬进输入台底部容器并挂 id=welcomeQuickRow，
+   所以不在 #chatNormalContent 里；两处都写上，兼容未搬移的旧渲染路径 */
+#welcomeQuickRow .welcome-suggestion,
+#chatNormalContent .welcome-suggestion {
+  background: rgba(255, 255, 255, 0.80) !important;
+  border: none !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04) !important;
+}
+#welcomeQuickRow .welcome-suggestion:hover,
+#chatNormalContent .welcome-suggestion:hover {
+  background: rgba(255, 255, 255, 0.95) !important;
+}
+html[data-theme="dark"] #welcomeQuickRow .welcome-suggestion,
+html[data-theme="dark"] #chatNormalContent .welcome-suggestion {
+  background: rgba(255, 255, 255, 0.10) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.20) !important;
+}
+html[data-theme="dark"] #welcomeQuickRow .welcome-suggestion:hover,
+html[data-theme="dark"] #chatNormalContent .welcome-suggestion:hover {
+  background: rgba(255, 255, 255, 0.16) !important;
+}
+
+/* 37.6 浅色态输入文字加深，提高对比度 */
+html[data-theme="light"] #chatInputNormal {
+  color: #111111 !important;
+}
+
+/* ---------- 38) [UI 2.0 步骤9] 品牌色全局切换（WorkBuddy 蓝） ----------
+   38.1 令牌层：主色 #2f7cf6。任务书只覆盖 brand/hover/text/on/accent，漏了
+        --brand-light 与 --glow-blue（仍是橙色 rgba(229,115,74,...)）——不补的话
+        所有选中底、徽章、发送键内发光会继续发橙。
+   38.2 深色档 --brand-text 用 #60a5fa：任务书统一给 #1e40af，深底深蓝看不清；
+        其自己的深色侧栏规则也是 #60a5fa，故按该意图分主题。
+   38.3 其余为写死橙色的高频可见落点：发送键渐变/阴影、纯色光晕、slash 菜单橙色图标底。 */
+
+/* 38.1 令牌：浅色 / 默认 */
+:root,
+html[data-theme="light"] {
+  --brand: #2f7cf6 !important;
+  --brand-hover: #1d4ed8 !important;
+  --brand-light: rgba(47, 124, 246, 0.10) !important;
+  --brand-text: #1e40af !important;
+  --brand-on: #ffffff !important;
+  --accent: #2f7cf6 !important;
+  --glow-blue: rgba(47, 124, 246, 0.25) !important;
+  /* Tailwind v4 运行时把这三个工具类色钉成橙色字面量（--brand-text 变了它们不跟），
+     必须直接覆盖 --color-brand-* 才能让 text-brand-cyan/violet、bg-brand-cyan/15 等变蓝 */
+  --color-brand-cobalt: var(--brand-text) !important;
+  --color-brand-cobalt-hover: var(--brand-hover) !important;
+  --color-brand-violet: var(--brand-text) !important;
+  --color-brand-cyan: var(--brand-text) !important;
+}
+/* 38.1b 令牌：深色（文字提亮） */
+html[data-theme="dark"] {
+  --brand: #2f7cf6 !important;
+  --brand-hover: #1d4ed8 !important;
+  --brand-light: rgba(47, 124, 246, 0.18) !important;
+  --brand-text: #60a5fa !important;
+  --brand-on: #ffffff !important;
+  --accent: #2f7cf6 !important;
+  --glow-blue: rgba(47, 124, 246, 0.35) !important;
+  --color-brand-cobalt: var(--brand-text) !important;
+  --color-brand-cobalt-hover: var(--brand-hover) !important;
+  --color-brand-violet: var(--brand-text) !important;
+  --color-brand-cyan: var(--brand-text) !important;
+}
+
+/* 38.2 发送键：蓝色渐变 + 蓝光（覆盖 §34.9 的橙色） */
+#coreInputContainer button[onclick*="sendChatMessage"],
+#coreInputContainer > .input-toolbar .ui6-send {
+  background-image: linear-gradient(135deg, #2f7cf6, #1d4ed8) !important;
+  box-shadow: 0 4px 12px rgba(47, 124, 246, 0.30) !important;
+}
+#coreInputContainer button[onclick*="sendChatMessage"]:hover,
+#coreInputContainer > .input-toolbar .ui6-send:hover {
+  background-image: linear-gradient(135deg, #1d4ed8, #2f7cf6) !important;
+  box-shadow: 0 6px 16px rgba(47, 124, 246, 0.40) !important;
+}
+
+/* 38.3 侧栏选中态：真实类名 .nav-icon-btn.active；任务书的 #app > aside .active 一并保留 */
+html[data-theme="light"] #app > aside .nav-icon-btn.active,
+html[data-theme="light"] #app > aside .active,
+html[data-theme="light"] .session-item.active {
+  background: rgba(47, 124, 246, 0.10) !important;
+  color: #1e40af !important;
+}
+html[data-theme="dark"] #app > aside .nav-icon-btn.active,
+html[data-theme="dark"] #app > aside .active,
+html[data-theme="dark"] .session-item.active {
+  background: rgba(47, 124, 246, 0.20) !important;
+  color: #60a5fa !important;
+}
+
+/* 38.4 纯色光晕改冷蓝（覆盖 §36，作用域保持一致） */
+html[data-theme="light"] #app#app[data-wallpaper="pure"],
+html[data-theme="light"] #app#app:not([data-wallpaper]) {
+  background-image:
+    radial-gradient(circle at 15% 50%, rgba(200, 215, 255, 0.5), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(47, 124, 246, 0.1), transparent 40%),
+    radial-gradient(circle at 50% 80%, rgba(240, 240, 245, 0.6), transparent 50%) !important;
+}
+html[data-theme="dark"] #app#app[data-wallpaper="pure"],
+html[data-theme="dark"] #app#app:not([data-wallpaper]) {
+  background-image:
+    radial-gradient(circle at 15% 50%, rgba(30, 64, 175, 0.2), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(47, 124, 246, 0.1), transparent 40%),
+    radial-gradient(circle at 50% 80%, rgba(20, 20, 25, 0.8), transparent 50%) !important;
+}
+
+/* 38.5 slash 菜单里写死橙底的图标：只改橙，保留黄/绿/红命令色 */
+#coreInputContainer .slash-menu-item-icon[style*="229,115,74"] {
+  background: rgba(47, 124, 246, 0.12) !important;
+}
+
+/* 38.6 Firefox 滚动条通道色（Electron 走 ::-webkit-scrollbar，不受影响） */
+* { scrollbar-color: rgba(47, 124, 246, 0.25) transparent; }
+
+/* 38.7 beacon 呼吸环：动画值会压过普通 box-shadow，必须重定义同名关键帧（后者生效），
+   否则状态点本体是蓝的、脉冲环仍是橙色 */
+@keyframes beacon {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(47, 124, 246, 0.45); }
+  50%      { opacity: 0.65; box-shadow: 0 0 0 4px rgba(47, 124, 246, 0); }
+}
+
+/* ---------- 39) [UI 2.0 最后补丁] 输入台 ON 态按钮转蓝 ----------
+   39.1 真凶：125_tools.js 在运行时 append 一个 <style>，把 .native-agent-btn.native-on
+        与 .think-mode-btn.think-on 写成橙色 rgba(229,115,74,.15)/#E5734A/描边 .35；
+        它是运行时插入的，普通类选择器压不住，必须带 #coreInputContainer 升权 + !important。
+   39.2 任务书把 .restart-btn / #restartAllServices 也写在本节——那是 Electron 壳的元素
+        （index.html #btn-restart），网页端不存在；已在 electron-app/src/style.css 落地。 */
+
+#coreInputContainer .native-agent-btn.native-on,
+#coreInputContainer .think-mode-btn.think-on,
+#coreInputContainer .tools-toggle-btn.tools-on,
+#coreInputContainer .input-toolbar-btn.active {
+  background: rgba(47, 124, 246, 0.15) !important;
+  color: #2f7cf6 !important;
+  box-shadow: inset 0 0 0 1px rgba(47, 124, 246, 0.35) !important;
+}
+html[data-theme="dark"] #coreInputContainer .native-agent-btn.native-on,
+html[data-theme="dark"] #coreInputContainer .think-mode-btn.think-on,
+html[data-theme="dark"] #coreInputContainer .tools-toggle-btn.tools-on,
+html[data-theme="dark"] #coreInputContainer .input-toolbar-btn.active {
+  background: rgba(47, 124, 246, 0.22) !important;
+  color: #60a5fa !important;
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.40) !important;
+}
+
+/* ---------- 40) [UI 2.0 步骤11] 页面级残留橙色清理 ----------
+   40.1 根因：应用中心（86_home_apps.js）与 Synapse（140_synapse.js）的图标/胶囊/徽章
+        全部消费 var(--color-brand, #E5734A) 与 var(--color-brand-subtle, rgba(229,115,74,.08))；
+        而 --color-brand 在主题块里被定义成橙色字面量（组装产物 L5383），
+        改 --brand / --brand-text 它们不跟。直接覆盖这两个变量即可让两页整体转蓝。
+   40.2 仅剩一处写死字面量：.argus-mode-pill:hover 的 rgba(229,115,74,.16)，单独兜底。
+   40.3 状态色（成功绿/警告黄/失败红）不动，只清品牌橙。 */
+
+:root,
+html[data-theme="light"] {
+  --color-brand: #2f7cf6 !important;
+  --color-brand-hover: #1d4ed8 !important;
+  --color-brand-subtle: rgba(47, 124, 246, 0.10) !important;
+}
+html[data-theme="dark"] {
+  --color-brand: #2f7cf6 !important;
+  --color-brand-hover: #1d4ed8 !important;
+  --color-brand-subtle: rgba(47, 124, 246, 0.18) !important;
+}
+
+/* 40.2 写死橙色兜底（应用中心 Argus 模式胶囊 hover） */
+.argus-mode-pill:hover { background: rgba(47, 124, 246, 0.16) !important; }
 `;
   document.head.appendChild(st);
 })();
