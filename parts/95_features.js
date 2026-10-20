@@ -178,7 +178,7 @@ function openConversationTemplates() {
   const box = showModal(`<div class="grid grid-cols-2 gap-3">
     ${CONVERSATION_TEMPLATES.map(t => `
       <div class="doc-card p-4 cursor-pointer" data-tpl-id="${t.id}">
-        <div class="flex items-center gap-2 mb-1.5">
+        <div class="flex items-center gap-2 mb-2">
           <div class="w-8 h-8 rounded-lg bg-brand-cobalt/12 flex items-center justify-center">
             <i data-lucide="${t.icon}" class="w-4 h-4 text-brand-cobalt"></i>
           </div>
@@ -246,7 +246,7 @@ function openPromptMarket() {
         <div class="flex items-center justify-between mb-1">
           <div class="flex items-center gap-2"><span class="text-sm text-text-primary">${escapeHtml(p.title)}</span>
             <span class="tag-pill bg-brand-violet/15 text-brand-violet">${escapeHtml(p.category)}</span></div>
-          <button class="btn-primary px-2.5 py-1 rounded-lg text-[11px]" data-market-import="${PROMPT_MARKET.indexOf(p)}">导入</button>
+          <button class="btn-primary px-3 py-1 rounded-lg text-[11px]" data-market-import="${PROMPT_MARKET.indexOf(p)}">导入</button>
         </div>
         <div class="text-[11px] text-text-tertiary line-clamp-2">${escapeHtml(p.content.slice(0, 110))}…</div>
       </div>`).join('');

@@ -236,8 +236,8 @@ const PaletteSearch = {
         '<i data-lucide="search-x" class="w-6 h-6 mx-auto mb-2 opacity-50"></i>',
         '<div class="text-xs text-text-secondary mb-2">未找到匹配内容</div>',
         '<div class="flex gap-2 justify-center">',
-        '<button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" data-empty-action="new-chat">新建会话</button>',
-        '<button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" data-empty-action="docs">搜索文档</button>',
+        '<button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" data-empty-action="new-chat">新建会话</button>',
+        '<button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" data-empty-action="docs">搜索文档</button>',
         '</div></div>'
       ].join('');
       refreshIcons();
@@ -316,12 +316,12 @@ const PaletteSearch = {
         case 'prompt': {
           const p = PromptsApp.cache.find(x => x.id === item.id);
           if (p) PromptsApp.insertToInput(p.content);
-          else { document.querySelector('.nav-icon-btn[data-page="prompts"]').click(); }
+          else { KnowledgeTabs.setTab('prompts', true); }  // [A-2] prompts 已并入知识库 tab
           break;
         }
         case 'snippet': {
           const s = SnippetsApp.cache.find(x => x.id === item.id);
-          document.querySelector('.nav-icon-btn[data-page="snippets"]').click();
+          KnowledgeTabs.setTab('snippets', true);  // [A-2] snippets 已并入知识库 tab
           if (s) {
             copyToClipboard(s.code).then(ok => showNotification(ok ? '已复制' : '复制失败', s.title, ok ? 'success' : 'error', 1600));
           }

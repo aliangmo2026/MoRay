@@ -148,6 +148,9 @@ const CostEngine = {
  * @returns {string} HTML 药丸标签 */
 function renderCostPills(msg) {
   if (!msg || typeof CostEngine === 'undefined') return '';
+  // [Argus 深度研究] 自动追加的报告消息不是模型推理产物：没有 token 也没有 API 费用，
+  // 照常渲染会挂一条 "0 tok + ¥0" 的噪声标签
+  if (msg.argusAuto) return '';
   const model = msg.model || '';
   const tokens = msg.tokens || 0;
   const cached = !!(msg.cacheInfo && msg.cacheInfo.from);
@@ -210,7 +213,7 @@ const CostBudget = {
       const box = showModal('<p class="text-sm text-text-secondary">本月 API 费用已达预算上限：<span class="text-danger font-mono">¥' + month.toFixed(2) + '</span> / ¥' + budget + '</p><p class="text-xs text-text-tertiary mt-2">缓存命中与本地 Ollama 不受影响。可继续使用或暂停云端 API；也可在 成本与省钱 开启"超预算自动降级"。</p>',
         { title: '月度预算已用完', icon: 'wallet', footer: false });
       const foot = document.createElement('div');
-      foot.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--color-line-ghost)';
+      foot.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;padding:16px 20px;border-top:1px solid var(--color-line-ghost)';
       foot.innerHTML = '<button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="cnyBudgetContinue">继续使用</button><button class="px-3 py-2 rounded-lg text-xs bg-danger text-white" id="cnyBudgetPause">暂停云端 API</button>';
       box.appendChild(foot);
       on(foot.querySelector('#cnyBudgetContinue'), 'click', () => { closeModal(); showNotification('已选择继续', '本期不再重复提醒', 'info', 2000); });
@@ -242,8 +245,8 @@ const CostCenterApp = {
       '    <span class="text-sm font-medium text-text-primary">成本与省钱中心</span>',
       '    <span class="tag-pill bg-brand-cyan/15 text-brand-cyan">按当前价格估算 · 价格可在设置→成本调整</span></div>',
       '  <div class="flex items-center gap-2">',
-      ['today', 'week', 'month', 'all'].map(r => '<button class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost ' + (this.range === r ? 'text-brand-cyan border-brand-cyan/40' : 'text-text-tertiary') + '" data-cost-range="' + r + '">' + (r === 'today' ? '今天' : r === 'week' ? '本周' : r === 'month' ? '本月' : '全部') + '</button>').join(''),
-      '    <button class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="costExportBtn"><i data-lucide="download" class="w-3 h-3"></i>导出CSV</button></div>',
+      ['today', 'week', 'month', 'all'].map(r => '<button class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost ' + (this.range === r ? 'text-brand-cyan border-brand-cyan/40' : 'text-text-tertiary') + '" data-cost-range="' + r + '">' + (r === 'today' ? '今天' : r === 'week' ? '本周' : r === 'month' ? '本月' : '全部') + '</button>').join(''),
+      '    <button class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="costExportBtn"><i data-lucide="download" class="w-3 h-3"></i>导出CSV</button></div>',
       '</div>',
       '<div class="flex-1 overflow-y-auto p-5"><div class="max-w-5xl mx-auto space-y-4">',
       '<div class="grid grid-cols-4 gap-2" id="costStatCards"></div>',
@@ -351,7 +354,7 @@ const CostCenterApp = {
     page.querySelector('#costStatCards').innerHTML = cards.map(c => [
       '<div class="rounded-lg bg-surface-panel/60 py-3 px-3 text-center">',
       '<div class="text-sm font-mono ' + c[2] + '">' + c[1] + '</div>',
-      '<div class="text-[10px] text-text-tertiary mt-0.5">' + c[0] + '</div></div>'
+      '<div class="text-[10px] text-text-tertiary mt-1">' + c[0] + '</div></div>'
     ].join('')).join('');
 
     const last14 = rows.slice(-14);
@@ -363,7 +366,7 @@ const CostCenterApp = {
           '<div style="width:70%;max-width:16px;height:' + Math.max(2, r.cost / maxV * 110) + 'px;background:linear-gradient(180deg,var(--color-brand-cyan),var(--color-brand-cobalt));border-radius:2px"></div>',
           '</div>'
         ].join('')).join('') + '</div>' +
-        '<div class="flex gap-3 text-[9px] text-text-tertiary mt-1"><span class="flex items-center gap-1"><span style="width:8px;height:8px;background:var(--color-brand-cobalt);display:inline-block;border-radius:2px"></span>实际花费</span><span class="flex items-center gap-1"><span style="width:8px;height:8px;background:var(--color-surface-hover);display:inline-block;border-radius:2px"></span>不优化对照</span></div>'
+        '<div class="flex gap-3 text-[10px] text-text-tertiary mt-1"><span class="flex items-center gap-1"><span style="width:8px;height:8px;background:var(--color-brand-cobalt);display:inline-block;border-radius:2px"></span>实际花费</span><span class="flex items-center gap-1"><span style="width:8px;height:8px;background:var(--color-surface-hover);display:inline-block;border-radius:2px"></span>不优化对照</span></div>'
       : '<div class="text-[11px] text-text-tertiary text-center py-10">暂无数据，发一条消息后这里会显示每日花费对比</div>';
 
     const models = Object.keys(byModel);
@@ -413,7 +416,7 @@ const CostCenterApp = {
     page.querySelector('#costBudgetText').textContent = budget ? '¥' + monthCost.toFixed(2) + ' / ¥' + budget + '（' + Math.round(pct) + '%）' : '未设置（设置→成本）';
 
     page.querySelector('#costDetailList').innerHTML = rows.length ? rows.slice().reverse().map(r => [
-      '<div class="flex items-center justify-between px-3 py-1.5 rounded-lg bg-surface-panel/40 text-[11px]">',
+      '<div class="flex items-center justify-between px-3 py-2 rounded-lg bg-surface-panel/40 text-[11px]">',
       '<span class="text-text-secondary">' + r.day + '</span>',
       '<span class="text-text-tertiary">' + r.tokens + ' tok · ' + r.requests + ' 次请求</span>',
       '<span class="font-mono">¥' + r.cost.toFixed(4) + (r.saved > 0 ? ' <span class="text-success">省¥' + r.saved.toFixed(4) + '</span>' : '') + '</span></div>'
@@ -436,7 +439,7 @@ const CostCenterApp = {
 /** 设置页成本卡片（价格表编辑 + 预算 + 覆盖新增）
  * @returns {Promise<void>} */
 async function appendCostSettings() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container || container.querySelector('#costSettingsCard')) return;
   const overrides = MoraySettings.get('priceOverrides') || {};
   const card = document.createElement('div');
@@ -445,10 +448,11 @@ async function appendCostSettings() {
   const priceRows = PRICE_TABLE.map((rule, i) => {
     const key = rule.match.includes('default') ? '默认档' : rule.match[0];
     const ov = overrides[key];
-    const inp = (f) => '<input type="number" step="0.1" min="0" value="' + (ov ? ov[f] : rule.prices[f]) + '" data-price-row="' + i + '" data-field="' + f + '" class="form-input" style="width:64px;padding:2px 6px;font-size:10px">';
-    return '<div class="flex items-center gap-1.5"><span class="text-[10px] text-text-tertiary w-24 truncate" title="' + escapeHtml(rule.note) + '">' + escapeHtml(key) + '</span>' + inp('input') + inp('output') + inp('cacheHit') + (rule.prices.input === 0 ? '<span class="text-[9px] text-success">本地免费</span>' : '') + '</div>';
+    const inp = (f) => '<input type="number" step="0.1" min="0" value="' + (ov ? ov[f] : rule.prices[f]) + '" data-price-row="' + i + '" data-field="' + f + '" class="form-input" style="width:64px;padding:2px 8px;font-size:10px">';
+    return '<div class="flex items-center gap-2"><span class="text-[10px] text-text-tertiary w-24 truncate" title="' + escapeHtml(rule.note) + '">' + escapeHtml(key) + '</span>' + inp('input') + inp('output') + inp('cacheHit') + (rule.prices.input === 0 ? '<span class="text-[10px] text-success">本地免费</span>' : '') + '</div>';
   }).join('');
   card.innerHTML = [
+    '<div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">系统与数据</span></div>',
     '<h3 class="text-sm font-semibold text-text-primary mb-2 flex items-center gap-2"><i data-lucide="coins" class="w-4 h-4 text-brand-cyan"></i>成本与省钱</h3>',
     '<p class="text-[10px] text-text-tertiary mb-3">价格为默认值、可能变动、以官方定价为准；成本中心按当前价格实时估算。</p>',
     '<div class="flex items-center justify-between mb-3">',
@@ -456,7 +460,7 @@ async function appendCostSettings() {
     '<div class="flex items-center gap-2"><span class="text-xs text-text-secondary">超预算自动降级</span><div class="toggle-track ' + (MoraySettings.get('autoDegrade') ? 'active' : '') + '" id="setAutoDegrade"><div class="toggle-thumb"></div></div></div></div>',
     '<div class="text-[10px] text-text-tertiary mb-1">价格表（元/百万token · 输入/输出/缓存命中）</div>',
     '<div class="space-y-1 mb-2" id="costPriceRows">' + priceRows + '</div>',
-    '<div class="flex gap-1.5 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
+    '<div class="flex gap-2 items-center"><input type="text" id="costNewModel" class="form-input" style="flex:1;padding:4px 8px;font-size:12px" placeholder="自定义模型名（如 my-model）"><button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="costAddOverride">新增自定义价格</button></div>',
     '<button class="text-[10px] text-danger mt-2 hover:opacity-80" id="costResetOverrides">清除全部自定义价格</button>'
   ].join('');
   container.insertBefore(card, container.querySelector('#gatewaySettingsCard') || container.querySelector('#enhanceSettingsCard') || container.lastElementChild);

@@ -134,7 +134,7 @@ const SnippetsApp = {
         </div>
         <div class="code-preview"><div class="code-block rounded-none border-0" style="max-height:150px;overflow:hidden"><div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div><span class="code-lang">${escapeHtml(s.language || 'text')}</span></div>
-          <pre class="text-text-secondary text-[12px]" style="padding:12px 14px;margin:0"><code class="language-${escapeHtml(s.language || 'text')}">${escapeHtml((s.code || '').slice(0, 1200))}</code></pre>
+          <pre class="text-text-secondary text-[12px]" style="padding:12px 16px;margin:0"><code class="language-${escapeHtml(s.language || 'text')}">${escapeHtml((s.code || '').slice(0, 1200))}</code></pre>
         </div></div>
         <div class="px-4 py-2 flex items-center justify-between border-t border-line-ghost/50">
           <div class="flex items-center gap-2 flex-wrap">${(s.tags || []).map(t => `<span class="tag-pill bg-surface-floating text-text-tertiary">${escapeHtml(t)}</span>`).join('')}</div>
@@ -488,10 +488,10 @@ const DocsApp = {
           <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="ragModePill" title="">检索模式：探测中</span>
         </div>
         <div class="flex items-center gap-2">
-          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragClearAllBtn" title="删除全部文档与索引">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-2 border border-line-ghost" id="ragClearAllBtn" title="删除全部文档与索引">
             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>清空
           </button>
-          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="ragSettingsBtn">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-2 border border-line-ghost" id="ragSettingsBtn">
             <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>知识库设置
           </button>
           <div class="relative w-56">
@@ -615,7 +615,7 @@ const DocsApp = {
               <i data-lucide="${d.type === 'pdf' ? 'file-text' : d.type === 'code' ? 'file-code' : 'file-text'}" class="w-4 h-4 text-brand-violet"></i>
             </div>
             <div class="min-w-0">
-              <div class="text-sm text-text-primary truncate flex items-center gap-1.5">${escapeHtml(d.name)}${d.sample ? '<span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt">示例</span>' : ''}</div>
+              <div class="text-sm text-text-primary truncate flex items-center gap-2">${escapeHtml(d.name)}${d.sample ? '<span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt">示例</span>' : ''}</div>
               <div class="text-[10px] text-text-tertiary">${formatBytes(d.size)} · ${chars} 字 · ${idx} 段${d.status === 'ready' ? ' · 已向量化 ' + embedded + ' 段' : ''} · 导入于 ${relTime(d.createdAt)}</div>
             </div>
           </div>

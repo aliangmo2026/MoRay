@@ -24,10 +24,10 @@ const CompareApp = {
       <div class="h-9 px-5 flex items-center justify-between border-b border-line-ghost/30 flex-shrink-0">
         <div class="flex items-center gap-3 text-[10px] text-text-tertiary" id="compareStatusText">勾选模型后输入提示词开始竞速</div>
         <div class="flex items-center gap-2 text-xs text-text-secondary">
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="compareExportBtn" style="display:none">
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="compareExportBtn" style="display:none">
             <i data-lucide="file-down" class="w-3 h-3"></i>导出报告
           </button>
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="compareStopBtn" style="display:none">
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[11px] border border-line-ghost flex items-center gap-1" id="compareStopBtn" style="display:none">
             <i data-lucide="square" class="w-3 h-3"></i>停止
           </button>
           <span>同步滚动</span>
@@ -36,7 +36,7 @@ const CompareApp = {
       </div>
       <div class="flex-1 flex min-h-0 divide-x divide-line-ghost" id="compareColumns"></div>
       <div class="px-5 pb-4 flex-shrink-0">
-        <div class="core-input flex items-center gap-3 px-4 py-2.5 flex-wrap">
+        <div class="core-input flex items-center gap-3 px-4 py-3 flex-wrap">
           <div class="flex items-center gap-3 text-xs text-text-secondary flex-shrink-0 flex-wrap" id="compareModelChecks"></div>
           <textarea rows="1" placeholder="对比模式输入... 同时发送给已勾选的模型（Enter 发送）" id="compareInput"
             class="flex-1 bg-transparent text-sm text-text-primary placeholder:text-text-tertiary resize-none focus:outline-none py-1 max-h-32"></textarea>
@@ -153,7 +153,7 @@ const CompareApp = {
     const clean = this.normalizeSelected();
     const allowed = new Set(clean);
     wrap.innerHTML = models.map(name => `
-      <label class="flex items-center gap-1.5 cursor-pointer">
+      <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" data-compare-model="${escapeHtml(name)}" ${allowed.has(name) ? 'checked' : ''} class="accent-brand-cobalt w-3.5 h-3.5">
         <span class="beacon-dot" style="width:6px;height:6px"></span>
         <span title="${escapeHtml(name)}">${escapeHtml(uniqueModelName(name))}</span>
@@ -923,12 +923,12 @@ const ABTest = {
         </div>
       </div>
       <div class="flex items-center justify-between mt-3">
-        <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="abHistoryBtn">历史与胜率</button>
+        <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="abHistoryBtn">历史与胜率</button>
         <div class="flex gap-2">
-          <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="abScoreTie" disabled>平局</button>
-          <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-brand-cobalt/40 text-brand-cobalt" id="abScoreA" disabled>A 更好</button>
-          <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-brand-violet/40 text-brand-violet" id="abScoreB" disabled>B 更好</button>
-          <button class="btn-primary px-4 py-1.5 rounded-lg text-xs" id="abRunBtn">运行测试</button>
+          <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="abScoreTie" disabled>平局</button>
+          <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-brand-cobalt/40 text-brand-cobalt" id="abScoreA" disabled>A 更好</button>
+          <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-brand-violet/40 text-brand-violet" id="abScoreB" disabled>B 更好</button>
+          <button class="btn-primary px-4 py-2 rounded-lg text-xs" id="abRunBtn">运行测试</button>
         </div>
       </div>`,
       { title: '提示词 A/B 测试', icon: 'flask-round', wide: true, footer: false });

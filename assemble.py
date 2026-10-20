@@ -3,17 +3,18 @@
 同时生成 PWA 配套文件（sw.js / manifest.webmanifest）"""
 import io, os, re
 
-PARTS = ['parts/10_db.js', 'parts/20_ai.js', 'parts/30_chat.js',
+PARTS = ['parts/00_theme.js',
+         'parts/10_db.js', 'parts/20_ai.js', 'parts/memory_client.js', 'parts/memory_browser.js',
+         'parts/140_synapse.js', 'parts/30_chat.js',
          'parts/40_compare_prompts.js', 'parts/50_snippets.js',
-         'parts/60_workflow.js', 'parts/65_automation_page.js', 'parts/68_task_dispatch.js',
-         'parts/69_orchestrator.js',
+         'parts/60_workflow.js', 'parts/65_automation_page.js',
          'parts/70_models_settings_boot.js',
          'parts/80_enhance.js',
-         'parts/85_robust.js', 'parts/90_perf.js', 'parts/95_features.js',
+         'parts/85_engines.js', 'parts/85_robust.js', 'parts/86_home_apps.js', 'parts/87_iris_bridge.js', 'parts/88_local_log_intent.js', 'parts/89_zcode_stream.js', 'parts/91_log_monitor.js', 'parts/92_laya_agent.js', 'parts/90_perf.js', 'parts/95_features.js',
          'parts/100_gateway.js', 'parts/110_polish.js',
          'parts/115_backend_sync.js',
          'parts/120_cost.js', 'parts/125_tools.js', 'parts/130_search.js',
-         'parts/135_ui_polish.js', 'parts/138_timeline.js']
+         'parts/135_ui_polish.js', 'parts/138_timeline.js', 'parts/145_chat_rails.js', 'parts/146_introspect.js']
 
 chunks = []
 for p in PARTS:
@@ -81,7 +82,7 @@ MANIFEST = """{
   "theme_color": "#0A0C14",
   "lang": "zh-CN",
   "icons": [
-    { "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230A0C14'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%233AD6E8'%3E%E2%97%88%3C/text%3E%3C/svg%3E", "sizes": "192x192", "type": "image/svg+xml" }
+    { "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230A0C14'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23E5734A'%3E%E2%97%88%3C/text%3E%3C/svg%3E", "sizes": "192x192", "type": "image/svg+xml" }
   ]
 }
 """
@@ -106,10 +107,11 @@ if 'manifest.webmanifest' not in html:
 # （file:// 双击打开同样无网络请求，行为一致；不改动任何 UI 设计）
 if 'rel="icon"' not in html:
     html = html.replace('<link rel="manifest" href="manifest.webmanifest">',
-        '<link rel="manifest" href="manifest.webmanifest">\n<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%230A0C14%27/%3E%3Ctext x=%2732%27 y=%2742%27 font-size=%2732%27 text-anchor=%27middle%27 fill=%27%233AD6E8%27%3E%E2%97%88%3C/text%3E%3C/svg%3E">')
+        '<link rel="manifest" href="manifest.webmanifest">\n<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%230A0C14%27/%3E%3Ctext x=%2732%27 y=%2742%27 font-size=%2732%27 text-anchor=%27middle%27 fill=%27%23E5734A%27%3E%E2%97%88%3C/text%3E%3C/svg%3E">')
 # [问题4] 构建期图标名修正：本地 lucide 库不存在的 2 个名称 → 确定替换（HTML 模板中的 data-lucide 属性）
 html = html.replace('data-lucide="code-review"', 'data-lucide="search-code"')
 html = html.replace('data-lucide="message-square-question"', 'data-lucide="message-circle-question"')
+html = html.replace("fill=%27%233AD6E8%27", "fill=%27%23E5734A%27")
 
 # 3) 全部产物先写 .tmp（原子构建：任一步失败则删除临时文件、保留上一版正式产物）
 staged = []
@@ -128,6 +130,22 @@ try:
     sw_src = re.sub(r"const CACHE_NAME = '[^']*'", "const CACHE_NAME = 'moray-" + build_ver + "'", sw_src, count=1)
     stage('sw.js', sw_src)
     stage('manifest.webmanifest', MANIFEST)
+
+    # [3.24.1] SW 预缓存清单防复发校验：模板 SHELL_URLS 里除 './' 外的每个条目都必须真实存在
+    # 于工程根。历史教训：./index.html 在工程根无文件、本地后端无此路由，cache.addAll 原子失败
+    # 又被静默吞掉，预缓存整体失效 → vendor 机会性缓存缺失 → 后端未就绪窗口全站白条。
+    m_shell = re.search(r'const SHELL_URLS = \[(.*?)\]', sw_src, re.S)
+    bad_sw_urls = []
+    if m_shell:
+        for u in re.findall(r"'([^']+)'", m_shell.group(1)):
+            if u == './':
+                continue
+            rel = u[2:] if u.startswith('./') else u
+            if not os.path.exists(rel):
+                bad_sw_urls.append(u)
+    if bad_sw_urls:
+        print('构建失败：sw_template.js SHELL_URLS 存在工程根不存在的条目：' + ', '.join(bad_sw_urls))
+        sys.exit(1)
 
     # 4) 运行时依赖校验（通过后才允许替换正式文件）
     missing = [rel for rel in RUNTIME_DEPS if not os.path.exists(rel)]
@@ -222,11 +240,20 @@ print('依赖校验通过：' + ', '.join(os.path.basename(r) for r in RUNTIME_D
 
 # ===================== [BYOK] --web：一键导出可部署静态网站目录 =====================
 # 用法：python assemble.py --web [目录名]（默认 web/）；不带参数 = 仅本地构建，行为不变。
+#
+# [批次二·任务F] 防复发约束：2026-09-30 批次一·续已把 web/moray-workbench.html 与
+# web/index.html 统一为顶层权威版（main.py 的 FRONTEND_HTML = 顶层 moray-workbench.html，
+# web/ 只是副本）。默认 --web 会用带演示横幅的变体覆盖这两个文件、再次制造分歧；
+# 加 --no-web-override 可在导出时跳过这两个文件。顶层 moray-workbench.html 是权威版本，
+# 只由本脚本的无参构建（parts -> SRC）生成，--web 分支从不写它。
 import argparse
 
 _parser = argparse.ArgumentParser(description='MoRay 构建脚本（parts -> 单文件 HTML）')
 _parser.add_argument('--web', nargs='?', const='web', default=None, metavar='DIR',
                      help='导出可直接部署到静态托管的网站目录（默认 web/），含线上版入口 index.html')
+_parser.add_argument('--no-web-override', action='store_true', dest='no_web_override',
+                     help='[批次二·任务F] --web 导出时跳过 index.html 与 moray-workbench.html'
+                          '（二者已与顶层权威版逐字统一，防止被演示横幅变体覆盖）')
 _args, _unknown = _parser.parse_known_args()
 if _unknown:
     print('忽略未知参数：' + ' '.join(_unknown))
@@ -294,8 +321,13 @@ if _args.web:
         import re as _re
         html = _re.sub(r'<body[^>]*>', lambda m: m.group(0) + banner, html, count=1)
         return html
-    _emit(SRC, 'index.html', _read_with_demo_banner())
-    _emit(SRC, 'moray-workbench.html', _read_with_demo_banner())
+    if _args.no_web_override:
+        # [批次二·任务F] 防复发：这两个文件已与顶层权威版逐字统一，禁止被 --web 变体覆盖。
+        print('[--no-web-override] 跳过 index.html 与 moray-workbench.html'
+              '（已与顶层权威版统一；如确需导出演示变体，请去掉本开关）')
+    else:
+        _emit(SRC, 'index.html', _read_with_demo_banner())
+        _emit(SRC, 'moray-workbench.html', _read_with_demo_banner())
     # deploy/（Worker 代理 + 部署说明）随包携带
     if os.path.isdir('deploy'):
         for root, _dirs, files in os.walk('deploy'):

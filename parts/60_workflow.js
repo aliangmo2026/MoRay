@@ -591,7 +591,7 @@ const WorkflowsApp = {
     list.innerHTML = recent.map(r => {
       const cls = r.status === 'success' ? 'success' : r.status === 'failed' ? 'error' : 'indexing';
       const text = r.status === 'success' ? '成功' : r.status === 'failed' ? '失败' : '停止';
-      return `<div class="doc-card px-4 py-2.5 flex items-center justify-between" data-run-view="${r.id}" style="cursor:pointer">
+      return `<div class="doc-card px-4 py-3 flex items-center justify-between" data-run-view="${r.id}" style="cursor:pointer">
         <div class="flex items-center gap-3 min-w-0">
           <span class="doc-status ${cls}">${text}</span>
           <span class="text-xs text-text-primary truncate">${escapeHtml(r.workflowName)}</span>
@@ -774,7 +774,7 @@ const WorkflowsApp = {
       const box = showModal(`
         <div class="form-row form-inline">
           <div style="flex:2"><label class="form-label">名称 *</label><input type="text" id="weName" class="form-input" value="${escapeHtml(state.name)}" placeholder="工作流名称"></div>
-          <div><label class="form-label">强调色</label><div class="flex gap-1.5 h-9 items-center">${ACCENTS.map(c => `<div class="theme-color-option ${state.accent === c ? 'active' : ''}" data-accent="${c}" style="width:20px;height:20px;background:${c};border-radius:6px;cursor:pointer"></div>`).join('')}</div></div>
+          <div><label class="form-label">强调色</label><div class="flex gap-2 h-9 items-center">${ACCENTS.map(c => `<div class="theme-color-option ${state.accent === c ? 'active' : ''}" data-accent="${c}" style="width:20px;height:20px;background:${c};border-radius:6px;cursor:pointer"></div>`).join('')}</div></div>
         </div>
         <div class="form-row form-inline">
           <div style="flex:2"><label class="form-label">描述</label><input type="text" id="weDesc" class="form-input" value="${escapeHtml(state.description)}" placeholder="一句话说明用途"></div>

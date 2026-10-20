@@ -287,7 +287,7 @@ function buildErrorCard(title, message, onRetry) {
     <div class="error-card-title"><i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>${escapeHtml(title)}</div>
     <div class="error-card-msg">${escapeHtml(message)}</div>`;
   const retry = document.createElement('button');
-  retry.className = 'btn-ghost px-3 py-1.5 rounded-lg text-[11px] border border-line-ghost mt-2 flex items-center gap-1';
+  retry.className = 'btn-ghost px-3 py-2 rounded-lg text-[11px] border border-line-ghost mt-2 flex items-center gap-1';
   retry.innerHTML = '<i data-lucide="rotate-ccw" class="w-3 h-3"></i>重试';
   retry.addEventListener('click', onRetry);
   card.appendChild(retry);
@@ -568,8 +568,8 @@ const CustomShortcuts = {
       <div class="space-y-1">${rows}</div>
       <p class="text-[10px] text-text-tertiary mt-3">点击右侧按键后按下新的组合键即可重新绑定；Esc 取消捕获。自定义绑定与内建快捷键并存。</p>
       <div class="flex gap-2 mt-2">
-        <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="scExport">导出配置</button>
-        <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="scImport">导入配置</button>
+        <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="scExport">导出配置</button>
+        <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="scImport">导入配置</button>
       </div>`,
       { title: '快捷键自定义', icon: 'keyboard',
         footer: `<button class="btn-ghost px-4 py-2 rounded-lg text-sm border border-line-ghost" id="scReset">恢复默认</button>
@@ -652,13 +652,14 @@ function exportCompareReport(results, prompt) {
 /** 在设置页追加：隐私模式 / Embedding 后端 / 自定义快捷键入口
  * @returns {void} */
 function appendEnhanceSettings() {
-  const container = document.querySelector('#page-settings .max-w-2xl');
+  const container = document.querySelector('#settingsBody, #page-settings .max-w-2xl');
   if (!container || container.querySelector('#enhanceSettingsCard')) return;
   const c = MoraySettings.get();
   const card = document.createElement('div');
   card.id = 'enhanceSettingsCard';
   card.className = 'glass-card rounded-xl p-5 border border-line-ghost/60';
   card.innerHTML = `
+    <div class="settings-group-tag" style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:3px;height:10px;border-radius:2px;background:var(--brand,#E5734A);flex-shrink:0"></span><span style="font-size:10px;font-weight:500;color:var(--color-text-secondary,#a3a3a3);letter-spacing:0.05em">系统与数据</span></div>
     <h3 class="text-sm font-semibold text-text-primary mb-4 flex items-center gap-2">
       <i data-lucide="shield-check" class="w-4 h-4 text-success"></i>隐私与增强
     </h3>
@@ -675,7 +676,7 @@ function appendEnhanceSettings() {
           <div class="text-xs text-text-secondary">向量化后端</div>
           <div class="text-[10px] text-text-tertiary">auto=优先 Ollama；local=浏览器内 Transformers.js；hash=纯本地词频</div>
         </div>
-        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 10px;font-size:12px">
+        <select id="setEmbedBackend" class="form-select" style="width:auto;padding:4px 12px;font-size:12px">
           <option value="auto" ${c.embeddingBackend === 'auto' ? 'selected' : ''}>auto</option>
           <option value="transformers" ${c.embeddingBackend === 'transformers' ? 'selected' : ''}>local (Transformers.js)</option>
           <option value="hash" ${c.embeddingBackend === 'hash' ? 'selected' : ''}>hash</option>
@@ -683,14 +684,14 @@ function appendEnhanceSettings() {
       </div>
       <div class="flex items-center justify-between pt-2 border-t border-line-ghost/50">
         <div class="text-xs text-text-secondary">快捷键自定义</div>
-        <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="openShortcutSettings">配置快捷键</button>
+        <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="openShortcutSettings">配置快捷键</button>
       </div>
       <div class="flex items-center justify-between pt-2 border-t border-line-ghost/50">
         <div>
           <div class="text-xs text-text-secondary">加密导出数据</div>
           <div class="text-[10px] text-text-tertiary">导出时使用口令加密（AES-GCM），导入时需输入相同口令</div>
         </div>
-        <button class="btn-ghost px-3 py-1.5 rounded-lg text-xs border border-line-ghost" id="encryptedExportBtn">加密导出</button>
+        <button class="btn-ghost px-3 py-2 rounded-lg text-xs border border-line-ghost" id="encryptedExportBtn">加密导出</button>
       </div>
     </div>`;
     container.appendChild(card);

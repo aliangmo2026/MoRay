@@ -1,0 +1,54 @@
+{
+  "name": "moray-desktop",
+  "version": "1.0.0",
+  "description": "MoRay 全生态工作台 - Electron 桌面端（只给现有网页套原生窗口外壳，不改动任何原有界面）",
+  "main": "main.js",
+  "author": "MoRay",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "electron-builder --win nsis",
+    "dist:portable": "electron-builder --win portable",
+    "dist:dir": "electron-builder --win dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.moray.workbench",
+    "productName": "MoRay Workbench",
+    "copyright": "Copyright © 2026 MoRay",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MoRay Workbench",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "MoRayWorkbench-portable-${version}.exe"
+    }
+  }
+}

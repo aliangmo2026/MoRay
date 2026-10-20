@@ -18,13 +18,13 @@ const AutomationPage = {
           <span class="tag-pill bg-brand-cobalt/15 text-brand-cobalt" id="workflowCountPill">0 个模板</span>
         </div>
         <div class="flex items-center gap-2">
-          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="importWorkflowBtn">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-2 border border-line-ghost" id="importWorkflowBtn">
             <i data-lucide="upload" class="w-3.5 h-3.5"></i>导入
           </button>
-          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 border border-line-ghost" id="exportWorkflowBtn" title="导出全部工作流（JSON）">
+          <button class="btn-ghost px-3 h-8 rounded-lg text-xs flex items-center gap-2 border border-line-ghost" id="exportWorkflowBtn" title="导出全部工作流（JSON）">
             <i data-lucide="download" class="w-3.5 h-3.5"></i>导出
           </button>
-          <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-1.5 relative overflow-hidden" id="newWorkflowBtn" onclick="createRipple(event)">
+          <button class="btn-primary px-3 h-8 rounded-lg text-xs flex items-center gap-2 relative overflow-hidden" id="newWorkflowBtn" onclick="createRipple(event)">
             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
             新建工作流
           </button>
@@ -35,9 +35,9 @@ const AutomationPage = {
         <div class="mb-4 flex items-center justify-between rounded-lg bg-surface-panel/60 border border-line-ghost/50 px-3 py-2">
           <div class="flex-1 mr-3">
             <div class="text-xs text-text-secondary">允许自定义 JS 代码节点</div>
-            <div class="text-[10px] text-text-tertiary mt-0.5">代码节点将在本机浏览器主线程执行，可访问页面数据与本地存储（默认关闭，推荐保持关闭）</div>
+            <div class="text-[10px] text-text-tertiary mt-1">代码节点将在本机浏览器主线程执行，可访问页面数据与本地存储（默认关闭，推荐保持关闭）</div>
           </div>
-          <button class="btn-ghost px-2.5 py-1 rounded-lg text-[10px] border border-line-ghost" id="codeNodesToggleBtn">关闭</button>
+          <button class="btn-ghost px-3 py-1 rounded-lg text-[10px] border border-line-ghost" id="codeNodesToggleBtn">关闭</button>
         </div>
         <!-- 执行监控面板 -->
         <div class="mb-6 hidden" id="workflowRunSection">
@@ -67,8 +67,8 @@ const AutomationPage = {
             <div class="running-workflow-steps" id="runSteps"></div>
           </div>
           <div class="glass-card rounded-xl border border-line-ghost/60 mt-3 overflow-hidden">
-            <div class="px-4 py-2.5 flex items-center justify-between border-b border-line-ghost/50">
-              <span class="text-xs font-medium text-text-secondary flex items-center gap-1.5">
+            <div class="px-4 py-3 flex items-center justify-between border-b border-line-ghost/50">
+              <span class="text-xs font-medium text-text-secondary flex items-center gap-2">
                 <i data-lucide="scroll-text" class="w-3.5 h-3.5 text-brand-cobalt"></i>执行日志
               </span>
               <button class="text-[10px] text-text-tertiary hover:text-text-secondary" id="runLogClear">清空</button>

@@ -796,7 +796,7 @@ function enhanceCodeBlocks(container, withLineNumbers) {
     try { pre.replaceWith(wrapper); } catch (e) { return; }
     wrapper.querySelector('.code-with-lines').appendChild(pre);
     pre.className = 'text-text-secondary text-[12px] m-0';
-    pre.style.cssText = 'padding:12px 14px;margin:0;overflow-x:auto;max-height:420px;overflow-y:auto';
+    pre.style.cssText = 'padding:12px 16px;margin:0;overflow-x:auto;max-height:420px;overflow-y:auto';
 
     const rawText = codeEl.textContent;
     // 行数多时显示行号开关

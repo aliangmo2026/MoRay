@@ -2,16 +2,35 @@
    策略：HTML/导航请求 -> 网络优先（失败回退缓存）；CDN 与静态资源 -> 缓存优先（后台更新）
    例外：/api/* 一律不拦截（见下方注释） */
 const CACHE_NAME = 'moray-v2.0.1';
+// [3.24.1] 预缓存清单 = 页面外壳 + 首屏同步加载的渲染关键 vendor。
+// 此前清单只有 4 个 HTML/manifest 项，vendor（含 tailwind-browser-4.js）全靠"首次成功访问时
+// 机会性入缓存"；一旦 vendor 缓存未命中 + 后端未就绪，HTML 能渲染但 Tailwind 拿不到 → 全站白条
+// （周期性复现的根因）。pdf/mammoth/prettier 是按需懒加载（首次用到才请求），保持机会性缓存，
+// 不进预缓存清单。
+// 注意：./index.html 不列入 —— 工程根没有该文件、本地后端也没有这条路由，列入必 404。
 const SHELL_URLS = [
   './moray-workbench.html',
-  './index.html',
   './',
-  './manifest.webmanifest'
+  './manifest.webmanifest',
+  './vendor/tailwind-browser-4.js',
+  './vendor/lucide.min.js',
+  './vendor/marked.min.js',
+  './vendor/purify.min.js',
+  './vendor/highlight.min.js'
 ];
 
 self.addEventListener('install', (e) => {
+  // [3.24.1] 不再用 cache.addAll：它按清单整体失败（原子性），此前清单里的 ./index.html 必然
+  // 404，导致整个预缓存（含 4 个 HTML 项）从未真正成功，且 catch(() => {}) 把失败静默吞掉。
+  // 改为逐项 cache.add：单项失败只跳过该项并记录，不拖垮其余项。
   e.waitUntil(caches.open(CACHE_NAME).then(cache =>
-    cache.addAll(SHELL_URLS).catch(() => {})
+    Promise.allSettled(SHELL_URLS.map(u => cache.add(u))).then(results => {
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          console.warn('[MoRay SW] 预缓存单项失败（已跳过）:', SHELL_URLS[i], r.reason);
+        }
+      });
+    })
   ));
   self.skipWaiting();
 });

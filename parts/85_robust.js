@@ -131,7 +131,7 @@ function renderSessionListVirtual(filtered) {
       <div class="session-item ${AppState.activeConv && AppState.activeConv.id === c.id ? 'active' : ''} ${c.pinned ? 'pinned' : ''}"
            data-conv-id="${c.id}" data-title="${escapeHtml(c.title || '')}" style="height:100%">
         <div class="flex items-center justify-between">
-          <div class="session-title flex items-center gap-1.5 truncate">${escapeHtml(c.title || '新对话')}${c.unread ? '<span class="unread-dot"></span>' : ''}</div>
+          <div class="session-title flex items-center gap-2 truncate">${escapeHtml(c.title || '新对话')}${c.unread ? '<span class="unread-dot"></span>' : ''}</div>
           <div class="session-item-actions">
             <button class="session-item-action ${c.pinned ? 'active-pin' : ''}" data-op="pin" title="置顶"><i data-lucide="pin" class="w-3 h-3"></i></button>
             <button class="session-item-action" data-op="rename" title="重命名"><i data-lucide="pencil" class="w-3 h-3"></i></button>

@@ -314,7 +314,7 @@
         if (!conv || !conv.syncStatus || conv.syncStatus === '已同步') return;
         const badge = document.createElement('span');
         badge.className = 'sync-badge';
-        badge.style.cssText = 'font-size:8px;line-height:1;padding:2px 4px;border-radius:4px;margin-left:4px;flex-shrink:0;';
+        badge.style.cssText = 'font-size:10px;line-height:1;padding:2px 4px;border-radius:4px;margin-left:4px;flex-shrink:0;';
         if (conv.syncStatus === '待同步') {
           badge.textContent = '待同步';
           badge.style.color = '#F2B24C';

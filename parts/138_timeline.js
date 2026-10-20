@@ -139,16 +139,20 @@ const TimelineViewer = {
    * @returns {boolean} 是否已就绪 */
   installNavButton() {
     if (document.getElementById('navTimelineBtn')) return true;
+    // [A-1] 插入骨架「任务」分组容器；容器缺失时回退旧的 cost 同级插入
+    const group = document.querySelector('.nav-group[data-nav-group="tasks"]');
     const cost = document.querySelector('.nav-icon-btn[data-page="cost"]');
-    const nav = cost ? cost.parentElement : document.querySelector('aside nav');
+    const nav = group || (cost ? cost.parentElement : document.querySelector('aside nav'));
     if (!nav) return false;
     const btn = document.createElement('button');
     btn.id = 'navTimelineBtn';
     btn.className = 'nav-icon-btn';
     btn.setAttribute('data-tooltip', '飞行记录仪（工具调用时间轴）');
     btn.setAttribute('aria-label', '飞行记录仪（工具调用时间轴）');
-    btn.innerHTML = '<i data-lucide="activity" class="w-[18px] h-[18px]"></i>';
-    if (cost) cost.insertAdjacentElement('afterend', btn); else nav.appendChild(btn);
+    btn.innerHTML = '<i data-lucide="activity" class="w-4 h-4"></i><span class="nav-icon-label">飞行记录仪</span>';
+    if (group) { group.appendChild(btn); group.classList.remove('nav-group-empty'); }
+    else if (cost) cost.insertAdjacentElement('afterend', btn);
+    else nav.appendChild(btn);
     btn.addEventListener('click', () => this.toggle());
     refreshIcons();
     return true;
@@ -158,12 +162,30 @@ const TimelineViewer = {
    * @returns {void} */
   toggle() { this.state.open ? this.close() : this.open(); },
 
+  /** 导航栏高亮同步（互斥）
+   * 本入口是右侧浮层，刻意不设 data-page、不参与页面切换（见 installNavButton 注释），
+   * 因此骨架/68/69 那几套「只认 [data-page]」的切换逻辑永远不会碰它 —— 点击它时旧页面的
+   * 高亮会原地留着，看起来就是两个图标同时亮（且它自己因为没被清过一次也拿不到 active）。
+   * 浮层打开期间把高亮让给它，关闭时按**当前仍在显示的**页面容器还原，避免关闭后满栏无高亮。
+   * @param {boolean} on - 浮层是否已打开
+   * @returns {void} */
+  syncNavActive(on) {
+    document.querySelectorAll('.nav-icon-btn[data-page]').forEach(b => {
+      if (on) { b.classList.remove('active'); return; }
+      const page = document.getElementById('page-' + b.dataset.page);
+      b.classList.toggle('active', !!page && !page.classList.contains('hidden'));
+    });
+    const btn = document.getElementById('navTimelineBtn');
+    if (btn) btn.classList.toggle('active', !!on);
+  },
+
   /** 打开时间轴面板（首次调用创建 DOM；重复调用只做滑入）
    * @returns {void} */
   open() {
     const panel = this._ensurePanel();
     if (!panel) return;
     this.state.open = true;
+    this.syncNavActive(true);
     this.state.expandedId = null;
     panel.classList.remove('hidden');
     panel.classList.add('flex');
@@ -184,6 +206,7 @@ const TimelineViewer = {
   close() {
     if (!this.state.open) return;
     this.state.open = false;
+    this.syncNavActive(false);
     this.stopAutoRefresh();
     this.state.expandedId = null;
     const panel = document.getElementById('timelinePanel');
@@ -227,32 +250,32 @@ const TimelineViewer = {
             '<div class="text-[10px] text-text-tertiary">工具调用审计 · 后端 SQLite 持久化</div>' +
           '</div>' +
         '</div>' +
-        '<button id="timelineCloseBtn" class="btn-ghost p-1.5 rounded-lg border border-line-ghost" aria-label="关闭面板" title="关闭（Esc）">' +
+        '<button id="timelineCloseBtn" class="btn-ghost p-2 rounded-lg border border-line-ghost" aria-label="关闭面板" title="关闭（Esc）">' +
           '<i data-lucide="x" class="w-4 h-4"></i>' +
         '</button>' +
       '</div>' +
       '<div class="flex items-center gap-2 px-4 py-2 border-b border-line-ghost/50 flex-shrink-0 flex-wrap">' +
-        '<select id="timelineStatusSel" class="form-select" style="width:auto;padding:3px 8px;font-size:11px" aria-label="状态筛选"></select>' +
-        '<select id="timelineToolSel" class="form-select" style="width:auto;max-width:150px;padding:3px 8px;font-size:11px" aria-label="工具筛选"></select>' +
-        '<button id="timelineRefreshBtn" class="btn-ghost px-2.5 h-7 rounded-lg text-[10px] flex items-center gap-1.5 border border-line-ghost" title="重新从后端拉取最新记录">' +
+        '<select id="timelineStatusSel" class="form-select" style="width:auto;padding:4px 8px;font-size:11px" aria-label="状态筛选"></select>' +
+        '<select id="timelineToolSel" class="form-select" style="width:auto;max-width:150px;padding:4px 8px;font-size:11px" aria-label="工具筛选"></select>' +
+        '<button id="timelineRefreshBtn" class="btn-ghost px-3 h-7 rounded-lg text-[10px] flex items-center gap-2 border border-line-ghost" title="重新从后端拉取最新记录">' +
           '<i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>刷新' +
         '</button>' +
-        '<div class="ml-auto flex items-center gap-1.5 text-[10px] text-text-secondary" title="开启后每 10 秒自动刷新（页面隐藏时暂停）">自动刷新' +
+        '<div class="ml-auto flex items-center gap-2 text-[10px] text-text-secondary" title="开启后每 10 秒自动刷新（页面隐藏时暂停）">自动刷新' +
           '<div class="toggle-track" id="timelineAutoToggle" role="switch" aria-checked="false" aria-label="自动刷新" tabindex="0"><div class="toggle-thumb"></div></div>' +
         '</div>' +
       '</div>' +
-      '<div class="flex items-center gap-2 px-4 py-1.5 text-[10px] text-text-tertiary border-b border-line-ghost/40 flex-shrink-0">' +
+      '<div class="flex items-center gap-2 px-4 py-2 text-[10px] text-text-tertiary border-b border-line-ghost/40 flex-shrink-0">' +
         '<span id="timelineStats">显示 0 / 共 0 条</span>' +
         '<span id="timelineUpdated" class="ml-auto font-mono"></span>' +
       '</div>' +
       '<div id="timelineError" class="hidden mx-4 mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 flex-shrink-0">' +
         '<div class="flex items-start gap-2">' +
-          '<i data-lucide="alert-triangle" class="w-4 h-4 text-danger flex-shrink-0 mt-0.5"></i>' +
+          '<i data-lucide="alert-triangle" class="w-4 h-4 text-danger flex-shrink-0 mt-1"></i>' +
           '<div class="flex-1 min-w-0">' +
             '<div id="timelineErrorMsg" class="text-[11px] text-danger">无法连接后端</div>' +
             '<div id="timelineErrorHint" class="text-[10px] text-text-tertiary mt-1">请确认 MoRay 后端已启动（双击 启动MoRay.bat）</div>' +
           '</div>' +
-          '<button id="timelineRetryBtn" class="btn-ghost px-2 py-0.5 rounded-md text-[10px] border border-danger/40 text-danger flex-shrink-0">重试</button>' +
+          '<button id="timelineRetryBtn" class="btn-ghost px-2 py-1 rounded-md text-[10px] border border-danger/40 text-danger flex-shrink-0">重试</button>' +
         '</div>' +
       '</div>' +
       '<div id="timelineBody" class="flex-1 overflow-y-auto p-4 min-h-0">' +
@@ -466,20 +489,20 @@ const TimelineViewer = {
         '<div class="tl-card rounded-lg border bg-surface-card/50 hover:border-brand-cobalt/40 transition-colors cursor-pointer ' +
           (isOpen ? 'border-brand-cobalt/50' : 'border-line-ghost/50') + '"' +
           ' data-tl-id="' + Number(row.id) + '" tabindex="0" role="button" aria-expanded="' + (isOpen ? 'true' : 'false') + '">' +
-          '<div class="px-3 py-2.5">' +
+          '<div class="px-3 py-3">' +
             '<div class="flex items-center gap-2 mb-1">' +
               '<span class="text-xs font-medium text-text-primary">' + escapeHtml(this.toolLabel(row.tool)) + '</span>' +
-              '<span class="text-[9px] px-1.5 py-0.5 rounded border ' + st.badge + '">' + escapeHtml(st.label) + '</span>' +
+              '<span class="text-[10px] px-2 py-1 rounded border ' + st.badge + '">' + escapeHtml(st.label) + '</span>' +
               '<span class="ml-auto font-mono text-[10px] text-text-tertiary">' + escapeHtml(this._timeOnly(row.ts)) + '</span>' +
               '<i data-lucide="chevron-down" class="tl-caret w-3 h-3 text-text-tertiary transition-transform' + (isOpen ? ' rotate-180' : '') + '"></i>' +
             '</div>' +
             '<div class="font-mono text-[10px] text-text-tertiary break-all leading-relaxed">' + escapeHtml(summary || '（无参数摘要）') + '</div>' +
-            '<div class="flex items-center gap-3 mt-1.5 text-[10px]">' +
+            '<div class="flex items-center gap-3 mt-2 text-[10px]">' +
               '<span class="text-text-tertiary">耗时 <span class="font-mono">' + escapeHtml(this.formatMs(row.ms)) + '</span></span>' +
               (approved
                 ? '<span class="text-success">已审批</span>'
                 : '<span class="text-text-tertiary">未审批/自动</span>') +
-              '<span class="ml-auto font-mono text-[9px] opacity-70">#' + Number(row.id) + '</span>' +
+              '<span class="ml-auto font-mono text-[10px] opacity-70">#' + Number(row.id) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="overflow-hidden" data-tl-detail="' + Number(row.id) + '" style="max-height:0"></div>' +
@@ -499,7 +522,7 @@ const TimelineViewer = {
     const replayable = ['error', 'timeout', 'rejected', 'needs_approval'].indexOf(String(row.status)) >= 0;
     const hasSnapshot = row.snapshot_id != null && Number(row.snapshot_id) > 0;
     return '' +
-      '<div class="border-t border-line-ghost/40 bg-surface-panel/40 px-3 py-2.5 space-y-2">' +
+      '<div class="border-t border-line-ghost/40 bg-surface-panel/40 px-3 py-3 space-y-2">' +
         '<div>' +
           '<div class="text-[10px] text-text-tertiary mb-1">参数摘要（完整）</div>' +
           '<div class="font-mono text-xs text-text-secondary bg-surface-deep rounded-lg border border-line-ghost/50 p-2 break-all whitespace-pre-wrap">' +
@@ -524,16 +547,16 @@ const TimelineViewer = {
         (replayable && hasSnapshot
           ? '<div class="pt-1 border-t border-line-ghost/30">' +
               '<button data-tl-replay="' + Number(row.id) + '"' +
-                ' class="btn-primary px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 w-full justify-center">' +
+                ' class="btn-primary px-3 py-2 rounded-lg text-[11px] flex items-center gap-2 w-full justify-center">' +
                 '<i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>' +
                 '修改并重放此步骤' +
               '</button>' +
-              '<div class="text-[9px] text-text-tertiary text-center mt-1">重放将经过完整安全校验（路径防护 + 副作用审批）</div>' +
+              '<div class="text-[10px] text-text-tertiary text-center mt-1">重放将经过完整安全校验（路径防护 + 副作用审批）</div>' +
             '</div>'
           : '') +
         (replayable && !hasSnapshot
           ? '<div class="pt-1 border-t border-line-ghost/30">' +
-              '<div class="flex items-center justify-center gap-1.5 text-[10px] text-text-tertiary py-1.5">' +
+              '<div class="flex items-center justify-center gap-2 text-[10px] text-text-tertiary py-2">' +
                 '<i data-lucide="info" class="w-3 h-3"></i>' +
                 '该记录无事件快照，暂不支持重放（新产生的记录将自动支持）' +
               '</div>' +
@@ -570,7 +593,7 @@ const TimelineViewer = {
             '<div class="text-sm font-medium text-text-primary">修改并重放</div>' +
             '<div class="text-[10px] text-text-tertiary">' + escapeHtml(this.toolLabel(row.tool)) + ' · 记录 #' + Number(row.id) + '</div>' +
           '</div>' +
-          '<button id="tlReplayClose" class="btn-ghost p-1.5 rounded-lg border border-line-ghost" aria-label="关闭">' +
+          '<button id="tlReplayClose" class="btn-ghost p-2 rounded-lg border border-line-ghost" aria-label="关闭">' +
             '<i data-lucide="x" class="w-4 h-4"></i>' +
           '</button>' +
         '</div>' +
@@ -594,7 +617,7 @@ const TimelineViewer = {
           (isSideEffect
             ? '<div class="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2">' +
                 '<div class="flex items-start gap-2">' +
-                  '<i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-warning flex-shrink-0 mt-0.5"></i>' +
+                  '<i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-warning flex-shrink-0 mt-1"></i>' +
                   '<div class="text-[10px] text-text-secondary leading-relaxed">' +
                     '这是副作用工具（写文件/执行命令等），重放需要勾选下方「确认执行」才会真正执行。' +
                     '所有操作仍经过完整的路径越界防护和安全校验。' +
@@ -608,9 +631,9 @@ const TimelineViewer = {
             : '') +
         '</div>' +
         '<div class="flex items-center gap-2 px-4 py-3 border-t border-line-ghost/60 flex-shrink-0">' +
-          '<button id="tlReplayCancel" class="btn-ghost px-4 py-1.5 rounded-lg text-[11px] border border-line-ghost">取消</button>' +
+          '<button id="tlReplayCancel" class="btn-ghost px-4 py-2 rounded-lg text-[11px] border border-line-ghost">取消</button>' +
           '<div class="flex-1"></div>' +
-          '<button id="tlReplayRun" class="btn-primary px-4 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5">' +
+          '<button id="tlReplayRun" class="btn-primary px-4 py-2 rounded-lg text-[11px] flex items-center gap-2">' +
             '<i data-lucide="play" class="w-3.5 h-3.5"></i>执行重放' +
           '</button>' +
         '</div>' +
@@ -917,7 +940,7 @@ const TimelineViewer = {
       refreshIcons();
       return;
     }
-    f.innerHTML = '<span class="inline-flex items-center gap-1.5"><i data-lucide="check-circle-2" class="w-3 h-3 opacity-60"></i>已加载全部记录</span>';
+    f.innerHTML = '<span class="inline-flex items-center gap-2"><i data-lucide="check-circle-2" class="w-3 h-3 opacity-60"></i>已加载全部记录</span>';
     refreshIcons();
   },
 
@@ -1036,7 +1059,7 @@ const TimelineViewer = {
     const block = (text, cls, sign) => String(text || '').split('\n')
       .map(l => '<div class="font-mono text-[10px] whitespace-pre-wrap break-all px-1 ' + cls + '">' +
         escapeHtml(sign + l) + '</div>').join('');
-    return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-1.5 max-h-44 overflow-auto">' +
+    return '<div class="rounded border border-line-ghost/50 bg-surface-panel/40 p-2 max-h-44 overflow-auto">' +
       block(before, 'text-danger bg-danger/10', '-') + block(after, 'text-success bg-success/10', '+') + '</div>';
   },
 
