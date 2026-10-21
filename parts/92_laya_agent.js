@@ -988,7 +988,8 @@
 
   /* ---------------- [U-6-1 2026-10-01] 代码意图 → ZCode 沙箱直跑，完整过程渲染进主对话流 ----------------
    * 入口：tryWrap 的 'code' 分支（decideMode 判定 mode=agent 且 intent_type ∈ code/file_op/tool_call）。
-   * 数据流：POST 8000 /api/engines/zcode/tasks → GET /api/engines/zcode/stream/<task_id>
+   * 数据流：POST 8000 /api/engines/<engine>/tasks → GET /api/engines/<engine>/stream/<task_id>
+   *   （engine=输入台引擎选择器 localStorage 'moray_engine'，缺省 zcode；[多引擎切换 2026-10-21]）
    *   （fetch+ReadableStream 手写 SSE 解析，与 runAgent 同款分帧；无重连，[DONE] 即终态）。
    * 渲染契约：每帧 applyZCodeEvent 只改 msg.execution（纯可序列化状态 → IndexedDB），
    *   80ms 节流 zcodePaint → renderExecutionCard 从状态全量重绘卡片；终态强制重绘+落库。
@@ -1012,6 +1013,14 @@
     return base;
   }
 
+  /** [多引擎切换 2026-10-21] 执行引擎短名：输入台引擎选择器存 localStorage 'moray_engine'。
+   *  拼 URL 前过 URL 段白名单——引擎名进的是路径段，../ 或 :// 之类注入串一律打回 zcode。 */
+  function selectedEngineName() {
+    var n = '';
+    try { n = String(localStorage.getItem('moray_engine') || ''); } catch (e) { /* 隐私模式 */ }
+    return /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(n) ? n : 'zcode';
+  }
+
   function zcodeBasename(p) {
     var s = String(p || '');
     var i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
@@ -1031,13 +1040,14 @@
 
   var zcodeLive = {};   // msg.id → { el, timer, curReasoning, lastPaintAt, lastPersistAt, ctrl, stopping, stop }（后三项：[停止修复 2026-10-03]）
   var zcodeSnapStopping = {};   // [停止修复 2026-10-03] 快照态（刷新后无 zcodeLive 条目）停止防重点位图
+  var zcodeTaskEngine = {};   // [多引擎切换 2026-10-21] taskId → 受理时引擎名（kill 须同引擎，中途切引擎不串链）
 
   /** [停止修复 2026-10-03] 服务端收进程树（POST …/kill）。5s 超时；网络/非 2xx 一律
    *  诚实折成 {killed:false, reason}——调用方停止流程照常推进，绝不抛穿。 */
   async function zcodeKillTask(taskId) {
     var killed = false, reason = '', pid = null, exitCode = null;
     try {
-      var kr = await fetch(backendBase() + '/api/engines/zcode/tasks/' + encodeURIComponent(taskId) + '/kill',
+      var kr = await fetch(backendBase() + '/api/engines/' + encodeURIComponent(zcodeTaskEngine[taskId] || selectedEngineName()) + '/tasks/' + encodeURIComponent(taskId) + '/kill',
         { method: 'POST',
           signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(5000) : undefined });
       var kj = null;
@@ -1518,8 +1528,9 @@
 
       // 2. 受理任务（受理失败 → 置终态后 return，finally 统一重绘+落库+撤销注册表）
       var tid = null;
+      var engName = selectedEngineName();   // [多引擎切换 2026-10-21] 受理时点的引擎（stream/kill 同链，中途切换不串）
       try {
-        var resp = await fetch(backendBase() + '/api/engines/zcode/tasks', {
+        var resp = await fetch(backendBase() + '/api/engines/' + encodeURIComponent(engName) + '/tasks', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           signal: ctrl.signal,   // [停止修复 2026-10-03] 受理 fetch 同闸（按钮到 taskId 才亮，点不到受理期，接 signal 属防御完备）
           body: JSON.stringify({ prompt: String(prompt || ''), language: 'auto' })
@@ -1540,6 +1551,7 @@
         return;
       }
       msg.execution.taskId = tid;
+      zcodeTaskEngine[tid] = engName;   // [多引擎切换] kill 走同引擎
       zcodePersist(msg, true);
       zcodePaint(msg, true);
 
@@ -1547,7 +1559,7 @@
       //    服务端发完 [DONE] 即关流，读到 chunk.done 自然结束
       var gotResult = false;
       try {
-        var sResp = await fetch(backendBase() + '/api/engines/zcode/stream/' + encodeURIComponent(tid),
+        var sResp = await fetch(backendBase() + '/api/engines/' + encodeURIComponent(engName) + '/stream/' + encodeURIComponent(tid),
           { signal: ctrl.signal });   // [停止修复 2026-10-03] stop() abort 断此流（kill 先行，见上）
         if (!sResp.ok || !sResp.body) throw new Error('HTTP ' + sResp.status);
         var reader = sResp.body.getReader();

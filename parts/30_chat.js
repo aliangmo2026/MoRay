@@ -455,6 +455,159 @@ function installThinkModeBtn() {
   refreshThinkModeBtn();
 }
 
+/** [多引擎切换 2026-10-21] 输入工具栏"执行引擎"选择器（对齐深度思考按钮模式）：
+ * 启动时 GET /api/engines/list 动态拉取已注册引擎（local/zcode/laya…，后端注册即前端可见，
+ * 零写死），点击弹出 Popover 列表；选中存 localStorage 'moray_engine'（默认 zcode），
+ * 92 的任务派发据此拼 /api/engines/<name>/tasks 通用路由。
+ * 样式手写注入（Tailwind 动态类对运行时注入元素不可靠，thinkModeBtn 同款教训）；
+ * Popover 挂 body（#coreInputContainer overflow-hidden 会裁剪）。弹窗互斥：开本弹窗强拆
+ * modelPickerPop+thinkModePopover（thinkMode 强拆 modelPickerPop 同款）；外点收起走
+ * capture 阶段 mousedown——模型/思考触发器的 click stopPropagation 会阻断 document click
+ * closer，capture 先行即免动 110/30 既有闭合逻辑。引擎名过 URL 段白名单后才拼进 fetch
+ * （防 localStorage 被塞 ../ 或 :// 注入串进请求路径）；列表渲染前 escapeHtml。
+ * @returns {void} */
+function installEngineSelector() {
+  const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
+  if (!toolbar || document.getElementById('engineSelector')) return;
+  const ENGINE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+  const STORE_KEY = 'moray_engine';
+  const savedName = () => {
+    var n = '';
+    try { n = String(localStorage.getItem(STORE_KEY) || ''); } catch (e) { /* 隐私模式 */ }
+    return ENGINE_NAME_RE.test(n) ? n : 'zcode';
+  };
+  const displayName = (n) => ({ zcode: 'ZCode', laya: 'Laya', local: 'Local' })[n]
+    || (String(n).charAt(0).toUpperCase() + String(n).slice(1));
+  const esc = (typeof escapeHtml === 'function') ? escapeHtml : (s) => String(s)
+    .replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  let engineList = [];   // 启动预取存内存；每次开弹窗复检（后端可能晚于页面启动上线/热插拔）
+  // 后端基址与 89 的 streamBase / 92 的 backendBase 同链（跨 part 不共享闭包，各持一份小解析）
+  const backendOrigin = () => {
+    var trim = (s) => String(s).replace(/\/+$/, '');
+    var base = '';
+    try { var mb = window.MorayBackend; if (mb && mb.origin) base = trim(mb.origin); } catch (e) { /* 下一级 */ }
+    if (!base && typeof window.resolveBackendOrigin === 'function') {
+      try { base = trim(window.resolveBackendOrigin()); } catch (e) { /* 忽略 */ }
+    }
+    if (!base && typeof agentBackendBase === 'function') {
+      try { base = trim(agentBackendBase()); } catch (e) { /* 忽略 */ }
+    }
+    if (!base) base = 'http://127.0.0.1:8000';
+    try { if (trim(location.origin) === base) return ''; } catch (e) { /* file:// 等 */ }
+    return base;
+  };
+  // 1) 触发器按钮（icon + 当前引擎名）
+  const btn = document.createElement('button');
+  btn.id = 'engineSelector';
+  btn.className = 'input-toolbar-btn engine-selector-btn';
+  btn.setAttribute('aria-label', '执行引擎');
+  btn.innerHTML = '<i data-lucide="server" class="w-3.5 h-3.5"></i><span id="engineName" class="engine-name-tag"></span>';
+  const divider = toolbar.querySelector('.input-toolbar-divider');
+  if (divider) toolbar.insertBefore(btn, divider);
+  else toolbar.appendChild(btn);
+  // 2) Popover（body 级）
+  const pop = document.createElement('div');
+  pop.id = 'enginePopover';
+  document.body.appendChild(pop);
+  // 3) 控件专属样式（运行时注入；深浅主题双档）
+  if (!document.getElementById('engineSelectorStyle')) {
+    const st = document.createElement('style');
+    st.id = 'engineSelectorStyle';
+    st.textContent = '#enginePopover{position:fixed;display:none;transform:translateX(-50%);width:260px;padding:8px;border-radius:16px;z-index:9999;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:rgba(30,30,35,.85);border:1px solid rgba(255,255,255,.15);box-shadow:0 10px 40px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05) inset;max-height:280px;overflow-y:auto}'
+      + '#enginePopover.open{display:block}'
+      + 'html[data-theme="light"] #enginePopover{background:rgba(255,255,255,.85) !important;border:1px solid rgba(0,0,0,.08);box-shadow:0 10px 40px rgba(0,0,0,.1),0 0 0 1px rgba(255,255,255,.5) inset;color:#1d1d1f}'
+      + 'html[data-theme="dark"] #enginePopover{background:rgba(30,30,35,.85) !important;border:1px solid rgba(255,255,255,.15);box-shadow:0 10px 40px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05) inset;color:#fff}'
+      + '.engine-pop-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;cursor:pointer;transition:background .15s ease}'
+      + '.engine-pop-item:hover{background:var(--brand-light);color:var(--brand-text)}'
+      + '.engine-pop-item.selected{background:var(--brand-light);color:var(--brand-text)}'
+      + '.engine-pop-name{font-size:12px;font-weight:600;line-height:1.2}'
+      + '.engine-pop-desc{font-size:10px;line-height:1.3;color:var(--text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+      + '.engine-pop-item.selected .engine-pop-desc{color:inherit}'
+      + '.engine-pop-empty{font-size:11px;color:var(--text-tertiary);padding:8px 10px;text-align:center}'
+      + '.engine-selector-btn{display:inline-flex;align-items:center;gap:4px;width:auto;padding:3px 10px;border-radius:9999px;color:var(--text-tertiary);transition:background .15s ease,color .15s ease}'
+      + '.engine-selector-btn:hover{background:var(--brand-light);color:var(--brand-text)}'
+      + '.engine-selector-btn .engine-name-tag{font-size:11px;font-weight:600;line-height:1}';
+    document.head.appendChild(st);
+  }
+  // 4) 列表渲染与标签同步
+  const renderList = () => {
+    const cur = savedName();
+    if (!engineList.length) {
+      pop.innerHTML = '<div class="engine-pop-empty">暂无可用引擎（后端未返回）</div>';
+      return;
+    }
+    pop.innerHTML = engineList.map((e) => {
+      const n = String((e && e.name) || '');
+      const desc = String((e && e.description) || '');
+      return '<div class="engine-pop-item' + (n === cur ? ' selected' : '') + '" data-engine-name="' + esc(n) + '">'
+        + '<div style="min-width:0"><div class="engine-pop-name">' + esc(displayName(n)) + '</div>'
+        + '<div class="engine-pop-desc" title="' + esc(desc) + '">' + esc(desc) + '</div></div></div>';
+    }).join('');
+  };
+  const refreshLabel = () => {
+    const el = document.getElementById('engineName');
+    if (el) el.textContent = displayName(savedName());
+  };
+  const loadEngines = async () => {
+    try {
+      const resp = await fetch(backendOrigin() + '/api/engines/list');
+      const j = await resp.json();
+      const arr = (j && j.engines) || [];
+      engineList = arr.filter((e) => e && ENGINE_NAME_RE.test(String(e.name || '')));
+    } catch (e) { /* 后端离线：保留旧列表，开弹窗时如实显示空 */ }
+    refreshLabel();
+    renderList();
+  };
+  // 5) 开合 + 弹窗互斥 + 外点/Esc/滚动收起
+  const closeEnginePop = () => { pop.classList.remove('open'); };
+  on(btn, 'click', (e) => {
+    e.stopPropagation();
+    // [弹窗互斥] 模型下拉/思考强度开着先强关：其触发器 stopPropagation 会阻断各自
+    // document closer，不显式关就会与本 Popover 重叠（thinkMode 强拆 modelPickerPop 同款）
+    const mp = document.getElementById('modelPickerPop');
+    if (mp) mp.remove();
+    const tp = document.getElementById('thinkModePopover');
+    if (tp) tp.classList.remove('open');
+    if (pop.classList.contains('open')) { closeEnginePop(); return; }
+    loadEngines();   // 开弹窗顺手复检，列表鲜活（内存缓存兜底）
+    const rect = btn.getBoundingClientRect();
+    pop.classList.add('open');
+    pop.style.left = (rect.left + rect.width / 2) + 'px';
+    pop.style.bottom = (window.innerHeight - rect.top + 10) + 'px';
+  });
+  on(pop, 'click', (e) => {
+    // composedPath 判归属（Lucide 重渲染 detach e.target 的老坑）
+    const path = (e.composedPath && e.composedPath()) || [];
+    const item = path.find((n) => n && n.dataset && n.dataset.engineName);
+    if (!item) return;
+    const name = String(item.dataset.engineName || '');
+    if (!ENGINE_NAME_RE.test(name)) return;
+    try { localStorage.setItem(STORE_KEY, name); } catch (eS) { /* 隐私模式：仅当次生效 */ }
+    refreshLabel();
+    renderList();
+    closeEnginePop();
+    showNotification('执行引擎已切换', displayName(name), 'success', 1600);
+  });
+  // 外点收起：capture mousedown 先行——模型/思考触发器的 click stopPropagation 拦不住它
+  on(document, 'mousedown', (e) => {
+    if (!pop.classList.contains('open')) return;
+    const path = (e.composedPath && e.composedPath()) || [];
+    if (path.indexOf(pop) !== -1 || path.indexOf(btn) !== -1) return;
+    closeEnginePop();
+  }, true);
+  on(document, 'keydown', (e) => { if (e.key === 'Escape') closeEnginePop(); });
+  on(window, 'resize', closeEnginePop);
+  on(document, 'scroll', (e) => {
+    // Popover 自身可滚（max-height 限高）：滚动冒到 document 也不收起
+    const path = (e.composedPath && e.composedPath()) || [];
+    if (path.indexOf(pop) !== -1) return;
+    closeEnginePop();
+  }, true);
+  refreshLabel();
+  loadEngines();   // 启动预取，列表存内存
+  refreshIcons();
+}
+
 /** [阶段0 本机 Agent] 输入工具栏"本机工具/Agent"开关按钮（对齐深度思考按钮模式）：
  * 控制 nativeToolsEnabled（native 工具进入 listForRequest 的总门）。
  * 点击异步探测本地后端：在线 → 成功开启并提示工作区；离线 → 仍可开启（工具执行时给出
@@ -2526,6 +2679,10 @@ bindNewChatMain();
 // [深度思考] 输入工具栏三态按钮安装（script 位于 </body> 前，静态骨架已就绪）
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installThinkModeBtn);
 else installThinkModeBtn();
+
+// [多引擎切换 2026-10-21] 输入工具栏"执行引擎"选择器（同工具栏、同装载时机；幂等）
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installEngineSelector);
+else installEngineSelector();
 
 // [阶段0 本机 Agent] 输入工具栏"本机工具"开关（同工具栏、同装载时机；幂等）
 if (typeof installNativeAgentToggle === 'function') {
