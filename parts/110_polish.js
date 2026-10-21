@@ -843,6 +843,10 @@ function installModelSelector() {
   trigger.title = '点击切换模型';
   trigger.addEventListener('click', (e) => {
     e.stopPropagation();
+    // [弹窗互斥] 思考强度 Popover 开着先收起：think 按钮的 stopPropagation 会阻断其
+    // document 关闭监听，不显式收就会与本弹层重叠
+    const tp = document.getElementById('thinkModePopover');
+    if (tp) tp.classList.remove('open');
     const container = document.getElementById('coreInputContainer');
     let pop = document.getElementById('modelPickerPop');
     if (pop) { pop.remove(); return; } // 已开则关闭（切换）

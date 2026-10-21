@@ -267,10 +267,20 @@ function syncInputModelLabel() {
 /* ---------- [深度思考] 三态开关（auto / on / off） ---------- */
 
 const THINK_MODES = [
-  { key: 'auto', tag: 'AUTO', title: '深度思考：自动（复杂任务自动开启思考）', cls: '' },
-  { key: 'on',   tag: 'ON',   title: '深度思考：开启（所有请求强制思考）',       cls: 'think-on' },
-  { key: 'off',  tag: 'OFF',  title: '深度思考：关闭（所有请求不思考）',         cls: 'think-off' }
+  { key: 'auto', tag: '标准', desc: '（均衡）',    title: '思考强度：标准（模型自动决定是否思考）' },
+  { key: 'on',   tag: '深度', desc: '（长链推理）', title: '思考强度：深度（强制深度思考，消耗更多 Token）' },
+  { key: 'off',  tag: '极速', desc: '（最快响应）', title: '思考强度：极速（关闭思考，最快响应）' }
 ];
+
+/** [思考强度 Popover 滑条] 三档拖拽区间：ratio（0~1）落入区间 → 档位 + 滑块描边/label 高亮色。
+ * 色彩循序渐进：极速青 → 标准蓝（品牌）→ 深度紫。 */
+const THINK_ZONES = [
+  { max: 0.333, key: 'off',  color: '#06b6d4' },
+  { max: 0.666, key: 'auto', color: '#2f7cf6' },
+  { max: 1.001, key: 'on',   color: '#a855f7' }
+];
+/** 松手/回位吸附锚点：三档在轨道上的归位百分比 */
+const THINK_SNAP = { off: 100 / 6, auto: 50, on: 500 / 6 };
 
 /** [深度思考] 与普通对话完全一致的 think 决策（对比页/工作流复用，不另写一套）：
  * on→true；off→false；auto 档对 qwen3.5 系列默认 think=false（复杂任务也不自动开），
@@ -287,57 +297,160 @@ function decideThinkFor(model, messages) {
   return !!(typeof TaskRouter !== 'undefined' && TaskRouter.classify(messages || []) === 'complex');
 }
 
-/** [深度思考] 按钮 UI 同步：按当前 thinkMode 设置 图标高亮/小标/禁用态
+/** [思考强度 Popover 滑条] 按轨道位置（0~1）渲染 Popover：落入区间决定档位文案/高亮色/滑块位置
+ * @param {number} ratio - 0（最左/极速）~ 1（最右/深度）
+ * @returns {void} */
+function renderThinkPopover(ratio) {
+  const label = document.getElementById('thinkModeLabel');
+  const thumb = document.getElementById('thinkModeThumb');
+  const zone = THINK_ZONES.find(z => ratio < z.max) || THINK_ZONES[THINK_ZONES.length - 1];
+  const conf = THINK_MODES.find(t => t.key === zone.key) || THINK_MODES[0];
+  const r = Math.min(1, Math.max(0, ratio));
+  if (label) { label.textContent = conf.tag + conf.desc; label.style.color = zone.color; }
+  // 水位填充：流光+星尘只在滑块左侧点亮，右侧留暗轨（宽度与滑块同步涨落）
+  const fill = document.getElementById('thinkModeFill');
+  if (fill) fill.style.width = (r * 100).toFixed(2) + '%';
+  if (thumb) {
+    // 偏移=滑块半宽（32px/2=16）；color 同步档位色，霓虹光晕 box-shadow: 0 0 24px currentColor 随之变色
+    thumb.style.left = 'calc(' + (r * 100).toFixed(2) + '% - 16px)';
+    thumb.style.borderColor = zone.color;
+    thumb.style.color = zone.color;
+  }
+}
+
+/** [思考强度 Popover 滑条] 触发器按钮文字/title 同步；Popover 开着时同步其吸附位
  * @returns {void} */
 function refreshThinkModeBtn() {
   const btn = document.getElementById('thinkModeBtn');
   if (!btn) return;
   const mode = MoraySettings.get('thinkMode') || 'auto';
   const conf = THINK_MODES.find(t => t.key === mode) || THINK_MODES[0];
-  btn.className = 'input-toolbar-btn think-mode-btn' + (conf.cls ? ' ' + conf.cls : '');
-  btn.title = conf.title + (AppState.generating ? '（生成中已禁用）' : '');
   const tag = btn.querySelector('.think-mode-tag');
   if (tag) tag.textContent = conf.tag;
-}
-
-/** [深度思考] 点击三态循环：auto → on → off → auto；生成中禁用；持久化到 MoraySettings
- * @returns {void} */
-function cycleThinkMode() {
-  if (AppState.generating) {
-    showNotification('深度思考', 'AI 正在回复中，请在生成结束后切换', 'warning', 1600);
-    return;
+  btn.title = conf.title + (AppState.generating ? '（生成中已禁用）' : '');
+  const pop = document.getElementById('thinkModePopover');
+  if (pop && pop.classList.contains('open')) {
+    renderThinkPopover((THINK_SNAP[mode] != null ? THINK_SNAP[mode] : THINK_SNAP.auto) / 100);
   }
-  const cur = MoraySettings.get('thinkMode') || 'auto';
-  const idx = THINK_MODES.findIndex(t => t.key === cur);
-  const next = THINK_MODES[(idx + 1) % THINK_MODES.length];
-  MoraySettings.set('thinkMode', next.key);
-  refreshThinkModeBtn();
-  const hint = { auto: '已切换为自动：复杂任务自动开启深度思考', on: '已开启深度思考：所有请求强制思考', off: '已关闭深度思考：所有请求不思考' }[next.key];
-  showNotification('深度思考', hint, 'info', 1800);
 }
 
-/** [深度思考] 输入工具栏动态插入三态按钮（静态骨架无此按钮，纯 JS 增量，不改 HTML）+
- * 运行时注入按钮专属样式
+/** [思考强度 Popover 滑条] 输入工具栏触发器按钮 + body 级悬浮滑动变阻器（纯 JS 增量，不改 HTML）：
+ * 平时只占「脑图标 + 档位」小按钮；点击在按钮正上方弹出长条渐变轨道（极速青→标准蓝→深度紫），
+ * Pointer Events 拖拽实时跟手（label/描边色随区间变），松手吸附生效并收起；点击外部/Esc/滚动收起。
+ * popover 挂 body（fixed 按按钮 rect 定位）而非按钮内部：#coreInputContainer 有 overflow-hidden，
+ * 挂内会被裁剪；样式全手写注入（Tailwind 动态类对运行时注入元素不可靠，--color-* 类另有钉死橙前科）。
  * @returns {void} */
 function installThinkModeBtn() {
   const toolbar = document.querySelector('#coreInputContainer .input-toolbar');
   if (!toolbar || document.getElementById('thinkModeBtn')) return;
+  // 1) 触发器按钮
   const btn = document.createElement('button');
   btn.id = 'thinkModeBtn';
   btn.className = 'input-toolbar-btn think-mode-btn';
-  btn.setAttribute('aria-label', '深度思考');
-  btn.innerHTML = '<i data-lucide="brain" class="w-4 h-4"></i><span class="think-mode-tag">AUTO</span>';
-  on(btn, 'click', cycleThinkMode);
+  btn.setAttribute('aria-label', '思考强度');
+  btn.innerHTML = '<i data-lucide="brain" class="w-3 h-3"></i><span class="think-mode-tag">标准</span>';
   const divider = toolbar.querySelector('.input-toolbar-divider');
   if (divider) toolbar.insertBefore(btn, divider);
   else toolbar.appendChild(btn);
-  // 样式注入（不改静态骨架 CSS，纯运行时）
+  // 2) Popover 结构（body 级）
+  const pop = document.createElement('div');
+  pop.id = 'thinkModePopover';
+  pop.innerHTML = '<div id="thinkModeLabel">标准（均衡）</div>'
+    + '<div id="thinkModeTrack"><div id="thinkModeFill"></div><div id="thinkModeThumb"></div></div>'
+    + '<div class="think-zone-labels"><span class="think-zone-label">极速</span>'
+    + '<span class="think-zone-label">标准</span><span class="think-zone-label">深度</span></div>';
+  document.body.appendChild(pop);
+  // 3) 控件专属样式（运行时注入；深浅主题双档）
   if (!document.getElementById('thinkModeBtnStyle')) {
     const st = document.createElement('style');
     st.id = 'thinkModeBtnStyle';
-    st.textContent = '.think-mode-btn{position:relative}.think-mode-btn .think-mode-tag{font-size:10px;font-weight:800;line-height:1;position:absolute;bottom:1px;right:2px;letter-spacing:.5px}.think-mode-btn.think-on{background:rgba(229,115,74,.15);color:#E5734A;box-shadow:inset 0 0 0 1px rgba(229,115,74,.3)}.think-mode-btn.think-off{opacity:.4}';
+    st.textContent = '#thinkModePopover{position:fixed;display:none;transform:translateX(-50%);width:280px;padding:20px;border-radius:16px;z-index:9999;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:rgba(30,30,35,.85);border:1px solid rgba(255,255,255,.15);box-shadow:0 10px 40px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05) inset;transition:background .3s,border-color .3s,color .3s}'
+      + '#thinkModePopover.open{display:block}'
+      + 'html[data-theme="light"] #thinkModePopover{background:rgba(255,255,255,.85) !important;border:1px solid rgba(0,0,0,.08);box-shadow:0 10px 40px rgba(0,0,0,.1),0 0 0 1px rgba(255,255,255,.5) inset;color:#1d1d1f}'
+      + 'html[data-theme="dark"] #thinkModePopover{background:rgba(30,30,35,.85) !important;border:1px solid rgba(255,255,255,.15);box-shadow:0 10px 40px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05) inset;color:#fff}'
+      + '#thinkModeLabel{font-size:12px;font-weight:600;text-align:center;margin-bottom:14px;color:var(--text-primary);transition:color .15s ease}'
+      + 'html[data-theme="light"] #thinkModeLabel{color:#1d1d1f}'
+      + 'html[data-theme="dark"] #thinkModeLabel{color:#fff}'
+      + '#thinkModeTrack{position:relative;height:24px;border-radius:999px;cursor:pointer;touch-action:none;background:rgba(255,255,255,.12);box-shadow:inset 0 2px 4px rgba(0,0,0,.2)}'
+      + 'html[data-theme="light"] #thinkModeTrack{background:rgba(0,0,0,.08)}'
+      // 水位填充层：流光+星尘全挂这里，宽度=滑块比例随拖拽涨落（不加 width 过渡——拖拽中会滞后于滑块）；
+      // 渐变 background-size:200% 相对 fill 自身宽，窄窗口下随动画滑动仍是流光
+      + '#thinkModeFill{position:absolute;top:0;left:0;height:100%;width:0;background:linear-gradient(90deg,#06b6d4,#2f7cf6,#a855f7,#06b6d4);background-size:200% 100%;animation:energyFlow 3s linear infinite;pointer-events:none}'
+      // 星尘·质数尺寸错位法：X/Y 全质数（43/67/31 × 11/17/23，53/71 × 13/19）多行平铺互不整除；
+      // Y 按全高铺满修正：股2 posY 12px→20.5px 带（底）、股3 posY -8px→3.5px 带（顶）；X 位移=格距无缝
+      + '#thinkModeFill::before{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.9) 1.5px,transparent 2px),radial-gradient(circle,rgba(255,255,255,.6) 1px,transparent 1.5px),radial-gradient(circle,rgba(255,255,255,.8) .5px,transparent 1px);background-size:43px 11px,67px 17px,31px 23px;background-position:0 0,15px 12px,7px -8px;animation:dustFloat 4s linear infinite;pointer-events:none;z-index:1}'
+      + '@keyframes dustFloat{0%{background-position:0 0,15px 12px,7px -8px}100%{background-position:-43px 0,-52px 12px,-24px -8px}}'
+      + '#thinkModeFill::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.7) .5px,transparent 1px),radial-gradient(circle,rgba(255,255,255,.9) 1px,transparent 1.5px);background-size:53px 13px,71px 19px;background-position:3px 8px,20px 1px;animation:dustFloatFast 2.5s linear infinite;pointer-events:none;z-index:1}'
+      + '@keyframes dustFloatFast{0%{background-position:3px 8px,20px 1px}100%{background-position:-50px 8px,-51px 1px}}'
+      + '@keyframes energyFlow{0%{background-position:100% 0}100%{background-position:-100% 0}}'
+      + '#thinkModeThumb{position:absolute;top:50%;transform:translateY(-50%);width:32px;height:32px;border-radius:50%;background:#ffffff;border:2px solid rgba(255,255,255,.9);color:#2f7cf6;box-shadow:0 0 12px rgba(255,255,255,.8),0 0 24px currentColor;transition:left .15s ease-out,border-color .3s ease,color .3s ease;z-index:2}'
+      + '#thinkModeThumb.is-dragging{transition:border-color .3s ease,color .3s ease}'
+      + '.think-zone-labels{display:flex;justify-content:space-between;font-size:10px;margin-top:12px}'
+      + '.think-zone-label{color:#888}'
+      + 'html[data-theme="dark"] .think-zone-label{color:rgba(255,255,255,.5)}'
+      + '.think-mode-btn{display:inline-flex;align-items:center;gap:4px;width:auto;padding:3px 10px;border-radius:9999px;color:var(--text-tertiary);transition:background .15s ease,color .15s ease}'
+      + '.think-mode-btn:hover{background:var(--brand-light);color:var(--brand-text)}'
+      + '.think-mode-btn .think-mode-tag{font-size:11px;font-weight:600;line-height:1}';
     document.head.appendChild(st);
   }
+  // 4) 拖拽（Pointer Events + capture：移出轨道仍跟手）
+  const track = pop.querySelector('#thinkModeTrack');
+  const thumb = pop.querySelector('#thinkModeThumb');
+  const snapOf = () => (THINK_SNAP[MoraySettings.get('thinkMode') || 'auto'] != null ? THINK_SNAP[MoraySettings.get('thinkMode') || 'auto'] : THINK_SNAP.auto) / 100;
+  const ratioFrom = (e) => {
+    const r = track.getBoundingClientRect();
+    return r.width ? Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) : 0.5;
+  };
+  let dragging = false;
+  const closeThinkPopover = () => { pop.classList.remove('open'); };
+  on(track, 'pointerdown', (e) => {
+    if (AppState.generating) {
+      showNotification('思考强度', 'AI 正在回复中，请在生成结束后切换', 'warning', 1600);
+      return;
+    }
+    dragging = true;
+    try { track.setPointerCapture(e.pointerId); } catch (err) { /* 捕获失败仍可拖（事件未出 track 时） */ }
+    thumb.classList.add('is-dragging');
+    renderThinkPopover(ratioFrom(e));
+    e.preventDefault();
+  });
+  on(track, 'pointermove', (e) => { if (dragging) renderThinkPopover(ratioFrom(e)); });
+  const endDrag = (e, commit) => {
+    if (!dragging) return;
+    dragging = false;
+    thumb.classList.remove('is-dragging');
+    if (!commit) { renderThinkPopover(snapOf()); return; } // pointercancel：回到已存档位
+    const zone = THINK_ZONES.find(z => ratioFrom(e) < z.max) || THINK_ZONES[THINK_ZONES.length - 1];
+    MoraySettings.set('thinkMode', zone.key);
+    refreshThinkModeBtn();
+    closeThinkPopover();
+  };
+  on(track, 'pointerup', (e) => endDrag(e, true));
+  on(track, 'pointercancel', (e) => endDrag(e, false));
+  // 5) 开关与收起：按钮 toggle；点击外部/Esc/滚动/缩放收起
+  on(btn, 'click', (e) => {
+    e.stopPropagation();
+    // [弹窗互斥] 模型下拉开着先强关：模型触发器的 stopPropagation 会阻断其 document closer，
+    // 不显式 remove 就会与本 Popover 重叠
+    const mp = document.getElementById('modelPickerPop');
+    if (mp) mp.remove();
+    if (pop.classList.contains('open')) { closeThinkPopover(); return; }
+    const rect = btn.getBoundingClientRect();
+    pop.classList.add('open');
+    pop.style.left = (rect.left + rect.width / 2) + 'px';
+    pop.style.bottom = (window.innerHeight - rect.top + 10) + 'px';
+    renderThinkPopover(snapOf());
+  });
+  on(document, 'click', (e) => {
+    if (!pop.classList.contains('open')) return;
+    // composedPath 判归属（Lucide 重渲染 detach e.target 的老坑）
+    const path = (e.composedPath && e.composedPath()) || [];
+    if (path.indexOf(pop) !== -1 || path.indexOf(btn) !== -1) return;
+    closeThinkPopover();
+  });
+  on(document, 'keydown', (e) => { if (e.key === 'Escape') closeThinkPopover(); });
+  on(window, 'resize', closeThinkPopover);
+  on(document, 'scroll', closeThinkPopover, true);
   refreshIcons();
   refreshThinkModeBtn();
 }

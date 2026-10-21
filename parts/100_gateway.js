@@ -1664,10 +1664,6 @@ async function appendGatewaySettings() {
           <input type="number" min="10" max="300" value="${c.requestTimeout || 120}" id="setRequestTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
         <div class="flex items-center justify-between"><span class="text-text-secondary">工具轮超时（秒，单轮模型调用）</span>
           <input type="number" min="60" max="300" value="${c.toolRoundTimeout || 180}" id="setToolRoundTimeout" class="form-input" style="width:90px;padding:4px 8px;font-size:12px"></div>
-        <div class="flex items-center justify-between"><span class="text-text-secondary">27B 推理强度（bonsai2-27b）</span>
-          <select id="setBonsai2Reasoning" class="form-input" style="width:90px;padding:4px 8px;font-size:12px">
-            ${['low', 'medium', 'xhigh'].map(v => `<option value="${v}" ${((c.bonsai2ReasoningEffort || 'low') === v) ? 'selected' : ''}>${v}</option>`).join('')}
-          </select></div>
         ${c.pauseAPI ? `<div class="flex items-center justify-between rounded-lg bg-danger/10 border border-danger/30 px-3 py-2">
           <span class="text-[11px] text-danger">云端 API 已暂停</span>
           <button class="text-[10px] text-text-secondary underline" id="resumeCloudBtn">恢复</button></div>` : ''}
@@ -1736,9 +1732,8 @@ async function appendGatewaySettings() {
     if (costCard) { costCard.scrollIntoView({ behavior: 'smooth', block: 'start' }); costCard.style.boxShadow = '0 0 0 2px rgba(91,140,255,0.35)'; setTimeout(() => { costCard.style.boxShadow = ''; }, 900); }
   });
   on($('setRequestTimeout'), 'change', () => MoraySettings.set('requestTimeout', parseInt($('setRequestTimeout').value, 10) || 120));
-  // [2026-10-03 27B挂死修复] 工具轮每轮超时（60-300s，默认 180）+ 27B 推理强度（low/medium/xhigh）
+  // [2026-10-03 27B挂死修复] 工具轮每轮超时（60-300s，默认 180）；原 27B 推理强度下拉已删（thinkMode 三档统一接管）
   on($('setToolRoundTimeout'), 'change', () => MoraySettings.set('toolRoundTimeout', Math.max(60, Math.min(300, parseInt($('setToolRoundTimeout').value, 10) || 180))));
-  on($('setBonsai2Reasoning'), 'change', () => MoraySettings.set('bonsai2ReasoningEffort', $('setBonsai2Reasoning').value));
   // [体检] 降级重试上限输入框真实绑定（原无绑定，属死输入框）
   on($('setRoutingFallbacks'), 'change', () => {
     const v = Math.max(1, Math.min(5, parseInt($('setRoutingFallbacks').value, 10) || 2));

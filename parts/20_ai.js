@@ -434,71 +434,28 @@ class MorayAI {
         state.toolCalls = accToolCallsFinalize(state.toolAcc);
         return self._finish(state, startedAt, firstChunkAt, 0, 0);
       }
-      if (self.backend === 'ollama') {
-        // ---- Ollama /api/chat（NDJSON 流）----
-        const res = await fetch(self.ollamaURL + '/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model: opts.model,
-            messages: opts.messages,
-            stream: true,
-            keep_alive: '30m', // [速度优化] 显式常驻 30 分钟，避免逐请求冷加载
-            // [深度思考] think 是 /api/chat 顶层字段（与 model/messages 平级），不是 options 采样参数；
-            // 仅思考型模型且显式指定 think 才带（qwen2.x 等非思考模型绝不含 think）
-            ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
-            options: { temperature, top_p, num_predict: max_tokens }
-          })
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          throw self._normalizeError(res.status, text);
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop();
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const j = JSON.parse(line);
-              if (!firstChunkAt) firstChunkAt = performance.now();
-              const piece = (j.message && j.message.content) || '';
-              const think = (j.message && j.message.thinking) || '';
-              if (piece) state.content += piece;
-              if (think) state.reasoning += think;
-              // [阶段1 M1] Ollama 流式 tool_calls 聚合（一次性/分片兼容，真机实测 qwen2.5:7b/qwen3.5 一次性全量）
-              if (j.message && j.message.tool_calls && j.message.tool_calls.length) {
-                accToolCallDeltas(state.toolAcc, j.message.tool_calls);
-              }
-              if (opts.onChunk) opts.onChunk({ content: piece, reasoning: think, done: !!j.done });
-              if (j.done) {
-                state.toolCalls = accToolCallsFinalize(state.toolAcc);
-                return self._finish(state, startedAt, firstChunkAt, j.eval_count, j.eval_duration);
-              }
-            } catch (e) { /* 跳过不完整行 */ }
-          }
-        }
-        return self._finish(state, startedAt, firstChunkAt, 0, 0);
-      } else if (self.backend === 'openai') {
+      if (self.backend === 'openai' || self.backend === 'ollama') {
         // ---- OpenAI 兼容 /v1/chat/completions（SSE 流）----
+        // [2026-10-21 收尾] ollama 不再直连 /api/chat（native 端点忽略 reasoning_effort，极速档
+        // 关不净），统一走本地代理 /api/llm/chat（后端转 compat 端点，三档实测全生效）
         const model = opts.model || MoraySettings.get('openaiModel');
-        // [M2] 经本地后端代理：key 存于 server/.env，浏览器请求仅到 127.0.0.1（无 key 泄漏）
-        const proxyUrl = self._useProxy();
+        // [M2] 经本地后端代理：key 存于 server/.env，浏览器请求仅到 127.0.0.1（无 key 泄漏）；
+        // ollama 强制代理——不走 _useProxy（其"离线自动回退直连"副作用不适用：回退直连会让三档失效）
+        const proxyUrl = self.backend === 'ollama'
+          ? ((window.MorayBackend && MorayBackend.connected && MorayBackend.origin ? MorayBackend.origin : (location.origin.startsWith('http') ? location.origin : '')) + '/api/llm/chat')
+          : self._useProxy();
         if (proxyUrl) {
           const pbody = {
             model,
             messages: opts.messages,
             stream: true,
             temperature, top_p, max_tokens,
-            think: opts.think
+            think: opts.think,
+            // [2026-10-21 思考强度三档] 强制下发：llm_proxy 仅对 ollama/custom_27b 透传，云端分支自动忽略
+            reasoning_effort: self._bonsai2ReasoningEffort()
           };
+          // [2026-10-21 收尾] ollama 显式钉 provider：防全局 LLM_PROVIDER=cloud 时本地模型被路由到云端
+          if (self.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
           // [Day24.11] 预算桶：按对话隔离（无对话上下文时不带该字段，后端回落 default）
           const psid = self._budgetSessionId(opts);
           if (psid) pbody.session_id = psid;
@@ -509,7 +466,7 @@ class MorayAI {
             body: JSON.stringify(pbody)
           });
           if (!pres.ok || !pres.body) {
-            let msg = '云端代理请求失败（' + pres.status + '）';
+            let msg = '代理请求失败（' + pres.status + '）';
             // [Day24.11b] 读链 message(新契约人话) → msg(老熔断体) → error(兜底码)；429 熔断体此前只落通用文案
             try { const j = await pres.json(); if (j) msg = j.message || j.msg || j.error || msg; } catch (e) { /* 保留默认 */ }
             throw new Error(msg);
@@ -634,37 +591,16 @@ class MorayAI {
     try { return JSON.stringify(a); } catch (e) { return '{}'; }
   }
 
-  /** [阶段0] Ollama 协议消息规范化：assistant.tool_calls[].function.arguments 由
-   * OpenAI 形态（字符串）转为 Ollama 原生形态（对象）；role:"tool" 消息保持不变
-   * @param {Array} msgs - 消息
-   * @returns {Array} 转换后消息 */
-  _ollamaMessages(msgs) {
-    return (msgs || []).map(m => {
-      if (!m) return m;
-      // Ollama tool 消息仅需 role+content（多余字段由 struct 解析忽略，这里显式收敛）
-      if (m.role === 'tool') return { role: 'tool', content: m.content || '' };
-      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-        return Object.assign({}, m, {
-          content: m.content || '',
-          tool_calls: m.tool_calls.map(c => Object.assign({}, c, {
-            function: {
-              name: (c.function || {}).name || '',
-              arguments: this.toolArgsToObject((c.function || {}).arguments)
-            }
-          }))
-        });
-      }
-      return m;
-    });
-  }
-
-  /** [2026-10-03 27B挂死修复] bonsai2-27b 推理强度取值：设置缺省 low，非法值回 low。
-   * 27B 服务端模板只接受 low/medium/xhigh（缺省 xhigh——热模型实测 5.3 t/s 下超长 think
-   * 是单轮数分钟的放大器），其余取值服务端会 raise_exception。
-   * @returns {'low'|'medium'|'xhigh'} */
+  /** [2026-10-21 思考强度三档] 推理强度统一由 thinkMode 决定（极速 off / 标准 auto / 深度 on）：
+   * off→'none'（qwen3.5 系 think:false 被 runner 忽略，实测仅 reasoning_effort="none"
+   * 能真正关思考）；on→'xhigh'（27B llama.cpp 模板最大档）；auto/未知值→'low'。
+   * 原 bonsai2ReasoningEffort 设置键随之停用（设置页下拉不再影响请求）。
+   * @returns {'none'|'low'|'xhigh'} */
   _bonsai2ReasoningEffort() {
-    const v = String(MoraySettings.get('bonsai2ReasoningEffort') || 'low');
-    return ['low', 'medium', 'xhigh'].includes(v) ? v : 'low';
+    const mode = String(MoraySettings.get('thinkMode') || 'auto');
+    if (mode === 'off') return 'none';
+    if (mode === 'on') return 'xhigh';
+    return 'low';
   }
 
   /** 非流式聊天（流式失败时回退）
@@ -698,57 +634,32 @@ class MorayAI {
       const j = await res.json();
       return { content: j.content || '', reasoning: j.reasoning || '', toolCalls: j.tool_calls || [], promptTokens: 0, stats: { tokPerSec: null, ms: 0, tokens: 0, promptTokens: 0 } };
     }
-    if (this.backend === 'ollama') {
-      const obody = {
-        model: opts.model,
-        messages: this._ollamaMessages(opts.messages),
-        stream: false,
-        keep_alive: '30m', // [速度优化] 非流式（工具轮/工作流/摘要）同样常驻
-        // [深度思考] 同流式：think 顶层下发，options 不含 think（非思考模型行为与之前完全一致）
-        ...(isThinkingModel(opts.model) && opts.think !== undefined ? { think: !!opts.think } : {}),
-        options: { temperature, top_p: MoraySettings.get('topP'), num_predict: MoraySettings.get('maxTokens') }
-      };
-      // [阶段0] Ollama 原生 tools：请求体带 tools 才下发（无 tools 的旧请求行为完全一致）
-      // [修复 2026-10-20] tool_choice 与 27B 分支对齐，同批透传
-      if (opts.tools && opts.tools.length) {
-        obody.tools = opts.tools;
-        if (opts.tool_choice) obody.tool_choice = opts.tool_choice;
-      }
-      const res = await fetch(this.ollamaURL + '/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: opts.signal, // [2026-10-03 27B挂死修复] 同 bonsai2 分支：可中止
-        body: JSON.stringify(obody)
-      });
-      if (!res.ok) throw this._normalizeError(res.status, await res.text().catch(() => ''));
-      const j = await res.json();
-      const mc = j.message || {};
-      // [阶段1 M1] 解析经 sanitize 容错：空调用过滤、arguments 对象↔字符串统一、截断补全
-      const toolCalls = sanitizeToolCalls(mc.tool_calls);
-      return {
-        content: mc.content || '',
-        reasoning: mc.thinking || '',
-        toolCalls,
-        promptTokens: j.prompt_eval_count || 0,
-        stats: {
-          tokPerSec: j.eval_count && j.eval_duration ? +(j.eval_count / (j.eval_duration / 1e9)).toFixed(1) : null,
-          ms: 0, tokens: j.eval_count || 0, promptTokens: j.prompt_eval_count || 0
-        }
-      };
-    }
-    if (this.backend === 'openai') {
+    if (this.backend === 'openai' || this.backend === 'ollama') {
       // [M2] 经本地后端代理（非流式：工具轮/摘要等场景）
-      const proxyUrl = this._useProxy();
+      // [2026-10-21 收尾] ollama 不再直连 /api/chat（native 端点忽略 reasoning_effort，极速档关不净），
+      // 统一走代理 /api/llm/chat（后端转 compat 端点）；强制代理不走 _useProxy——其"离线自动回退
+      // 直连"副作用会让三档失效；provider 钉 ollama 防全局 LLM_PROVIDER=cloud 时本地模型误路由云端
+      const proxyUrl = this.backend === 'ollama'
+        ? ((window.MorayBackend && MorayBackend.connected && MorayBackend.origin ? MorayBackend.origin : (location.origin.startsWith('http') ? location.origin : '')) + '/api/llm/chat')
+        : this._useProxy();
       if (proxyUrl) {
         const pbody = {
           model: opts.model || MoraySettings.get('openaiModel'),
           messages: opts.messages, stream: false,
           temperature, top_p: MoraySettings.get('topP'),
           max_tokens: MoraySettings.get('maxTokens'),
-          think: opts.think
+          think: opts.think,
+          // [2026-10-21 思考强度三档] 强制下发：llm_proxy 仅对 ollama/custom_27b 透传，云端分支自动忽略
+          reasoning_effort: this._bonsai2ReasoningEffort()
         };
+        // [2026-10-21 收尾] ollama 显式钉 provider + keep_alive 30m 驻留（后端 llm_proxy 同批透传）
+        if (this.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
         // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
-        if (opts.tools && opts.tools.length) pbody.tools = opts.tools;
+        // [2026-10-21 收尾] tool_choice 同批透传：原 ollama 直连分支带此字段，合并后行为不丢
+        if (opts.tools && opts.tools.length) {
+          pbody.tools = opts.tools;
+          if (opts.tool_choice) pbody.tool_choice = opts.tool_choice;
+        }
         // [Day24.11] 预算桶：按对话隔离（与流式同一取值规则；无对话上下文时不带该字段）
         const psid = this._budgetSessionId(opts);
         if (psid) pbody.session_id = psid;
@@ -759,7 +670,7 @@ class MorayAI {
           body: JSON.stringify(pbody)
         });
         if (!pres.ok) {
-          let msg = '云端代理请求失败（' + pres.status + '）';
+          let msg = '代理请求失败（' + pres.status + '）';
           // [Day24.11b] 与流式同一读链：message → msg → error（429 熔断体/常规错误体/老后端全覆盖）
           try { const j = await pres.json(); if (j) msg = j.message || j.msg || j.error || msg; } catch (e) { /* 保留默认 */ }
           throw new Error(msg);

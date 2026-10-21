@@ -402,6 +402,12 @@ async def llm_chat(request: Request):
         payload["tools"] = tools
     if body.get("tool_choice") is not None:
         payload["tool_choice"] = body["tool_choice"]
+    # [2026-10-21 keep_alive 透传] 前端 ollama 请求统一走本代理后，keep_alive:'30m' 需后端接力
+    # 下发，否则 Ollama 按默认 5 分钟卸载模型，间隔稍久的下一条消息要等 GGUF 重新加载。
+    # 仅请求体显式携带且 provider 为本地两类时透传（云端网关无此概念，白名单外字段绝不下发）。
+    keep_alive = body.get("keep_alive")
+    if keep_alive and provider in ("ollama", "custom_27b"):
+        payload["keep_alive"] = keep_alive
     # [2026-10-03 27B挂死修复] reasoning_effort 仅对 custom_27b 透传：llama.cpp chat API 原生
     # 字段，27B 服务端模板缺省 xhigh（实测热模型 5.3 t/s 下超长 think 是单轮数分钟的放大器），
     # 前端默认下发 low；模板只接受 low/medium/xhigh，其余值服务端 raise_exception。
