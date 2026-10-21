@@ -30896,7 +30896,7 @@ function renderArtifactResult(body, opts) {
   let previewHtml = '';
   if (kind === 'html') {
     previewHtml = '<div data-artifact-frame-host></div>' +
-      '<div class="text-[10px] text-text-tertiary mt-1">HTML 在沙箱 iframe 中运行（sandbox=allow-scripts，无同源权限）</div>';
+      '<div class="text-[10px] text-text-tertiary mt-1">HTML 在沙箱 iframe 中运行（sandbox=allow-scripts allow-modals，无同源权限）</div>';
   } else if (kind === 'markdown') {
     previewHtml = '<div class="md-body" style="max-height:60vh;overflow:auto;padding:4px 2px">' +
       (typeof renderMarkdown === 'function' ? renderMarkdown(content) : escapeHtml(content).replace(/\n/g, '<br>')) +
@@ -30936,7 +30936,7 @@ function renderArtifactResult(body, opts) {
     const host = body.querySelector('[data-artifact-frame-host]');
     if (host) {
       const frame = document.createElement('iframe');
-      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('sandbox', 'allow-scripts allow-modals');
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.title = name || 'HTML 预览';
       frame.style.cssText = 'width:100%;height:60vh;border:0;border-radius:8px;background:#fff;display:block';
