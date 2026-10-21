@@ -32,6 +32,7 @@
 审计持久化责任在上层事件流）。start() 校验通过后起后台线程异步执行、即刻返回
 task_id，调用方按契约轮询 status()/result()。
 """
+import asyncio
 import json
 import logging
 import os
@@ -51,6 +52,7 @@ from .base import (
     STATUS_PENDING,
     STATUS_RUNNING,
     ExecutionEngine,
+    StreamTaskError,
 )
 
 _logger = logging.getLogger("moray.zcode_adapter")
@@ -93,6 +95,227 @@ CREATION_FLAGS = 0
 if sys.platform == "win32":
     # CREATE_NEW_PROCESS_GROUP（配合 taskkill /T 干净收树）| CREATE_NO_WINDOW（不弹黑框）
     CREATION_FLAGS = 0x00000200 | 0x08000000
+
+
+# ---------------- [引擎解耦 v1 2026-10-21] 流式任务子系统（自 api.py Day24b 收编） ----------------
+# Day24b 曾把「受理 + SSE 直通 + kill + files」四件套手写在 api.py（绕过 ExecutionEngine 契约、
+# 自持 _ZCODE_STREAM_TASKS/_PROCS 两张进程表）。本节将其整体收编进本模块：状态仍为模块级
+# 单例（与 SANDBOX_ROOT 等常量同一惯例，每个引擎模块自持自己的状态表），读流/收树为模块级
+# 函数，对外以 ZCodeAdapter 的 start_stream / stream_events / kill_stream_task / read_task_file
+# 四个方法暴露；api.py 只留通用 /api/engines/{engine_name}/* 派发路由（经 local_adapter.
+# get_engine_by_name 找到引擎单例）。语义零变化（红线）：出参/事件形状/白名单/清理时机与
+# api.py 原实现逐字一致；api.py 保留同名兼容别名（tests/organ_memory_selftest.py 直引）。
+_ZCODE_EVENT_WHITELIST = frozenset({
+    "turn.started", "turn.completed", "tool.updated", "checkpoint.created", "result",
+    "model.streaming",   # [2026-10-01 U-5] 放行模型文字流（占真机流 88%），
+                          # 让前端能显示"模型在说什么"的过程
+})
+
+# task_id -> {task_id, status, prompt, language, cwd, cmd, proc, queue, loop, created_at, done_at}
+_ZCODE_STREAM_TASKS: dict = {}
+
+# [停止修复 2026-10-03] 进程常登登记表：与主表共享同一 rec 引用，spawn 时写入、流终态/断连**不弹**
+# （主表弹出语义保持原样：重连 = 404）。页面关闭后孤儿 CLI 仍在跑、主表已被流 finally 弹掉，
+# 执行卡「快照态停止」靠本表找回 proc。生命周期：reader 补 done_at 后由受理端惰性清扫（1h）回收。
+_ZCODE_STREAM_PROCS: dict = {}
+
+
+def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
+    """后台线程：逐行读 CLI stdout → 白名单过滤 → 原始行入队；进程退出补 [DONE] 哨兵。
+
+    - 行内容原样透传（只去行尾换行，绝不重序列化——任务书 gotcha 5）；
+    - 单行 JSON 解析失败 / 非 dict / type 不在白名单 → 静默跳过，绝不抛出（gotcha 铁律）；
+    - asyncio.Queue 非线程安全，投递走 loop.call_soon_threadsafe；
+      事件循环已关闭（服务停机）时无处投递，丢弃即可。
+    """
+    def _put(item: str) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+        except RuntimeError:  # noqa: BLE001 - loop 已关：丢弃即可
+            pass
+
+    # [器官→记忆 线B] 终态帧暂存（只 reader 线程可见的局部，不入 rec）：
+    #   result.response = 正文；turn.completed.payload.duration = 全程毫秒
+    #   （Day24a schema：result 帧自带 response 但无 duration，时长在 turn.completed）。
+    last_result = None
+    last_turn = None
+    # [v5 step1 2026-10-08] 生命周期：progress 轮次计数（本 reader 私有）+ 流侧 caller 判定
+    # （受理端起线程前已写常登表，此处必命中；send 自吞异常）。
+    progress_seq = 0
+    _rec_init = _ZCODE_STREAM_PROCS.get(task_id)
+    is_laya_stream = bool(_rec_init) and str(_rec_init.get("caller") or "") == "laya"
+    # [桥接可观测 2026-10-10] 静默丢弃留痕：逐行计数，收尾进 meta
+    _dropped_types: dict = {}
+    _parse_errors = 0
+    _empty_lines = 0
+    # [桥接可观测 2026-10-10] 读流循环整体死亡的异常留痕："绝不抛出"铁律保持，只是不再吞掉指纹
+    _loop_exit_reason: str = ""
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            if not line.strip():
+                _empty_lines += 1
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                _parse_errors += 1
+                continue
+            if not isinstance(obj, dict) or obj.get("type") not in _ZCODE_EVENT_WHITELIST:
+                _t = obj.get("type") if isinstance(obj, dict) else type(obj).__name__
+                _dropped_types[_t] = _dropped_types.get(_t, 0) + 1
+                continue
+            if obj.get("type") == "result":
+                last_result = obj
+            elif obj.get("type") == "turn.completed":
+                last_turn = obj
+            _put(line)
+            # [v5 step1] turn.completed → progress（每轮一条上总线）。tool.updated/
+            # model.streaming 禁上总线（真机流 88% 会刷屏台账）。异常绝不影响读流。
+            if obj.get("type") == "turn.completed":
+                try:
+                    progress_seq += 1
+                    from .. import synapse_bus
+                    _p_dur = (obj.get("payload") or {}).get("duration")
+                    synapse_bus.send(
+                        "laya.task.progress" if is_laya_stream else "zcode.task.progress",
+                        "ZCode：第 %d 轮完成·%s" % (
+                            progress_seq,
+                            ("%sms" % _p_dur) if _p_dur is not None else "?"),
+                        thread_id=None,
+                        meta={"trace_id": "%s:p%d" % (task_id, progress_seq),
+                              "task_id": task_id, "round": progress_seq,
+                              "duration_ms": _p_dur,
+                              "caller": "laya" if is_laya_stream else "zcode"},
+                        from_member="organ.laya" if is_laya_stream else "organ.zcode")
+                except Exception:  # noqa: BLE001 - progress 上总线绝不影响读流
+                    pass
+    except Exception as e:  # noqa: BLE001 - 读流异常不影响收尾哨兵
+        _loop_exit_reason = "%s: %s" % (type(e).__name__, str(e)[:200])
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        rec = _ZCODE_STREAM_TASKS.get(task_id) or _ZCODE_STREAM_PROCS.get(task_id)
+        if rec is not None:
+            rec["done_at"] = time.time()
+        _put("[DONE]")
+        # ---- [器官→记忆 线B] ZCode 流式任务成功 → 旁路写一条 task_result 记忆 ----
+        # 判据（对齐 Laya "成功才钩"）：returncode==0 且截到 result 终态帧；
+        # caller=="laya" 跳过（线C 双写防护：Laya executor 已写整链 laya_task_result）。
+        # rec 已被流 finally 弹掉时（孤儿态）仍尽力用常登表 rec，取不到 prompt 也留痕。
+        # 任何异常绝不影响哨兵/收尾。
+        try:
+            rc = proc.returncode
+            is_laya = bool(rec) and str(rec.get("caller") or "") == "laya"
+            if rc == 0 and last_result is not None:
+                prompt = str((rec or {}).get("prompt") or "")[:200]
+                language = str((rec or {}).get("language") or "")
+                resp = str(last_result.get("response") or "")[:500]
+                dur = ((last_turn or {}).get("payload") or {}).get("duration") \
+                    if last_turn else None
+                content = "ZCode：%s\n耗时：%s·退出码：%s\n结果：%s" % (
+                    prompt, ("%sms" % dur) if dur is not None else "?", rc, resp)
+                if not is_laya:
+                    from .. import organ_memory
+                    tags = ["zcode_stream"] + ([language] if language else [])
+                    organ_memory.write_organ_memory(
+                        content, kind="task_result", tags=tags,
+                        source="zcode_stream", entity_id=task_id)
+                # [Synapse v4 第三步] 总线放行 Laya 流（记忆仍跳＝线C 双写防护）：
+                # Laya 流发 laya.task.succeeded（无规则，不触发 reflection）；
+                # 前端执行卡直连仍发 zcode.task.succeeded（reflection 规则，行为不变）。
+                # 总闸 MORAY_SYNAPSE 默认关 = send 内部首行 no-op；trace_id=task_id
+                # 防同一任务重发（幂等判重键）；send 自吞异常，此处无需额外防护。
+                from .. import synapse_bus
+                synapse_bus.send(
+                    "laya.task.succeeded" if is_laya else "zcode.task.succeeded",
+                    content, thread_id=None,
+                    meta={"trace_id": task_id, "task_id": task_id,
+                          "duration_ms": dur, "exit_code": rc,
+                          "caller": "laya" if is_laya else "zcode",
+                          "dropped_types": _dropped_types,
+                          "parse_errors": _parse_errors,
+                          "empty_lines": _empty_lines,
+                          "loop_exit_reason": _loop_exit_reason,
+                          "stream_vanished": (
+                              last_result is None
+                              and not _dropped_types
+                              and _parse_errors == 0
+                              and _empty_lines == 0
+                              and rc == 0
+                          )},
+                    from_member="organ.laya" if is_laya else "organ.zcode")
+            else:
+                # [v5 step1] rc!=0 或未截到 result 帧 → failed 上总线。记忆钩子维持
+                # "成功才钩"（本分支不写 organ_memory）；error_text 不提供：stderr 是
+                # DEVNULL（Popen 处既有裁定），不硬造；duration 用 done_at-created_at 兜底
+                # （失败时 last_turn 不可靠；done_at 由本 finally 上方刚补）。
+                prompt = str((rec or {}).get("prompt") or "")[:200]
+                _f_dur = None
+                if rec:
+                    _da, _ca = rec.get("done_at"), rec.get("created_at")
+                    if _da and _ca:
+                        _f_dur = int((_da - _ca) * 1000)
+                from .. import synapse_bus
+                synapse_bus.send(
+                    "laya.task.failed" if is_laya else "zcode.task.failed",
+                    "ZCode：%s\n失败：退出码 %s·耗时 %s" % (
+                        prompt, rc, ("%sms" % _f_dur) if _f_dur is not None else "?"),
+                    mentions=['user'], thread_id=None,  # [v5 step2] 失败叫醒用户（@user 发送侧）
+                    meta={"trace_id": task_id + ":failed", "task_id": task_id,
+                          "exit_code": rc, "duration_ms": _f_dur,
+                          "caller": "laya" if is_laya else "zcode",
+                          "got_result": last_result is not None,
+                          "dropped_types": _dropped_types,
+                          "parse_errors": _parse_errors,
+                          "empty_lines": _empty_lines,
+                          "loop_exit_reason": _loop_exit_reason,
+                          "stream_vanished": (
+                              last_result is None
+                              and not _dropped_types
+                              and _parse_errors == 0
+                              and _empty_lines == 0
+                              and rc == 0
+                          )},
+                    from_member="organ.laya" if is_laya else "organ.zcode")
+                # [读流告警 2026-10-10] 桥接层静默失败——走 ERROR 通道（桥一 v1.6 FileHandler + ErrorRingBuffer 天然收）
+                _sv = (last_result is None and not _dropped_types
+                       and _parse_errors == 0 and _empty_lines == 0 and rc == 0)
+                if _sv or _loop_exit_reason:
+                    import logging as _logging
+                    _logging.getLogger("moray.zcode").error(
+                        "[zcode] 读流异常：task=%s exit_code=%s got_result=%s "
+                        "loop_exit_reason=%r dropped_types=%r parse_errors=%d empty_lines=%d stream_vanished=%s",
+                        task_id, rc, last_result is not None,
+                        _loop_exit_reason, _dropped_types, _parse_errors, _empty_lines, _sv,
+                    )
+        except Exception as e:  # noqa: BLE001 - 旁路写入失败绝不影响流收尾
+            import logging
+            logging.getLogger("moray.zcode").warning(
+                "[zcode-memory] 写入钩子异常：task=%s err=%s: %s",
+                task_id, type(e).__name__, str(e)[:200])
+
+
+def _zcode_kill_proc_tree(pid: int) -> tuple:
+    """[停止修复 2026-10-03] 收进程树（taskkill /T /F），与 _kill_tree 的 win32 分支同语义
+    （spawn 已带 CREATE_NEW_PROCESS_GROUP，/T 收全树；CREATE_NO_WINDOW=0x08000000 不弹框）；
+    非 win killpg。阻塞函数——调用方必须 asyncio.to_thread。异常一律折成 (False, detail)
+    交调用方落 reason，不吞不抛。"""
+    import subprocess
+    import sys as _sys
+    try:
+        if _sys.platform == "win32":
+            r = subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=20,
+                               creationflags=0x08000000, check=False)
+            return (r.returncode == 0, "" if r.returncode == 0 else "taskkill_rc_%s" % r.returncode)
+        import os
+        os.killpg(os.getpgid(pid), 9)
+        return (True, "")
+    except Exception as e:  # noqa: BLE001 - kill 失败以结果形态上报，由端点兜底
+        return (False, str(e))
 
 
 # ---------------------------------------------------------------- 工具函数（agent_runner 同策略）
@@ -939,3 +1162,250 @@ class ZCodeAdapter(ExecutionEngine):
             "error": rec["error"],
             "cwd": str(rec["cwd_path"] or ""),
         }
+
+    # ---------------- [引擎解耦 v1 2026-10-21] 流式任务四方法（自 api.py Day24b 收编） ----------------
+    # 与 ExecutionEngine 五方法契约并行的"流式"扩展面：api.py 通用派发路由只认这四个方法名，
+    # 未来 LayaEngine 等新引擎只要实现同名方法即可挂上 /api/engines/{name}/* 通用端点。
+    # 语义与 api.py 原手写路由逐字一致（红线）；错误一律 raise StreamTaskError，路由层翻译。
+
+    def start_stream(self, body: dict) -> dict:
+        """[Day24b] 受理 ZCode 流式任务：spawn CLI（stream-json）即刻返回。
+
+        出参 {"ok": True, "task_id", "status": "running"}（扁平形，与 GET /stream 的 SSE
+        契约配对，前端按 task_id 直读）。校验失败/受理失败 raise StreamTaskError。
+        需在事件循环上下文调用（内部取 running loop 供 reader 线程投递）。
+        """
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise StreamTaskError("bad_request", "缺少 prompt 字段（要执行的任务指令）")
+        language = str(body.get("language") or "python").strip().lower() or "python"
+        # [器官→记忆 线C] 调用方标记：Laya tool_registry 调本端点时 body 带 caller="laya"。
+        # 流旁路记忆钩子（线B）见 caller=="laya" 即跳过——Laya executor 已在任务链收尾写
+        # laya_executor/task_result，本端点只是它链路里的一步，双写会 N+1（2026-10-04 裁断）。
+        caller = str(body.get("caller") or "").strip().lower()[:32]
+
+        # 惰性清理：已结束超过 1h 的任务记录顺手回收（无 lifespan 循环，与 L5.0 惯例一致）
+        now = time.time()
+        for stale in [t for t, r in _ZCODE_STREAM_TASKS.items()
+                      if r.get("done_at") and now - r["done_at"] > 3600]:
+            _ZCODE_STREAM_TASKS.pop(stale, None)
+        # [停止修复 2026-10-03] 进程常登表同口径回收（done_at 由 reader 线程在进程 EOF 后补）
+        for stale in [t for t, r in _ZCODE_STREAM_PROCS.items()
+                      if r.get("done_at") and now - r["done_at"] > 3600]:
+            _ZCODE_STREAM_PROCS.pop(stale, None)
+
+        task_id = uuid.uuid4().hex
+        sandbox_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
+        try:
+            sandbox_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise StreamTaskError("sandbox_mkdir_failed", f"创建沙箱目录失败：{e}", 500) from e
+
+        # CLI 解析与 __init__ 同口径：env MORAY_ZCODE_CLI 优先，缺省绝对路径 node + zcode.cjs
+        env_cmd = os.environ.get("MORAY_ZCODE_CLI", "").strip()
+        cli_cmd = [env_cmd] if env_cmd else [ZCODE_CMD, ZCODE_SCRIPT]
+        # spawn 参数与 Day24a 实证命令逐字一致（stream-json 只在该形态下被真机验证过）；
+        # --mode yolo 强制显式传（-p 缺省 mode 时 CLI 默认 yolo，Day9 实测）。
+        cmd = [*cli_cmd, "-p", prompt, "--output-format", "stream-json",
+               "--mode", "yolo", "--cwd", str(sandbox_dir)]
+        # [批次二·5 任务4] 数据目录隔离：与 _build_env 同口径——**硬覆盖**。
+        # 后端进程常继承桌面 ZCode 会话的 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE（指向 C 盘
+        # 真实配置、含云端 Key），setdefault 因变量已存在而失效（E2E 实证会偷跑云端），
+        # 故这里强制指到项目内脱敏配置并清出桌面 builtin 缓存路径。
+        zcode_env = dict(os.environ)
+        zcode_env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = ZCODE_PERSONAL_CONFIG
+        zcode_env["ZCODE_DATA_BASE_DIR"] = ZCODE_DATA_DIR
+        zcode_env["ZCODE_STORAGE_DIR"] = ZCODE_DATA_DIR
+        zcode_env.pop("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", None)
+        zcode_env.setdefault("ZCODE_MODEL_TELEMETRY_ENABLED", "0")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(sandbox_dir),
+                env=zcode_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # Day24a 实测 stderr 0 字节，不解析（任务书 gotcha 4）
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=CREATION_FLAGS,
+            )
+        except OSError as e:
+            raise StreamTaskError("spawn_failed", f"ZCode CLI 启动失败：{e}", 500) from e
+
+        queue: asyncio.Queue = asyncio.Queue()
+        rec = {
+            "task_id": task_id,
+            "status": "running",
+            "prompt": prompt,
+            "language": language,
+            "caller": caller,
+            "cwd": str(sandbox_dir),
+            "cmd": cmd,
+            "proc": proc,
+            "queue": queue,
+            "loop": asyncio.get_running_loop(),
+            "created_at": time.time(),
+            "done_at": None,
+        }
+        _ZCODE_STREAM_TASKS[task_id] = rec
+        _ZCODE_STREAM_PROCS[task_id] = rec   # [停止修复 2026-10-03] 进程常登（流断连不弹，kill 端点数据源）
+        threading.Thread(
+            target=_zcode_stream_reader, args=(task_id, proc, queue, rec["loop"]),
+            name="moray-zcode-stream-" + task_id[:8], daemon=True,
+        ).start()
+        # [v5 step1] 受理成功（子进程起 + reader 线程起）→ started 上总线。trace_id 分键
+        # task_id+":started"——succeeded 保持裸 task_id（send 幂等判重按 trace_id 全表唯一，
+        # 裸键互吞即丢终态事件）。总闸关 = send no-op；异常只在此留痕，绝不阻断受理返回。
+        try:
+            from .. import synapse_bus
+            _started_is_laya = caller == "laya"
+            synapse_bus.send(
+                "laya.task.started" if _started_is_laya else "zcode.task.started",
+                "ZCode：%s（受理开始）" % prompt[:200],
+                thread_id=None,
+                meta={"trace_id": task_id + ":started", "task_id": task_id,
+                      "language": language,
+                      "caller": "laya" if _started_is_laya else "zcode"},
+                from_member="organ.laya" if _started_is_laya else "organ.zcode")
+        except Exception as e:  # noqa: BLE001 - started 上总线绝不影响受理
+            import logging
+            logging.getLogger("moray.zcode").warning(
+                "[zcode-bus] started 事件异常：task=%s err=%s: %s",
+                task_id, type(e).__name__, str(e)[:200])
+        return {"ok": True, "task_id": task_id, "status": "running"}
+
+    def stream_events(self, task_id: str):
+        """[Day24b] 返回 SSE 事件 async 生成器：data: <原始行>\n\n 逐条透传，[DONE] 后关闭。
+
+        - task_id 不在登记表 → raise StreamTaskError("not_found")（路由层翻译 404）；
+        - 15s 无事件发一条 SSE 注释行保活（EventSource 自动忽略 ":" 开头行）；
+        - 流结束后登记表即剔除（重连语义：无）。
+        """
+        task = _ZCODE_STREAM_TASKS.get(task_id)
+        if task is None:
+            raise StreamTaskError("not_found", f"任务不存在或已结束：{task_id}", 404)
+        queue = task["queue"]
+
+        async def _gen():
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    if item == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    yield "data: " + item + "\n\n"
+            finally:
+                _ZCODE_STREAM_TASKS.pop(task_id, None)
+
+        return _gen()
+
+    async def kill_stream_task(self, task_id: str) -> dict:
+        """[停止修复 2026-10-03] 终止流式任务进程树——执行卡「停止」的服务端入口。
+
+        - 查 _ZCODE_STREAM_PROCS（spawn 常登，流断连不弹）：同时覆盖直播态与关页后的
+          「执行快照」孤儿态；主表 _ZCODE_STREAM_TASKS 已被流 finally 弹掉也不影响本方法。
+        - kill 与弹表解耦：本方法**不碰任何登记表条目**——主表弹出仍归 stream_events 的
+          finally、done_at 补记仍归 reader 线程，僵尸记录由受理端惰性清扫回收。
+        - proc.poll() 非空 → 不发 taskkill（防 pid 复用误杀无关进程），如实回 already_exited。
+        - 杀成功后 stdout EOF → reader 投 [DONE] 哨兵 → 直播中的 SSE 自然收尾，无需额外通知。
+        """
+        rec = _ZCODE_STREAM_PROCS.get(task_id)
+        if rec is None:
+            raise StreamTaskError("not_found", f"任务不存在或已回收：{task_id}", 404)
+        proc = rec.get("proc")
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            raise StreamTaskError("no_proc", f"任务记录缺少进程句柄：{task_id}", 500)
+        rc = proc.poll()
+        if rc is not None:
+            return {"ok": True, "task_id": task_id, "killed": False,
+                    "reason": "already_exited", "exit_code": rc, "pid": pid}
+        ok, detail = await asyncio.to_thread(_zcode_kill_proc_tree, pid)
+        if not ok and proc.poll() is None:
+            try:  # taskkill 失败兜底：至少杀掉直系子进程（_kill_tree 同形态）
+                proc.kill()
+                ok, detail = True, "fallback_proc_kill"
+            except OSError as e:
+                detail += "；proc.kill 亦失败：" + str(e)
+        return {"ok": True, "task_id": task_id, "killed": bool(ok), "reason": detail, "pid": pid}
+
+    def read_task_file(self, task_id: str, filename: str):
+        """[Day24b-d] 读取任务沙箱内单个文件供前端预览（原始内容直出）。
+
+        返回 (media_type, content)：图片 content 为 bytes、文本为 str（UTF-8 replace）；
+        失败 raise StreamTaskError（413 走 body={"ok": false, "error": "file too large"}）。
+
+        安全设计（spec 逐条，与 api.py 原实现同）：
+        - 穿越形态前置拒绝（..、路径分隔符、盘符/NTFS 数据流的冒号、NUL）→ 403，先于存在性判定；
+        - task_id 必须是本后端签发的 uuid4.hex（32 位十六进制），否则 404；
+        - os.path.realpath 后必须仍落在该任务沙箱目录内（防符号链接/junction 逃逸）→ 越界 403；
+        - 只服务该任务自己的 day24b_runs/<task_id>/ 顶层文件；Windows 保留设备名（CON/NUL/...）→ 404
+          （open 这类名字可能阻塞事件循环，防御性拒绝）。
+        存在性判定的实现偏差（报告已标）：SSE 流结束即从 _ZCODE_STREAM_TASKS 剔出（既有行为、
+        红线禁改），而预览恰发生在任务结束后——故「登记表命中 或 沙箱目录存在」任一即可，
+        两者皆无 → 404。安全属性不变：只有本后端真实受理过的 task_id 才会有沙箱目录。
+        """
+        text_exts = {".py", ".js", ".ts", ".json", ".sh", ".bat", ".txt", ".md"}
+        image_mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                      ".gif": "image/gif", ".webp": "image/webp"}
+        max_preview_bytes = 512 * 1024
+
+        def _bad_segment(s: str) -> bool:
+            """单段路径名非法形态：空、. / ..、含分隔符、盘符或 NTFS 数据流的冒号、NUL。"""
+            return (not s) or s in (".", "..") or ("/" in s) or ("\\" in s) or (":" in s) or ("\x00" in s)
+
+        # ---- 1. 穿越形态前置拒绝（403）----
+        if _bad_segment(task_id) or _bad_segment(filename):
+            raise StreamTaskError("path_traversal", "非法路径（拒绝访问）", 403)
+
+        # ---- 2. task_id 必须是本后端签发的 uuid4.hex；登记表或沙箱目录任一命中，否则 404 ----
+        if not re.fullmatch(r"[0-9a-f]{32}", task_id):
+            raise StreamTaskError("not_found", f"任务不存在：{task_id}", 404)
+        task_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
+        if task_id not in _ZCODE_STREAM_TASKS and not task_dir.is_dir():
+            raise StreamTaskError("not_found", f"任务不存在：{task_id}", 404)
+        # Windows 保留设备名（open 可能阻塞事件循环）→ 按不存在处理
+        if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^/\\]*)?", filename):
+            raise StreamTaskError("not_found", f"文件不存在：{filename}", 404)
+
+        # ---- 3. realpath 包含性（spec：realpath 后必须仍以沙箱目录 realpath 开头）----
+        base_real = os.path.realpath(str(task_dir))
+        target_real = os.path.realpath(str(task_dir / filename))
+        try:
+            if not Path(target_real).is_relative_to(Path(base_real)):
+                raise StreamTaskError("path_traversal", "非法路径（拒绝访问）", 403)
+        except (OSError, ValueError) as e:
+            raise StreamTaskError("read_error", f"路径解析失败：{e}", 500) from e
+
+        target = Path(target_real)
+        if not target.is_file():
+            raise StreamTaskError("not_found", f"文件不存在：{filename}", 404)
+
+        # ---- 4. 大小闸门（413 body 按 spec 逐字）----
+        try:
+            size = target.stat().st_size
+        except OSError as e:
+            raise StreamTaskError("read_error", f"读取失败：{e}", 500) from e
+        if size > max_preview_bytes:
+            raise StreamTaskError("file_too_large", "file too large", 413,
+                                  body={"ok": False, "error": "file too large"})
+
+        # ---- 5. 按扩展名出 MIME：图片原样 bytes；文本 UTF-8；未知 → octet-stream（前端按文本兜底）----
+        ext = os.path.splitext(filename)[1].lower()
+        try:
+            with open(target_real, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            raise StreamTaskError("read_error", f"读取失败：{e}", 500) from e
+        if ext in image_mime:
+            return image_mime[ext], data
+        if ext in text_exts:
+            media = "text/plain; charset=utf-8"
+        elif ext in (".html", ".htm"):
+            media = "text/html; charset=utf-8"
+        else:
+            media = "application/octet-stream"
+        return media, data.decode("utf-8", errors="replace")
