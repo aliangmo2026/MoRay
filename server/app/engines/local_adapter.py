@@ -30,6 +30,7 @@ from .base import (
     STATUS_RUNNING,
     ExecutionEngine,
 )
+from .laya_adapter import LayaEngine  # [引擎解耦 v1 2026-10-21] Laya 8001 编排引擎（构造无副作用）
 from .zcode_adapter import ZCodeAdapter  # [Day10] engines_list 注册用（构造无副作用，目录懒创建）
 
 # 任务 2.c：路径白名单根（唯一允许写入的目录）
@@ -161,10 +162,11 @@ router = APIRouter()
 # 模块级默认实例：仅用于 /api/engines/list 的能力申报，构造无任何副作用（目录懒创建）
 _default_engine = LocalAdapter()
 _default_zcode_engine = ZCodeAdapter()  # [Day10] 骨架注册：capabilities 诚实申报 is_isolated=False
+_default_laya_engine = LayaEngine()  # [引擎解耦 v1 2026-10-21] Laya 8001 编排引擎注册
 
 # [引擎解耦 v1 2026-10-21] 模块级注册表：engines_list 只读路由与 api.py 通用派发路由
 # （/api/engines/{engine_name}/*）共用同一名单；新增引擎时在本列表登记即可。
-all_engines = [_default_engine, _default_zcode_engine]
+all_engines = [_default_engine, _default_zcode_engine, _default_laya_engine]
 
 
 def get_engine_by_name(name: str):

@@ -404,7 +404,7 @@ class TestEnginesListRegistration(unittest.TestCase):
         data = engines_list()
         self.assertTrue(data["ok"])
         names = [e["name"] for e in data["engines"]]
-        self.assertEqual(names, ["local", "zcode"])
+        self.assertEqual(names, ["local", "zcode", "laya"])
         zc = next(e for e in data["engines"] if e["name"] == "zcode")
         self.assertTrue(zc["description"])
         self.assertEqual(zc["capabilities"], {
