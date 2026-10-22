@@ -10,6 +10,10 @@ import json
 import os
 import sqlite3
 
+#: [心智状态机 2026-10-22] 心智状态来源 kind（self_narrative stage2 落库产物，
+#: content=JSON 串 {"narrative","mental_state"}；10-14 写入矩阵预埋）
+_NARRATIVE_KIND = "self_narrative"
+
 
 def render_self_card(state: dict) -> str:
     """纯函数：db_state → 事实卡字符串。
@@ -32,6 +36,21 @@ def render_self_card(state: dict) -> str:
     recent = state.get("recent_self")
     if recent:
         lines.append(f"- 最近自我模型：{recent[:120]}")
+    ms = state.get("mental_state")
+    if isinstance(ms, dict) and (ms.get("focus_shift") or ms.get("recent_failures")):
+        # [心智状态机 2026-10-22] 独立标题框住：状态属"背景事实"，措辞自证仍禁外推，
+        # 不给卡尾"禁止外推"红线开缺口。定长截断保确定性（test_self_card 纯函数红线）。
+        lines.append("- 心智状态（自省叙事产出·背景事实，仍禁外推）：")
+        focus = str(ms.get("focus_shift") or "").strip()[:120]
+        fails = ms.get("recent_failures")
+        fail_parts = []
+        if isinstance(fails, list):
+            for x in fails[:3]:
+                s = str(x).strip()[:40]
+                if s:
+                    fail_parts.append(s)
+        lines.append("  最近关注点：%s（历史失败：%s）"
+                     % (focus or "无", "、".join(fail_parts) or "无"))
     up = state.get("uptime_hours")
     if up is not None:
         lines.append(f"- 本次运行：{up:.1f} 小时")
@@ -69,6 +88,24 @@ def collect_db_state() -> dict:
                 row = cur.fetchone()
                 if row:
                     state["recent_self"] = row[0]
+                # [心智状态机 2026-10-22] 最新一条 self_narrative → JSON 解析取
+                # mental_state；无行/解析失败/无该键一律不置键（render 条件行自然
+                # 不出现，fail-open 与上方同款）。参数绑定，禁拼接 SQL。
+                cur.execute(
+                    "SELECT content FROM memory_bank WHERE kind = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (_NARRATIVE_KIND,)
+                )
+                nar_row = cur.fetchone()
+                if nar_row and nar_row[0]:
+                    try:
+                        nar_obj = json.loads(nar_row[0])
+                    except ValueError:
+                        nar_obj = None
+                    if isinstance(nar_obj, dict):
+                        ms = nar_obj.get("mental_state")
+                        if isinstance(ms, dict) and ms:
+                            state["mental_state"] = ms
             finally:
                 conn.close()
         except Exception:  # noqa: BLE001

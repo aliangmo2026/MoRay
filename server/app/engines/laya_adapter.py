@@ -10,8 +10,11 @@
 （start → step_start/step_result/check/retry → final 帧），没有"受理拿 id、再另开端点拉流"
 的两段式；而引擎契约要求 start_stream 受理即返回 task_id、事件走 stream_events 订阅。
 照抄 ZCodeAdapter 的"reader 线程 + asyncio.Queue"骨架桥接：后台线程消费 Laya 的 SSE，
-把帧原文投进队列，stream_events 再从队列取。流式语义逐字对齐 zcode_adapter：
-"data: <原始行>\\n\\n" 逐条透传不重序列化、"[DONE]" 哨兵、15s keep-alive 注释行。
+把帧投进队列，stream_events 再从队列取。流式语义逐字对齐 zcode_adapter：
+"data: <帧>\\n\\n" 逐条投递、"[DONE]" 哨兵、15s keep-alive 注释行。差别仅在出线帧：
+[帧翻译 2026-10-22] 前端（89 面板 / 92 执行卡）只认 ZCode CLI 的 stream-json 信封，
+故投队列前经 _translate_frame 把 Laya 原文译成 ZCode 方言（详见该函数头注）；
+_on_frame 状态机仍吃 Laya 原文，翻译层与其解耦。
 
 Laya 帧词汇（decision-kernel/lora-training/modules/executor.py）：start / step_start /
 step_result / check / retry / step_end / final；**终态只认 event=="final"**——step_result
@@ -106,6 +109,124 @@ def _post(loop, queue, item: str) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, item)
     except RuntimeError:
         pass  # 事件循环已关：订阅端已走远，丢帧无害
+
+
+# ------------------------------------------------------------ 帧翻译（Laya → ZCode stream-json）
+# [帧翻译 2026-10-22] 前端只认 ZCode CLI 的 stream-json 信封 {type, payload, timestamp, seq}
+# （result 尾行无 seq/timestamp），Laya 帧是 event 平铺方言——引擎契约的事实线上格式即
+# ZCode 方言，故在本适配器出口一次性翻译，前端 / api.py 零改动。映射表（有损）：
+#   start         → turn.started{payload:{input, totalSteps}}
+#   step_start    → tool.updated{kind:scheduled, toolName, input, description}
+#   step_result   → tool.updated{kind:result|error, toolName, duration:elapsed_ms, error}
+#   step_end      → 丢弃（与 step_result 同构镜像，防时间线重复行）
+#   check / retry → model.streaming{kind:text_delta}（文本流叙述自检/重试，前端无对应事件）
+#   final success → turn.completed{duration,usage} + result 尾行{response,usage}
+#   final failed/cancelled → tool.updated{kind:error} 红行、**不发 result**（方案 a：
+#                   终态交给前端既有的"未见 result"兜底，失败正确变红，零前端改动）。
+# 已知有损点：Laya 无 token 流（model.streaming 无来源）→ 正文打字机区为空；usage 恒空。
+# 状态机 _on_frame 继续吃 Laya 原文，与本翻译层完全解耦。
+_TR_LOCK = threading.Lock()
+_TR_SEQ = 0
+_TR_TURN_T0 = {}   # execution_id → start 帧 ts（算全程毫秒；uuid 键无并发串扰）
+
+
+def _tr_envelope(typ: str, payload: dict = None, ts=None, tail: dict = None) -> str:
+    """ZCode stream-json 信封序列化。result 尾行只带 type+tail（无 seq/timestamp，89 契约）；
+    其余帧带自增 seq 与毫秒 timestamp（Laya 帧的 ts 优先，缺省取当前时间）。"""
+    global _TR_SEQ
+    if typ == "result":
+        obj = {"type": "result"}
+        obj.update(tail or {})
+        return json.dumps(obj, ensure_ascii=False)
+    with _TR_LOCK:
+        _TR_SEQ += 1
+        seq = _TR_SEQ
+    stamp = ts if isinstance(ts, (int, float)) else int(time.time() * 1000)
+    return json.dumps({"type": typ, "payload": payload or {},
+                       "timestamp": stamp, "seq": seq}, ensure_ascii=False)
+
+
+def _translate_frame(raw: str) -> list:
+    """Laya 原始帧（JSON 串）→ ZCode stream-json 信封列表（0..2 条）。
+
+    坏帧 / 非 dict / 未知事件一律丢弃返回 []（与 _on_frame 同口径，绝不抛——翻译失败
+    不能把整条流带崩）。纯出线翻译：只读帧字段 + 全局 seq 计数器 + turn 起点表。
+    """
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(d, dict):
+        return []
+    ev = str(d.get("event") or "")
+    ts = d.get("ts")
+    if ev == "start":
+        eid = str(d.get("execution_id") or "")
+        if eid:
+            _TR_TURN_T0[eid] = ts if isinstance(ts, (int, float)) \
+                else int(time.time() * 1000)
+        return [_tr_envelope("turn.started",
+                             {"input": str(d.get("goal") or ""),
+                              "totalSteps": d.get("total_steps")}, ts)]
+    if ev == "step_start":
+        return [_tr_envelope("tool.updated",
+                             {"kind": "scheduled", "toolName": d.get("tool") or "tool",
+                              "input": d.get("input"),
+                              "description": d.get("description")}, ts)]
+    if ev == "step_end":
+        return []   # 与 step_result 同构镜像（executor.py 自证），丢弃防重复行
+    if ev == "step_result":
+        tool = d.get("tool") or "tool"
+        if str(d.get("status") or "") == "ok":
+            payload = {"kind": "result", "toolName": tool}
+            if isinstance(d.get("elapsed_ms"), (int, float)):
+                payload["duration"] = d["elapsed_ms"]   # 92/89 显示 "done · Nms"
+            return [_tr_envelope("tool.updated", payload, ts)]
+        err = d.get("error")
+        if not isinstance(err, str):
+            err = json.dumps(err, ensure_ascii=False, default=str) if err is not None \
+                else "步骤失败"
+        return [_tr_envelope("tool.updated",
+                             {"kind": "error", "toolName": tool, "error": err}, ts)]
+    if ev == "check":
+        # ZCode 方言无自检事件 → 转文本流叙述（任务书：无法映射者走 text 输出）
+        sid = str(d.get("step_id") or "")
+        if d.get("success"):
+            rc = d.get("retry_count") or 0
+            line = "[自检] %s 通过%s\n" % (
+                sid, "（重试 %d 次后通过）" % rc if rc else "")
+        else:
+            line = "[自检未通过] %s：%s\n" % (sid, str(d.get("reason") or "")[:200])
+        return [_tr_envelope("model.streaming", {"kind": "text_delta", "delta": line}, ts)]
+    if ev == "retry":
+        rc = d.get("retry_count") if d.get("retry_count") is not None \
+            else d.get("attempt")
+        line = "[重试] 第 %s 次重试：%s\n" % (
+            rc if rc is not None else "?",
+            str(d.get("description") or d.get("tool") or "")[:80])
+        return [_tr_envelope("model.streaming", {"kind": "text_delta", "delta": line}, ts)]
+    if ev == "final":
+        st = str(d.get("status") or "")
+        eid = str(d.get("execution_id") or "")
+        t0 = _TR_TURN_T0.pop(eid, None) if eid else None
+        dur = None
+        if isinstance(ts, (int, float)) and isinstance(t0, (int, float)):
+            dur = int(ts - t0)
+        if st == "success":
+            result = d.get("result")
+            if result is not None and not isinstance(result, str):
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            turn_p = {"usage": {}}
+            if dur is not None:
+                turn_p["duration"] = dur
+            return [_tr_envelope("turn.completed", turn_p, ts),
+                    _tr_envelope("result", tail={"response": result or "",
+                                                 "usage": {}})]
+        # 方案 (a)：failed/cancelled 只产 tool.updated(kind=error) 红行、不发 result——
+        # 前端"未见 result"兜底把执行卡收敛为失败态（零前端改动）。
+        err = str(d.get("error") or ("已取消" if st == "cancelled" else "任务失败"))
+        return [_tr_envelope("tool.updated", {"kind": "error", "error": err}, ts)]
+    return []
 
 
 class LayaEngine(ExecutionEngine):
@@ -377,12 +498,20 @@ class LayaEngine(ExecutionEngine):
                                   % (type(e).__name__, str(e)[:200]), 502) from e
 
     def _run_stream(self, rec: dict, payload: dict) -> None:
-        """流式面消费线程：帧原文投 asyncio.Queue（zcode reader 同款），终态改登记表。"""
+        """流式面消费线程：帧投 asyncio.Queue（zcode reader 同款），终态改登记表。
+
+        [帧翻译 2026-10-22] 投递前经 _translate_frame 译成 ZCode stream-json 信封
+        （前端只认该方言）；_on_frame 仍吃 Laya 原文维护状态机，两者解耦。
+        """
         queue, loop = rec["queue"], rec["loop"]
+
+        def _emit(s: str) -> None:
+            self._on_frame(rec, s)              # 状态机吃原文（只认 event=="final"）
+            for frame in _translate_frame(s):   # 出线走 ZCode 方言翻译
+                _post(loop, queue, frame)
+
         try:
-            self._consume_stream(
-                rec, payload,
-                lambda s: (self._on_frame(rec, s), _post(loop, queue, s)))
+            self._consume_stream(rec, payload, _emit)
         except StreamTaskError as e:
             self._fail_transport(rec, e.message, loop, queue)
         finally:
@@ -400,14 +529,17 @@ class LayaEngine(ExecutionEngine):
 
     def _fail_transport(self, rec: dict, message: str, loop, queue) -> None:
         """传输层失败 → 补发合成 final{status:failed}（形状对齐 laya_std_server._sse 的
-        异常收尾帧），让消费端拿到闭合终态；已见过真 final 则不再补。"""
+        异常收尾帧），让消费端拿到闭合终态；已见过真 final 则不再补。
+        [帧翻译 2026-10-22] 记录仍吃合成原文，出线也走 _translate_frame（合成
+        final{failed} 译成 tool.updated(kind=error) 红行，不留 Laya 方言裸帧给前端）。"""
         frame = json.dumps({"event": "final", "status": "failed", "error": message},
                            ensure_ascii=False)
         with self._lock:
             already_done = rec["done_at"] is not None
         if not already_done:
             self._on_frame(rec, frame)
-            _post(loop, queue, frame)
+            for out in _translate_frame(frame):
+                _post(loop, queue, out)
 
     def _on_frame(self, rec: dict, raw: str) -> None:
         """帧状态机：**只认 event=="final"**（step_result 也带 status 字段，误读会把重试

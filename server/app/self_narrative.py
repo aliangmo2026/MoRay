@@ -18,6 +18,7 @@
      = 从未生成，条件②视为满足。
 """
 import datetime
+import json
 import logging
 
 import httpx
@@ -25,6 +26,11 @@ from fastapi import APIRouter
 
 from . import config
 from .memory_routes import insert_memory
+
+try:
+    import json_repair  # reflection 同款容错；venv 已装但 requirements 未声明，故 try-import
+except ImportError:  # noqa: BLE001 - 无 json_repair 时走 _parse_narrative_json 手写兜底
+    json_repair = None
 
 logger = logging.getLogger("moray.self_narrative")
 
@@ -42,12 +48,16 @@ _SELF_KIND = "self"
 #: 喂给 stage2 的近期 insight 条数上限
 _INSIGHTS_LIMIT = 30
 #: 喂给 stage2 的观察条数上限：ASC 序取尾部即最新 _NARRATIVE_OBS_LIMIT 条
-_NARRATIVE_OBS_LIMIT = 100
+#: [2026-10-22 本地算力适配] 100 → 30：8G 共享显存（与 llama-server:8080 分卡）
+#: 下全量 prompt 实测两次必超 REFLECTION_TIMEOUT=600s（ReadTimeout），30 条可跑完。
+_NARRATIVE_OBS_LIMIT = 30
 #: user prompt 总字符预算（reflection._MAX_PROMPT_CHARS 同款实证值：8192 ctx 安全）
 _NARRATIVE_PROMPT_CHARS = 12000
-#: 叙事落库截断——insert_memory 不截 content，必须自设（800 字产出给 5 倍余量）
+#: 叙事正文截断——insert_memory 不截 content，必须自设（800 字产出给 5 倍余量）。
+#: [心智状态机 2026-10-22] 截断**只作用 narrative 字段**、之后重新 json.dumps：
+#: 对 JSON 串整体切片会拦腰截出坏 JSON，落库后永久解析不回来。
 _NARRATIVE_MAX_CONTENT = 4000
-#: 产出最短字数——低于此视为空转/垃圾，拒写不落库
+#: 产出最短字数——低于此视为空转/垃圾，拒写不落库（作用于 narrative 字段）
 _NARRATIVE_MIN_CONTENT = 50
 
 
@@ -179,10 +189,12 @@ def check_readiness() -> dict:
 
 # ---- stage2 叙事生成（2026-10-21）：LLM 熔炼 → 落库。范式=reflection.py 同款 ----
 
-_SYSTEM_PROMPT = """你是 MoRay。请基于以下观察，用第一人称写一篇自我叙事，不超过 800 字。只放事实，不出现"应该/建议"等词。
+_SYSTEM_PROMPT = """你是 MoRay。请基于以下观察，用第一人称写一篇自我叙事（不超过 800 字），并给出当前心智状态。只放事实，不出现"应该/建议"等词。
+只输出一个 JSON 对象，不要任何解释文字、不要代码块标记，严格符合这个形状：
+{"narrative": "第一人称自我叙事正文（中文纯文本，不要小标题与序号）", "mental_state": {"capability_score": 85, "recent_failures": ["最近遇到的失败事实，没有则给空数组"], "focus_shift": "最近关注点的变化，一句话"}}
 要求：
 1. 归纳而不是复述：写多条记录合起来才成立的规律与状态，不逐条转述观察。
-2. 中文纯文本输出：不要 JSON、不要代码块标记、不要小标题与序号。
+2. narrative 不超过 800 字；mental_state 各字段同样只依据观察里存在的事实。
 3. 绝不编造观察里不存在的依据。"""
 
 #: 在飞闸（进程内存活，重启清零）：生成中不重复触发，端点与循环两入口共用
@@ -231,10 +243,48 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+def _parse_narrative_json(raw: str) -> dict:
+    """模型输出 → {"narrative": str, "mental_state": dict}。纯函数零 IO。
+
+    [心智状态机 2026-10-22] json_repair 优先（reflection._parse_json_array 同款容错，
+    对象版兜底取首 '{' 到末 '}'）；解析失败/没有可用 narrative → **整段降级为
+    narrative 纯文本、mental_state 空 dict**（旧纯文本产物与模型没照 JSON 说话时
+    不丢内容，与任务书容错口径一致）。绝不抛。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {"narrative": "", "mental_state": {}}
+    obj = None
+    try:
+        if json_repair is not None:
+            fixed = json_repair.repair_json(text)
+            data = json.loads(fixed) if isinstance(fixed, str) else fixed
+        else:
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                data = None
+            else:
+                data = json.loads(text[start:end + 1])
+        if isinstance(data, dict):
+            obj = data
+    except (ValueError, TypeError):
+        obj = None
+    if obj is not None:
+        narrative = obj.get("narrative")
+        if isinstance(narrative, str) and narrative.strip():
+            ms = obj.get("mental_state")
+            return {"narrative": narrative.strip(),
+                    "mental_state": ms if isinstance(ms, dict) else {}}
+    return {"narrative": _strip_code_fence(text), "mental_state": {}}
+
+
 async def _llm_narrate(messages: list):
-    """喂 messages 要纯文本叙事；任何异常/非 200/空应答返回 (None, 原因)。
+    """喂 messages 要 JSON 叙事；任何异常/非 200/空应答返回 (None, 原因)。
     复用 reflection 同组 config（REFLECTION_API/BASE_URL/MODEL/TIMEOUT/NUM_CTX），
-    双协议口径与其 _llm_reflect 完全一致；差异仅在输出语义：自由文本而非 JSON 数组。"""
+    双协议口径与其 _llm_reflect 完全一致；差异仅在输出语义：JSON 对象而非 JSON 数组。
+    [心智状态机 2026-10-22] 应答经 _parse_narrative_json 归一为
+    {"narrative", "mental_state"}；**解析失败不再当错误**——整段降级为 narrative
+    纯文本（mental_state 空），正常返回。"""
     if config.REFLECTION_API == "openai":
         url = config.REFLECTION_BASE_URL.rstrip("/") + "/v1/chat/completions"
         payload = {"model": config.REFLECTION_MODEL, "stream": False,
@@ -255,10 +305,9 @@ async def _llm_narrate(messages: list):
             raw = ((body.get("choices") or [{}])[0].get("message") or {}).get("content", "")
         else:
             raw = (body.get("message") or {}).get("content", "")
-        text = _strip_code_fence(raw)
-        if not text:
+        if not (raw or "").strip():
             return None, "推理服务应答为空"
-        return text, ""
+        return _parse_narrative_json(raw), ""
     except Exception as e:  # noqa: BLE001 - fail-open：异常转错误原因返回，不上抛
         logger.warning("[self_narrative] 推理调用异常：%s: %s",
                        type(e).__name__, str(e)[:200])
@@ -271,7 +320,9 @@ async def generate_narrative() -> dict:
       ① 在飞闸：_narrative_inflight 生成中不重复触发（端点/循环两入口共用）；
       ② readiness：observation 够量 + 7 天冷却（check_readiness，stage1 闸沿用）；
       ③ 素材非空。
-    产出侧两道：过短拒写（<_NARRATIVE_MIN_CONTENT）、落库截断（_NARRATIVE_MAX_CONTENT）。
+    产出侧两道：narrative 过短拒写（<_NARRATIVE_MIN_CONTENT）、字段级截断
+    （_NARRATIVE_MAX_CONTENT，只切 narrative 再重序列化，绝不拦腰截 JSON 串）。
+    [心智状态机 2026-10-22] 落库 content=完整 JSON 串 {"narrative","mental_state"}；
     写入走 insert_memory（矩阵预埋 source='self_narrative'→kind='self_narrative'；
     主表+FTS 双写 + 同 source 归一化判重幂等均白得）；tags=basis 原料 memory_id 溯源。
     fail-open：任何失败返回 {"ran": False, "reason": ...}，绝不抛。"""
@@ -294,25 +345,32 @@ async def generate_narrative() -> dict:
                 "readiness": readiness}
     _narrative_inflight = True
     try:
-        text, err = await _llm_narrate(messages)
-        if text is None:
+        nar, err = await _llm_narrate(messages)
+        if nar is None:
             logger.warning("[self_narrative] LLM 阶段失败：%s", err)
             return {"ran": False, "reason": "llm_failed: %s" % err,
                     "readiness": readiness}
-        if len(text) < _NARRATIVE_MIN_CONTENT:
-            logger.warning("[self_narrative] 拒写（过短 %d 字）：%r", len(text), text[:40])
-            return {"ran": False, "reason": "rejected_too_short: %d chars" % len(text),
+        narrative = str(nar.get("narrative") or "")
+        if len(narrative) < _NARRATIVE_MIN_CONTENT:
+            logger.warning("[self_narrative] 拒写（过短 %d 字）：%r",
+                           len(narrative), narrative[:40])
+            return {"ran": False, "reason": "rejected_too_short: %d chars" % len(narrative),
                     "readiness": readiness}
-        text = text[:_NARRATIVE_MAX_CONTENT]
+        # [心智状态机 2026-10-22] 截断只作用 narrative 字段再重新序列化——
+        # 对 JSON 串整体切片会拦腰截出坏 JSON，落库后永久解析不回来。
+        doc = {"narrative": narrative[:_NARRATIVE_MAX_CONTENT],
+               "mental_state": nar.get("mental_state")
+               if isinstance(nar.get("mental_state"), dict) else {}}
+        content = json.dumps(doc, ensure_ascii=False)
         mem_id, db_err = insert_memory(
-            text, kind=_NARRATIVE_KIND, source=_NARRATIVE_KIND, tags=basis_ids)
+            content, kind=_NARRATIVE_KIND, source=_NARRATIVE_KIND, tags=basis_ids)
         if db_err:
             logger.warning("[self_narrative] 写库失败：%s", db_err)
             return {"ran": False, "reason": "insert_failed: %s" % db_err,
                     "readiness": readiness}
         logger.warning("[self_narrative] 叙事已落库 id=%s chars=%d basis=%d",
-                       mem_id, len(text), len(basis_ids))
-        return {"ran": True, "memory_id": mem_id, "chars": len(text),
+                       mem_id, len(content), len(basis_ids))
+        return {"ran": True, "memory_id": mem_id, "chars": len(content),
                 "basis_count": len(basis_ids), "readiness": readiness}
     finally:
         _narrative_inflight = False

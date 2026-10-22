@@ -380,10 +380,28 @@
       return card('📜 自我叙事',
         '<div class="text-[11px] text-text-tertiary">尚未生成——重启后端后由自省循环自动产出（素材够 10 条且过 7 天冷却），或 POST /api/self_narrative/generate 手动触发。</div>');
     }
-    const text = String(nr.content || '');
-    const chars = Number(nr.chars) || text.length;
+    const raw = String(nr.content || '');
+    /* [第九卡 JSON 2026-10-22] 落库 content=self_narrative 产物的 JSON 串
+     * {"narrative","mental_state"}：解析成功只渲染 narrative 正文（mental_state
+     * 出小徽章 focus_shift）；解析失败（旧纯文本产物/异常串）整段当纯文本——
+     * 与后端 fail-open 同口径，新旧两种落库形态都可展示。 */
+    let text = raw;
+    let focus = '';
+    try {
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object' && typeof obj.narrative === 'string') {
+        text = obj.narrative;
+        const ms = obj.mental_state;
+        if (ms && typeof ms === 'object' && typeof ms.focus_shift === 'string') {
+          focus = ms.focus_shift.slice(0, 60);
+        }
+      }
+    } catch (e) { /* 旧纯文本产物：整段当正文渲染 */ }
+    const chars = text.length;
     const meta = '<div class="text-[11px] text-text-tertiary">生成于 ' +
-      esc(agoLabel(nr.created_at) || nr.created_at || '—') + ' · ' + esc(chars) + ' 字</div>';
+      esc(agoLabel(nr.created_at) || nr.created_at || '—') + ' · ' + esc(chars) + ' 字' +
+      (focus ? '　<span class="text-warning">[当前关注：' + esc(focus) + ']</span>' : '') +
+      '</div>';
     const body = '<div class="text-[11px] leading-relaxed whitespace-pre-wrap text-text-secondary mt-1">' + esc(text) + '</div>';
     return card('📜 自我叙事', meta +
       (text.length > 500
