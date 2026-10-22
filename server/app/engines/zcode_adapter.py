@@ -54,6 +54,8 @@ from .base import (
     ExecutionEngine,
     StreamTaskError,
 )
+# [v3 心智反哺 2026-10-23] 心智块数据源/渲染（纯函数层，顶层导入保持可 mock）
+from ..self_card import collect_db_state, render_mental_context
 
 _logger = logging.getLogger("moray.zcode_adapter")
 
@@ -687,18 +689,41 @@ class ZCodeAdapter(ExecutionEngine):
         文件名带 task_id 防覆盖（同目录多次跑互不踩）；相对路径用 POSIX 斜杠直接进
         argv（--cwd 已钉到沙箱目录，CLI 在该目录内解析）。写失败返回 None，由调用方
         按 failed 收敛——绝不退回"无提示词起进程"。
+        [v3 心智反哺 2026-10-23] 落盘前先拼心智块（_mental_prompt_block）：
+        有心智数据 → "[背景状态]…\\n\\n[任务指令]\\n<原 prompt>"；无数据/异常 → 原文
+        逐字落盘（fail-open，不给调用方和逐字断言添变数）。
         """
         rel = "inbox/prompt_%s.md" % rec["task_id"]
+        body = str(rec["task"].get("prompt") or "")
+        block = self._mental_prompt_block()
+        text = (block + "\n\n[任务指令]\n" + body) if block else body
         try:
             inbox = rec["cwd_path"] / "inbox"
             inbox.mkdir(parents=True, exist_ok=True)
-            (inbox / ("prompt_%s.md" % rec["task_id"])).write_text(
-                str(rec["task"].get("prompt") or ""), encoding="utf-8")
+            (inbox / ("prompt_%s.md" % rec["task_id"])).write_text(text, encoding="utf-8")
         except OSError as e:
             self._append(rec, "[MoRay] 提示词落盘失败：%s" % e)
             return None
         rec["prompt_file_rel"] = rel
         return rel
+
+    def _mental_prompt_block(self) -> str:
+        """[v3 心智反哺 2026-10-23] 渲染心智块；无数据/任何异常 → ""（零注入，fail-open）。
+
+        总闸 MORAY_MENTAL_CONTEXT（默认开；0/false/no/off=跳过，同 MORAY_SELF_CARD
+        关断词表）。数据/渲染两段各兜一层：collect_db_state 读库失败、render 抛错都
+        不许把提示词落盘带崩——落盘失败=任务直接 failed，代价远大于丢一次心智注入。
+        """
+        if os.environ.get("MORAY_MENTAL_CONTEXT", "1").strip().lower() in ("0", "false", "no", "off"):
+            return ""
+        try:
+            state = collect_db_state()
+        except Exception:  # noqa: BLE001 - 心智采集失败降级为零注入
+            return ""
+        try:
+            return render_mental_context(state) or ""
+        except Exception:  # noqa: BLE001 - 渲染失败同上
+            return ""
 
     def _build_env(self) -> dict:
         """认证/模型无 CLI flag（Day9 实测）：走 provider 配置文件 + 环境变量注入。

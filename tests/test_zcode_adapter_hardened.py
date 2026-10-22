@@ -49,11 +49,32 @@ if TEST_DB.exists():
     TEST_DB.unlink()
 os.environ["MORAY_WORKSPACE"] = str(WS)
 os.environ["MORAY_DB"] = str(TEST_DB)
+# [v3 心智反哺隔离 2026-10-23] 同 test_zcode_adapter：MEMORY_DB 硬指不存在路径，
+# 心智注入零素材 → prompt 文件逐字原文，逐字断言不被生产库叙事行干扰。
+os.environ["MORAY_MEMORY_DB"] = str(TEST_DIR / "test_memory_absent.sqlite3")
 
 from server.app import crud, db
 from server.app.engines import zcode_adapter as za
 from server.app.engines.local_adapter import engines_list
 from server.app.engines.zcode_adapter import ZCodeAdapter
+
+# [v3 心智反哺隔离] config.MEMORY_DB 是 import 时冻结的模块属性，其他测试模块
+# 也依赖它（防 import 顺序漂移惯例）——补丁作用域化，只罩本模块用例。
+from server.app import config as _app_config  # noqa: E402
+
+_MEM_DB_PATCH = None
+
+
+def setUpModule():
+    global _MEM_DB_PATCH
+    _MEM_DB_PATCH = mock.patch.object(_app_config, "MEMORY_DB",
+                                      os.environ["MORAY_MEMORY_DB"])
+    _MEM_DB_PATCH.start()
+
+
+def tearDownModule():
+    if _MEM_DB_PATCH is not None:
+        _MEM_DB_PATCH.stop()
 
 db.init_db()  # 建表（含 Day2 event_snapshots + Day3 agent_sessions）
 

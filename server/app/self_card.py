@@ -59,6 +59,32 @@ def render_self_card(state: dict) -> str:
     return "\n".join(lines)
 
 
+def render_mental_context(state: dict) -> str:
+    """[v3 心智反哺 2026-10-23] 纯函数：db_state → 执行引擎心智块；无可用心智返回 ""。
+
+    与 render_self_card 姿态相反：事实卡收在"仅复述禁外推"（被动），执行引擎在干活，
+    要的是行为约束（引以为戒）——预研红线：直接复用事实卡反而抑制行动，故独立渲染。
+    返回 "" 时调用方零注入（ZCode prompt 文件逐字保持原样，保住逐字断言）。
+    定长截断保确定性（同 render_self_card 红线）。
+    """
+    ms = state.get("mental_state")
+    if not isinstance(ms, dict):
+        return ""
+    focus = str(ms.get("focus_shift") or "").strip()[:120]
+    fails = ms.get("recent_failures")
+    fail_parts = []
+    if isinstance(fails, list):
+        for x in fails[:3]:
+            s = str(x).strip()[:40]
+            if s:
+                fail_parts.append(s)
+    if not focus and not fail_parts:
+        return ""
+    return ("[背景状态]\n你最近的心智关注点是：%s（历史失败：%s）。"
+            "在执行任务时，请引以为戒。"
+            % (focus or "无", "、".join(fail_parts) or "无"))
+
+
 def collect_db_state() -> dict:
     """读三处，拼成 render_self_card 的输入。IO 与渲染分离。"""
     from . import config

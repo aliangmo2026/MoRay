@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from server.app.self_card import render_self_card  # noqa: E402
+from server.app.self_card import render_mental_context, render_self_card  # noqa: E402
 
 STATE = {
     "memory_total": 90,
@@ -69,6 +69,39 @@ class TestRenderSelfCard(unittest.TestCase):
         self.assertNotIn("最近自我模型", out)
         self.assertNotIn("本次运行", out)
         self.assertIn("禁止外推", out)
+
+
+class TestRenderMentalContext(unittest.TestCase):
+    """[v3 心智反哺 2026-10-23] 执行引擎心智块纯函数单测。"""
+
+    MS = {"mental_state": {"focus_shift": "端口探活口径",
+                           "recent_failures": ["8080 误判存活", "超时没收敛", "第四条被截", "第五条被截"]}}
+
+    def test_empty_state_returns_empty(self):
+        """无 mental_state / 空字段 → ""（调用方零注入，prompt 文件逐字原文）。"""
+        self.assertEqual(render_mental_context({}), "")
+        self.assertEqual(render_mental_context({"mental_state": {}}), "")
+        self.assertEqual(render_mental_context({"mental_state": {"focus_shift": "  ",
+                                                                 "recent_failures": []}}), "")
+        self.assertEqual(render_mental_context({"mental_state": "not-a-dict"}), "")
+
+    def test_block_content_and_caps(self):
+        """关注点 120 截断、失败只收前 3 条各 40 截断（确定性红线同 render_self_card）。"""
+        out = render_mental_context(self.MS)
+        self.assertTrue(out.startswith("[背景状态]"))
+        self.assertIn("你最近的心智关注点是：端口探活口径", out)
+        self.assertIn("历史失败：8080 误判存活、超时没收敛、第四条被截", out)
+        self.assertNotIn("第五条被截", out)
+        self.assertIn("请引以为戒", out)
+        self.assertNotIn("禁止外推", out, "执行引擎块是行为约束姿态，不得带被动卡禁语")
+
+    def test_focus_only_or_fails_only(self):
+        """单边有值也成块（缺边兜'无'），渲染逐字确定。"""
+        a = render_mental_context({"mental_state": {"focus_shift": "X"}})
+        self.assertIn("（历史失败：无）", a)
+        b = render_mental_context({"mental_state": {"recent_failures": ["Y"]}})
+        self.assertIn("你最近的心智关注点是：无（历史失败：Y）", b)
+        self.assertEqual(a, render_mental_context({"mental_state": {"focus_shift": "X"}}))
 
 
 if __name__ == "__main__":

@@ -42,11 +42,34 @@ shutil.rmtree(WS, ignore_errors=True)
 WS.mkdir(exist_ok=True)
 SANDBOX = WS / "zcode_sandbox"          # 注入版沙箱根（替代生产 D:\MoRay\workspace\zcode_sandbox）
 os.environ.setdefault("MORAY_DB", str(TEST_DIR / "test_zcode.db"))
+# [v3 心智反哺隔离 2026-10-23] 心智注入读 MEMORY_DB：硬指到永不创建的路径 →
+# collect_db_state 无 mental_state → 零注入 → prompt 文件保持逐字原文
+# （test_prompt_goes_through_inbox_file 的逐字断言不被库内容干扰）。
+# 必须硬设（非 setdefault）：direct-run 无 conftest，config 缺省=生产库（已有叙事行）。
+os.environ["MORAY_MEMORY_DB"] = str(TEST_DIR / "test_memory_absent.sqlite3")
 
 from server.app.engines import zcode_adapter as za
 from server.app.engines.base import ExecutionEngine
 from server.app.engines.local_adapter import engines_list
 from server.app.engines.zcode_adapter import SANDBOX_ROOT, ZCodeAdapter
+
+# [v3 心智反哺隔离] config.MEMORY_DB 是 import 时冻结的模块属性，别的测试模块
+#（如 test_memory_bridge）也依赖它——补丁必须作用域化，不能在模块导入期全局生效。
+from server.app import config as _app_config  # noqa: E402
+
+_MEM_DB_PATCH = None
+
+
+def setUpModule():
+    global _MEM_DB_PATCH
+    _MEM_DB_PATCH = mock.patch.object(_app_config, "MEMORY_DB",
+                                      os.environ["MORAY_MEMORY_DB"])
+    _MEM_DB_PATCH.start()
+
+
+def tearDownModule():
+    if _MEM_DB_PATCH is not None:
+        _MEM_DB_PATCH.stop()
 
 FAKE_CLI = [r"C:\fake\node.exe", r"C:\fake\zcode.cjs"]
 
