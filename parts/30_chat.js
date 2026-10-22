@@ -1447,16 +1447,50 @@ function scrollToMsgBottom() {
 
 /* ---------- 上下文计量 ---------- */
 
+/** [上下文预算] 每张图片附件固定扣减的 token：视觉编码开销远超文本启发式，保守按 1000/张 估 */
+const IMG_TOKEN_COST = 1000;
+
+/** [上下文预算] 消息回发正文（content + toolCalls 重建块）。
+ * 预算记账与 buildRequestMessages 组装 msgs 共用本函数，保证“记账口径 = 实际发送口径”；
+ * 早期只按 m.content 记账，工具轮重建文本在记账后追加，会漏记 token 导致上下文超卖。
+ * @param {Object} m - 消息对象
+ * @returns {string} 回发正文 */
+function messageRequestText(m) {
+  let text = m.content || '';
+  if (m.toolCalls && m.toolCalls.length) {
+    text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
+    m.toolCalls.forEach(tc => {
+      let argStr = '';
+      try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
+      if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
+      const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
+      text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
+    });
+  }
+  return text;
+}
+
+/** [上下文预算] 单条消息占用的 token 估算 = 回发正文（含 toolCalls 重建块）+ 图片附件固定扣减
+ * @param {Object} m - 消息对象
+ * @returns {number} 估算 token 数 */
+function estimateMessageTokens(m) {
+  if (!m) return 0;
+  const imgs = (m.attachments && m.attachments.length) ? m.attachments.length : 0;
+  return estimateTokens(messageRequestText(m)).tokens + imgs * IMG_TOKEN_COST;
+}
+
 /** 更新 token 计量条（当前会话上下文用量 / 限制）
  * @returns {void} */
 function updateTokenMeter() {
   const meter = document.getElementById('tokenMeter');
   if (!meter) return;
-  const limit = MoraySettings.get('contextLimit') || 8192;
+  // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，避免计量口径漂移
+  const limit = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX);
   // [P0 治本] 只统计当前激活会话的消息（与请求口径一致；空会话显示 0）
   const cid = AppState.activeConv ? AppState.activeConv.id : null;
   const own = cid ? AppState.messages.filter(m => m.conversationId === cid) : [];
-  const total = own.reduce((s, m) => s + (estimateTokens(m.content).tokens), 0);
+  // [上下文预算] 与请求口径一致：含 toolCalls 重建块 + 图片固定扣减
+  const total = own.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const pct = Math.min(100, Math.round(total / limit * 100));
   document.getElementById('tokenMeterText').textContent = total + ' / ' + limit;
   const fill = document.getElementById('tokenMeterFill');
@@ -1764,10 +1798,12 @@ async function buildRequestMessages(conv, extraContext) {
     console.error('[MoRay] 请求历史仍含越界消息，已强制剔除:', leaked.length, '条');
     history = history.filter(m => m.conversationId === conv.id);
   }
-  console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', estimateTokens(history.map(m => m.content).join(' ')).tokens, 'tok');
+  console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', history.reduce((s, m) => s + estimateMessageTokens(m), 0), 'tok');
   // 上下文长度预算（估算 token），保留最近的历史
-  const budget = (MoraySettings.get('contextLimit') || 8192) - (MoraySettings.get('maxTokens') || 2048) - 100;
-  let used = estimateTokens(sys).tokens;
+  // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，本地小显存一碰就死的根因在此
+  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - (MoraySettings.get('maxTokens') || 2048) - 100;
+  // [上下文预算] 系统提示 + 本轮图片附件先扣预算：图片不进文本启发式，固定每张 1000 token 防超卖
+  let used = estimateTokens(sys).tokens + (AppState.attachments || []).length * IMG_TOKEN_COST;
   const strategy = MoraySettings.get('truncationStrategy') || 'recent';
   let picked = [];
 
@@ -1780,7 +1816,7 @@ async function buildRequestMessages(conv, extraContext) {
     // 策略A（recent）：默认从最新往回收集
     let fitIndex = -1; // 最后一条放入预算的消息下标
     for (let i = history.length - 1; i >= 0; i--) {
-      const t = estimateTokens(history[i].content).tokens;
+      const t = estimateMessageTokens(history[i]);
       if (used + t > budget && history.length - 1 - i >= 2) break;
       used += t;
       fitIndex = i;
@@ -1817,27 +1853,17 @@ async function buildRequestMessages(conv, extraContext) {
     conv.__ctxWarned = true;
     showNotification('上下文即将满', `已用约 ${Math.round(used / budget * 100)}%，较早消息将被自动截断以节省 token`, 'warning', 3500);
   }
-  // [成本中心] 记录本次压缩/截断节省（系统提示词清洗 + 截断掉的旧消息）
-  const totalHistory = history.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
-  const kept = picked.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
+  // [成本中心] 记录本次压缩/截断节省（系统提示词清洗 + 截断掉的旧消息；口径含 toolCalls 重建块与图片扣减）
+  const totalHistory = history.reduce((s, m) => s + estimateMessageTokens(m), 0);
+  const kept = picked.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const sysSaved = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(rawSys).savedTokens : 0;
   conv.__lastCompressionSaved = Math.max(0, sysSaved + (totalHistory - kept));
   // [历史断片修复 2026-10-20] 回发历史时重建工具轮：上一轮的代码常活在 toolCalls（步骤卡）的 args 里，
   // 仅序列化 role/content 会让模型"忘记自己写过什么"（实探：create_file 被拒后反问"需要写入什么内容"）。
   // 工具名+执行状态+参数（单条截断 2000 字符防爆 token）追加进正文；content 为空时该重建块即占位。
+  // [上下文预算] 序列化统一走 messageRequestText：预算记账用同一口径，重建文本不再漏记 token。
   picked.forEach(m => {
-    let text = m.content || '';
-    if (m.toolCalls && m.toolCalls.length) {
-      text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
-      m.toolCalls.forEach(tc => {
-        let argStr = '';
-        try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
-        if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
-        const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
-        text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
-      });
-    }
-    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: messageRequestText(m) });
   });
   if (extraContext && extraContext.text) {
     msgs.push({ role: 'system', content: extraContext.text });

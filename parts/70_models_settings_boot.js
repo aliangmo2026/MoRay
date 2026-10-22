@@ -244,6 +244,8 @@ const SettingsApp = {
     const page = document.getElementById('page-settings');
     if (!page) return;
     const c = MoraySettings.get();
+    // [上下文预算] 滑条物理上限：存量超限值（如 131072）显示与滑块都夹到上限，本地小显存一碰就死
+    const ctxLimit = Math.min(Number(c.contextLimit) || 8192, CONTEXT_LIMIT_MAX);
     page.innerHTML = `
       <header class="h-14 px-5 flex items-center border-b border-line-ghost/50 flex-shrink-0">
         <h1 class="text-base font-semibold text-text-primary">设置</h1>
@@ -411,8 +413,10 @@ const SettingsApp = {
                 <input type="range" min="256" max="16384" step="256" value="${c.maxTokens}" id="setMaxTokens" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div>
-                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${c.contextLimit}</span></div>
-                <input type="range" min="2048" max="131072" step="2048" value="${c.contextLimit}" id="setContextLimit" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${ctxLimit}</span></div>
+                <!-- [上下文预算] 滑条物理上限 CONTEXT_LIMIT_MAX：131072 拉满本地小显存模型直接被挤死 -->
+                <input type="range" min="2048" max="${CONTEXT_LIMIT_MAX}" step="2048" value="${ctxLimit}" id="setContextLimit" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
+                ${AI.backend === 'ollama' ? '<div class="text-[10px] text-warning/80 mt-1.5 leading-relaxed">本地 8G 显存建议不超过 16384</div>' : ''}
               </div>
               <div class="form-row">
                 <label class="form-label">全局默认系统提示词</label>
@@ -996,10 +1000,15 @@ const SettingsApp = {
     on($('setAutoNaming'), 'change', () => MoraySettings.set('autoNaming', $('setAutoNaming').checked));
     on($('setNamingStyle'), 'change', () => MoraySettings.set('namingStyle', $('setNamingStyle').value));
     // 生成参数
-    const bindRange = (id, key, valId, fmt) => {
+    // [上下文预算] cap：写入物理上限——超限值先夹到上限再入库（滑块与数值同步回显）
+    const bindRange = (id, key, valId, fmt, cap) => {
       const el = $(id);
       el.addEventListener('input', () => { $(valId).textContent = fmt ? fmt(el.value) : el.value; });
-      el.addEventListener('change', async () => { await MoraySettings.set(key, parseFloat(el.value)); });
+      el.addEventListener('change', async () => {
+        let v = parseFloat(el.value);
+        if (cap != null && v > cap) { v = cap; el.value = String(cap); $(valId).textContent = fmt ? fmt(el.value) : el.value; }
+        await MoraySettings.set(key, v);
+      });
     };
     // [夜间优化4.6] 参数预设一键应用
     document.querySelectorAll('[data-param-preset]').forEach(b => {
@@ -1011,7 +1020,7 @@ const SettingsApp = {
     bindRange('setTemperature', 'temperature', 'tempValue', v => parseFloat(v).toFixed(2));
     bindRange('setTopP', 'topP', 'topPValue', v => parseFloat(v).toFixed(2));
     bindRange('setMaxTokens', 'maxTokens', 'maxTokValue');
-    bindRange('setContextLimit', 'contextLimit', 'ctxValue');
+    bindRange('setContextLimit', 'contextLimit', 'ctxValue', null, CONTEXT_LIMIT_MAX);
     on($('setSystemPrompt'), 'change', () => MoraySettings.set('systemPrompt', $('setSystemPrompt').value.trim()));
     // [体验优化] 默认系统提示（简洁直答）开关与内容编辑
     on($('setDefaultSysPromptToggle'), 'click', async function () {

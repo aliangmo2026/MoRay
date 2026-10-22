@@ -5484,13 +5484,23 @@ function throttle(fn, wait) {
   };
 }
 
-/** 字数 / token 估算（中文约1.5字/token，英文约4字符/token）
+/** [上下文预算] contextLimit 物理上限：本地小显存模型拉满大上下文会直接把模型挤死，
+ * 写入（滑条）与读出（预算/计量条）两端都必须夹到这个值。 */
+const CONTEXT_LIMIT_MAX = 32768;
+
+/** 字数 / token 估算（中文约1.5字/token，英文约4字符/token；
+ * 代码块/ASCII 符号密集文本 tokenizer 切得更碎，按 3 字符/token 保守估算防预算超卖）
  * @param {string} text - 文本
  * @returns {{chars:number, tokens:number}} 统计结果 */
 function estimateTokens(text) {
-  const chars = (text || '').length;
-  const cn = ((text || '').match(/[\u4e00-\u9fa5]/g) || []).length;
-  return { chars, tokens: Math.ceil(cn / 1.5 + (chars - cn) / 4) };
+  text = text || '';
+  const chars = text.length;
+  const cn = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const ascii = chars - cn;
+  // ASCII 标点/符号（运算符、括号、引号等）几乎每个单占 token；符号密度高或带代码围栏即按 3 字符/token
+  const sym = (text.match(/[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]/g) || []).length;
+  const codeHeavy = /```/.test(text) || (ascii > 20 && sym / ascii > 0.15);
+  return { chars, tokens: Math.ceil(cn / 1.5 + ascii / (codeHeavy ? 3 : 4)) };
 }
 
 /** 字节数格式化
@@ -10793,16 +10803,50 @@ function scrollToMsgBottom() {
 
 /* ---------- 上下文计量 ---------- */
 
+/** [上下文预算] 每张图片附件固定扣减的 token：视觉编码开销远超文本启发式，保守按 1000/张 估 */
+const IMG_TOKEN_COST = 1000;
+
+/** [上下文预算] 消息回发正文（content + toolCalls 重建块）。
+ * 预算记账与 buildRequestMessages 组装 msgs 共用本函数，保证“记账口径 = 实际发送口径”；
+ * 早期只按 m.content 记账，工具轮重建文本在记账后追加，会漏记 token 导致上下文超卖。
+ * @param {Object} m - 消息对象
+ * @returns {string} 回发正文 */
+function messageRequestText(m) {
+  let text = m.content || '';
+  if (m.toolCalls && m.toolCalls.length) {
+    text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
+    m.toolCalls.forEach(tc => {
+      let argStr = '';
+      try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
+      if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
+      const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
+      text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
+    });
+  }
+  return text;
+}
+
+/** [上下文预算] 单条消息占用的 token 估算 = 回发正文（含 toolCalls 重建块）+ 图片附件固定扣减
+ * @param {Object} m - 消息对象
+ * @returns {number} 估算 token 数 */
+function estimateMessageTokens(m) {
+  if (!m) return 0;
+  const imgs = (m.attachments && m.attachments.length) ? m.attachments.length : 0;
+  return estimateTokens(messageRequestText(m)).tokens + imgs * IMG_TOKEN_COST;
+}
+
 /** 更新 token 计量条（当前会话上下文用量 / 限制）
  * @returns {void} */
 function updateTokenMeter() {
   const meter = document.getElementById('tokenMeter');
   if (!meter) return;
-  const limit = MoraySettings.get('contextLimit') || 8192;
+  // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，避免计量口径漂移
+  const limit = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX);
   // [P0 治本] 只统计当前激活会话的消息（与请求口径一致；空会话显示 0）
   const cid = AppState.activeConv ? AppState.activeConv.id : null;
   const own = cid ? AppState.messages.filter(m => m.conversationId === cid) : [];
-  const total = own.reduce((s, m) => s + (estimateTokens(m.content).tokens), 0);
+  // [上下文预算] 与请求口径一致：含 toolCalls 重建块 + 图片固定扣减
+  const total = own.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const pct = Math.min(100, Math.round(total / limit * 100));
   document.getElementById('tokenMeterText').textContent = total + ' / ' + limit;
   const fill = document.getElementById('tokenMeterFill');
@@ -11110,10 +11154,12 @@ async function buildRequestMessages(conv, extraContext) {
     console.error('[MoRay] 请求历史仍含越界消息，已强制剔除:', leaked.length, '条');
     history = history.filter(m => m.conversationId === conv.id);
   }
-  console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', estimateTokens(history.map(m => m.content).join(' ')).tokens, 'tok');
+  console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', history.reduce((s, m) => s + estimateMessageTokens(m), 0), 'tok');
   // 上下文长度预算（估算 token），保留最近的历史
-  const budget = (MoraySettings.get('contextLimit') || 8192) - (MoraySettings.get('maxTokens') || 2048) - 100;
-  let used = estimateTokens(sys).tokens;
+  // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，本地小显存一碰就死的根因在此
+  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - (MoraySettings.get('maxTokens') || 2048) - 100;
+  // [上下文预算] 系统提示 + 本轮图片附件先扣预算：图片不进文本启发式，固定每张 1000 token 防超卖
+  let used = estimateTokens(sys).tokens + (AppState.attachments || []).length * IMG_TOKEN_COST;
   const strategy = MoraySettings.get('truncationStrategy') || 'recent';
   let picked = [];
 
@@ -11126,7 +11172,7 @@ async function buildRequestMessages(conv, extraContext) {
     // 策略A（recent）：默认从最新往回收集
     let fitIndex = -1; // 最后一条放入预算的消息下标
     for (let i = history.length - 1; i >= 0; i--) {
-      const t = estimateTokens(history[i].content).tokens;
+      const t = estimateMessageTokens(history[i]);
       if (used + t > budget && history.length - 1 - i >= 2) break;
       used += t;
       fitIndex = i;
@@ -11163,27 +11209,17 @@ async function buildRequestMessages(conv, extraContext) {
     conv.__ctxWarned = true;
     showNotification('上下文即将满', `已用约 ${Math.round(used / budget * 100)}%，较早消息将被自动截断以节省 token`, 'warning', 3500);
   }
-  // [成本中心] 记录本次压缩/截断节省（系统提示词清洗 + 截断掉的旧消息）
-  const totalHistory = history.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
-  const kept = picked.reduce((s, m) => s + estimateTokens(m.content).tokens, 0);
+  // [成本中心] 记录本次压缩/截断节省（系统提示词清洗 + 截断掉的旧消息；口径含 toolCalls 重建块与图片扣减）
+  const totalHistory = history.reduce((s, m) => s + estimateMessageTokens(m), 0);
+  const kept = picked.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const sysSaved = (typeof PromptCompression !== 'undefined') ? PromptCompression.clean(rawSys).savedTokens : 0;
   conv.__lastCompressionSaved = Math.max(0, sysSaved + (totalHistory - kept));
   // [历史断片修复 2026-10-20] 回发历史时重建工具轮：上一轮的代码常活在 toolCalls（步骤卡）的 args 里，
   // 仅序列化 role/content 会让模型"忘记自己写过什么"（实探：create_file 被拒后反问"需要写入什么内容"）。
   // 工具名+执行状态+参数（单条截断 2000 字符防爆 token）追加进正文；content 为空时该重建块即占位。
+  // [上下文预算] 序列化统一走 messageRequestText：预算记账用同一口径，重建文本不再漏记 token。
   picked.forEach(m => {
-    let text = m.content || '';
-    if (m.toolCalls && m.toolCalls.length) {
-      text += '\n\n【本轮实际执行过的工具调用（用户已在步骤卡看到相同内容）】\n';
-      m.toolCalls.forEach(tc => {
-        let argStr = '';
-        try { argStr = JSON.stringify(tc.args || {}); } catch (e) { argStr = String((tc.args == null ? '' : tc.args)); }
-        if (argStr.length > 2000) argStr = argStr.slice(0, 2000) + '…(参数已截断)';
-        const st = tc.status === 'denied' ? '已被用户拒绝' : (tc.status === 'success' ? '已成功' : (tc.status === 'error' ? '失败' : (tc.status || '状态未知')));
-        text += '- ' + (tc.name || '?') + '（' + st + '）参数：' + argStr + '\n';
-      });
-    }
-    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+    msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: messageRequestText(m) });
   });
   if (extraContext && extraContext.text) {
     msgs.push({ role: 'system', content: extraContext.text });
@@ -15956,6 +15992,8 @@ const SettingsApp = {
     const page = document.getElementById('page-settings');
     if (!page) return;
     const c = MoraySettings.get();
+    // [上下文预算] 滑条物理上限：存量超限值（如 131072）显示与滑块都夹到上限，本地小显存一碰就死
+    const ctxLimit = Math.min(Number(c.contextLimit) || 8192, CONTEXT_LIMIT_MAX);
     page.innerHTML = `
       <header class="h-14 px-5 flex items-center border-b border-line-ghost/50 flex-shrink-0">
         <h1 class="text-base font-semibold text-text-primary">设置</h1>
@@ -16123,8 +16161,10 @@ const SettingsApp = {
                 <input type="range" min="256" max="16384" step="256" value="${c.maxTokens}" id="setMaxTokens" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
               </div>
               <div>
-                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${c.contextLimit}</span></div>
-                <input type="range" min="2048" max="131072" step="2048" value="${c.contextLimit}" id="setContextLimit" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
+                <div class="flex justify-between text-xs mb-2"><span class="text-text-secondary">上下文长度限制</span><span class="text-text-primary font-mono" id="ctxValue">${ctxLimit}</span></div>
+                <!-- [上下文预算] 滑条物理上限 CONTEXT_LIMIT_MAX：131072 拉满本地小显存模型直接被挤死 -->
+                <input type="range" min="2048" max="${CONTEXT_LIMIT_MAX}" step="2048" value="${ctxLimit}" id="setContextLimit" class="w-full h-1.5 bg-surface-floating rounded-full appearance-none cursor-pointer accent-brand-cobalt">
+                ${AI.backend === 'ollama' ? '<div class="text-[10px] text-warning/80 mt-1.5 leading-relaxed">本地 8G 显存建议不超过 16384</div>' : ''}
               </div>
               <div class="form-row">
                 <label class="form-label">全局默认系统提示词</label>
@@ -16708,10 +16748,15 @@ const SettingsApp = {
     on($('setAutoNaming'), 'change', () => MoraySettings.set('autoNaming', $('setAutoNaming').checked));
     on($('setNamingStyle'), 'change', () => MoraySettings.set('namingStyle', $('setNamingStyle').value));
     // 生成参数
-    const bindRange = (id, key, valId, fmt) => {
+    // [上下文预算] cap：写入物理上限——超限值先夹到上限再入库（滑块与数值同步回显）
+    const bindRange = (id, key, valId, fmt, cap) => {
       const el = $(id);
       el.addEventListener('input', () => { $(valId).textContent = fmt ? fmt(el.value) : el.value; });
-      el.addEventListener('change', async () => { await MoraySettings.set(key, parseFloat(el.value)); });
+      el.addEventListener('change', async () => {
+        let v = parseFloat(el.value);
+        if (cap != null && v > cap) { v = cap; el.value = String(cap); $(valId).textContent = fmt ? fmt(el.value) : el.value; }
+        await MoraySettings.set(key, v);
+      });
     };
     // [夜间优化4.6] 参数预设一键应用
     document.querySelectorAll('[data-param-preset]').forEach(b => {
@@ -16723,7 +16768,7 @@ const SettingsApp = {
     bindRange('setTemperature', 'temperature', 'tempValue', v => parseFloat(v).toFixed(2));
     bindRange('setTopP', 'topP', 'topPValue', v => parseFloat(v).toFixed(2));
     bindRange('setMaxTokens', 'maxTokens', 'maxTokValue');
-    bindRange('setContextLimit', 'contextLimit', 'ctxValue');
+    bindRange('setContextLimit', 'contextLimit', 'ctxValue', null, CONTEXT_LIMIT_MAX);
     on($('setSystemPrompt'), 'change', () => MoraySettings.set('systemPrompt', $('setSystemPrompt').value.trim()));
     // [体验优化] 默认系统提示（简洁直答）开关与内容编辑
     on($('setDefaultSysPromptToggle'), 'click', async function () {

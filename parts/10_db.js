@@ -56,13 +56,23 @@ function throttle(fn, wait) {
   };
 }
 
-/** 字数 / token 估算（中文约1.5字/token，英文约4字符/token）
+/** [上下文预算] contextLimit 物理上限：本地小显存模型拉满大上下文会直接把模型挤死，
+ * 写入（滑条）与读出（预算/计量条）两端都必须夹到这个值。 */
+const CONTEXT_LIMIT_MAX = 32768;
+
+/** 字数 / token 估算（中文约1.5字/token，英文约4字符/token；
+ * 代码块/ASCII 符号密集文本 tokenizer 切得更碎，按 3 字符/token 保守估算防预算超卖）
  * @param {string} text - 文本
  * @returns {{chars:number, tokens:number}} 统计结果 */
 function estimateTokens(text) {
-  const chars = (text || '').length;
-  const cn = ((text || '').match(/[\u4e00-\u9fa5]/g) || []).length;
-  return { chars, tokens: Math.ceil(cn / 1.5 + (chars - cn) / 4) };
+  text = text || '';
+  const chars = text.length;
+  const cn = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const ascii = chars - cn;
+  // ASCII 标点/符号（运算符、括号、引号等）几乎每个单占 token；符号密度高或带代码围栏即按 3 字符/token
+  const sym = (text.match(/[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]/g) || []).length;
+  const codeHeavy = /```/.test(text) || (ascii > 20 && sym / ascii > 0.15);
+  return { chars, tokens: Math.ceil(cn / 1.5 + ascii / (codeHeavy ? 3 : 4)) };
 }
 
 /** 字节数格式化
