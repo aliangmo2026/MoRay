@@ -377,6 +377,11 @@ async def self_check_loop() -> None:
         await self_narrative.self_narrative_maybe()  # 自我叙事：ready+冷却过 → LLM 熔炼写 kind='self_narrative'（函数内自守卫；不 trap 进上块防 CancelledError 口径）
     except Exception:  # noqa: BLE001 - self_narrative 失败不拖循环
         logger.warning("[self_check] self_narrative_maybe 异常", exc_info=True)
+    try:
+        from . import memory_hippocampus  # [海马体 v1] 惰性导入（self_narrative 同款防环惯例）
+        await memory_hippocampus.memory_hippocampus_maybe()  # 睡眠压缩：旧 self_observation 浓缩为 memory_digest 并物理删源（函数内自守卫；不 trap 进上块防 CancelledError 口径）
+    except Exception:  # noqa: BLE001 - 海马体失败不拖循环
+        logger.warning("[self_check] memory_hippocampus_maybe 异常", exc_info=True)
     while True:
         await asyncio.sleep(_SELF_CHECK_INTERVAL)
         try:
@@ -396,6 +401,11 @@ async def self_check_loop() -> None:
             await self_narrative.self_narrative_maybe()  # 自我叙事：ready+冷却过 → LLM 熔炼写 kind='self_narrative'（函数内自守卫；不 trap 进上块防 CancelledError 口径）
         except Exception:  # noqa: BLE001 - self_narrative 失败不拖循环
             logger.warning("[self_check] self_narrative_maybe 异常", exc_info=True)
+        try:
+            from . import memory_hippocampus  # [海马体 v1] 第二挂点：每轮尾同款（起手块镜像；1h 冷却+素材闸自然拦本轮）
+            await memory_hippocampus.memory_hippocampus_maybe()  # 睡眠压缩：旧 self_observation 浓缩为 memory_digest 并物理删源（函数内自守卫；不 trap 进上块防 CancelledError 口径）
+        except Exception:  # noqa: BLE001 - 海马体失败不拖循环
+            logger.warning("[self_check] memory_hippocampus_maybe 异常", exc_info=True)
 
 
 def write_self_check_log(report: dict) -> None:
