@@ -372,6 +372,11 @@ async def self_check_loop() -> None:
         self_model.self_model_maybe()  # 自我仪表盘：写 kind='self'（函数内自守卫三重防重复；不 trap 进上块防 CancelledError 口径）
     except Exception:  # noqa: BLE001 - self_model 失败不拖循环
         logger.warning("[self_check] self_model_maybe 异常", exc_info=True)
+    try:
+        from . import self_narrative  # [桥三 stage2] 惰性导入（self_model 同款防环惯例）
+        await self_narrative.self_narrative_maybe()  # 自我叙事：ready+冷却过 → LLM 熔炼写 kind='self_narrative'（函数内自守卫；不 trap 进上块防 CancelledError 口径）
+    except Exception:  # noqa: BLE001 - self_narrative 失败不拖循环
+        logger.warning("[self_check] self_narrative_maybe 异常", exc_info=True)
     while True:
         await asyncio.sleep(_SELF_CHECK_INTERVAL)
         try:
@@ -386,6 +391,11 @@ async def self_check_loop() -> None:
             self_model.self_model_maybe()  # 自我仪表盘：写 kind='self'（函数内自守卫三重防重复；不 trap 进上块防 CancelledError 口径）
         except Exception:  # noqa: BLE001 - self_model 失败不拖循环
             logger.warning("[self_check] self_model_maybe 异常", exc_info=True)
+        try:
+            from . import self_narrative  # [桥三 stage2] 第二挂点：每轮尾同款（起手块镜像；7 天冷却自然拦本轮）
+            await self_narrative.self_narrative_maybe()  # 自我叙事：ready+冷却过 → LLM 熔炼写 kind='self_narrative'（函数内自守卫；不 trap 进上块防 CancelledError 口径）
+        except Exception:  # noqa: BLE001 - self_narrative 失败不拖循环
+            logger.warning("[self_check] self_narrative_maybe 异常", exc_info=True)
 
 
 def write_self_check_log(report: dict) -> None:

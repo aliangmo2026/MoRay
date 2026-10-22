@@ -11,7 +11,9 @@
    [v1.1 2026-10-10] 追加第六卡「记忆」：GET /api/memory/stats 与 report 并行拉取、
    独立失败（只标本卡不拖五卡）；不新增图标名（emoji 标题与现有卡同款）。
    [v1.2 2026-10-13] 追加第八卡「写入拒绝」：GET /api/memory/rejections 同款并行拉取、
-   独立失败（只标本卡）；数据源=errors.log 尾部 [memory_reject] 行（只读回读，零写库）。 */
+   独立失败（只标本卡）；数据源=errors.log 尾部 [memory_reject] 行（只读回读，零写库）。
+   [v1.3 2026-10-21] 追加第九卡「自我叙事」：GET /api/self_narrative/latest 同款并行拉取、
+   独立失败（只标本卡）；MEM_KIND_ORDER 补 self_narrative 单列（桥三 stage2 产物）。 */
 (function () {
   'use strict';
   const PAGE = 'introspect';
@@ -133,7 +135,7 @@
     if (typeof refreshIcons === 'function') refreshIcons();
   }
 
-  function renderReport(d, mem, fail, reject) {
+  function renderReport(d, mem, fail, reject, nr) {
     const body = document.getElementById('introspectBody');
     if (!body) return;
     const parts = [];
@@ -212,6 +214,9 @@
     // ── 写入拒绝（v1.2：独立数据源 /api/memory/rejections，随报刷新；只读回读，零写库） ──
     parts.push(rejectionsCardHtml(reject));
 
+    // ── 自我叙事（v1.3：独立数据源 /api/self_narrative/latest，随报刷新） ──
+    parts.push(narrativeCardHtml(nr));
+
     body.innerHTML = parts.join('');
     if (typeof refreshIcons === 'function') refreshIcons();
   }
@@ -220,6 +225,7 @@
 
   const MEM_KIND_ORDER = [
     ['self', '身份记忆（桥三）'],
+    ['self_narrative', '自我叙事（桥三）'],
     ['self_observation', '过程观察（桥二）'],
     ['insight', '反思产出'],
     ['task_result', '任务结果'],
@@ -270,6 +276,22 @@
       try { data = await r.json(); } catch (e) { data = null; }
       if (r.status === 200 && data && data.ok === true) return data;
       return { ok: false, note: '写入拒绝返回 HTTP ' + r.status };
+    } catch (e) {
+      return { ok: false, note: '后端不可达' };
+    }
+  }
+
+  async function fetchNarrative() {
+    try {
+      const ctrl = ('AbortController' in window) ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 8000) : null;
+      const r = await fetch(backendOrigin() + '/api/self_narrative/latest',
+        { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+      if (timer) clearTimeout(timer);
+      let data = null;
+      try { data = await r.json(); } catch (e) { data = null; }
+      if (r.status === 200 && data && data.ok === true) return data;
+      return { ok: false, note: '自我叙事返回 HTTP ' + r.status };
     } catch (e) {
       return { ok: false, note: '后端不可达' };
     }
@@ -347,6 +369,28 @@
       (rj.truncated ? '，已按上限截取' : '，全量扫描') + '；留痕=拒绝事实，不代表代码有问题）</div>');
   }
 
+  /* ---------------- 自我叙事卡（v1.3：GET /api/self_narrative/latest，桥三 stage2 产物） ---------------- */
+
+  function narrativeCardHtml(nr) {
+    if (!nr || nr.ok !== true) {
+      return card('📜 自我叙事',
+        '<div class="text-[11px] text-text-tertiary">' + esc((nr && nr.note) || '后端不可达') + '</div>');
+    }
+    if (!nr.found) {
+      return card('📜 自我叙事',
+        '<div class="text-[11px] text-text-tertiary">尚未生成——重启后端后由自省循环自动产出（素材够 10 条且过 7 天冷却），或 POST /api/self_narrative/generate 手动触发。</div>');
+    }
+    const text = String(nr.content || '');
+    const chars = Number(nr.chars) || text.length;
+    const meta = '<div class="text-[11px] text-text-tertiary">生成于 ' +
+      esc(agoLabel(nr.created_at) || nr.created_at || '—') + ' · ' + esc(chars) + ' 字</div>';
+    const body = '<div class="text-[11px] leading-relaxed whitespace-pre-wrap text-text-secondary mt-1">' + esc(text) + '</div>';
+    return card('📜 自我叙事', meta +
+      (text.length > 500
+        ? '<details class="mt-1"><summary class="text-[11px] text-text-tertiary cursor-pointer">展开全文（' + esc(text.length) + ' 字）</summary>' + body + '</details>'
+        : body));
+  }
+
   /* ---------------- 拉数 ---------------- */
 
   async function loadReport() {
@@ -356,6 +400,7 @@
     const statsPromise = fetchStats();   // 与 report 并行拉取，成功分支里 await
     const failuresPromise = fetchFailures();   // 失败档案 v1：同款并行拉取，成功分支里 await
     const rejectionsPromise = fetchRejections();   // 写入拒绝 v1.2：同款并行拉取，成功分支里 await
+    const narrativePromise = fetchNarrative();   // 自我叙事 v1.3：同款并行拉取，成功分支里 await
     let note = '';
     try {
       const ctrl = ('AbortController' in window) ? new AbortController() : null;
@@ -366,7 +411,7 @@
       let data = null;
       try { data = await r.json(); } catch (e) { data = null; }
       if (r.status === 200 && data && data.ok === true) {
-        renderReport(data, await statsPromise, await failuresPromise, await rejectionsPromise);
+        renderReport(data, await statsPromise, await failuresPromise, await rejectionsPromise, await narrativePromise);
         _loaded = true;
         setHead('最近报告 ' + (agoLabel(data.ts) || data.ts));
         _inFlight = false;
