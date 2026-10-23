@@ -32,7 +32,6 @@
   'use strict';
   const PAGE = 'introspect';
 
-  let _loaded = false;    // 是否已成功取到报告（失败保持 false，下次进入/刷新重试）
   let _inFlight = false;  // 防并发拉取
 
   /* ---------------- 工具 ---------------- */
@@ -658,7 +657,6 @@
       try { data = await r.json(); } catch (e) { data = null; }
       if (r.status === 200 && data && data.ok === true) {
         renderReport(data, await statsPromise, await failuresPromise, await rejectionsPromise, await narrativePromise, await goalsPromise);
-        _loaded = true;
         setHead('最近报告 ' + (agoLabel(data.ts) || data.ts));
         _inFlight = false;
         return;
@@ -671,7 +669,6 @@
     } catch (e) {
       note = '后端不可达（' + backendOrigin() + '）：确认本地后端已启动，或稍后点刷新';
     }
-    _loaded = false;
     renderOffline(note);
     setHead('未取到报告');
     _inFlight = false;
@@ -683,7 +680,6 @@
   }
 
   function refresh() {
-    _loaded = false;
     loadReport();
   }
 

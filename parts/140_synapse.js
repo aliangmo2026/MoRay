@@ -652,7 +652,7 @@ body:has(#page-synapse:not(.hidden)) #middleSidebar { display: none; }
   }
 
   function ensureLoaded() {
-    if (_loaded || _inFlight) return;
+    if (_inFlight) return;
     tick();
   }
 
