@@ -697,6 +697,10 @@ class ZCodeAdapter(ExecutionEngine):
         body = str(rec["task"].get("prompt") or "")
         block = self._mental_prompt_block()
         text = (block + "\n\n[任务指令]\n" + body) if block else body
+        # [v4 硬约束 2026-10-23] 连败/心智分越线 → 系统强制警告置最前（同款 fail-open）
+        hard = self._hard_constraint_block()
+        if hard:
+            text = hard + text
         try:
             inbox = rec["cwd_path"] / "inbox"
             inbox.mkdir(parents=True, exist_ok=True)
@@ -724,6 +728,30 @@ class ZCodeAdapter(ExecutionEngine):
             return render_mental_context(state) or ""
         except Exception:  # noqa: BLE001 - 渲染失败同上
             return ""
+
+    def _hard_constraint_block(self) -> str:
+        """[v4 硬约束 2026-10-23] 连败>=3 或 mental_score<70 → 系统强制警告块，否则 ""。
+
+        数据源 self_state_log 最新一行（self_state.get_current_state）；与
+        _mental_prompt_block 同款 fail-open：读取/整形任何异常 → 零注入，绝不把
+        提示词落盘带崩（落盘失败=任务直接 failed，代价远大于丢一次警告）。
+        空状态基线（cf=0/mental=100）不触发，存量逐字断言不受扰动。
+        """
+        try:
+            from .. import self_state
+            state = self_state.get_current_state()
+            cf = int(state.get("consecutive_failures") or 0)
+            ms = int(state.get("mental_score") or 100)
+        except Exception:  # noqa: BLE001 - 状态读取/整形失败降级为零注入
+            return ""
+        if cf < 3 and ms >= 70:
+            return ""
+        return (
+            "[系统强制警告]\n"
+            f"你最近连续失败了 {cf} 次，当前心智分数已降至 {ms}。\n"
+            "请立刻停止之前的无效尝试，仔细检查你的代码和逻辑。"
+            "如果遇到死胡同，请直接输出失败原因并终止，不要盲目重试！\n\n"
+        )
 
     def _build_env(self) -> dict:
         """认证/模型无 CLI flag（Day9 实测）：走 provider 配置文件 + 环境变量注入。
