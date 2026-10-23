@@ -18,7 +18,13 @@
    独立失败（只标本卡）；每条目标带「执行（送 ZCode）」「忽略（X）」按钮——执行=前端取目标
    文本 POST /api/engines/zcode/tasks {prompt}，成功后 POST /api/self_driven/approve 出队
    + Toast「已派发给 ZCode 引擎」；忽略=POST /api/self_driven/reject 出队。事件委托用
-   composedPath（125:409 纪律）；不新增图标名（emoji 标题 + 纯文字按钮，Lucide 总数守 124）。 */
+   composedPath（125:409 纪律）；不新增图标名（emoji 标题 + 纯文字按钮，Lucide 总数守 124）。
+   [v2 2026-10-23] 自驱目标卡多引擎路由 + 执行闭环：卡带 target_engine 标签（[ZCode]/
+   [Laya]）与状态徽章（待审批/执行中…/已完成/失败）；「执行」按卡上引擎拼通用路由
+   POST /api/engines/<name>/tasks（引擎名过 URL 段白名单，30_chat ENGINE_NAME_RE 同款
+   纪律），拿到引擎 task_id 后 POST /api/self_driven/approve {task_id, engine_task_id}
+   登记派发——卡不删、就地流转「执行中…」且按钮置灰；终态（done/failed）由后端引擎
+   收尾事件经 synapse 闭环回写，刷新即见历史（queue 已返全状态卡）。 */
 (function () {
   'use strict';
   const PAGE = 'introspect';
@@ -437,6 +443,60 @@
 
   /* ---------------- 自驱目标卡（v1.4：GET /api/self_driven/queue，独立失败不拖他卡） ---------------- */
 
+  /* ---- v2 引擎/状态小件（引擎名进 URL 段前必须过白名单：localStorage/后端字段
+          都可能被塞 ../ 或 :// 注入串进请求路径，30_chat ENGINE_NAME_RE 同款纪律） ---- */
+
+  var GOAL_ENGINE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+  var GOAL_ENGINE_DISPLAY = { zcode: 'ZCode', laya: 'Laya', local: 'Local' };
+  var GOAL_STATUS_META = {
+    pending_approval: { label: '待审批', cls: 'text-text-tertiary' },
+    dispatched: { label: '执行中…', cls: 'text-brand-cyan' },
+    done: { label: '已完成', cls: 'text-success' },
+    failed: { label: '失败', cls: 'text-error' }
+  };
+  var GOAL_BTN_DISABLED_CLS = 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary opacity-50 cursor-default';
+
+  function goalEngineSafe(n) {
+    var k = String(n || '').trim();
+    return GOAL_ENGINE_RE.test(k) ? k : 'zcode';
+  }
+  function goalEngineLabel(n) {
+    var k = String(n || '');
+    return GOAL_ENGINE_DISPLAY[k] || (k.charAt(0).toUpperCase() + k.slice(1));
+  }
+  function goalStatusMeta(st) {
+    return GOAL_STATUS_META[String(st || '')] || { label: String(st || '未知'), cls: 'text-text-tertiary' };
+  }
+
+  function goalRowHtml(it) {
+    const gid = String(it.task_id || '');
+    const goal = String(it.goal || '');
+    const engine = goalEngineSafe(it.target_engine);
+    const st = String(it.status || 'pending_approval');
+    const sm = goalStatusMeta(st);
+    // 终态卡只留徽章（历史只读）；dispatched 按钮置灰不删（第四段契约）；待审批可操作
+    const graying = st === 'dispatched';
+    const btns = (st === 'done' || st === 'failed') ? '' :
+      '<button type="button" data-goal-act="run" data-goal-id="' + esc(gid) + '"' +
+      (graying ? ' disabled' : '') +
+      ' class="' + (graying ? GOAL_BTN_DISABLED_CLS : 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel') + '">' +
+      (graying ? '执行中…' : '执行（送 ' + esc(goalEngineLabel(engine)) + '）') + '</button>' +
+      '<button type="button" data-goal-act="ignore" data-goal-id="' + esc(gid) + '"' +
+      (graying ? ' disabled' : '') +
+      ' class="' + (graying ? GOAL_BTN_DISABLED_CLS : 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary hover:text-error hover:bg-surface-panel') + '">忽略（X）</button>';
+    return '<div class="flex items-start gap-2 py-2 border-b border-line-ghost/40" data-goal-row="1"' +
+      ' data-goal-id="' + esc(gid) + '" data-goal-text="' + esc(goal) + '"' +
+      ' data-goal-engine="' + esc(engine) + '" data-goal-status="' + esc(st) + '">' +
+      '<div class="flex-1 min-w-0">' +
+      '<div class="text-[11px] font-bold text-text-primary leading-relaxed">' +
+      '<span class="text-[10px] font-bold text-brand-cyan mr-1">[' + esc(goalEngineLabel(engine)) + ']</span>' +
+      esc(goal) + '</div>' +
+      '<div class="text-[11px] text-text-tertiary mt-0.5">' +
+      '<span data-goal-status-badge class="' + esc(sm.cls) + '">' + esc(sm.label) + '</span> · 生成于 ' +
+      esc(agoLabel(it.created_at) || it.created_at || '—') + '</div></div>' +
+      '<div class="flex items-center gap-1.5 flex-shrink-0">' + btns + '</div></div>';
+  }
+
   function goalsCardHtml(gs) {
     if (!gs || gs.ok !== true) {
       return card('🎯 自驱目标',
@@ -446,26 +506,11 @@
     if (!items.length) {
       return card('🎯 自驱目标', '<div class="text-[11px] text-text-tertiary">暂无自驱目标</div>');
     }
-    const rows = items.map(function (it) {
-      const gid = String(it.task_id || '');
-      const goal = String(it.goal || '');
-      return '<div class="flex items-start gap-2 py-2 border-b border-line-ghost/40" data-goal-row="1"' +
-        ' data-goal-id="' + esc(gid) + '" data-goal-text="' + esc(goal) + '">' +
-        '<div class="flex-1 min-w-0">' +
-        '<div class="text-[11px] font-bold text-text-primary leading-relaxed">' + esc(goal) + '</div>' +
-        '<div class="text-[11px] text-text-tertiary mt-0.5">生成于 ' +
-        esc(agoLabel(it.created_at) || it.created_at || '—') + '</div></div>' +
-        '<div class="flex items-center gap-1.5 flex-shrink-0">' +
-        '<button type="button" data-goal-act="run" data-goal-id="' + esc(gid) + '"' +
-        ' class="text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel">执行（送 ZCode）</button>' +
-        '<button type="button" data-goal-act="ignore" data-goal-id="' + esc(gid) + '"' +
-        ' class="text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary hover:text-error hover:bg-surface-panel">忽略（X）</button>' +
-        '</div></div>';
-    }).join('');
+    const rows = items.map(goalRowHtml).join('');
     return card('🎯 自驱目标',
       '<div id="selfDrivenGoalRows">' + rows + '</div>' +
-      '<div class="text-[11px] text-text-tertiary mt-2">「执行」派发 ZCode 引擎后出队，「忽略」直接出队；' +
-      '每日最多生成 3 条（安全熔断）。</div>');
+      '<div class="text-[11px] text-text-tertiary mt-2">「执行」派发到卡上引擎（进入执行中，完成后自动回写已完成/失败），' +
+      '「忽略」移除该目标；每日最多生成 3 条（安全熔断）。</div>');
   }
 
   /* ---- v1.4 交互：事件委托用 composedPath（125:409 纪律：refreshIcons 把 <i> 换成 <svg> 后
@@ -510,6 +555,26 @@
     } catch (e) { /* 忽略 */ }
   }
 
+  /* [v2] 就地流转 dispatched：状态徽章换「执行中…」、按钮置灰（不删除，第四段契约）。
+     行内 DOM 变更而非整行重渲染——created_at 不在行属性上，重渲染会丢显示。 */
+  function markGoalRowDispatched(row) {
+    try {
+      row.setAttribute('data-goal-status', 'dispatched');
+      const badge = row.querySelector('[data-goal-status-badge]');
+      if (badge) {
+        badge.textContent = '执行中…';
+        badge.className = 'text-brand-cyan';
+      }
+      const btns = row.querySelectorAll('button[data-goal-act]');
+      for (let i = 0; i < btns.length; i++) {
+        const b = btns[i];
+        b.disabled = true;
+        b.className = GOAL_BTN_DISABLED_CLS;
+        if (b.getAttribute('data-goal-act') === 'run') b.textContent = '执行中…';
+      }
+    } catch (e) { /* 置灰失败不影响主流程（卡已登记 dispatched，刷新自愈） */ }
+  }
+
   async function onGoalAction(act, gid, goalText, row) {
     if (!gid || !row || row.getAttribute('data-busy') === '1') return;
     row.setAttribute('data-busy', '1');
@@ -524,19 +589,23 @@
         }
         toast('忽略失败：' + (d.reason || ('HTTP ' + res.status)));
       } else if (act === 'run') {
-        // 前端直接提取目标文本（data-goal-text）发给 ZCode 引擎
-        const res = await postJson('/api/engines/zcode/tasks', { prompt: String(goalText || '') });
+        // [v2] 按卡上 target_engine 拼通用路由（引擎名过白名单后才进 URL 段）
+        const engine = goalEngineSafe(row.getAttribute('data-goal-engine'));
+        const res = await postJson('/api/engines/' + encodeURIComponent(engine) + '/tasks',
+          { prompt: String(goalText || '') });
         const d = res.data || {};
         const engineTaskId = d.task_id || (d.data && d.data.task_id) || '';
         if (res.status >= 200 && res.status < 300 && engineTaskId) {
-          // 出队用目标卡自身的 task_id（gid），不是引擎返回的 engineTaskId——两者是两套 id
-          const ap = await postJson('/api/self_driven/approve', { task_id: gid });
+          // approve 登记引擎 task_id（闭环匹配键；目标卡 task_id 与它是两套 id）——
+          // 卡不删、就地流转「执行中…」，终态由后端引擎收尾事件经 synapse 闭环回写
+          const ap = await postJson('/api/self_driven/approve',
+            { task_id: gid, engine_task_id: engineTaskId });
           if (ap.status === 200 && (ap.data || {}).ok === true) {
-            removeGoalRow(row);
-            toast('已派发给 ZCode 引擎');
+            markGoalRowDispatched(row);
+            toast('已派发给 ' + goalEngineLabel(engine) + ' 引擎（执行中）');
             return;
           }
-          toast('已派发给 ZCode 引擎（队列出队失败，请刷新）');
+          toast('已派发给 ' + goalEngineLabel(engine) + ' 引擎（状态登记失败，请刷新）');
         } else {
           toast('派发失败：' + (d.message || d.msg || d.error || ('HTTP ' + res.status)));
         }

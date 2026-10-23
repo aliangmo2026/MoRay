@@ -61,6 +61,7 @@ _SOURCE_KIND_MATRIX = {
     "self_narrative": {"self_narrative"},  # [桥三 stage2 预埋 2026-10-14] 叙事产物专属 source×kind
     "memory_hippocampus": {"memory_digest"},  # [海马体 v1 2026-10-22] 睡眠压缩产物专属 source×kind
     "digital_twin": {"corpus"},  # [数字分身 v1 2026-10-23] 语料切块摄入专属 source×kind（recall 白名单不含 corpus，主召回零污染）
+    "self_driven": {"self_observation"},  # [自驱 v2 2026-10-23] 执行闭环回写「我执行了自驱目标…」专属 source×kind
 }
 
 #: 写入校验拒绝的错误前缀——端点据此判定 HTTP code

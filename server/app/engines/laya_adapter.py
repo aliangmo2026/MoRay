@@ -301,11 +301,15 @@ class LayaEngine(ExecutionEngine):
                 return False
         if not self._cancel_remote(task_id):
             return False
+        closed = False
         with self._lock:
             if rec["status"] in (STATUS_PENDING, STATUS_RUNNING):
                 rec["status"] = STATUS_FAILED
                 rec["error"] = "canceled"
                 rec["done_at"] = time.time()
+                closed = True
+        if closed:  # [自驱 v2] 本地收敛终态同样上总线（否则目标卡悬在执行中）
+            self._publish_completed(rec, "cancelled")
         return True
 
     def result(self, task_id: str) -> dict:
@@ -543,7 +547,9 @@ class LayaEngine(ExecutionEngine):
 
     def _on_frame(self, rec: dict, raw: str) -> None:
         """帧状态机：**只认 event=="final"**（step_result 也带 status 字段，误读会把重试
-        中的失败步当整任务失败）。终态只定一次：cancel()/传输层收尾先定则不回写覆盖。"""
+        中的失败步当整任务失败）。终态只定一次：cancel()/传输层收尾先定则不回写覆盖。
+        [自驱 v2] 终态首次落定即发 laya.task.completed（锁外投递，done_at 闸保证恰一次；
+        _fail_transport 的合成 final{failed} 同样经本方法过账）。"""
         try:
             d = json.loads(raw)
         except ValueError:
@@ -566,11 +572,48 @@ class LayaEngine(ExecutionEngine):
                 rec["error"] = str(d.get("error") or ("laya_final_status=" + st if st
                                                       else "laya_final_missing_status"))
             rec["done_at"] = time.time()
+        self._publish_completed(rec, "success" if st == "success"
+                                else ("cancelled" if st == "cancelled" else "failed"))
 
     def _ensure_terminal(self, rec: dict) -> None:
-        """流结束仍未见 final 帧 → 如实 failed（zcode 未截到 result 帧同口径）。"""
+        """流结束仍未见 final 帧 → 如实 failed（zcode 未截到 result 帧同口径）。
+        [自驱 v2] 该落定同样发 laya.task.completed——否则无 final 的任务会让自驱
+        目标卡永远悬在执行中。"""
         with self._lock:
-            if rec["done_at"] is None:
-                rec["status"] = STATUS_FAILED
-                rec["error"] = "stream ended without final frame"
-                rec["done_at"] = time.time()
+            if rec["done_at"] is not None:
+                return
+            rec["status"] = STATUS_FAILED
+            rec["error"] = "stream ended without final frame"
+            rec["done_at"] = time.time()
+        self._publish_completed(rec, "failed")
+
+    def _publish_completed(self, rec: dict, status: str) -> None:
+        """[自驱 v2 2026-10-23] 任务终态 → Synapse laya.task.completed（锁外调用；
+        send 可从非事件循环线程安全投递，zcode_adapter reader 线程同款约定）。
+
+        meta.task_id = 引擎任务 id——自驱目标卡 engine_task_id 的闭环匹配键；
+        meta.status ∈ success/failed/cancelled（synapse handler 据此分成败）。
+        失败/取消 mentions=['user']（zcode.task.failed 补报叫醒用户同款）。
+        任何异常绝不反噬消费线程/终态本身。"""
+        try:
+            task_id = str(rec.get("task_id") or "")
+            if not task_id:
+                return
+            prompt = str(rec.get("prompt") or "")[:200]
+            dur = None
+            da, ca = rec.get("done_at"), rec.get("created_at")
+            if da and ca:
+                dur = int((da - ca) * 1000)
+            content = "Laya：%s\n结果：%s·耗时 %s" % (
+                prompt, status, ("%sms" % dur) if dur is not None else "?")
+            from .. import synapse_bus  # 函数内懒导入（zcode_adapter 同款防环）
+            synapse_bus.send(
+                "laya.task.completed", content,
+                mentions=['user'] if status != "success" else [],
+                thread_id=None,
+                meta={"trace_id": task_id, "task_id": task_id, "status": status,
+                      "duration_ms": dur, "caller": "laya"},
+                from_member="organ.laya")
+        except Exception as e:  # noqa: BLE001 - 上总线失败绝不影响任务终态本身
+            _LOG.warning("[laya] laya.task.completed 发送失败：task=%s err=%s: %s",
+                         rec.get("task_id"), type(e).__name__, str(e)[:200])

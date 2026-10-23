@@ -134,6 +134,88 @@ _HANDLERS["self_state.bump_fail"] = _handler_self_state_bump_fail
 _HANDLERS["self_state.bump_success"] = _handler_self_state_bump_success
 
 
+# ---------------- [自驱引擎 v2 2026-10-23] 执行闭环 handler ----------------
+#: 闭环规则（handler 注册内存 _HANDLERS，规则行落 synapse_rules）：引擎任务终态
+#: 事件 → 按 meta.task_id 匹配自驱目标卡 engine_task_id → 置 done/failed 并写一条
+#: self_observation。规则行在 start_loop 幂等补种（任务书指定本模块承载，不动
+#: synapse_db.SEED_RULES；INSERT OR IGNORE 与 init_synapse_db 的 seed 同语义——
+#: 手工 enabled=0 的行重启仍保持禁用）。
+_SELF_DRIVEN_RULES = (
+    ("zcode.task.succeeded", "self_driven.close_loop"),
+    ("zcode.task.failed", "self_driven.close_loop"),
+    ("laya.task.completed", "self_driven.close_loop"),
+)
+
+
+def _handler_self_driven_close_loop(event: dict):
+    """handler 内核：引擎终态事件 → 自驱目标卡闭环（v2）。
+
+    成败判定：zcode.task.succeeded=成 / zcode.task.failed=败 /
+    laya.task.completed 看 meta.status=="success"（cancelled 归败）。
+    匹配键 = meta.task_id ↔ 目标卡 engine_task_id；无匹配卡（普通聊天任务/
+    编排工具子任务）静默跳过。卡状态由 self_driven.close_dispatched_goal 流转
+    （幂等，只动 dispatched 卡）——命中新终态才写 self_observation，重复事件
+    不二写。记忆回写失败不影响卡状态已落盘的闭环事实。"""
+    async def _run() -> None:
+        meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
+        tid = str(meta.get("task_id") or "").strip()
+        if not tid:
+            return
+        src = str(event.get("proxy_source") or "")
+        if src == "zcode.task.succeeded":
+            success = True
+        elif src == "zcode.task.failed":
+            success = False
+        else:  # laya.task.completed
+            success = str(meta.get("status") or "") == "success"
+        from . import self_driven  # 函数内懒导入（reflection.run 同款防环）
+        card = self_driven.close_dispatched_goal(
+            tid, success, note=str(event.get("content") or ""))
+        if not card:
+            return
+        content = "我执行了自驱目标：%s，结果是：%s" % (
+            str(card.get("goal") or "")[:200], "成功" if success else "失败")
+        try:
+            from .memory_routes import insert_memory  # 函数内懒导入：记忆链防环
+            mem_id, err = insert_memory(content, kind="self_observation",
+                                        tags=["self_driven"], source="self_driven",
+                                        entity_id=tid)
+            if err:
+                logger.warning("[synapse] self_observation 回写失败：%s（engine_task_id=%s）",
+                               err[:120], tid)
+            else:
+                logger.warning("[synapse] 自驱闭环完成：engine_task_id=%s status=%s mem_id=%s",
+                               tid, card.get("status"), mem_id)
+        except Exception as e:  # noqa: BLE001 - 记忆回写失败不影响卡状态已落盘
+            logger.warning("[synapse] self_observation 回写异常：%s: %s",
+                           type(e).__name__, str(e)[:200])
+
+    return _run()
+
+
+_HANDLERS["self_driven.close_loop"] = _handler_self_driven_close_loop
+
+
+def _ensure_self_driven_rules() -> None:
+    """[自驱 v2] 闭环规则幂等补种（synapse_db.SEED_RULES 同款 INSERT OR IGNORE，
+    ? 参数绑定）。失败只记 warning 不影响总线启动——规则缺位退化为闭环不回写，
+    绝不反噬 consumer。"""
+    try:
+        conn = synapse_db.connect()
+        try:
+            for event_type, handler in _SELF_DRIVEN_RULES:
+                conn.execute(
+                    "INSERT OR IGNORE INTO synapse_rules "
+                    "(event_type, handler, enabled, params_json) VALUES (?, ?, 1, NULL)",
+                    (event_type, handler))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[synapse] 自驱闭环规则落库失败：%s: %s",
+                       type(e).__name__, str(e)[:200])
+
+
 # ---------------- A类 send() ----------------
 def send(event_type, content, mentions=[], thread_id=None, meta={}, from_member="system") -> str:
     """A类一行 send：总闸关 = 完全 no-op；开着 = 同步落库单行 + 叫醒 consumer。
@@ -464,6 +546,7 @@ def start_loop() -> asyncio.Task:
     _queue = asyncio.Queue(maxsize=_QUEUE_MAX)
     _consumer_task = asyncio.ensure_future(_consumer_loop())
     _state_started_at = time.time()  # [v5 第四条] 内存链状态从此刻起有效（重启即重记）
+    _ensure_self_driven_rules()  # [自驱 v2] 闭环规则幂等补种（先于日志，rules 计数才准）
     logger.warning("[synapse] bus started: queue_max=%d rules=%d（规则落库改库即生效；"
                    "防环五闸 depth>=3/TTL%ds/turns<=%d/chain<=%d）",
                    _QUEUE_MAX, _count_enabled_rules(),

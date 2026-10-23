@@ -1,22 +1,29 @@
 # -*- coding: utf-8 -*-
-"""自驱引擎 v1（目标生成器）self_driven（2026-10-23）：
+"""自驱引擎 v2（多引擎路由 + 执行闭环）self_driven（2026-10-23）：
 
 自驱引擎第一步——读最近一次自我叙事落库的心智状态（memory_bank 中
 kind='self_narrative' 行 content JSON 里的 mental_state 字段），让本地 LLM
-据此生成一个简短改进目标，封装成结构化目标卡进待审批队列（pending_approval）。
+据此生成一个简短改进目标**并选择执行引擎**，封装成结构化目标卡进待审批队列
+（pending_approval）。[v2] 产出改 JSON 契约 {"goal", "target_engine"}：
+json_repair 容错解析（self_narrative._parse_narrative_json 同款），target_engine
+白名单 ["zcode", "laya"] 外一律回落 zcode（解析失败整段退化纯文本当目标）。
 
 级别边界（与 self_narrative 同口径，勿扩）：
-- 对 memory_bank：只 SELECT 读心智状态，绝不写、绝不改；
-- 产物不落 memory_bank：目标卡自带 status 流转语义（pending_approval），
-  memory_bank 只追加无 UPDATE，装不下审批状态机 → 落本模块私有状态文件
-  （config.DATA_DIR/self_driven_state.json，与 memory.sqlite3/synapse.sqlite3
-  同目录惯例），每日配额与目标队列同文件；
+- 对 memory_bank：本模块只 SELECT 读心智状态，绝不写、绝不改（v2 闭环自省
+  回写 kind='self_observation' 由 synapse_bus._handler_self_driven_close_loop
+  落库，不经本模块——本模块与 memory_bank 的关系仍是单向只读）；
+- 产物不落 memory_bank：目标卡自带 status 流转语义（pending_approval →
+  dispatched → done/failed），memory_bank 只追加无 UPDATE，装不下审批状态机
+  → 落本模块私有状态文件（config.DATA_DIR/self_driven_state.json，与
+  memory.sqlite3/synapse.sqlite3 同目录惯例），每日配额与目标队列同文件；
 - fail-open：读不到心智状态 / LLM 失败 / 产出为空一律返回 None（"没生成"），
   事实原因只进日志，绝不把异常抛给调用方；唯熔断落盘失败 fail-close（见下）；
 - 零自动执行（硬约束）：目标只生成到 pending_approval，绝不接入执行链/自省
   循环/启动钩子；生成唯一入口 = POST /api/self_driven/generate 手动触发；
-  出队仅两口 POST /api/self_driven/approve|reject（前端审批动作：执行=派发
-  ZCode 后确认出队、忽略=直接出队），同样手动、零自动执行；
+  [v2] 派发仍由前端手动发起：POST /api/self_driven/approve 只做状态流转
+  （pending_approval→dispatched 并登记引擎 task_id），绝不触发执行；执行结果
+  由引擎收尾事件经 synapse handler 回写（close_dispatched_goal 置 done/failed）；
+  POST /api/self_driven/reject = 删卡出队（忽略）；
 - LLM 调用零新增配置面：复用 reflection 同组 config（REFLECTION_API/BASE_URL/
   MODEL/TIMEOUT/NUM_CTX），与 self_narrative._llm_narrate 完全同款 httpx 双协议。
 
@@ -39,6 +46,11 @@ import uuid
 import httpx
 from fastapi import APIRouter, Request
 
+try:
+    import json_repair  # [v2] self_narrative 同款容错；venv 已装但 requirements 未声明，故 try-import
+except ImportError:  # noqa: BLE001 - 无 json_repair 时退化裸 json.loads（解析失败整卡按纯文本兜底）
+    json_repair = None
+
 from . import config
 
 logger = logging.getLogger("moray.self_driven")
@@ -58,14 +70,25 @@ _GOAL_TEXT_MAX = 200
 STATE_DIR = config.DATA_DIR
 STATE_FILE = STATE_DIR / "self_driven_state.json"
 
-#: 目标生成 prompt（任务书原样）。{mental_state} 用 str.replace 注入——
-#: 模板与 JSON 花括号会跟 str.format 打架，replace 最稳。
+#: [v2] 执行引擎白名单：target_engine 只认这两个短名（与 local_adapter 注册表
+#: NAME 对齐），其余取值（大小写漂移/带后缀/编造名）一律回落默认引擎。
+_ENGINE_WHITELIST = ("zcode", "laya")
+_DEFAULT_ENGINE = "zcode"
+
+#: 目标生成 prompt。{mental_state} 用 str.replace 注入——模板与 JSON 花括号会跟
+#: str.format 打架，replace 最稳（v2 输出契约示例自带花括号，更不能用 format）。
+#: 引擎说明写死在模板里（任务书允许）：LLM 只看得到 mental_state，不喂引擎画像
+#: 就只能凭名字猜路由。
 _SYSTEM_PROMPT = (
     "你是 MoRay。这是你当前的心智状态：{mental_state}。"
-    "请根据你最近的失败或不足，给自己生成一个简短的改进目标（不超过 50 字）。"
-    "只输出目标本身，不要解释。"
+    "可用执行引擎：zcode（擅长写代码、执行命令）；laya（擅长任务拆解与编排）。"
+    "请根据你最近的失败或不足，给自己生成一个简短的改进目标（不超过 50 字），"
+    "并从可用执行引擎中选一个最合适的。只输出一个 JSON 对象，不要任何解释文字、"
+    "不要代码块标记，严格符合这个形状："
+    '{"goal": "改进目标文本", "target_engine": "zcode"}'
+    "。target_engine 只允许取值 zcode 或 laya。"
 )
-_USER_PROMPT = "生成我的下一步目标。"
+_USER_PROMPT = "生成我的下一步目标（输出 JSON）。"
 
 #: 在飞闸（进程内存活，重启清零）：生成中不重复触发（self_narrative 同款）
 _goal_inflight = False
@@ -171,6 +194,66 @@ def _remove_goal(task_id: str) -> int:
         return removed
 
 
+def mark_dispatched(task_id: str, engine_task_id: str) -> dict | None:
+    """[v2] approve 状态流转：pending_approval → dispatched，登记引擎 task_id
+    （闭环匹配键）。不删卡——执行结果要靠 engine_task_id 回写（close_dispatched_goal）。
+
+    终态只进不出：已 done/failed 的卡不回退（事件先到的竞态下终态事实优先），
+    原样返回让调用方按成功计；重复 approve 幂等刷新 engine_task_id（后写胜）。
+    返回更新后的卡片 dict；task_id 未命中/落盘失败返回 None（fail-open 不抛）。"""
+    tid = str(task_id or "").strip()
+    etid = str(engine_task_id or "").strip()[:64]
+    if not tid or not etid:
+        return None
+    with _STATE_LOCK:
+        state = _load_state()
+        card = None
+        for g in state.get("queue") or []:
+            if isinstance(g, dict) and str(g.get("task_id")) == tid:
+                card = g
+                break
+        if card is None:
+            return None
+        if str(card.get("status") or "") not in ("done", "failed"):
+            card["status"] = "dispatched"
+            card["engine_task_id"] = etid
+            if not _save_state(state):
+                logger.warning("[self_driven] 派发登记落盘失败 task_id=%s", tid)
+                return None
+        return dict(card)
+
+
+def close_dispatched_goal(engine_task_id: str, success: bool,
+                          note: str = "") -> dict | None:
+    """[v2] 引擎终态回写：engine_task_id 匹配的 dispatched 卡 → done/failed。
+
+    幂等：只流转 status=='dispatched' 的卡（重复事件/已终态返回 None 不二写）；
+    无匹配卡也返回 None——普通聊天任务/编排工具子任务的引擎事件同样会进来，
+    无卡即无事（不是错误，不记 warning）。note 留事件正文痕（截 200）。
+    成功返回更新后的卡片 dict（含 goal，供调用方写 self_observation）；
+    落盘失败返回 None（fail-open 不抛）。"""
+    etid = str(engine_task_id or "").strip()
+    if not etid:
+        return None
+    with _STATE_LOCK:
+        state = _load_state()
+        card = None
+        for g in state.get("queue") or []:
+            if (isinstance(g, dict)
+                    and str(g.get("engine_task_id") or "") == etid
+                    and str(g.get("status") or "") == "dispatched"):
+                card = g
+                break
+        if card is None:
+            return None
+        card["status"] = "done" if success else "failed"
+        card["result_note"] = str(note or "").strip()[:200]
+        if not _save_state(state):
+            logger.warning("[self_driven] 闭环回写落盘失败 engine_task_id=%s", etid)
+            return None
+        return dict(card)
+
+
 # ---- 心智状态读取（memory_bank 只读） ----
 
 def _fetch_mental_state():
@@ -236,10 +319,62 @@ def _clean_goal_text(raw: str) -> str:
     return t[:_GOAL_TEXT_MAX]
 
 
+def _sanitize_engine(value) -> str:
+    """target_engine 归一：strip+lower 后必须落在 _ENGINE_WHITELIST，否则回落
+    _DEFAULT_ENGINE（任务书：不在白名单内默认 zcode）。纯函数零 IO。"""
+    v = str(value or "").strip().lower()
+    return v if v in _ENGINE_WHITELIST else _DEFAULT_ENGINE
+
+
+def _try_parse_json_object(text: str):
+    """文本 → dict | None。剥代码围栏 + 截最外层花括号段 + json_repair 优先修复
+    （self_narrative._parse_narrative_json 同款容错链），裸 json.loads 兜底。
+    修不出 dict 一律 None（调用方按纯文本退化），不抛。纯函数零 IO。"""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        t = t[nl + 1:] if nl >= 0 else ""
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    t = t.strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    cand = t[start:end + 1]
+    if json_repair is not None:
+        try:
+            fixed = json_repair.repair_json(cand)
+            data = json.loads(fixed) if isinstance(fixed, str) else fixed
+            if isinstance(data, dict):
+                return data
+        except (ValueError, TypeError):
+            pass  # 修不动再走裸 loads
+    try:
+        data = json.loads(cand)
+        return data if isinstance(data, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_goal_payload(raw: str):
+    """模型输出 → (goal, target_engine)。纯函数零 IO。
+
+    [v2] JSON 契约：{"goal": "...", "target_engine": "..."}。goal 经
+    _clean_goal_text 清洗（空产出由调用方拒发卡）；target_engine 经 _sanitize_engine
+    白名单校验（漂移/编造名回落 zcode）。模型没照 JSON 说话时退化整段文本当目标、
+    引擎回落默认（self_narrative 解析失败降级纯叙事同款 fail-open）。"""
+    text = (raw or "").strip()
+    obj = _try_parse_json_object(text)
+    if isinstance(obj, dict):
+        return (_clean_goal_text(str(obj.get("goal") or "")),
+                _sanitize_engine(obj.get("target_engine")))
+    return _clean_goal_text(text), _DEFAULT_ENGINE
+
+
 async def _llm_goal(messages: list):
-    """喂 messages 要一句目标文本；任何异常/非 200/空应答返回 (None, 原因)。
-    与 self_narrative._llm_narrate 同一套 httpx 配置（REFLECTION_API/BASE_URL/
-    MODEL/TIMEOUT/NUM_CTX）与双协议口径；差异仅输出语义：纯文本非 JSON。"""
+    """喂 messages 要目标 JSON 原文（解析归 _parse_goal_payload）；任何异常/非 200/
+    空应答返回 (None, 原因)。与 self_narrative._llm_narrate 同一套 httpx 配置
+    （REFLECTION_API/BASE_URL/MODEL/TIMEOUT/NUM_CTX）与双协议口径。"""
     if config.REFLECTION_API == "openai":
         url = config.REFLECTION_BASE_URL.rstrip("/") + "/v1/chat/completions"
         payload = {"model": config.REFLECTION_MODEL, "stream": False,
@@ -280,8 +415,9 @@ async def generate_goal():
       ① 在飞闸 _goal_inflight：生成中不重复触发；
       ② 心智状态非空（_fetch_mental_state）；
       ③ 每日配额 < _DAILY_GOAL_LIMIT（安全熔断）。
-    产出侧：文本清洗（_clean_goal_text，空产出拒发卡）→ 发卡前 _record_goal
-    再守一次限额并原子落盘，落盘失败不发卡（熔断 fail-close）。"""
+    产出侧：JSON 解析（_parse_goal_payload：goal 清洗、target_engine 白名单，
+    空产出拒发卡）→ 发卡前 _record_goal 再守一次限额并原子落盘，落盘失败
+    不发卡（熔断 fail-close）。"""
     global _goal_inflight
     if _goal_inflight:
         logger.warning("[self_driven] 拒绝：上一次生成还在飞")
@@ -303,12 +439,14 @@ async def generate_goal():
         if raw is None:
             logger.warning("[self_driven] LLM 阶段失败：%s", err)
             return None
-        goal = _clean_goal_text(raw)
+        goal, engine = _parse_goal_payload(raw)
         if not goal:
             logger.warning("[self_driven] 拒发卡（产出为空）：%r", str(raw)[:60])
             return None
         card = {"task_id": str(uuid.uuid4()),
                 "goal": goal,
+                "target_engine": engine,
+                "engine_task_id": "",
                 "status": "pending_approval",
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds")}
         if not _record_goal(card):  # 超限/落盘失败：不发卡（见模块 docstring）
@@ -346,7 +484,7 @@ async def self_driven_generate() -> dict:
 
 
 async def _remove_goal_route(request: Request, action: str) -> dict:
-    """approve/reject 共用体：body {"task_id": "..."} → 出队。
+    """reject 专用出队体：body {"task_id": "..."} → 删卡。
     契约：成功 {"ok": true, "removed": n}；task_id 缺失/坏 JSON/落盘失败
     {"ok": false, "reason": ...}（fail-open 不抛 500）。"""
     try:
@@ -366,10 +504,30 @@ async def _remove_goal_route(request: Request, action: str) -> dict:
 
 @router.post("/self_driven/approve")
 async def self_driven_approve(request: Request) -> dict:
-    """[自驱引擎 v1] 执行确认出队：POST /api/self_driven/approve。
-    前端把目标派发给 ZCode 成功后调用（body {"task_id": 目标卡 task_id}），
-    从队列移除该项。纯出队动作，不触发任何执行。"""
-    return await _remove_goal_route(request, "approve")
+    """[自驱引擎 v2] 派发登记（状态流转，不删卡）：POST /api/self_driven/approve。
+    前端把目标派发给引擎、拿到引擎 task_id 后调用（body {"task_id": 目标卡
+    task_id, "engine_task_id": 引擎任务 id}）：卡不删，状态流转
+    pending_approval→dispatched 并登记 engine_task_id；执行结果由引擎收尾事件
+    经 synapse handler 回写 done/failed。纯登记动作，不触发任何执行。
+    契约：成功 {"ok": true, "updated": 1, "status": ...}；task_id/engine_task_id
+    缺失/坏 JSON {"ok": false, "reason": ...}；卡不存在 {"reason": "not_found"}。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - 坏 JSON 转契约错误，不上抛
+        return {"ok": False, "reason": "bad_json"}
+    task_id = str((body or {}).get("task_id") or "").strip()
+    engine_task_id = str((body or {}).get("engine_task_id") or "").strip()
+    if not task_id:
+        return {"ok": False, "reason": "task_id_required"}
+    if not engine_task_id:
+        return {"ok": False, "reason": "engine_task_id_required"}
+    card = mark_dispatched(task_id, engine_task_id)
+    if card is None:
+        return {"ok": False, "reason": "not_found",
+                "detail": "目标不存在或落盘失败，详见服务端日志"}
+    logger.warning("[self_driven] approve 派发登记 task_id=%s engine_task_id=%s",
+                   task_id, engine_task_id)
+    return {"ok": True, "updated": 1, "status": card.get("status")}
 
 
 @router.post("/self_driven/reject")
@@ -381,11 +539,11 @@ async def self_driven_reject(request: Request) -> dict:
 
 @router.get("/self_driven/queue")
 def self_driven_queue() -> dict:
-    """[自驱引擎 v1] 只读待审批目标队列：GET /api/self_driven/queue。
-    返回 status='pending_approval' 的目标卡（新→旧）+ 今日配额水位。
-    只读状态文件，不调 LLM、不写任何库。"""
+    """[自驱引擎 v2] 只读目标队列（含历史终态）：GET /api/self_driven/queue。
+    [v2] 返回全部状态的目标卡（pending_approval/dispatched/done/failed，新→旧），
+    前端按 status 分别展示待审批/执行中/已完成/失败（刷新即见历史）；
+    + 今日配额水位。只读状态文件，不调 LLM、不写任何库。"""
     state = _load_state()
-    items = [g for g in (state.get("queue") or [])
-             if isinstance(g, dict) and g.get("status") == "pending_approval"]
+    items = [g for g in (state.get("queue") or []) if isinstance(g, dict)]
     return {"ok": True, "count": len(items), "items": list(reversed(items)),
             **_quota_info(state)}
