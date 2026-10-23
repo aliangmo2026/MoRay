@@ -14,7 +14,9 @@ kind='self_narrative' 行 content JSON 里的 mental_state 字段），让本地
 - fail-open：读不到心智状态 / LLM 失败 / 产出为空一律返回 None（"没生成"），
   事实原因只进日志，绝不把异常抛给调用方；唯熔断落盘失败 fail-close（见下）；
 - 零自动执行（硬约束）：目标只生成到 pending_approval，绝不接入执行链/自省
-  循环/启动钩子；唯一入口 = POST /api/self_driven/generate 手动触发；
+  循环/启动钩子；生成唯一入口 = POST /api/self_driven/generate 手动触发；
+  出队仅两口 POST /api/self_driven/approve|reject（前端审批动作：执行=派发
+  ZCode 后确认出队、忽略=直接出队），同样手动、零自动执行；
 - LLM 调用零新增配置面：复用 reflection 同组 config（REFLECTION_API/BASE_URL/
   MODEL/TIMEOUT/NUM_CTX），与 self_narrative._llm_narrate 完全同款 httpx 双协议。
 
@@ -35,7 +37,7 @@ import threading
 import uuid
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from . import config
 
@@ -143,6 +145,30 @@ def _record_goal(card: dict) -> bool:
             logger.warning("[self_driven] 拒发卡：配额/队列落盘失败（熔断 fail-close）")
             return False
         return True
+
+
+def _remove_goal(task_id: str) -> int:
+    """从队列移除指定 task_id 的目标卡（approve/reject 两路由共用）。
+    安全读改写：_STATE_LOCK 包住 load→filter→save 纯同步段，写回走
+    _save_state 原子换名（与 _record_goal 同一把锁，互不交叉读半截状态）。
+    返回移除条数；task_id 空/落盘失败 = -1（fail-open 不抛）；队列里没有
+    该项 = 0（幂等：重复 approve/reject 也回 ok）。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return -1
+    with _STATE_LOCK:
+        state = _load_state()
+        before = state.get("queue") or []
+        after = [g for g in before
+                 if not (isinstance(g, dict) and str(g.get("task_id")) == tid)]
+        removed = len(before) - len(after)
+        if removed == 0:
+            return 0
+        state["queue"] = after
+        if not _save_state(state):
+            logger.warning("[self_driven] 出队落盘失败 task_id=%s", tid)
+            return -1
+        return removed
 
 
 # ---- 心智状态读取（memory_bank 只读） ----
@@ -294,7 +320,7 @@ async def generate_goal():
         _goal_inflight = False
 
 
-# ---- API（POST /api/self_driven/generate + GET /api/self_driven/queue） ----
+# ---- API（generate/approve/reject 三 POST + GET queue） ----
 
 router = APIRouter()
 
@@ -317,6 +343,40 @@ async def self_driven_generate() -> dict:
         return {"ok": False, "reason": "generation_failed",
                 "detail": "LLM 失败/产出为空/配额落盘失败，详见服务端日志"}
     return {"ok": True, **card}
+
+
+async def _remove_goal_route(request: Request, action: str) -> dict:
+    """approve/reject 共用体：body {"task_id": "..."} → 出队。
+    契约：成功 {"ok": true, "removed": n}；task_id 缺失/坏 JSON/落盘失败
+    {"ok": false, "reason": ...}（fail-open 不抛 500）。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - 坏 JSON 转契约错误，不上抛
+        return {"ok": False, "reason": "bad_json"}
+    task_id = str((body or {}).get("task_id") or "").strip()
+    if not task_id:
+        return {"ok": False, "reason": "task_id_required"}
+    removed = _remove_goal(task_id)
+    if removed < 0:
+        return {"ok": False, "reason": "state_save_failed"}
+    logger.warning("[self_driven] %s 出队 task_id=%s removed=%d",
+                   action, task_id, removed)
+    return {"ok": True, "removed": removed}
+
+
+@router.post("/self_driven/approve")
+async def self_driven_approve(request: Request) -> dict:
+    """[自驱引擎 v1] 执行确认出队：POST /api/self_driven/approve。
+    前端把目标派发给 ZCode 成功后调用（body {"task_id": 目标卡 task_id}），
+    从队列移除该项。纯出队动作，不触发任何执行。"""
+    return await _remove_goal_route(request, "approve")
+
+
+@router.post("/self_driven/reject")
+async def self_driven_reject(request: Request) -> dict:
+    """[自驱引擎 v1] 忽略出队：POST /api/self_driven/reject。
+    前端点「忽略（X）」调用（body 同 approve），同样移除该项。"""
+    return await _remove_goal_route(request, "reject")
 
 
 @router.get("/self_driven/queue")

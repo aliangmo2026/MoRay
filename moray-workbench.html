@@ -38667,7 +38667,12 @@ if (document.readyState === 'loading') {
    [v1.2 2026-10-13] 追加第八卡「写入拒绝」：GET /api/memory/rejections 同款并行拉取、
    独立失败（只标本卡）；数据源=errors.log 尾部 [memory_reject] 行（只读回读，零写库）。
    [v1.3 2026-10-21] 追加第九卡「自我叙事」：GET /api/self_narrative/latest 同款并行拉取、
-   独立失败（只标本卡）；MEM_KIND_ORDER 补 self_narrative 单列（桥三 stage2 产物）。 */
+   独立失败（只标本卡）；MEM_KIND_ORDER 补 self_narrative 单列（桥三 stage2 产物）。
+   [v1.4 2026-10-23] 追加第十卡「🎯 自驱目标」：GET /api/self_driven/queue 同款并行拉取、
+   独立失败（只标本卡）；每条目标带「执行（送 ZCode）」「忽略（X）」按钮——执行=前端取目标
+   文本 POST /api/engines/zcode/tasks {prompt}，成功后 POST /api/self_driven/approve 出队
+   + Toast「已派发给 ZCode 引擎」；忽略=POST /api/self_driven/reject 出队。事件委托用
+   composedPath（125:409 纪律）；不新增图标名（emoji 标题 + 纯文字按钮，Lucide 总数守 124）。 */
 (function () {
   'use strict';
   const PAGE = 'introspect';
@@ -38766,6 +38771,8 @@ if (document.readyState === 'loading') {
       </div>`;
     const btn = page.querySelector('#introspectRefreshBtn');
     if (btn) btn.addEventListener('click', refresh);
+    const bd = document.getElementById('introspectBody');
+    if (bd) bd.addEventListener('click', onGoalClick);
   }
 
   /* ---------------- 渲染 ---------------- */
@@ -38789,7 +38796,7 @@ if (document.readyState === 'loading') {
     if (typeof refreshIcons === 'function') refreshIcons();
   }
 
-  function renderReport(d, mem, fail, reject, nr) {
+  function renderReport(d, mem, fail, reject, nr, gs) {
     const body = document.getElementById('introspectBody');
     if (!body) return;
     const parts = [];
@@ -38871,6 +38878,9 @@ if (document.readyState === 'loading') {
     // ── 自我叙事（v1.3：独立数据源 /api/self_narrative/latest，随报刷新） ──
     parts.push(narrativeCardHtml(nr));
 
+    // ── 自驱目标（v1.4：独立数据源 /api/self_driven/queue，随报刷新） ──
+    parts.push(goalsCardHtml(gs));
+
     body.innerHTML = parts.join('');
     if (typeof refreshIcons === 'function') refreshIcons();
   }
@@ -38946,6 +38956,22 @@ if (document.readyState === 'loading') {
       try { data = await r.json(); } catch (e) { data = null; }
       if (r.status === 200 && data && data.ok === true) return data;
       return { ok: false, note: '自我叙事返回 HTTP ' + r.status };
+    } catch (e) {
+      return { ok: false, note: '后端不可达' };
+    }
+  }
+
+  async function fetchGoals() {
+    try {
+      const ctrl = ('AbortController' in window) ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 8000) : null;
+      const r = await fetch(backendOrigin() + '/api/self_driven/queue',
+        { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+      if (timer) clearTimeout(timer);
+      let data = null;
+      try { data = await r.json(); } catch (e) { data = null; }
+      if (r.status === 200 && data && data.ok === true) return data;
+      return { ok: false, note: '自驱队列返回 HTTP ' + r.status };
     } catch (e) {
       return { ok: false, note: '后端不可达' };
     }
@@ -39063,6 +39089,134 @@ if (document.readyState === 'loading') {
         : body));
   }
 
+  /* ---------------- 自驱目标卡（v1.4：GET /api/self_driven/queue，独立失败不拖他卡） ---------------- */
+
+  function goalsCardHtml(gs) {
+    if (!gs || gs.ok !== true) {
+      return card('🎯 自驱目标',
+        '<div class="text-[11px] text-text-tertiary">' + esc((gs && gs.note) || '后端不可达') + '</div>');
+    }
+    const items = Array.isArray(gs.items) ? gs.items : [];
+    if (!items.length) {
+      return card('🎯 自驱目标', '<div class="text-[11px] text-text-tertiary">暂无自驱目标</div>');
+    }
+    const rows = items.map(function (it) {
+      const gid = String(it.task_id || '');
+      const goal = String(it.goal || '');
+      return '<div class="flex items-start gap-2 py-2 border-b border-line-ghost/40" data-goal-row="1"' +
+        ' data-goal-id="' + esc(gid) + '" data-goal-text="' + esc(goal) + '">' +
+        '<div class="flex-1 min-w-0">' +
+        '<div class="text-[11px] font-bold text-text-primary leading-relaxed">' + esc(goal) + '</div>' +
+        '<div class="text-[11px] text-text-tertiary mt-0.5">生成于 ' +
+        esc(agoLabel(it.created_at) || it.created_at || '—') + '</div></div>' +
+        '<div class="flex items-center gap-1.5 flex-shrink-0">' +
+        '<button type="button" data-goal-act="run" data-goal-id="' + esc(gid) + '"' +
+        ' class="text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel">执行（送 ZCode）</button>' +
+        '<button type="button" data-goal-act="ignore" data-goal-id="' + esc(gid) + '"' +
+        ' class="text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary hover:text-error hover:bg-surface-panel">忽略（X）</button>' +
+        '</div></div>';
+    }).join('');
+    return card('🎯 自驱目标',
+      '<div id="selfDrivenGoalRows">' + rows + '</div>' +
+      '<div class="text-[11px] text-text-tertiary mt-2">「执行」派发 ZCode 引擎后出队，「忽略」直接出队；' +
+      '每日最多生成 3 条（安全熔断）。</div>');
+  }
+
+  /* ---- v1.4 交互：事件委托用 composedPath（125:409 纪律：refreshIcons 把 <i> 换成 <svg> 后
+          e.target.closest 会静默失效）。Toast 为本文件私有轻量实现（全库无全局 toast 助手）。 ---- */
+
+  function toast(msg) {
+    try {
+      const el = document.createElement('div');
+      el.setAttribute('role', 'status');
+      el.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;' +
+        'padding:8px 12px;border-radius:8px;font-size:11px;max-width:320px;' +
+        'background:rgba(20,20,22,0.92);color:#f2f2f2;border:1px solid rgba(255,255,255,0.14);' +
+        'box-shadow:0 6px 24px rgba(0,0,0,0.35);opacity:0;transition:opacity .18s';
+      el.textContent = String(msg || '');
+      document.body.appendChild(el);
+      requestAnimationFrame(function () { el.style.opacity = '1'; });
+      setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { try { el.remove(); } catch (e) { /* 忽略 */ } }, 220);
+      }, 2400);
+    } catch (e) { /* Toast 失败绝不影响主流程 */ }
+  }
+
+  async function postJson(path, body) {
+    const r = await fetch(backendOrigin() + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) { data = null; }
+    return { status: r.status, data: data };
+  }
+
+  function removeGoalRow(row) {
+    try {
+      row.remove();
+      const box = document.getElementById('selfDrivenGoalRows');
+      if (box && !box.querySelector('[data-goal-row]')) {
+        box.innerHTML = '<div class="text-[11px] text-text-tertiary">暂无自驱目标</div>';
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  async function onGoalAction(act, gid, goalText, row) {
+    if (!gid || !row || row.getAttribute('data-busy') === '1') return;
+    row.setAttribute('data-busy', '1');
+    try {
+      if (act === 'ignore') {
+        const res = await postJson('/api/self_driven/reject', { task_id: gid });
+        const d = res.data || {};
+        if (res.status === 200 && d.ok === true) {
+          removeGoalRow(row);
+          toast('已忽略该目标');
+          return;
+        }
+        toast('忽略失败：' + (d.reason || ('HTTP ' + res.status)));
+      } else if (act === 'run') {
+        // 前端直接提取目标文本（data-goal-text）发给 ZCode 引擎
+        const res = await postJson('/api/engines/zcode/tasks', { prompt: String(goalText || '') });
+        const d = res.data || {};
+        const engineTaskId = d.task_id || (d.data && d.data.task_id) || '';
+        if (res.status >= 200 && res.status < 300 && engineTaskId) {
+          // 出队用目标卡自身的 task_id（gid），不是引擎返回的 engineTaskId——两者是两套 id
+          const ap = await postJson('/api/self_driven/approve', { task_id: gid });
+          if (ap.status === 200 && (ap.data || {}).ok === true) {
+            removeGoalRow(row);
+            toast('已派发给 ZCode 引擎');
+            return;
+          }
+          toast('已派发给 ZCode 引擎（队列出队失败，请刷新）');
+        } else {
+          toast('派发失败：' + (d.message || d.msg || d.error || ('HTTP ' + res.status)));
+        }
+      }
+    } catch (e) {
+      toast('操作失败：后端不可达');
+    }
+    row.removeAttribute('data-busy');
+  }
+
+  function onGoalClick(e) {
+    const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+    let btn = null;
+    let row = null;
+    for (let i = 0; i < path.length; i++) {
+      const n = path[i];
+      if (!n || typeof n.getAttribute !== 'function') continue;
+      if (!row && n.getAttribute('data-goal-row')) row = n;
+      if (n.getAttribute('data-goal-act')) { btn = n; break; }
+    }
+    if (!btn || !row) return;
+    onGoalAction(btn.getAttribute('data-goal-act'),
+      row.getAttribute('data-goal-id') || btn.getAttribute('data-goal-id') || '',
+      row.getAttribute('data-goal-text') || '', row);
+  }
+
   /* ---------------- 拉数 ---------------- */
 
   async function loadReport() {
@@ -39073,6 +39227,7 @@ if (document.readyState === 'loading') {
     const failuresPromise = fetchFailures();   // 失败档案 v1：同款并行拉取，成功分支里 await
     const rejectionsPromise = fetchRejections();   // 写入拒绝 v1.2：同款并行拉取，成功分支里 await
     const narrativePromise = fetchNarrative();   // 自我叙事 v1.3：同款并行拉取，成功分支里 await
+    const goalsPromise = fetchGoals();   // 自驱目标 v1.4：同款并行拉取，成功分支里 await
     let note = '';
     try {
       const ctrl = ('AbortController' in window) ? new AbortController() : null;
@@ -39083,7 +39238,7 @@ if (document.readyState === 'loading') {
       let data = null;
       try { data = await r.json(); } catch (e) { data = null; }
       if (r.status === 200 && data && data.ok === true) {
-        renderReport(data, await statsPromise, await failuresPromise, await rejectionsPromise, await narrativePromise);
+        renderReport(data, await statsPromise, await failuresPromise, await rejectionsPromise, await narrativePromise, await goalsPromise);
         _loaded = true;
         setHead('最近报告 ' + (agoLabel(data.ts) || data.ts));
         _inFlight = false;
