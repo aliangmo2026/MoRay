@@ -242,6 +242,8 @@ app.include_router(self_check.router, prefix="/api")  # [自省循环 2026-10-09
 app.include_router(self_narrative.router, prefix="/api")  # [桥三 v1-stage1 2026-10-10] GET /api/self_narrative/readiness 只读端点；追加在 self_check.router 之后，独立路径，既有匹配顺序不变
 from .digital_twin import router as digital_twin_router  # noqa: E402 [数字分身 v1 2026-10-23]
 app.include_router(digital_twin_router)  # [数字分身 v1 2026-10-23] POST /api/twin/ingest + /api/twin/recall；独立路径，既有匹配顺序不变
+from .self_driven import router as self_driven_router  # noqa: E402 [自驱引擎 v1 2026-10-23]
+app.include_router(self_driven_router, prefix="/api")  # [自驱引擎 v1 2026-10-23] POST /api/self_driven/generate + GET /api/self_driven/queue；独立路径，既有匹配顺序不变
 
 # 关键坑：前端可能以 file:// 打开（Origin 为字符串 "null"），也可能来自
 # http://127.0.0.1 或 http://localhost 的任意端口 —— 正则统一放行
