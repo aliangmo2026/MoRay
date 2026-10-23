@@ -7,7 +7,7 @@
    红线：不改后端、不改 self_check.py、不改骨架 HTML、不动任何已有面板；
    图标复用 activity/brain/refresh-cw（均已被现网使用，不新增图标名，
    构建期 Lucide 校验图标总数保持 124）。
-   刷新策略：进入面板拉一次 + 页头手动刷新按钮；无轮询。
+   刷新策略：每次进入面板重拉（v2.1 前为页面生命周期内仅一次）+ 页头手动刷新按钮；无轮询。
    [v1.1 2026-10-10] 追加第六卡「记忆」：GET /api/memory/stats 与 report 并行拉取、
    独立失败（只标本卡不拖五卡）；不新增图标名（emoji 标题与现有卡同款）。
    [v1.2 2026-10-13] 追加第八卡「写入拒绝」：GET /api/memory/rejections 同款并行拉取、
@@ -24,7 +24,10 @@
    POST /api/engines/<name>/tasks（引擎名过 URL 段白名单，30_chat ENGINE_NAME_RE 同款
    纪律），拿到引擎 task_id 后 POST /api/self_driven/approve {task_id, engine_task_id}
    登记派发——卡不删、就地流转「执行中…」且按钮置灰；终态（done/failed）由后端引擎
-   收尾事件经 synapse 闭环回写，刷新即见历史（queue 已返全状态卡）。 */
+   收尾事件经 synapse 闭环回写，刷新即见历史（queue 已返全状态卡）。
+   [v2.1 2026-10-24] 切页缓存修复：ensureLoaded 去掉 _loaded 永久短路——原实现页面
+   生命周期内只拉一次，切页回来不重拉，引擎事件异步回写的目标终态永远看不见；
+   只留 _inFlight 防并发。 */
 (function () {
   'use strict';
   const PAGE = 'introspect';
@@ -675,7 +678,7 @@
   }
 
   function ensureLoaded() {
-    if (_loaded || _inFlight) return;
+    if (_inFlight) return;
     loadReport();
   }
 
