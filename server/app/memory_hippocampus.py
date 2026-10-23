@@ -1,5 +1,5 @@
-"""记忆海马体 v1（2026-10-22）：睡眠压缩——旧 self_observation 浓缩为 1 条
-memory_digest，并物理删除被吸收的源行。
+"""记忆海马体 v1（2026-10-22）：睡眠压缩——旧素材（self_observation +
+argus_research 研究结论）浓缩为 1 条 memory_digest，并物理删除被吸收的源行。
 
 范式参照（只加不改，零旧逻辑改动）：
 - self_narrative.py：LLM 双协议调用（REFLECTION_* config 组）、在飞闸、冷却、fail-open；
@@ -7,7 +7,7 @@ memory_digest，并物理删除被吸收的源行。
 - memory_routes.forget 端点底层：memory_bank + memory_fts 双表同步删除（参数绑定）。
 
 机制：
-- 素材闸：kind='self_observation' 总数 ≥ _MIN_OBS_TOTAL（100）才动手；
+- 素材闸：吸收范围（self_observation + argus_research 研究结论）总数 ≥ _MIN_OBS_TOTAL（100）才动手；
 - 批次：每次只压最旧 _COMPACT_BATCH（50）条，压后剩 ≥50 条，攒批天然节流；
 - 产物：insert_memory(kind='memory_digest', source='memory_hippocampus')（矩阵许可对），
   content=纯文本摘要（约 200 字），tags=被吸收行的 memory_id 溯源（self_narrative
@@ -33,6 +33,11 @@ _DIGEST_KIND = "memory_digest"
 _DIGEST_SOURCE = "memory_hippocampus"
 #: 素材 kind（self_reflection._OBS_KIND 同值；写入方=self_reflection，此处只读+删）
 _OBS_KIND = "self_observation"
+#: 追加吸收：Argus 研究结论（argus_proxy 写入 kind='task_result'/source='argus_research'）。
+#: 刻意不吸全部 task_result：zcode_stream/laya_executor/task_flow 是任务流水账
+#: 非长期教训，误压缩会丢任务档案（失败档案端点还靠它们），故谓词钉 source。
+_RESULT_KIND = "task_result"
+_ARGUS_SOURCE = "argus_research"
 
 #: 素材闸：self_observation 总数达到该值才压缩（v1 钉死 100）
 _MIN_OBS_TOTAL = 100
@@ -55,23 +60,30 @@ _last_hippo_monotonic = 0.0
 
 
 def _read_old_observations() -> dict:
-    """读素材：kind='self_observation' 总数 + 最旧 _COMPACT_BATCH 条（id/content/created_at）。
+    """读素材：吸收范围（self_observation + source='argus_research' 的 task_result）
+    总数 + 最旧 _COMPACT_BATCH 条（id/kind/content/created_at）。
     只 SELECT；排序 created_at ASC, id ASC（同刻稳定序）。fail-open：异常转 status=error。"""
     try:
         from . import memory_db  # 惰性 import（self_model/self_narrative 同款惯例）
         conn = memory_db.connect()
         try:
+            # 吸收谓词（两查询共用）：kind='self_observation'
+            # OR (kind='task_result' AND source='argus_research')——
+            # ★ 任务书分支：不吸无关 task_result（zcode_stream/laya_executor/task_flow）
             total = conn.execute(
-                "SELECT COUNT(*) FROM memory_bank WHERE kind = ?", (_OBS_KIND,)
+                "SELECT COUNT(*) FROM memory_bank WHERE kind = ? "
+                "OR (kind = ? AND source = ?)",
+                (_OBS_KIND, _RESULT_KIND, _ARGUS_SOURCE),
             ).fetchone()[0]
             rows = conn.execute(
-                "SELECT id, content, created_at FROM memory_bank WHERE kind = ? "
+                "SELECT id, kind, content, created_at FROM memory_bank "
+                "WHERE kind = ? OR (kind = ? AND source = ?) "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
-                (_OBS_KIND, _COMPACT_BATCH),
+                (_OBS_KIND, _RESULT_KIND, _ARGUS_SOURCE, _COMPACT_BATCH),
             ).fetchall()
         finally:
             conn.close()
-        items = [{"id": r["id"], "content": r["content"] or "",
+        items = [{"id": r["id"], "kind": r["kind"] or "", "content": r["content"] or "",
                   "created_at": r["created_at"]} for r in rows]
         return {"status": "ok", "total": int(total or 0), "items": items}
     except Exception as e:  # noqa: BLE001
@@ -82,23 +94,27 @@ def _read_old_observations() -> dict:
 
 
 def _build_digest_messages(items: list) -> list:
-    """组压缩 prompt（任务书语义：浓缩为 1 条约 200 字的长期教训/摘要，纯文本输出）。
+    """组压缩 prompt（任务书语义：浓缩为 1 条约 200 字的长期教训/摘要，纯文本输出；
+    必须涵盖研究结论——Argus 报告的核心结论不得在浓缩中丢失）。
     逐行截 _OBS_LINE_CHARS、总预算 _PROMPT_CHARS 钳制（超预算丢尾部较新条目——
     批次语义就是最旧优先，与取批口径一致）。"""
     lines = []
     used = 0
     for i, it in enumerate(items, 1):
-        line = "%d. [%s] %s" % (i, it.get("created_at") or "?",
-                                str(it.get("content") or "")[:_OBS_LINE_CHARS])
+        label = "研究结论" if it.get("kind") == _RESULT_KIND else "自省观察"
+        line = "%d. [%s][%s] %s" % (i, it.get("created_at") or "?", label,
+                                    str(it.get("content") or "")[:_OBS_LINE_CHARS])
         if used + len(line) > _PROMPT_CHARS:
             break
         lines.append(line)
         used += len(line)
-    user = ("请将以下 %d 条自省观察浓缩为 1 条约 %d 字的长期教训/摘要。纯文本输出。\n\n%s"
+    user = ("请将以下 %d 条记忆素材（自省观察与 Argus 研究结论）浓缩为 1 条约 %d 字的"
+            "长期教训/摘要，必须保留其中重要的研究结论。纯文本输出。\n\n%s"
             % (len(lines), _DIGEST_TARGET_CHARS, "\n".join(lines)))
     return [
         {"role": "system",
-         "content": "你是长期记忆压缩器。只输出浓缩后的纯文本摘要，不要任何解释或前缀。"},
+         "content": "你是长期记忆压缩器。只输出浓缩后的纯文本摘要，不要任何解释或前缀。"
+                    "摘要须涵盖素材中的研究结论。"},
         {"role": "user", "content": user},
     ]
 
@@ -165,7 +181,7 @@ async def compress_once() -> dict:
     防跑飞三闸（全在 LLM 调用之前判定，被拒调用零推理开销）：
       ① 在飞闸：_hippo_inflight 压缩中不重复触发（两挂点/未来端点共用）；
       ② 冷却：1h 进程内 monotonic，成功才更新（失败不消耗，下轮重试）；
-      ③ 素材闸：self_observation 总数 < 100 不动手。
+      ③ 素材闸：吸收范围（self_observation + argus_research）总数 < 100 不动手。
     fail-open：任何失败返回 {"ran": False, "reason": ...}，绝不抛。"""
     global _hippo_inflight, _last_hippo_monotonic
     if _hippo_inflight:

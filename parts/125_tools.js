@@ -2056,7 +2056,7 @@ const ARGUS_STATUS_REPEAT_MS = 120000;
 
 /** [Argus] 本会话"最近启动/查询过哪条研究"的记账（上下文感知兜底的判定条件 2）。
  *
- * 为什么不直接用 ArgusWatcher._tasks：那张表是**跟踪用**的，超时（30 分钟）/离线/取报告
+ * 为什么不直接用 ArgusWatcher._tasks：那张表是**跟踪用**的，超时（15 分钟）/离线/取报告
  * 失败时会被 _stop 删掉——而用户正是在那些时候按提示回来问"进度如何"，此时跟踪表里
  * 已经没有条目，兜底就哑了。这张表只回答"这个对话最近碰过哪个 session_id"，TTL 内一直留着。
  * @type {Object<string,{sid:string,convId:(string|null),question:string,startedAt:number,touchedAt:number}>} */
@@ -2853,7 +2853,7 @@ function argusExplicitQuestion(messages) {
 const ARGUS_PROGRESS_RE = /进度|进展|状态|怎么样了|怎么样子|怎样了|如何了|好了吗|好了没|好了没有|完了吗|完成了吗|完成了没|完成没有|搞定了吗|出来了吗|出来了没|出来没|结果出来|有结果|结束了吗|还要多久|得多久|多久|跑到哪|到哪了|到哪一步|查到什么|查到了吗|查到了什么|什么情况/;
 
 /** [Argus] 研究会话记录的保鲜期（ms）：超过这个时长就不再认它是"当前在跑的研究"。
- * 取得比 ArgusWatcher.MAX_WAIT_MS（30 分钟）宽一倍，让"跟踪已超时、用户按提示回来
+ * 取得比 ArgusWatcher.MAX_WAIT_MS（15 分钟）宽三倍，让"跟踪已超时、用户按提示回来
  * 问进度"这条路径也能命中（见 ARGUS_SESSION_LOG 的注释）。 */
 const ARGUS_SESSION_TTL_MS = 60 * 60 * 1000;
 
