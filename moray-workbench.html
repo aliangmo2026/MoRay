@@ -39277,8 +39277,9 @@ if (document.readyState === 'loading') {
     for (let i = 0; i < path.length; i++) {
       const n = path[i];
       if (!n || typeof n.getAttribute !== 'function') continue;
+      if (!btn && n.getAttribute('data-goal-act')) btn = n;
       if (!row && n.getAttribute('data-goal-row')) row = n;
-      if (n.getAttribute('data-goal-act')) { btn = n; break; }
+      if (btn && row) break;
     }
     if (!btn || !row) return;
     onGoalAction(btn.getAttribute('data-goal-act'),
