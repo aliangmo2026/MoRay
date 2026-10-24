@@ -144,6 +144,12 @@ _SELF_DRIVEN_RULES = (
     ("zcode.task.succeeded", "self_driven.close_loop"),
     ("zcode.task.failed", "self_driven.close_loop"),
     ("laya.task.completed", "self_driven.close_loop"),
+    # [失败重试 v3 2026-10-24] 失败事件额外触发重试复盘（与 close_loop 同事件并行，
+    # 顺序无关：retry 不要求卡已置 failed）。⚠turn 账：failed 事件 = bump_fail +
+    # close_loop + retry_handler 恰好 3/3 顶满 _MAX_TURNS，再往同事件挂 handler
+    # 必须同步调大 _MAX_TURNS。
+    ("zcode.task.failed", "self_driven.retry_handler"),
+    ("laya.task.failed", "self_driven.retry_handler"),
 )
 
 
@@ -194,6 +200,30 @@ def _handler_self_driven_close_loop(event: dict):
 
 
 _HANDLERS["self_driven.close_loop"] = _handler_self_driven_close_loop
+
+
+def _handler_self_driven_retry(event: dict):
+    """[失败重试 v3 2026-10-24] 失败事件 → self_driven.retry_handler：按
+    meta.task_id 找目标卡，谱系内重规划修复式新卡（retry_of/retry_count 留痕）
+    或超限置 abandoned。与 close_loop 同事件并行执行、先后无关；普通聊天任务/
+    编排子任务的失败（无匹配卡）静默跳过。handler 内核全 fail-open 不上抛。"""
+    async def _run() -> None:
+        meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
+        tid = str(meta.get("task_id") or "").strip()
+        if not tid:
+            return
+        reason = str(event.get("content") or "")[:400]
+        from . import self_driven  # 函数内懒导入（close_loop 同款防环）
+        try:
+            await self_driven.retry_handler(tid, reason)
+        except Exception as e:  # noqa: BLE001 - 单 handler 异常不拖垮其他 handler
+            logger.warning("[synapse] self_driven.retry_handler 异常（task_id=%s）：%s: %s",
+                           tid, type(e).__name__, str(e)[:200])
+
+    return _run()
+
+
+_HANDLERS["self_driven.retry_handler"] = _handler_self_driven_retry
 
 
 def _ensure_self_driven_rules() -> None:

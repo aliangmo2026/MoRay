@@ -254,6 +254,111 @@ def close_dispatched_goal(engine_task_id: str, success: bool,
         return dict(card)
 
 
+# ---- 失败重试/复盘 v3（2026-10-24 深海阶段二） ----
+#: 谱系重试上限：retry_count 达到该值的失败卡直接置 abandoned，不再生成新卡。
+#: 防跑飞第三道闸（与每日配额、self_state_log 熔断并行）：重试卡必须人工审批
+#: 才会执行，自动面每谱系最多 2 跳。
+_RETRY_MAX = 2
+#: 失败原因字符钳制（进 prompt 与新卡 retry_reason 的统一口径）
+_RETRY_REASON_CHARS = 400
+
+_RETRY_SYSTEM_PROMPT = (
+    "你是 MoRay 自驱引擎的失败复盘器。刚才一次自驱目标执行失败，请基于失败原因"
+    "给出一个修复式的下一步目标（换一个可行做法，而不是原样重试）。只输出一个 "
+    "JSON 对象，不要任何解释或代码块标记，严格符合这个形状："
+    '{"goal": "新的改进目标（不超过50字）", "target_engine": "zcode 或 laya"}'
+    "。target_engine 只允许取值 zcode 或 laya。"
+)
+
+
+def _build_retry_messages(goal: str, engine: str, reason: str) -> list:
+    """失败卡三要素（原目标/引擎/失败原因）→ messages。纯函数零 IO（单测惯例）。"""
+    user = ("失败的原目标：%s\n执行引擎：%s\n失败原因（引擎输出摘录）：\n%s\n"
+            "请给出修复式新目标的 JSON。"
+            % (str(goal or "")[:200], str(engine or "zcode"),
+               str(reason or "")[:_RETRY_REASON_CHARS]))
+    return [{"role": "system", "content": _RETRY_SYSTEM_PROMPT},
+            {"role": "user", "content": user}]
+
+
+async def retry_handler(engine_task_id: str, failure_reason: str) -> dict | None:
+    """[v3 失败重试闭环] 引擎终态失败事件 → 找到对应目标卡 → 谱系内重规划。
+
+    流程：按 engine_task_id 找卡（close_loop 与本 handler 同事件并行、先后不限，
+    故不要求卡已置 failed，只跳过 done/abandoned 终态）→ retry_count >=
+    _RETRY_MAX 置 abandoned（终态只进不出，mark_dispatched 同语义）→ 否则喂
+    LLM（复用 _llm_goal/_parse_goal_payload，JSON 契约同 v2）生成修复式新卡：
+    status=pending_approval 人工审批，retry_of=父卡 task_id、retry_count+1、
+    retry_reason 留痕。重试卡不计每日配额（防跑飞由谱系上限承担，审批人是
+    最后一道闸）。
+
+    fail-open：卡不存在（普通聊天任务的失败事件）/LLM 失败/产出为空/落盘失败
+    一律返回 None 只记日志，绝不抛给 synapse 派发器。"""
+    tid = str(engine_task_id or "").strip()
+    reason = str(failure_reason or "").strip()[:_RETRY_REASON_CHARS]
+    if not tid:
+        return None
+    with _STATE_LOCK:
+        state = _load_state()
+        card = None
+        for g in state.get("queue") or []:
+            if isinstance(g, dict) and str(g.get("engine_task_id") or "") == tid:
+                card = g
+                break
+        if card is None:
+            return None  # 非 self-driven 引擎任务的失败：静默跳过（close_loop 同口径）
+        if str(card.get("status") or "") in ("done", "abandoned"):
+            return None
+        retry_count = int(card.get("retry_count") or 0)
+        if retry_count >= _RETRY_MAX:
+            card["status"] = "abandoned"
+            card["abandoned_reason"] = reason[:200]
+            if not _save_state(state):
+                logger.warning("[self_driven] abandoned 落盘失败 engine_task_id=%s", tid)
+                return None
+            logger.warning("[self_driven] 重试超限置 abandoned task_id=%s retry_count=%d",
+                           card.get("task_id"), retry_count)
+            return dict(card)
+
+    # LLM 重规划（_STATE_LOCK 绝不跨 await：此处锁已释放，await 安全）
+    messages = _build_retry_messages(str(card.get("goal") or ""),
+                                     str(card.get("target_engine") or _DEFAULT_ENGINE),
+                                     reason)
+    raw, err = await _llm_goal(messages)
+    if raw is None:
+        logger.warning("[self_driven] 重试规划 LLM 失败（engine_task_id=%s）：%s",
+                       tid, err)
+        return None
+    goal, engine = _parse_goal_payload(raw)
+    if not goal:
+        logger.warning("[self_driven] 重试规划产出为空（engine_task_id=%s）：%r",
+                       tid, str(raw)[:60])
+        return None
+    new_card = {
+        "task_id": str(uuid.uuid4()),
+        "goal": goal,
+        "target_engine": engine,
+        "engine_task_id": "",
+        "status": "pending_approval",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "retry_of": str(card.get("task_id") or ""),
+        "retry_count": retry_count + 1,
+        "retry_reason": reason[:200],
+    }
+    with _STATE_LOCK:
+        state = _load_state()
+        state["queue"] = list(state.get("queue") or []) + [new_card]
+        if not _save_state(state):
+            logger.warning("[self_driven] 重试卡落盘失败 retry_of=%s",
+                           new_card["retry_of"])
+            return None
+    logger.warning("[self_driven] 失败重试卡已生成 task_id=%s retry_of=%s "
+                   "retry_count=%d goal=%s",
+                   new_card["task_id"], new_card["retry_of"],
+                   new_card["retry_count"], goal[:40])
+    return new_card
+
+
 # ---- 心智状态读取（memory_bank 只读） ----
 
 def _fetch_mental_state():
