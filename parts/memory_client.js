@@ -45,7 +45,9 @@ window.MorayMemory = (function () {
         resp = await fetch(_base() + '/api/memory/recall', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: q, limit: limit }),
+          // [向量召回 v1 2026-10-24] mode:'hybrid' = FTS 词面 + 向量语义 RRF 融合
+          // （后端默认 mode:'fts' 保持 M1 旧契约；此处显式升级语义召回）
+          body: JSON.stringify({ query: q, limit: limit, mode: 'hybrid' }),
           signal: ctrl.signal
         });
       } finally {

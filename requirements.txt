@@ -16,4 +16,8 @@ uvicorn[standard]>=0.30,<1.0
 httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0
 
+# [向量召回 v1 2026-10-24] sqlite-vec：memory_vec KNN 虚表（server/app/memory_db.py
+# 按需加载；失败自动降级 memory_embed.search_similar 纯 Python 余弦扫描）
+sqlite-vec>=0.1.9,<0.2
+
 # 安装命令：pip install -r requirements.txt

@@ -29,6 +29,9 @@ TEST_DIR.mkdir(exist_ok=True)
 os.environ["MORAY_WORKSPACE"] = str(TEST_DIR)
 os.environ["MORAY_DB"] = str(TEST_DIR / "events.sqlite3")
 os.environ["MORAY_MEMORY_DB"] = str(TEST_DIR / "bootstrap_memory.sqlite3")
+# [向量召回 v1 2026-10-24] 关掉 insert 后台补嵌线程（否则 daemon 线程握住临时库
+# 文件导致 tearDown WinError 32，且单测会摸真 Ollama——本文件契约是零真实网络）
+os.environ["MORAY_EMBED_AUTO"] = "0"
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

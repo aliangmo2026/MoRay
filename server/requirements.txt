@@ -4,3 +4,6 @@ fastapi>=0.111,<1.0
 uvicorn[standard]>=0.30,<1.0
 httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0
+# [向量召回 v1 2026-10-24] memory_vec KNN 索引（memory_db 按需加载；
+# 加载失败自动降级 memory_embed.search_similar 纯 Python 余弦，不留死胡同）
+sqlite-vec>=0.1.9,<0.2

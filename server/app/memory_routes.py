@@ -33,7 +33,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from . import memory_db
+from . import memory_db, memory_embed
 
 logger = logging.getLogger("moray.memory")
 
@@ -209,6 +209,15 @@ def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
         return "", str(e)[:200]
     finally:
         conn.close()
+
+    # [向量召回 v1 2026-10-24] 异步补嵌（后台 daemon 线程——嵌入走 HTTP 绝不上
+    # 事件循环）。失败只记日志不影响入库：FTS 路兜底召回，backfill_embeddings
+    # 随时补存量。spawn 内部全 fail-open，此处再兜一层保 insert 契约（id, ""）。
+    try:
+        memory_embed.spawn_embed(mem_id, content)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[memory] spawn_embed 调度异常（mem_id=%s）：%s: %s",
+                       mem_id, type(e).__name__, str(e)[:160])
     return mem_id, ""
 
 
@@ -241,6 +250,22 @@ async def memory_save(request: Request):
         return _bad(code, err, status)
 
     return _ok({"memory_id": mem_id})
+
+
+def _recall_item(row, score: float) -> dict:
+    """memory_bank 行 → 召回 item 形状（[向量召回 v1] FTS/向量两通道共用；
+    字段与 M1 契约逐字一致，新增 fts_score/vec_score/matches 由融合段补）。"""
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "content": row["content"],
+        "tags": [t for t in (row["tags"] or "").split(",") if t],
+        "source": row["source"],
+        "entity_id": row["entity_id"],
+        "session_id": row["session_id"],
+        "score": round(score, 6),
+        "created_at": row["created_at"]
+    }
 
 
 @router.post("/api/memory/recall")
@@ -321,7 +346,7 @@ async def memory_recall(request: Request):
     finally:
         conn.close()
 
-    # 时间衰减重排
+    # 时间衰减重排（[向量召回 v1] item 组装抽 _recall_item 供双通道共用）
     now_dt = datetime.now()
     items = []
     for row in rows:
@@ -335,23 +360,80 @@ async def memory_recall(request: Request):
         # 时间衰减因子（指数半衰）
         decay_factor = math.exp(-age_days / decay_days)
         final_score = bm25_score * decay_factor * (row["weight"] or 1.0)
-        items.append({
-            "id": row["id"],
-            "kind": row["kind"],
-            "content": row["content"],
-            "tags": [t for t in (row["tags"] or "").split(",") if t],
-            "source": row["source"],
-            "entity_id": row["entity_id"],
-            "session_id": row["session_id"],
-            "score": round(final_score, 6),
-            "created_at": row["created_at"]
-        })
+        items.append(_recall_item(row, final_score))
 
-    # 按 final_score DESC 排序，取 top limit
+    # 按 final_score DESC 排序
     items.sort(key=lambda x: x["score"], reverse=True)
-    items = items[:limit]
 
-    return _ok({"items": items})
+    # ---- [向量召回 v1 2026-10-24] 语义通道（请求级 opt-in：body.mode=="hybrid"）。
+    # 默认 mode="fts" 与 M1 契约逐字节一致（零命中=空列表、条数/排序不变——
+    # test_memory_bridge 旧断言与既有调用方零感知）；前端 memory_client 显式带
+    # mode:"hybrid" 走融合。语义通道 = query 嵌入 → 相似扫描（sqlite-vec KNN /
+    # 纯 Python 余弦兜底）→ 与 FTS 面 RRF 融合（k=60）。向量通道任何异常只降级
+    # 为纯 FTS（与 AND→OR 兜底同哲学：只降级不加阈值）。回表用"嵌行全扫 +
+    # Python 过滤"而非 IN 拼接（参数绑定纪律；嵌行规模=库内带 embedding 的行数）。
+    mode = str(body.get("mode") or "fts").strip().lower()
+    _RECALL_KINDS = ("fact", "task_result", "insight", "preference")  # 与上方 SQL 白名单同口径，改一处必改两处
+    vec_items = []
+    if mode == "hybrid":
+        try:
+            q_vec = memory_embed.get_embedding(query)
+            if q_vec:
+                cand = dict(memory_embed.search_similar(q_vec, k=max(limit * 3, 15)))
+                if cand:
+                    conn2 = _conn()
+                    try:
+                        vrows = conn2.execute(
+                            "SELECT id, kind, content, tags, source, entity_id, session_id, weight, created_at "
+                            "FROM memory_bank WHERE embedding IS NOT NULL"
+                        ).fetchall()
+                    finally:
+                        conn2.close()
+                    for row in vrows:
+                        vs = cand.get(row["id"])
+                        if vs is None or row["kind"] not in _RECALL_KINDS:
+                            continue
+                        try:
+                            created = datetime.strptime(row["created_at"], "%Y-%m-%dT%H:%M:%S")
+                            age_days = (now_dt - created).total_seconds() / 86400.0
+                        except Exception:  # noqa: BLE001 - 同 FTS 面：解析失败按新记忆
+                            age_days = 0.0
+                        vec_final = (float(vs) * math.exp(-age_days / decay_days)
+                                     * (row["weight"] or 1.0))
+                        vec_items.append(_recall_item(row, vec_final))
+                    vec_items.sort(key=lambda x: x["score"], reverse=True)
+                    vec_items = vec_items[:limit]
+        except Exception as e:  # noqa: BLE001 - 向量通道失败只降级，绝不拖垮召回
+            logger.warning("[memory] 向量召回通道降级（不影响 FTS 结果）：%s: %s",
+                           type(e).__name__, str(e)[:160])
+            vec_items = []
+
+    if mode == "hybrid":
+        # RRF 融合（k=60）：item["score"] 换成融合分；fts_score/vec_score/matches
+        # 留痕哪路命中（前端命中明细兼容旧字段，新增字段为纯增量）。
+        fused = {}
+        for rank, it in enumerate(items[:limit], 1):
+            it["fts_score"] = it["score"]
+            it["vec_score"] = None
+            it["matches"] = ["fts"]
+            fused[it["id"]] = [it, 1.0 / (60.0 + rank)]
+        for rank, it in enumerate(vec_items, 1):
+            cur = fused.get(it["id"])
+            if cur is not None:
+                cur[0]["vec_score"] = it["score"]
+                cur[0]["matches"].append("vec")
+                cur[1] += 1.0 / (60.0 + rank)
+            else:
+                it["fts_score"] = None
+                it["vec_score"] = it["score"]
+                it["matches"] = ["vec"]
+                fused[it["id"]] = [it, 1.0 / (60.0 + rank)]
+        merged = sorted(fused.values(), key=lambda t: t[1], reverse=True)[:limit]
+        for it, rrf in merged:
+            it["score"] = round(rrf, 6)
+        return _ok({"items": [it for it, _rrf in merged], "mode": "hybrid"})
+
+    return _ok({"items": items[:limit], "mode": "fts"})
 
 
 @router.post("/api/memory/forget")
@@ -377,6 +459,8 @@ async def memory_forget(request: Request):
             cur = conn.execute("DELETE FROM memory_bank WHERE id = ?", (mem_id,))
             deleted = cur.rowcount or 0
             conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mem_id,))
+            if memory_db.VEC_AVAILABLE:
+                conn.execute("DELETE FROM memory_vec WHERE memory_id = ?", (mem_id,))
         elif query:
             if len(query) < 3:
                 conn.rollback()
@@ -394,6 +478,8 @@ async def memory_forget(request: Request):
             for mid in ids:
                 conn.execute("DELETE FROM memory_bank WHERE id = ?", (mid,))
                 conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mid,))
+                if memory_db.VEC_AVAILABLE:
+                    conn.execute("DELETE FROM memory_vec WHERE memory_id = ?", (mid,))
                 deleted += 1
         else:
             if not isinstance(tags_filter, list):
@@ -410,6 +496,8 @@ async def memory_forget(request: Request):
             for mid in ids:
                 conn.execute("DELETE FROM memory_bank WHERE id = ?", (mid,))
                 conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mid,))
+                if memory_db.VEC_AVAILABLE:
+                    conn.execute("DELETE FROM memory_vec WHERE memory_id = ?", (mid,))
                 deleted += 1
         conn.commit()
     except Exception as e:  # noqa: BLE001

@@ -165,6 +165,10 @@ def _delete_rows(ids: list) -> tuple:
             for mid in ids:
                 conn.execute("DELETE FROM memory_bank WHERE id = ?", (mid,))
                 conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (mid,))
+                # [向量召回 v1 2026-10-24] 同事务清 vec 索引残留（connect 已装载
+                # 扩展；VEC_AVAILABLE=False 时无表可删，bank 行删除已连带数据面）
+                if memory_db.VEC_AVAILABLE:
+                    conn.execute("DELETE FROM memory_vec WHERE memory_id = ?", (mid,))
             conn.commit()
             return len(ids), ""
         except Exception as e:  # noqa: BLE001
