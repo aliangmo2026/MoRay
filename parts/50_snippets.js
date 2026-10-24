@@ -735,6 +735,29 @@ const DocsApp = {
       status: 'ready', chunks, createdAt: Date.now(), tags: [], error: ''
     };
     await DB.putDocument(doc);
+    // [数字分身 RAG 2026-10-24] 落库成功后异步投喂 twin 语料库（fire-and-forget）
+    // 后端自行切块嵌入（digital_twin.py），此处传原始全文，不预切块。
+    // fail-open：任何失败只 console.warn，不阻断本地导入。
+    try {
+      const _twinText = String(text || '');
+      const _TWIN_MAX = 5000000;
+      if (_twinText.length > 0 && _twinText.length <= _TWIN_MAX) {
+        const _twinBase = (typeof agentBackendBase === 'function')
+          ? agentBackendBase()
+          : ((window.MorayBackend && window.MorayBackend.origin) || 'http://127.0.0.1:8000');
+        fetch(_twinBase + '/api/twin/ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: _twinText, name: file.name || 'unnamed' })
+        }).then(function (r) { return r.json(); })
+          .then(function (body) {
+            if (!body || body.ok !== true) console.warn('[twin-ingest] 后端未确认:', body && (body.code || body.error));
+          })
+          .catch(function (e) { console.warn('[twin-ingest] 网络失败（已忽略）:', e && e.message); });
+      } else if (_twinText.length > _TWIN_MAX) {
+        console.warn('[twin-ingest] 文档过大已跳过，字符数=', _twinText.length);
+      }
+    } catch (_e) { console.warn('[twin-ingest] 组装失败（已忽略）:', _e && _e.message); }
     this.cache.push(doc);
     this.renderList();
     // 异步向量化（不阻塞 UI）

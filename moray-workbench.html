@@ -7503,7 +7503,9 @@ window.MorayMemory = (function () {
         resp = await fetch(_base() + '/api/memory/recall', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: q, limit: limit }),
+          // [向量召回 v1 2026-10-24] mode:'hybrid' = FTS 词面 + 向量语义 RRF 融合
+          // （后端默认 mode:'fts' 保持 M1 旧契约；此处显式升级语义召回）
+          body: JSON.stringify({ query: q, limit: limit, mode: 'hybrid' }),
           signal: ctrl.signal
         });
       } finally {
@@ -14253,6 +14255,29 @@ const DocsApp = {
       status: 'ready', chunks, createdAt: Date.now(), tags: [], error: ''
     };
     await DB.putDocument(doc);
+    // [数字分身 RAG 2026-10-24] 落库成功后异步投喂 twin 语料库（fire-and-forget）
+    // 后端自行切块嵌入（digital_twin.py），此处传原始全文，不预切块。
+    // fail-open：任何失败只 console.warn，不阻断本地导入。
+    try {
+      const _twinText = String(text || '');
+      const _TWIN_MAX = 5000000;
+      if (_twinText.length > 0 && _twinText.length <= _TWIN_MAX) {
+        const _twinBase = (typeof agentBackendBase === 'function')
+          ? agentBackendBase()
+          : ((window.MorayBackend && window.MorayBackend.origin) || 'http://127.0.0.1:8000');
+        fetch(_twinBase + '/api/twin/ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: _twinText, name: file.name || 'unnamed' })
+        }).then(function (r) { return r.json(); })
+          .then(function (body) {
+            if (!body || body.ok !== true) console.warn('[twin-ingest] 后端未确认:', body && (body.code || body.error));
+          })
+          .catch(function (e) { console.warn('[twin-ingest] 网络失败（已忽略）:', e && e.message); });
+      } else if (_twinText.length > _TWIN_MAX) {
+        console.warn('[twin-ingest] 文档过大已跳过，字符数=', _twinText.length);
+      }
+    } catch (_e) { console.warn('[twin-ingest] 组装失败（已忽略）:', _e && _e.message); }
     this.cache.push(doc);
     this.renderList();
     // 异步向量化（不阻塞 UI）
@@ -39108,7 +39133,8 @@ if (document.readyState === 'loading') {
     pending_approval: { label: '待审批', cls: 'text-text-tertiary' },
     dispatched: { label: '执行中…', cls: 'text-brand-cyan' },
     done: { label: '已完成', cls: 'text-success' },
-    failed: { label: '失败', cls: 'text-error' }
+    failed: { label: '失败', cls: 'text-error' },
+    abandoned: { label: '已放弃', cls: 'text-error' }  /* [v3 失败重试] retry_count 超限终态 */
   };
   var GOAL_BTN_DISABLED_CLS = 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary opacity-50 cursor-default';
 
@@ -39132,7 +39158,7 @@ if (document.readyState === 'loading') {
     const sm = goalStatusMeta(st);
     // 终态卡只留徽章（历史只读）；dispatched 按钮置灰不删（第四段契约）；待审批可操作
     const graying = st === 'dispatched';
-    const btns = (st === 'done' || st === 'failed') ? '' :
+    const btns = (st === 'done' || st === 'failed' || st === 'abandoned') ? '' :
       '<button type="button" data-goal-act="run" data-goal-id="' + esc(gid) + '"' +
       (graying ? ' disabled' : '') +
       ' class="' + (graying ? GOAL_BTN_DISABLED_CLS : 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel') + '">' +
@@ -39149,7 +39175,9 @@ if (document.readyState === 'loading') {
       esc(goal) + '</div>' +
       '<div class="text-[11px] text-text-tertiary mt-0.5">' +
       '<span data-goal-status-badge class="' + esc(sm.cls) + '">' + esc(sm.label) + '</span> · 生成于 ' +
-      esc(agoLabel(it.created_at) || it.created_at || '—') + '</div></div>' +
+      esc(agoLabel(it.created_at) || it.created_at || '—') +
+      (Number(it.retry_count) > 0 ? ' · <span class="text-warning">失败重试 #' + esc(Number(it.retry_count)) + '</span>' : '') +
+      '</div></div>' +
       '<div class="flex items-center gap-1.5 flex-shrink-0">' + btns + '</div></div>';
   }
 
