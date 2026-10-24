@@ -365,6 +365,54 @@ async def llm_chat(request: Request):
         else:
             messages.insert(0, {"role": "system", "content": _card_marker + _card_text})
 
+    # [数字分身 RAG 2026-10-24] twin 语料注入（紧随事实卡之后）：取最后一条 user
+    # 消息作 query，进程内直调 digital_twin._hybrid_recall（FTS + 向量 RRF 融合）
+    # 取 kind='corpus' 语料 top-3，作为独立 system 消息插到全部前导 system 之后
+    # （事实卡 marker 自称"岗位①"，不插到它前面）。总闸 MORAY_TWIN_RAG 默认开。
+    # fail-open 总纪律：闸关/query 过短/检索为空/任何异常一律静默跳过，绝不阻断
+    # 聊天。corpus 为空（分身未灌语料）时行为零变化——只有一次空 FTS 查询与一次
+    # 嵌入调用（Ollama 不在线时 get_embedding 秒级 fail-open 返回 None）。
+    if os.environ.get("MORAY_TWIN_RAG", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from .digital_twin import _hybrid_recall
+
+            _twin_query = ""
+            for _m in reversed(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content")
+                    if isinstance(_c, str):
+                        _twin_query = _c.strip()
+                    elif isinstance(_c, list):
+                        # 多模态分片（OpenAI 形状）：只取文本片，图片等非文本忽略
+                        _twin_query = " ".join(
+                            str(_p.get("text") or "") for _p in _c
+                            if isinstance(_p, dict)).strip()
+                    break
+            if len(_twin_query) > 2:
+                _twin_items = _hybrid_recall(_twin_query, limit=3)
+                if _twin_items:
+                    _twin_lines = ["[相关个人文档知识]（回答引用以下内容时，请标注来源文档名）"]
+                    for _i, _it in enumerate(_twin_items, 1):
+                        _doc = "未命名文档"
+                        _tags = _it.get("tags") or []
+                        if _tags:
+                            _doc = str(_tags[0]) or _doc
+                        _twin_lines.append("[%d] %s（来源：%s）"
+                                           % (_i, str(_it.get("content") or "").strip(), _doc))
+                    _insert_at = 0
+                    for _m in messages:
+                        if isinstance(_m, dict) and _m.get("role") == "system":
+                            _insert_at += 1
+                        else:
+                            break
+                    messages.insert(_insert_at, {
+                        "role": "system",
+                        "content": "\n".join(_twin_lines),
+                    })
+        except Exception as _twin_err:  # noqa: BLE001 - fail-open：检索/组装失败不阻断聊天
+            _logger.warning("[twin-rag] 注入跳过（不影响聊天）：%s: %s",
+                            type(_twin_err).__name__, str(_twin_err)[:160])
+
     # 模型名解析（[2026-09-30 本地优先强制；2026-09-30b 支持 custom_27b]）：
     # provider=ollama → 直接透传请求模型名（Ollama 接受任意模型名），缺省回落 OLLAMA_MODEL；
     # provider=custom_27b → 透传，缺省回落 LOCAL_27B_MODEL_NAME；
