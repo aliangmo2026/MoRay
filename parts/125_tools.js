@@ -121,8 +121,7 @@ const ToolRegistry = {
         const bytes = (typeof a.content === 'string') ? a.content.length : 0;
         return '新建 ' + (a.path || '') + (bytes ? '（' + bytes + ' 字符）' : '（空文件）');
       }
-      if (name === 'rename_file') return '重命名 ' + (a.from || '') + ' → ' + (a.to || '');
-      if (name === 'move_file') return '移动 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'move_file') return '移动/重命名 ' + (a.from || '') + ' → ' + (a.to || '');
       if (name === 'list_processes') return '查看进程' + (a.sort === 'pid' ? '（按 PID）' : '（占内存前 ' + (a.limit || 30) + ' 条）');
       if (name === 'system_info') return '读取系统概览（只读）';
       // [Argus 深度研究] 研究类工具的可读摘要
@@ -194,7 +193,7 @@ const ToolRegistry = {
       // [阶段1 M2] 高价值三工具
       find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen',
       // [3.20 阶段3] 新增本机工具
-      create_file: 'file-plus-2', rename_file: 'file-pen', move_file: 'folder-input',
+      create_file: 'file-plus-2', move_file: 'folder-input',
       list_processes: 'activity', system_info: 'cpu',
       // [Argus 深度研究] 研究工具图标
       detective_research: 'telescope', detective_status: 'radar'
@@ -1548,7 +1547,7 @@ async function agentFingerprintForApproval(def, args) {
     } catch (e) {
       fp += '::absent';
     }
-  } else if (def.name === 'move_file' || def.name === 'rename_file') {
+  } else if (def.name === 'move_file') {
     // 源文件内容变化 / 目标位置被占用 → 指纹变化，必须重新授权
     const src = String((args && (args.from || args.src)) || '');
     const dst = String((args && (args.to || args.dst)) || '');
@@ -1644,10 +1643,10 @@ function agentApproval(def, args, ctx) {
         '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' +
         (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空文件）</span>') +
         '</div></div>';
-    } else if (def.name === 'rename_file' || def.name === 'move_file') {
+    } else if (def.name === 'move_file') {
       // [3.20 阶段3] 移动/重命名：源 → 目标，并提示"目标存在即拒绝"
       argCards = '<div class="' + cell + '">' +
-        '<div class="text-[10px] text-text-tertiary mb-2">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mb-2">移动/重命名（工作区内）</div>' +
         '<div class="font-mono text-[11px] text-text-tertiary break-all">' + escapeHtml(String(args.from || '')) + '</div>' +
         '<div class="text-[10px] text-text-tertiary my-1">↓</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.to || '')) + '</div>' +
@@ -1899,26 +1898,13 @@ const NATIVE_TOOLS = [
     run(args, ctx) { return agentNativeRun(this, args, ctx); }
   },
   {
-    name: 'rename_file', label: '重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
-    description: '在工作区内重命名文件或目录（需用户授权，可理解为同一目录内的移动）。目标已存在时会被拒绝，不会覆盖。当用户说"把 a.txt 改名成 b.txt"时使用。',
-    parameters: {
-      type: 'object',
-      properties: {
-        from: { type: 'string', description: '相对工作区根的原路径（必填，必须存在）' },
-        to: { type: 'string', description: '重命名后的相对路径（必填，通常与 from 同目录）' }
-      },
-      required: ['from', 'to']
-    },
-    run(args, ctx) { return agentNativeRun(this, args, ctx); }
-  },
-  {
-    name: 'move_file', label: '移动文件', native: true, sideEffect: true, timeoutMs: 60000,
-    description: '在工作区内把文件或目录移动到另一个位置（需用户授权）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"时使用。',
+    name: 'move_file', label: '移动/重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内移动或重命名文件/目录（需用户授权；重命名就是移到同目录下的新名字）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"或"把 a.txt 改名成 b.txt"时使用。',
     parameters: {
       type: 'object',
       properties: {
         from: { type: 'string', description: '相对工作区根的源路径（必填，必须存在）' },
-        to: { type: 'string', description: '相对工作区根的目标路径（必填）' }
+        to: { type: 'string', description: '相对工作区根的目标路径（必填；与 from 同目录不同名即重命名）' }
       },
       required: ['from', 'to']
     },
@@ -2105,7 +2091,7 @@ function argusSessionRecords() {
 const ARGUS_TOOLS = [
   {
     name: 'detective_research', label: 'Argus 深度研究',
-    description: '强制优先调用：只要用户要求查资料、做调研、对比产品/价格、了解行业信息（包括提到 "Argus"、"深度研究"、"帮我查一下"），就调用本工具，不要先用自己的记忆回答。调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。返回的 session_id 是研究任务的唯一凭证 —— 只有本工具返回的 id 才是真的。',
+    description: '强制优先调用：只要用户要求查资料、做调研、对比产品/价格、了解行业信息（包括提到 "Argus"、"深度研究"、"帮我查一下"），就调用本工具。若当前上下文中已注入了内部文档知识（如 [相关个人文档知识]），则不要调用本工具，直接依据内部知识回答；否则请调用本工具。调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。返回的 session_id 是研究任务的唯一凭证 —— 只有本工具返回的 id 才是真的。',
     parameters: {
       type: 'object',
       properties: {
@@ -2985,10 +2971,10 @@ const PlanTracker = {
   SYSTEM_PROMPT: [
     '- 【工具调用强制规则】\n1. 指令中出现「调用xx工具」「使用xx工具」的明确格式时，直接调用对应工具执行任务，禁止触发搜索、联网等其他工具，无需额外推理。\n2. 指令包含本地磁盘路径（C:\\、D:\\ 等）+ 代码文件后缀（.py/.js/.go 等）+ 运行/执行/启动/跑 等关键词时，优先调用 zcode_run 工具执行代码，禁止调用搜索工具。\n3. 代码修改、bug修复、功能开发类需求，优先匹配 file + zcode 系列工具，不触发通用搜索。',
     '# 本机 Agent 工作规范（受控工作区内操作）',
-    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；rename_file 重命名；move_file 移动；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
+    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；move_file 移动/重命名；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
     '- 工作区边界：所有 path 都必须是相对工作区根的路径；默认无法访问工作区以外的文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。例外：授权目录（D:\\MoRay\\config\\authorized_paths.json 内的 C:/D: 盘目录）允许按真实路径直接读写，不受工作区根限制。',
     '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
-    '- 授权与拒绝：create_file / write_file / edit_file / rename_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
+    '- 授权与拒绝：create_file / write_file / edit_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
     '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
     '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。',
     '- 【本地代码开发模式】支持读写用户授权的本地目录（C/D 盘均可），所有文件操作优先使用真实路径；执行文件操作前默认路径已通过授权校验，直接调用 file 工具即可；若返回"路径未授权"错误，告知用户将目录添加到 D:\\MoRay\\config\\authorized_paths.json 配置中；代码运行、文件修改严格基于用户真实目录结构，操作完成后自动同步回原路径。',
@@ -3480,8 +3466,11 @@ function agentRecommendedModel() {
   return '';
 }
 
-/** [批次修复 #2] Agent 模式默认模型：当前模型自检通过则维持原默认；
- * 否则（未自检/未通过）切到推荐模型——不强制锁定，用户仍可手动切换。
+/** [批次修复 #2] Agent 模式默认模型建议：当前模型自检通过则维持原默认。
+ * [2026-10-25 解耦修复] 原实现会在自检未通过时**强制覆盖 defaultModel**——用户在设置里
+ * 选好的云端模型（如智谱 glm 系）一开本机 Agent 就被顶掉（"选引擎配置→模型被覆盖"的
+ * 元凶之一）。现改为：defaultModel 为空时才写入推荐（填充而非覆盖）；非空时只弹一次
+ * 建议通知，绝不改用户的模型选择。
  * @returns {void} */
 function agentApplyRecommendedModel() {
   try {
@@ -3492,11 +3481,19 @@ function agentApplyRecommendedModel() {
     if (sc && sc.ok === true && sc.model === cur) return; // 自检通过 → 维持原默认
     const rec = agentRecommendedModel();
     if (!rec || cur === rec) return;
+    if (cur) {
+      // [解耦] 已有模型选择 → 只建议不覆盖
+      if (!window.__agentRecNoticed) {
+        window.__agentRecNoticed = true;
+        showNotification('Agent 推荐模型', '工具调用最稳模型为 ' + rec + '；当前模型 ' + cur + ' 不受影响，如需切换请在输入台选择', 'info', 4500);
+      }
+      return;
+    }
     MoraySettings.set('defaultModel', rec).then(() => {
       try {
         if (typeof syncInputModelLabel === 'function') syncInputModelLabel();
         if (typeof updateStatusBar === 'function') updateStatusBar();
-        showNotification('Agent 默认模型已切换', rec + '（Agent 推荐模型）；仍可在输入台手动切换', 'info', 4500);
+        showNotification('Agent 默认模型已设为', rec + '（Agent 推荐模型）；仍可在输入台手动切换', 'info', 4500);
       } catch (e) { /* 忽略 */ }
     }).catch(() => {});
   } catch (e) { /* 忽略 */ }

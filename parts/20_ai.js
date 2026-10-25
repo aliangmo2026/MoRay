@@ -456,6 +456,25 @@ class MorayAI {
           };
           // [2026-10-21 收尾] ollama 显式钉 provider：防全局 LLM_PROVIDER=cloud 时本地模型被路由到云端
           if (self.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
+          // [2026-10-25 BYOK 透传] openai 后端走代理时随请求透传界面配置的 base/key：后端据此
+          // 转发到用户选择的服务商（浏览器直连被 CORS 拦截的第三方 API 经本机后端出网）；
+          // Key 只到本机后端、不出本机。透传即用户显式意图 → 钉 provider='cloud'，防全局
+          // LLM_PROVIDER=ollama 时透传被无视；后端对 base_url 做 SSRF 校验后才转发。
+          // [2026-10-25 统一下拉] 智能路由/下拉选中的云端模型（不在本地 AI.models）同样进
+          // 此分支：模型名判定 → 自动切云端通道（覆盖 ollama 钉的 provider，后写胜出）。
+          if (self.backend === 'openai' || (typeof isCloudModelName === 'function' && isCloudModelName(model))) {
+            const obase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+            const okey = MoraySettings.getAPIKey();
+            if (obase && okey) {
+              pbody.base_url = obase;
+              pbody.api_key = okey;
+              pbody.provider = 'cloud';
+            } else if (obase && typeof isCloudModelName === 'function' && isCloudModelName(model)) {
+              // [2026-10-25 统一下拉] 云端模型缺 Key：明确报错（后端契约 base/key 必须成对，
+              // 只发 base 会得 400 疑难杂症）——引导用户填 Key，不静默降级本地
+              throw new Error('云端模型「' + model + '」未配置 API Key：请在「设置 → OpenAI 兼容 API」填写 API Key 后重试');
+            }
+          }
           // [Day24.11] 预算桶：按对话隔离（无对话上下文时不带该字段，后端回落 default）
           const psid = self._budgetSessionId(opts);
           if (psid) pbody.session_id = psid;
@@ -654,6 +673,22 @@ class MorayAI {
         };
         // [2026-10-21 收尾] ollama 显式钉 provider + keep_alive 30m 驻留（后端 llm_proxy 同批透传）
         if (this.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
+        // [2026-10-25 BYOK 透传] 与流式分支同一规则：openai 后端透传界面 base/key + 钉 provider=cloud
+        // [2026-10-25 统一下拉] 云端模型名（路由/下拉选中）同样判定进此分支，自动切云端通道
+        if (this.backend === 'openai' || (typeof isCloudModelName === 'function' &&
+            isCloudModelName(opts.model || MoraySettings.get('openaiModel')))) {
+          const obase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+          const okey = MoraySettings.getAPIKey();
+          const __cloudModel = opts.model || MoraySettings.get('openaiModel');
+          if (obase && okey) {
+            pbody.base_url = obase;
+            pbody.api_key = okey;
+            pbody.provider = 'cloud';
+          } else if (obase && typeof isCloudModelName === 'function' && isCloudModelName(__cloudModel)) {
+            // [2026-10-25 统一下拉] 与流式分支同规则：缺 Key 明确报错，不丢后端 400
+            throw new Error('云端模型「' + __cloudModel + '」未配置 API Key：请在「设置 → OpenAI 兼容 API」填写 API Key 后重试');
+          }
+        }
         // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
         // [2026-10-21 收尾] tool_choice 同批透传：原 ollama 直连分支带此字段，合并后行为不丢
         if (opts.tools && opts.tools.length) {

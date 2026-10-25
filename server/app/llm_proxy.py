@@ -4,7 +4,10 @@
 API key 只存在 server/.env，绝不进入浏览器。
 
 安全约束：
-- 转发目标 base_url 只来自后端配置（server/.env / 环境变量），前端请求体指定的一律忽略 → 防 SSRF/开放代理；
+- 转发目标 base_url 默认只来自后端配置（server/.env / 环境变量）；前端请求体可显式
+  携带 base_url+api_key（[2026-10-25 BYOK 透传] 设置页"经本地后端代理"链路），但必须
+  成对提供并通过 SSRF 校验（仅 http/https + 公网 host，拒绝环回/私有/保留地址），
+  否则拒绝 → 防开放代理/内网探测；
 - 只监听 127.0.0.1（config.HOST）；CORS 沿用现有正则；
 - 上游错误转 {ok:false, code, message} JSON，不泄漏堆栈/请求头/key；
 - 日志打印 key 最多掩码 sk-***后4位。
@@ -220,6 +223,39 @@ def _mask_key(key: str) -> str:
     return (key[:3] + "***" + key[-4:]) if len(key) > 7 else "***"
 
 
+def _validate_upstream_base(base_url: str) -> tuple[str | None, str | None]:
+    """[2026-10-25 BYOK 透传] 校验前端透传的上游 baseURL（防 SSRF/开放代理）。
+
+    仅允许 http/https；host 解析出的每个 IP 都必须是公网地址——环回/私有/链路本地/
+    保留/组播/未指定地址一律拒绝（含域名 DNS 解析后指向内网的情况）。
+    返回 (规范化 base, None) 成功；(None, 错误文案) 失败。
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    raw = str(base_url or "").strip().rstrip("/")
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https"):
+        return None, "仅支持 http/https"
+    host = parts.hostname
+    if not host:
+        return None, "缺少主机名（示例：https://openrouter.ai/api/v1）"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return None, "无法解析主机名：%s" % host
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return None, "主机名解析出非法地址：%s" % info[4][0]
+        if not ip.is_global:
+            return None, ("指向非公网地址（%s），已拒绝：代理转发仅允许公网服务商；"
+                          "本地服务请直连，或在 server/.env 配置固定转发目标" % ip)
+    return raw, None
+
+
 def _upstream_code(status: int) -> str:
     return {
         401: "invalid_key",
@@ -269,6 +305,21 @@ async def llm_chat(request: Request):
     except Exception:  # noqa: BLE001
         return _err(400, "bad_json", "请求体不是合法 JSON。")
 
+    # ---- 1.5 [2026-10-25 BYOK 透传] 前端显式携带的第三方兼容 API base/key ----
+    # 设置页"经本地后端代理"链路：浏览器直连 openrouter.ai 等被 CORS 拦成 Failed to
+    # fetch，改由本机后端转发。安全：必须成对提供；过 SSRF 校验（仅 http/https + 公网
+    # host）后作为本次请求的云端转发目标（优先于 .env 配置）；半透传/校验失败明确 400。
+    custom_base_raw = str(body.get("base_url") or "").strip()
+    custom_key = str(body.get("api_key") or "").strip()
+    custom_base: str | None = None
+    if custom_base_raw or custom_key:
+        if not (custom_base_raw and custom_key):
+            return _err(400, "bad_upstream_override",
+                        "base_url 与 api_key 必须同时提供（只给其一无法安全转发）。")
+        custom_base, _upstream_err = _validate_upstream_base(custom_base_raw)
+        if not custom_base:
+            return _err(400, "upstream_url_rejected", "base_url 被拒绝：" + str(_upstream_err))
+
     # ---- 2. 配置检查（[2026-09-30 本地优先强制] provider=ollama/custom_27b 不要求云端 key；
     #         provider=cloud 需云端 key，且必须过云端熔断闸门）----
     # [2026-09-30d 任务二点五] 补一级检查缺口：provider 生效值 = body.provider > config.LLM_PROVIDER
@@ -295,7 +346,7 @@ async def llm_chat(request: Request):
                         "ZCode 云端调用已被禁用（ENABLE_ZCODE_CLOUD 未设为 true）。"
                         "如需 ZCode 走云端，请在 server/.env 设置 ENABLE_ZCODE_CLOUD=true "
                         "并重启后端。")
-        if not config.LLM_BASE_URL or not config.LLM_API_KEY:
+        if not custom_base and (not config.LLM_BASE_URL or not config.LLM_API_KEY):
             return _err(503, "cloud_not_configured", "云端未配置：LLM_BASE_URL 或 LLM_API_KEY 为空")
     if config.LLM_PROVIDER == "ollama":
         if not config.OLLAMA_BASE_URL:
@@ -308,7 +359,7 @@ async def llm_chat(request: Request):
                         "服务端未配置 27B 本地服务（MORAY_27B_BASE_URL / MORAY_27B_MODEL_NAME，"
                         "默认 http://127.0.0.1:8080/v1 + bonsai2-27b）。")
     else:
-        if not config.LLM_BASE_URL or not config.LLM_API_KEY:
+        if not custom_base and (not config.LLM_BASE_URL or not config.LLM_API_KEY):
             return _err(503, "cloud_not_configured",
                         "服务端未配置云端 LLM。二选一：① 在前端「设置 → OpenAI 兼容 API」"
                         "填写服务商接口地址与 API Key（或改用本机 Ollama）；"
@@ -372,6 +423,9 @@ async def llm_chat(request: Request):
     # fail-open 总纪律：闸关/query 过短/检索为空/任何异常一律静默跳过，绝不阻断
     # 聊天。corpus 为空（分身未灌语料）时行为零变化——只有一次空 FTS 查询与一次
     # 嵌入调用（Ollama 不在线时 get_embedding 秒级 fail-open 返回 None）。
+    # [twin×argus 冲突修复 2026-10-24] _twin_strong_hit：twin 强命中标志。闸关/异常/召回为空
+    # 时恒 False，tools 剥夺段（下方 payload 组装处）据此判定。
+    _twin_strong_hit = False
     if os.environ.get("MORAY_TWIN_RAG", "1").strip().lower() not in ("0", "false", "no", "off"):
         try:
             from .digital_twin import _hybrid_recall
@@ -391,7 +445,11 @@ async def llm_chat(request: Request):
             if len(_twin_query) > 2:
                 _twin_items = _hybrid_recall(_twin_query, limit=3)
                 if _twin_items:
-                    _twin_lines = ["[相关个人文档知识]（回答引用以下内容时，请标注来源文档名）"]
+                    # [twin×argus 2026-10-24b 取消阈值] 实机验证 0.02 会误杀：RRF 融合分在
+                    # 单路召回（仅 FTS 或仅向量命中一路）时天然极低，够答的内部知识也被放行
+                    # 去外部搜索。改为"召回非空即强命中"——宁可剥夺外部搜索靠内部文档作答，
+                    # 也不能放它去百度瞎搜。
+                    _twin_lines = ["[相关个人文档知识]（回答引用以下内容时，请标注来源文档名；系统已为你注入内部知识，请优先依据上述内部文档回答，严禁调用外部搜索工具）"]
                     for _i, _it in enumerate(_twin_items, 1):
                         _doc = "未命名文档"
                         _tags = _it.get("tags") or []
@@ -447,7 +505,15 @@ async def llm_chat(request: Request):
     # [阶段0 本机 Agent] 工具调用协议透传：仅请求体显式携带时才透传（无 tools 的旧请求行为完全不变）
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
-        payload["tools"] = tools
+        # [twin×argus 冲突修复 2026-10-24] 物理剥夺：twin 强命中（内部文档足够回答）时把
+        # detective_research（Argus 外部搜索）从本次请求的 tools 里摘除，模型无此工具可调，
+        # 只能依据注入的内部知识作答；zcode 等其余工具不受影响。全部摘除时不下发 tools 键。
+        if _twin_strong_hit:
+            tools = [t for t in tools
+                     if not (isinstance(t, dict) and isinstance(t.get("function"), dict)
+                             and (t["function"].get("name") or "") == "detective_research")]
+        if tools:
+            payload["tools"] = tools
     if body.get("tool_choice") is not None:
         payload["tool_choice"] = body["tool_choice"]
     # [2026-10-21 keep_alive 透传] 前端 ollama 请求统一走本代理后，keep_alive:'30m' 需后端接力
@@ -538,13 +604,25 @@ async def llm_chat(request: Request):
         _logger.info("[router] 云端预算预扣 permit=%s est=%.4f",
                      _cloud_permit.permit_id, _cloud_permit.reserved_usd)
         use_local = False
-        upstream_url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
-        upstream_headers = {
-            "Authorization": "Bearer " + config.LLM_API_KEY,
-            "Content-Type": "application/json",
-        }
-        upstream_model = model
-        _logger.info("[router] 云端路由 → %s (ENABLE_CLOUD_API=true)", config.LLM_BASE_URL)
+        # [2026-10-25 BYOK 透传] 界面透传的 base/key 优先于 .env（已过 SSRF 校验）；
+        # 未透传时行为与改动前完全一致（.env 固定转发目标）。
+        if custom_base:
+            upstream_url = custom_base.rstrip("/") + "/chat/completions"
+            upstream_headers = {
+                "Authorization": "Bearer " + custom_key,
+                "Content-Type": "application/json",
+            }
+            upstream_model = model
+            _logger.info("[router] 云端路由 → %s (前端透传, key=%s)",
+                         custom_base, _mask_key(custom_key))
+        else:
+            upstream_url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+            upstream_headers = {
+                "Authorization": "Bearer " + config.LLM_API_KEY,
+                "Content-Type": "application/json",
+            }
+            upstream_model = model
+            _logger.info("[router] 云端路由 → %s (ENABLE_CLOUD_API=true)", config.LLM_BASE_URL)
 
     payload["model"] = upstream_model
 
@@ -606,6 +684,12 @@ async def llm_chat(request: Request):
                     _logger.warning("[llm_proxy] refund 失败（不影响响应）：%s", e)
             if status == 400 and msg and "model" in msg.lower():
                 msg = (msg + " ｜ " + _model_hint()).strip()
+            # [2026-10-25 任务B] 429 人话化：智谱等免费档并发限流常见，原样透传英文/原文
+            # 用户看不懂；明确给出"并发受限或额度用尽"的可行动作（前端 Gateway 备用降级
+            # 消费同一条错误链，措辞同时出现在降级日志里）。
+            if status == 429:
+                msg = ("服务商并发受限或额度用尽（429），请稍后重试或切换其他服务商；"
+                       "原错误：" + str(msg)[:160]).strip()
             return _err(502, _upstream_code(status),
                         f"上游错误（{status}）：{msg}".strip())
 
@@ -650,7 +734,7 @@ async def llm_chat(request: Request):
                 req = client.build_request("POST", attempt_url, json=attempt_payload, headers=attempt_headers)
                 try:
                     upstream = await client.send(req, stream=True)
-                except (httpx.ConnectError, httpx.TimeoutException):
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
                     if not local_tried:
                         # [批次二·任务E + 批次二·5 任务1 红线] 本地 provider 连接失败/超时：
                         # 无论熔断闸门状态都绝不降级云端，如实报错。
@@ -911,3 +995,84 @@ async def openai_chat_completions(request: Request):
 
     # ---- 4c. 非流式成功（dict）→ 标准 OpenAI chat.completion ----
     return _to_openai_completion(inner_result)
+
+
+def _test_err(status: int, error: str, advice: str, latency: int | None = None):
+    """[2026-10-25 /api/llm/test] 诊断错误体：前端直读 error/advice 字段。"""
+    content: dict = {"ok": False, "error": error, "advice": advice}
+    if latency is not None:
+        content["latency"] = latency
+    return JSONResponse(status_code=status, content=content)
+
+
+@router.post("/api/llm/test")
+async def llm_test(request: Request):
+    """[2026-10-25 BYOK 代理测试] 1 token 最小请求经后端转发（设置页"测试连接"专用）。
+
+    浏览器直连第三方兼容 API 必被 CORS 拦成 Failed to fetch；此端点让测试请求与
+    聊天链路走同一出口（本机后端）。前端携带界面填写的 base/key/model，后端 SSRF
+    校验（仅 http/https + 公网 host）后发最小请求，返回 {ok, latency, model} 或
+    {ok:false, error, advice}。
+
+    与 /api/llm/chat 的差异（刻意）：诊断动作不计 session 额度/预算、不受
+    ENABLE_CLOUD_API 熔断约束——熔断防的是代理链路自动偷跑计费，不是用户显式诊断。
+    本服务只监听 127.0.0.1，Key 只到本机不出本机；日志掩码。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _test_err(400, "请求体不是合法 JSON。", "检查请求内容后重试")
+    if not isinstance(body, dict):
+        return _test_err(400, "请求体必须是 JSON 对象。", "检查请求内容后重试")
+    base_url = str(body.get("base_url") or "").strip()
+    api_key = str(body.get("api_key") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if not base_url:
+        return _test_err(400, "未填写接口地址", "选择服务商预设或手动输入 baseURL（以 /v1 结尾）")
+    if not api_key:
+        return _test_err(400, "未填写 API Key", "在服务商控制台创建 Key 后粘贴到此处")
+    if not model:
+        return _test_err(400, "未填写模型名", "在「默认模型」填写服务商支持的模型名")
+    safe_base, err = _validate_upstream_base(base_url)
+    if not safe_base:
+        return _test_err(400, "接口地址被拒绝：" + str(err),
+                         "代理转发仅允许公网 http/https 地址；本地服务请用直连")
+
+    payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 1, "stream": False}
+    headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(
+                connect=10.0, read=30.0, write=30.0, pool=10.0)) as client:
+            resp = await client.post(safe_base.rstrip("/") + "/chat/completions",
+                                     json=payload, headers=headers)
+    except httpx.TimeoutException:
+        return _test_err(504, "上游超时（30 秒无响应）", "检查网络与服务商状态后重试")
+    except httpx.HTTPError as e:
+        return _test_err(502, "无法连接上游（%s）" % type(e).__name__,
+                         "检查接口地址拼写、是否以 /v1 结尾、本机网络与代理设置")
+    latency = int((time.perf_counter() - started) * 1000)
+    if resp.status_code >= 400:
+        advice_map = {
+            401: "检查 Key 是否复制完整、是否属于该服务商、账户是否有余额",
+            402: "请前往服务商控制台充值",
+            404: "确认 baseURL 以 /v1 结尾；确认模型名在服务商处可用",
+            429: "服务商并发受限或额度用尽，请稍后重试或升级套餐/切换其他服务商",
+        }
+        try:
+            detail = resp.json()
+            msg = (detail.get("error", {}).get("message")
+                   or detail.get("message") or resp.text[:160])
+        except Exception:  # noqa: BLE001
+            msg = resp.text[:160]
+        return _test_err(200, "HTTP %d：%s" % (resp.status_code, str(msg)[:200]),
+                         advice_map.get(resp.status_code, "检查接口地址、模型名与网络"),
+                         latency=latency)
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    _logger.info("[llm-test] ok %s model=%s latency=%dms key=%s",
+                 safe_base, model, latency, _mask_key(api_key))
+    return {"ok": True, "latency": latency, "model": data.get("model") or model}

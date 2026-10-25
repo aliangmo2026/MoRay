@@ -6826,6 +6826,25 @@ class MorayAI {
           };
           // [2026-10-21 收尾] ollama 显式钉 provider：防全局 LLM_PROVIDER=cloud 时本地模型被路由到云端
           if (self.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
+          // [2026-10-25 BYOK 透传] openai 后端走代理时随请求透传界面配置的 base/key：后端据此
+          // 转发到用户选择的服务商（浏览器直连被 CORS 拦截的第三方 API 经本机后端出网）；
+          // Key 只到本机后端、不出本机。透传即用户显式意图 → 钉 provider='cloud'，防全局
+          // LLM_PROVIDER=ollama 时透传被无视；后端对 base_url 做 SSRF 校验后才转发。
+          // [2026-10-25 统一下拉] 智能路由/下拉选中的云端模型（不在本地 AI.models）同样进
+          // 此分支：模型名判定 → 自动切云端通道（覆盖 ollama 钉的 provider，后写胜出）。
+          if (self.backend === 'openai' || (typeof isCloudModelName === 'function' && isCloudModelName(model))) {
+            const obase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+            const okey = MoraySettings.getAPIKey();
+            if (obase && okey) {
+              pbody.base_url = obase;
+              pbody.api_key = okey;
+              pbody.provider = 'cloud';
+            } else if (obase && typeof isCloudModelName === 'function' && isCloudModelName(model)) {
+              // [2026-10-25 统一下拉] 云端模型缺 Key：明确报错（后端契约 base/key 必须成对，
+              // 只发 base 会得 400 疑难杂症）——引导用户填 Key，不静默降级本地
+              throw new Error('云端模型「' + model + '」未配置 API Key：请在「设置 → OpenAI 兼容 API」填写 API Key 后重试');
+            }
+          }
           // [Day24.11] 预算桶：按对话隔离（无对话上下文时不带该字段，后端回落 default）
           const psid = self._budgetSessionId(opts);
           if (psid) pbody.session_id = psid;
@@ -7024,6 +7043,22 @@ class MorayAI {
         };
         // [2026-10-21 收尾] ollama 显式钉 provider + keep_alive 30m 驻留（后端 llm_proxy 同批透传）
         if (this.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
+        // [2026-10-25 BYOK 透传] 与流式分支同一规则：openai 后端透传界面 base/key + 钉 provider=cloud
+        // [2026-10-25 统一下拉] 云端模型名（路由/下拉选中）同样判定进此分支，自动切云端通道
+        if (this.backend === 'openai' || (typeof isCloudModelName === 'function' &&
+            isCloudModelName(opts.model || MoraySettings.get('openaiModel')))) {
+          const obase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+          const okey = MoraySettings.getAPIKey();
+          const __cloudModel = opts.model || MoraySettings.get('openaiModel');
+          if (obase && okey) {
+            pbody.base_url = obase;
+            pbody.api_key = okey;
+            pbody.provider = 'cloud';
+          } else if (obase && typeof isCloudModelName === 'function' && isCloudModelName(__cloudModel)) {
+            // [2026-10-25 统一下拉] 与流式分支同规则：缺 Key 明确报错，不丢后端 400
+            throw new Error('云端模型「' + __cloudModel + '」未配置 API Key：请在「设置 → OpenAI 兼容 API」填写 API Key 后重试');
+          }
+        }
         // [阶段0] 云端代理透传 tools（本地 llm_proxy 白名单同步放行；无 tools 的旧请求零变化）
         // [2026-10-21 收尾] tool_choice 同批透传：原 ollama 直连分支带此字段，合并后行为不丢
         if (opts.tools && opts.tools.length) {
@@ -16142,7 +16177,7 @@ const SettingsApp = {
                     <i data-lucide="plug" class="w-3.5 h-3.5"></i>前端直连
                   </button>
                 </div>
-                <div class="form-hint">代理模式下云端 API Key 保存在本地后端（server/.env），不会进入浏览器；后端离线时自动回退直连。</div>
+                <div class="form-hint">代理模式下请求经本地后端转发（解决浏览器直连被跨域拦截）：界面填写的 API Key 只随请求发往本机后端、不出本机；也可在 server/.env 固化转发地址与 Key（Key 完全不进浏览器）。后端离线时自动回退直连。</div>
               </div>
               <div>
                 <label class="form-label">默认模型</label>
@@ -16701,16 +16736,35 @@ const SettingsApp = {
     window.addEventListener('moray-backend-probed', syncSettingsUI);
     syncSettingsUI();
     // [V3 P1.2] 服务商预设填充
+    // [2026-10-25 连环触发修复] 原生 select 在键盘 ↑↓ / 滚轮扫过选项时会对每一项实时触发
+    // change：旧实现每项都立即改值+弹通知 → 扫一遍下拉就连环弹出所有服务商的「已填充」
+    // 提示，且输入框被最后扫过的项覆盖（与用户意图脱节）。修复：① 只按 sel.value 精确
+    // 匹配单个 preset（不遍历、不依赖 selectedIndex）；② 填充/通知防抖 400ms 合并连续
+    // 扫动，稳定后只对最终选中项生效一次；③ 同名项重复选中不重复弹通知。
     on($('providerPresetSel'), 'change', function () {
-      const opt = this.options[this.selectedIndex];
-      const docLink = $('providerDocLink');
-      if (!opt.dataset.base) { docLink.style.display = 'none'; return; }
-      $('setOpenaiBase').value = opt.dataset.base;
-      if (opt.dataset.model) $('setOpenaiModel').value = opt.dataset.model;
-      docLink.href = 'https://' + opt.dataset.doc;
-      docLink.textContent = opt.dataset.doc + ' ↗';
-      docLink.style.display = '';
-      showNotification('已填充 ' + opt.value, '填写 API Key 后点击「测试连接」', 'info', 2500);
+      const sel = this;
+      clearTimeout(sel.__presetFillTimer);
+      sel.__presetFillTimer = setTimeout(() => {
+        const name = String(sel.value || '');
+        const preset = (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === name);
+        const docLink = $('providerDocLink');
+        if (!docLink) return;
+        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址
+        if (!preset) { docLink.style.display = 'none'; return; }
+        $('setOpenaiBase').value = preset.base;
+        // [2026-10-25 解耦修复] 推荐模型仅在输入框为空时填入（首填便利）；用户已手填的
+        // 模型绝不被预设推荐顶掉——模型输入权完全交给用户
+        const modelInput = $('setOpenaiModel');
+        const fillModel = !String(modelInput.value || '').trim();
+        if (fillModel) modelInput.value = preset.models;
+        docLink.href = 'https://' + preset.doc;
+        docLink.textContent = preset.doc + ' ↗';
+        docLink.style.display = '';
+        if (sel.__presetLastNotified !== name) {
+          sel.__presetLastNotified = name;
+          showNotification('已填充 ' + name, fillModel ? '已填入地址与推荐模型，填写 API Key 后点击「测试连接」' : '已填入地址（模型保留你手填的值），填写 API Key 后点击「测试连接」', 'info', 2500);
+        }
+      }, 400);
     });
     // [V3 P1.2] Key 显示/隐藏 + trim
     on($('toggleKeyBtn'), 'click', () => {
@@ -25591,6 +25645,64 @@ function isNonChatModel(name) {
   return NON_CHAT_MODEL_PREFIXES.some(p => s.startsWith(p));
 }
 
+/** [2026-10-25 统一下拉] 是否"云端模型"：不在本地 AI.models、非聊天/判定专用、且已配置
+ * openaiBaseURL 的模型名。判定为纯本地（不依赖 100 的加载时机，运行时调用）。
+ * 选中的云端模型经此判定切换到云端通道（AI.chat 透传 base/key + 钉 provider=cloud）。
+ * @param {string} name - 模型名
+ * @returns {boolean} 是否云端模型 */
+function isCloudModelName(name) {
+  const n = String(name || '').trim();
+  if (!n) return false;
+  try {
+    if (isNonChatModel(n) || isJudgeOnlyModel(n)) return false;
+    if ((AI.models || []).some(m => m && m.name === n)) return false;
+    return !!String(MoraySettings.get('openaiBaseURL') || '').trim();
+  } catch (e) { return false; }
+}
+
+/** [2026-10-25 统一下拉] 设置面板可选模型统一数据源：
+ * 1) 本地模型（AI.models 过滤 isNonChatModel + isJudgeOnlyModel，nomic/moray-laya-* 不外露）；
+ * 2) 已配置的云端模型（openaiBaseURL + openaiModel 齐备时追加一项，cloud 标记）。
+ * @returns {Array<{name:string, cloud:boolean}>} 可选模型列表 */
+function getAllSelectableModels() {
+  const out = [];
+  const seen = {};
+  (AI.models || []).forEach(m => {
+    const n = m && m.name;
+    if (!n || seen[n]) return;
+    if (isNonChatModel(n) || isJudgeOnlyModel(n)) return;
+    seen[n] = true;
+    out.push({ name: n, cloud: false });
+  });
+  try {
+    const cloudBase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+    const cloudModel = String(MoraySettings.get('openaiModel') || '').trim();
+    if (cloudBase && cloudModel && !seen[cloudModel]) {
+      out.push({ name: cloudModel, cloud: true });
+    }
+  } catch (e) { /* 云端配置读取失败 → 只出本地 */ }
+  return out;
+}
+
+/** [2026-10-25 统一下拉] 生成 optgroup 分组的 option HTML（本地/云端两组；云端文本带 [云端] 前缀）。
+ * value 恒为裸模型名（不带前缀），路由配置与发请求链零转换。
+ * @param {string} current - 当前选中模型名（命中则 selected）
+ * @param {boolean} [withEmpty] - 是否首项带"（未配置）"空选项
+ * @returns {string} option/optgroup HTML */
+function selectableModelOptionsHtml(current, withEmpty) {
+  const list = getAllSelectableModels();
+  const optOf = (m) => {
+    const label = m.cloud ? '[云端] ' + m.name : m.name;
+    return `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  };
+  const local = list.filter(m => !m.cloud);
+  const cloud = list.filter(m => m.cloud);
+  let html = withEmpty ? '<option value="">（未配置）</option>' : '';
+  if (local.length) html += `<optgroup label="本地模型">${local.map(optOf).join('')}</optgroup>`;
+  if (cloud.length) html += `<optgroup label="云端模型">${cloud.map(optOf).join('')}</optgroup>`;
+  return html;
+}
+
 function localModelNames() {
   const seen = {};
   const out = [];
@@ -25791,7 +25903,10 @@ const TaskRouter = {
     const cfg = MoraySettings.get('routingConfig') || {};
     const conf = cfg[type] || {};
     const available = AI.models.map(m => m.name);
-    const pick = (name) => name && (available.includes(name) || AI.backend === 'openai') ? name : '';
+    // [2026-10-25 统一下拉] pick 放行云端模型：显式配置的 primary/fallback 是已配置云端模型
+    // （如 glm-4-flash）时不再被 available.includes(仅本地) 丢弃——注释语义"命中即用（可能为
+    // 云端）"至此真正成立；发请求链由 isCloudModelName 在 AI.chat 侧切云端通道。
+    const pick = (name) => name && (available.includes(name) || AI.backend === 'openai' || isCloudModelName(name)) ? name : '';
     const primary = pick(conf.primary);
     const fallback = pick(conf.fallback);
     if (primary) {
@@ -26189,8 +26304,10 @@ const Gateway = {
       }
     }
     // [路由修复] 兜底：decision.model 必须非空合法字符串，否则回退默认模型
+    // [2026-10-25 统一下拉] 最后手段从 AI.models[0] 换 localModelNames()[0]：AI.models 首项
+    // 可能是 nomic-embed-text（冒名同型漏洞），兜底也必须走已过滤候选
     if (!decision || !decision.model) {
-      const fb = opts.model || MoraySettings.get('defaultModel') || (AI.models && AI.models[0] && AI.models[0].name) || '';
+      const fb = opts.model || MoraySettings.get('defaultModel') || localModelNames()[0] || '';
       const useDefault = !!(opts.model || MoraySettings.get('defaultModel'));
       const why = (!AI.models || !AI.models.length) ? '无可用模型' : '无本地模型';
       const src = useDefault ? '默认模型' : '首个可用模型';
@@ -26198,8 +26315,9 @@ const Gateway = {
       decision = { model: fb, fallbacks: [], reason: type + '任务 → ' + why + '，使用' + src + (label ? ' ' + label : '') };
     }
     // [成本中心] 超预算自动降级：选最便宜可用模型（cheapest 始终为字符串，初始为当前决策模型）
+    // [2026-10-25 统一下拉] 候选换 localModelNames()（滤非聊天/判定专用），防超预算降级选中 nomic
     if (MoraySettings.get('autoDegrade') && typeof CostBudget !== 'undefined' && CostBudget.isOver()) {
-      const available = AI.models.map(m => m.name);
+      const available = localModelNames();
       if (available.length) {
         let cheapest = decision.model, minCost = Infinity;
         available.forEach(n => {
@@ -26431,7 +26549,20 @@ Gateway.chatStream = function (opts) {
         }
       }
       if (result === undefined) {
-        const fallbacks = routed.routeInfo ? routed.routeInfo.fallbacks : [];
+        let fallbacks = routed.routeInfo ? routed.routeInfo.fallbacks : [];
+        // [2026-10-25 任务B] 首选是云端且路由未配备用 → 失败（含智谱免费档 429 并发限流）
+        // 时自动补一个本地模型作为降级目标，不让云端瞬时故障把整轮对话卡死。
+        // 候选优先级：Agent 推荐最稳模型（qwen3.5:9b 系）> 过滤后的本地列表尾项。
+        if (!fallbacks.length && !isLocalModelName(effective.model)) {
+          let autoLocal = '';
+          if (typeof agentRecommendedModel === 'function') autoLocal = agentRecommendedModel();
+          if (!autoLocal) {
+            const lc = (typeof localModelNames === 'function' ? localModelNames() : [])
+              .filter(n => n && n !== effective.model);
+            autoLocal = lc.length ? lc[lc.length - 1] : '';
+          }
+          if (autoLocal) fallbacks = [autoLocal];
+        }
         if (fallbacks.length && effective.model !== fallbacks[0]) {
           const primaryWasCloud = !isLocalModelName(effective.model);
           const fallbackIsLocal = isLocalModelName(fallbacks[0]);
@@ -26791,12 +26922,12 @@ async function appendGatewaySettings() {
   const month = await UsageTracker.summarize('month');
   const meta = await gatewayMetaGet('__meta__', { routeStats: { byType: {}, byModel: {} } });
   const rs = meta.routeStats || { byType: {}, byModel: {} };
-  const models = AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('');
   const rc = c.routingConfig || {};
-  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route-${type}-${field}>
-    <option value="">（未配置）</option>${models}</select>`.replace(`data-route-${type}-${field}>`, `data-route-${type}-${field}>`).replace('</select>', '</select>');
+  // [2026-10-25 统一下拉] 智能路由下拉框数据源统一走 selectableModelOptionsHtml：
+  // 本地过滤（isNonChatModel 滤 nomic-embed-text 等 + isJudgeOnlyModel 滤 moray-laya-*）+
+  // 已配置云端模型入列 + optgroup 分组。（原 models/sel 两处直接 AI.models.map 的死代码一并清除）
   const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route="${type}.${field}">
-    <option value="">（未配置）</option>${AI.models.map(m => `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}</select>`;
+    ${selectableModelOptionsHtml(current, true)}</select>`;
 
   const maxDay = Math.max(1, ...Object.values(cacheStats.byDay || {}).map(d => Math.max(d.hits || 0, d.queries || 0)));
   const last7 = Object.keys(cacheStats.byDay).sort().slice(-7);
@@ -27165,7 +27296,10 @@ const ConnectionGuide = {
       btn.disabled = true;
       btn.innerHTML = '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>测试中…';
       refreshIcons();
-      await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiModel: card.dataset.model || '', openaiEnabled: true });
+      // [2026-10-25 解耦修复] 仅当预设携带推荐模型时才写入（原 `|| ''` 会在用户未选预设
+      // 时把已填模型清空；预设推荐模型也只作首填，用户手填的值不被顶掉——见引导卡语义）
+      await MoraySettings.set(Object.assign({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true },
+        card.dataset.model ? { openaiModel: card.dataset.model } : {}));
       const r = await testCloudConnectionDetailed();
       btn.disabled = false;
       btn.innerHTML = '<i data-lucide="zap" class="w-3.5 h-3.5"></i>测试连接';
@@ -27234,6 +27368,38 @@ async function testCloudConnectionDetailed() {
   if (!base) return { ok: false, error: '未填写接口地址', advice: '选择服务商预设或手动输入 baseURL（以 /v1 结尾）' };
   if (!key) return { ok: false, error: '未填写 API Key', advice: '在服务商控制台创建 Key 后粘贴到此处' };
   const started = performance.now();
+  // [2026-10-25 代理测试打通] 代理模式且后端在线：测试请求经后端 /api/llm/test 转发
+  // （旧版直连必被浏览器 CORS 拦成 Failed to fetch；Key 只到本机后端、不出本机）。
+  // 仅当后端为旧版（无此端点 404）时回退直连。
+  const mb = window.MorayBackend;
+  if (MoraySettings.get('useBackendProxy') === true && mb && mb.connected && mb.origin) {
+    try {
+      const pres = await fetch(mb.origin + '/api/llm/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: base, api_key: key, model })
+      });
+      if (pres.status !== 404) { // 404 = 旧版后端无此端点 → 回退直连
+        const j = await pres.json().catch(() => ({}));
+        if (pres.ok && j.ok) {
+          return { ok: true, latency: j.latency || Math.round(performance.now() - started), model: j.model || model };
+        }
+        if (j && j.error) {
+          return { ok: false, latency: j.latency || Math.round(performance.now() - started), error: j.error, advice: j.advice || '经本地后端代理测试未通过（详见错误信息）' };
+        }
+      }
+    } catch (e) {
+      // [2026-10-25 抓包定案] 代理请求本身失败（8000 未启动 / 被防火墙或代理软件拦截）：
+      // 不回退直连——直连必被浏览器 CORS 拦成 Failed to fetch，只会掩盖真实原因。
+      const emsg = String((e && e.message) || e);
+      console.warn('[MoRay] /api/llm/test 代理请求失败:', emsg);
+      return {
+        ok: false,
+        error: '无法连接到 MoRay 本地代理（8000）：' + emsg,
+        advice: '请检查后端是否启动（浏览器访问 http://127.0.0.1:8000/api/health 应返回 ok），或是否被防火墙/代理软件拦截；也可切换为「前端直连」'
+      };
+    }
+  }
   try {
     const res = await fetch(base + '/chat/completions', {
       method: 'POST',
@@ -27249,17 +27415,20 @@ async function testCloudConnectionDetailed() {
     const map = {
       401: { error: 'API Key 无效（401）', advice: '检查 Key 是否复制完整、是否属于该服务商、账户是否有余额' },
       404: { error: '地址或模型不存在（404）', advice: '确认 baseURL 以 /v1 结尾；确认模型名在服务商处可用' },
-      429: { error: '请求被限流（429）', advice: 'Key 有效但触发限流，稍后重试或升级套餐' },
+      429: { error: '服务商并发受限或额度用尽（429）', advice: '请稍后重试，或在「服务商预设」切换其他服务商（如 DeepSeek/通义）' },
       402: { error: '余额不足（402）', advice: '请前往服务商控制台充值' }
     };
     const m = map[res.status] || { error: 'HTTP ' + res.status, advice: text.slice(0, 140) || '检查地址与网络' };
     return Object.assign({ ok: false, latency }, m);
   } catch (e) {
     const msg = String(e.message || e);
+    console.warn('[MoRay] 云端直连测试失败:', msg);
     let advice = '检查网络连接；若使用代理请确认代理可用；国内网络建议选择 DeepSeek/智谱/通义等服务商';
     // [BYOK] https/线上环境下直连常见 CORS 拦截 → 提示 Worker 代理
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
       advice += '。若控制台报 CORS 跨域：部署 Cloudflare Worker 代理后，把接口地址按 deploy/README 规则换成代理地址即可（设置页"跨域怎么办"帮助可一键拼接）';
+      // [2026-10-25 抓包定案] 最常见根因是代理开关未生效（后端短暂离线时会被自动回退为直连）
+      advice += '。也可在设置页「云端通道」点选「经本地后端代理」绕过浏览器跨域限制（注意：需按钮呈高亮激活态；后端短暂离线时会自动回退直连，需重新点选）';
     }
     return { ok: false, error: '网络错误：' + msg, advice };
   }
@@ -28317,7 +28486,10 @@ Onboarding.openV2 = function () {
       if (testBtn) testBtn.addEventListener('click', async () => {
         const base = box.querySelector('#ob2Base').value.trim();
         const key = box.querySelector('#ob2Key').value.trim();
-        await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true, openaiModel: 'deepseek-chat' });
+        // [2026-10-25 解耦修复] 原硬编码 openaiModel:'deepseek-chat'：用户在引导里填任意
+        // 服务商（如智谱）地址点测试，模型就被锁死成 DeepSeek 家的模型——已删除，
+        // 测试连接不再触碰模型字段（模型在下一步 ob2Model 下拉里由用户选）。
+        await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true });
         const r = await testCloudConnectionDetailed();
         box.querySelector('#ob2CloudHint').innerHTML = r.ok
           ? `<span class="text-success">✓ 连接成功 · 延迟 ${r.latency}ms · ${escapeHtml(r.model || '')}</span>`
@@ -30714,8 +30886,7 @@ const ToolRegistry = {
         const bytes = (typeof a.content === 'string') ? a.content.length : 0;
         return '新建 ' + (a.path || '') + (bytes ? '（' + bytes + ' 字符）' : '（空文件）');
       }
-      if (name === 'rename_file') return '重命名 ' + (a.from || '') + ' → ' + (a.to || '');
-      if (name === 'move_file') return '移动 ' + (a.from || '') + ' → ' + (a.to || '');
+      if (name === 'move_file') return '移动/重命名 ' + (a.from || '') + ' → ' + (a.to || '');
       if (name === 'list_processes') return '查看进程' + (a.sort === 'pid' ? '（按 PID）' : '（占内存前 ' + (a.limit || 30) + ' 条）');
       if (name === 'system_info') return '读取系统概览（只读）';
       // [Argus 深度研究] 研究类工具的可读摘要
@@ -30787,7 +30958,7 @@ const ToolRegistry = {
       // [阶段1 M2] 高价值三工具
       find_files: 'file-search', search_text: 'text-search', edit_file: 'square-pen',
       // [3.20 阶段3] 新增本机工具
-      create_file: 'file-plus-2', rename_file: 'file-pen', move_file: 'folder-input',
+      create_file: 'file-plus-2', move_file: 'folder-input',
       list_processes: 'activity', system_info: 'cpu',
       // [Argus 深度研究] 研究工具图标
       detective_research: 'telescope', detective_status: 'radar'
@@ -32141,7 +32312,7 @@ async function agentFingerprintForApproval(def, args) {
     } catch (e) {
       fp += '::absent';
     }
-  } else if (def.name === 'move_file' || def.name === 'rename_file') {
+  } else if (def.name === 'move_file') {
     // 源文件内容变化 / 目标位置被占用 → 指纹变化，必须重新授权
     const src = String((args && (args.from || args.src)) || '');
     const dst = String((args && (args.to || args.dst)) || '');
@@ -32237,10 +32408,10 @@ function agentApproval(def, args, ctx) {
         '<div class="text-[10px] text-text-primary whitespace-pre-wrap break-all max-h-28 overflow-auto font-mono">' +
         (c ? escapeHtml(c.slice(0, 300)) + (c.length > 300 ? '<span class="text-warning"> …（已截断，共 ' + c.length + ' 字符）</span>' : '') : '<span class="text-text-tertiary">（空文件）</span>') +
         '</div></div>';
-    } else if (def.name === 'rename_file' || def.name === 'move_file') {
+    } else if (def.name === 'move_file') {
       // [3.20 阶段3] 移动/重命名：源 → 目标，并提示"目标存在即拒绝"
       argCards = '<div class="' + cell + '">' +
-        '<div class="text-[10px] text-text-tertiary mb-2">' + (def.name === 'rename_file' ? '重命名（工作区内）' : '移动（工作区内）') + '</div>' +
+        '<div class="text-[10px] text-text-tertiary mb-2">移动/重命名（工作区内）</div>' +
         '<div class="font-mono text-[11px] text-text-tertiary break-all">' + escapeHtml(String(args.from || '')) + '</div>' +
         '<div class="text-[10px] text-text-tertiary my-1">↓</div>' +
         '<div class="font-mono text-[11px] text-text-primary break-all">' + escapeHtml(String(args.to || '')) + '</div>' +
@@ -32492,26 +32663,13 @@ const NATIVE_TOOLS = [
     run(args, ctx) { return agentNativeRun(this, args, ctx); }
   },
   {
-    name: 'rename_file', label: '重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
-    description: '在工作区内重命名文件或目录（需用户授权，可理解为同一目录内的移动）。目标已存在时会被拒绝，不会覆盖。当用户说"把 a.txt 改名成 b.txt"时使用。',
-    parameters: {
-      type: 'object',
-      properties: {
-        from: { type: 'string', description: '相对工作区根的原路径（必填，必须存在）' },
-        to: { type: 'string', description: '重命名后的相对路径（必填，通常与 from 同目录）' }
-      },
-      required: ['from', 'to']
-    },
-    run(args, ctx) { return agentNativeRun(this, args, ctx); }
-  },
-  {
-    name: 'move_file', label: '移动文件', native: true, sideEffect: true, timeoutMs: 60000,
-    description: '在工作区内把文件或目录移动到另一个位置（需用户授权）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"时使用。',
+    name: 'move_file', label: '移动/重命名文件', native: true, sideEffect: true, timeoutMs: 60000,
+    description: '在工作区内移动或重命名文件/目录（需用户授权；重命名就是移到同目录下的新名字）。目标已存在时会被拒绝，不会覆盖；父目录不存在会自动创建。当用户说"把 X 移到 Y 目录"或"把 a.txt 改名成 b.txt"时使用。',
     parameters: {
       type: 'object',
       properties: {
         from: { type: 'string', description: '相对工作区根的源路径（必填，必须存在）' },
-        to: { type: 'string', description: '相对工作区根的目标路径（必填）' }
+        to: { type: 'string', description: '相对工作区根的目标路径（必填；与 from 同目录不同名即重命名）' }
       },
       required: ['from', 'to']
     },
@@ -33578,10 +33736,10 @@ const PlanTracker = {
   SYSTEM_PROMPT: [
     '- 【工具调用强制规则】\n1. 指令中出现「调用xx工具」「使用xx工具」的明确格式时，直接调用对应工具执行任务，禁止触发搜索、联网等其他工具，无需额外推理。\n2. 指令包含本地磁盘路径（C:\\、D:\\ 等）+ 代码文件后缀（.py/.js/.go 等）+ 运行/执行/启动/跑 等关键词时，优先调用 zcode_run 工具执行代码，禁止调用搜索工具。\n3. 代码修改、bug修复、功能开发类需求，优先匹配 file + zcode 系列工具，不触发通用搜索。',
     '# 本机 Agent 工作规范（受控工作区内操作）',
-    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；rename_file 重命名；move_file 移动；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
+    '- 工具与时机：list_directory 列目录；read_file 读文本文件；find_files 按文件名通配查找（不确定路径时先用它定位）；search_text 全文搜索（按内容找，支持正则）；create_file 新建文件（已存在即拒绝，绝不覆盖）；write_file 新建或整体覆盖文件；edit_file 精确替换已有文件的某一段（修改已有文件优先用 edit_file，不要整体重写）；move_file 移动/重命名；list_processes 看进程占用；system_info 看系统与磁盘概览；run_command 只读白名单命令（git status/log/diff/branch、python/node/npm --version、where）。',
     '- 工作区边界：所有 path 都必须是相对工作区根的路径；默认无法访问工作区以外的文件；禁止臆造不存在的路径——不确定就先用 find_files / list_directory 确认。例外：授权目录（D:\\MoRay\\config\\authorized_paths.json 内的 C:/D: 盘目录）允许按真实路径直接读写，不受工作区根限制。',
     '- 多步任务：需要 2 个以上步骤时，先调用 submit_plan 提交编号计划（每步含意图与预计工具），然后按计划逐步执行；某步失败就修正参数重试（最多 2 次），全部完成后用一段话总结结果。',
-    '- 授权与拒绝：create_file / write_file / edit_file / rename_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
+    '- 授权与拒绝：create_file / write_file / edit_file / move_file / run_command 会先请求用户授权；被拒绝时不要重复尝试相同操作，改用文字向用户说明。',
     '- 文件内容为 UTF-8 文本；二进制或非 UTF-8 文件会收到明确错误，不要反复尝试。',
     '- edit_file 的 old_str 必须与文件内容逐字符一致且唯一；先 read_file 再编辑，匹配不唯一时补充上下文或用 replace_all。',
     '- 【本地代码开发模式】支持读写用户授权的本地目录（C/D 盘均可），所有文件操作优先使用真实路径；执行文件操作前默认路径已通过授权校验，直接调用 file 工具即可；若返回"路径未授权"错误，告知用户将目录添加到 D:\\MoRay\\config\\authorized_paths.json 配置中；代码运行、文件修改严格基于用户真实目录结构，操作完成后自动同步回原路径。',
@@ -34073,8 +34231,11 @@ function agentRecommendedModel() {
   return '';
 }
 
-/** [批次修复 #2] Agent 模式默认模型：当前模型自检通过则维持原默认；
- * 否则（未自检/未通过）切到推荐模型——不强制锁定，用户仍可手动切换。
+/** [批次修复 #2] Agent 模式默认模型建议：当前模型自检通过则维持原默认。
+ * [2026-10-25 解耦修复] 原实现会在自检未通过时**强制覆盖 defaultModel**——用户在设置里
+ * 选好的云端模型（如智谱 glm 系）一开本机 Agent 就被顶掉（"选引擎配置→模型被覆盖"的
+ * 元凶之一）。现改为：defaultModel 为空时才写入推荐（填充而非覆盖）；非空时只弹一次
+ * 建议通知，绝不改用户的模型选择。
  * @returns {void} */
 function agentApplyRecommendedModel() {
   try {
@@ -34085,11 +34246,19 @@ function agentApplyRecommendedModel() {
     if (sc && sc.ok === true && sc.model === cur) return; // 自检通过 → 维持原默认
     const rec = agentRecommendedModel();
     if (!rec || cur === rec) return;
+    if (cur) {
+      // [解耦] 已有模型选择 → 只建议不覆盖
+      if (!window.__agentRecNoticed) {
+        window.__agentRecNoticed = true;
+        showNotification('Agent 推荐模型', '工具调用最稳模型为 ' + rec + '；当前模型 ' + cur + ' 不受影响，如需切换请在输入台选择', 'info', 4500);
+      }
+      return;
+    }
     MoraySettings.set('defaultModel', rec).then(() => {
       try {
         if (typeof syncInputModelLabel === 'function') syncInputModelLabel();
         if (typeof updateStatusBar === 'function') updateStatusBar();
-        showNotification('Agent 默认模型已切换', rec + '（Agent 推荐模型）；仍可在输入台手动切换', 'info', 4500);
+        showNotification('Agent 默认模型已设为', rec + '（Agent 推荐模型）；仍可在输入台手动切换', 'info', 4500);
       } catch (e) { /* 忽略 */ }
     }).catch(() => {});
   } catch (e) { /* 忽略 */ }

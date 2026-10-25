@@ -138,7 +138,10 @@ const ConnectionGuide = {
       btn.disabled = true;
       btn.innerHTML = '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i>测试中…';
       refreshIcons();
-      await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiModel: card.dataset.model || '', openaiEnabled: true });
+      // [2026-10-25 解耦修复] 仅当预设携带推荐模型时才写入（原 `|| ''` 会在用户未选预设
+      // 时把已填模型清空；预设推荐模型也只作首填，用户手填的值不被顶掉——见引导卡语义）
+      await MoraySettings.set(Object.assign({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true },
+        card.dataset.model ? { openaiModel: card.dataset.model } : {}));
       const r = await testCloudConnectionDetailed();
       btn.disabled = false;
       btn.innerHTML = '<i data-lucide="zap" class="w-3.5 h-3.5"></i>测试连接';
@@ -207,6 +210,38 @@ async function testCloudConnectionDetailed() {
   if (!base) return { ok: false, error: '未填写接口地址', advice: '选择服务商预设或手动输入 baseURL（以 /v1 结尾）' };
   if (!key) return { ok: false, error: '未填写 API Key', advice: '在服务商控制台创建 Key 后粘贴到此处' };
   const started = performance.now();
+  // [2026-10-25 代理测试打通] 代理模式且后端在线：测试请求经后端 /api/llm/test 转发
+  // （旧版直连必被浏览器 CORS 拦成 Failed to fetch；Key 只到本机后端、不出本机）。
+  // 仅当后端为旧版（无此端点 404）时回退直连。
+  const mb = window.MorayBackend;
+  if (MoraySettings.get('useBackendProxy') === true && mb && mb.connected && mb.origin) {
+    try {
+      const pres = await fetch(mb.origin + '/api/llm/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: base, api_key: key, model })
+      });
+      if (pres.status !== 404) { // 404 = 旧版后端无此端点 → 回退直连
+        const j = await pres.json().catch(() => ({}));
+        if (pres.ok && j.ok) {
+          return { ok: true, latency: j.latency || Math.round(performance.now() - started), model: j.model || model };
+        }
+        if (j && j.error) {
+          return { ok: false, latency: j.latency || Math.round(performance.now() - started), error: j.error, advice: j.advice || '经本地后端代理测试未通过（详见错误信息）' };
+        }
+      }
+    } catch (e) {
+      // [2026-10-25 抓包定案] 代理请求本身失败（8000 未启动 / 被防火墙或代理软件拦截）：
+      // 不回退直连——直连必被浏览器 CORS 拦成 Failed to fetch，只会掩盖真实原因。
+      const emsg = String((e && e.message) || e);
+      console.warn('[MoRay] /api/llm/test 代理请求失败:', emsg);
+      return {
+        ok: false,
+        error: '无法连接到 MoRay 本地代理（8000）：' + emsg,
+        advice: '请检查后端是否启动（浏览器访问 http://127.0.0.1:8000/api/health 应返回 ok），或是否被防火墙/代理软件拦截；也可切换为「前端直连」'
+      };
+    }
+  }
   try {
     const res = await fetch(base + '/chat/completions', {
       method: 'POST',
@@ -222,17 +257,20 @@ async function testCloudConnectionDetailed() {
     const map = {
       401: { error: 'API Key 无效（401）', advice: '检查 Key 是否复制完整、是否属于该服务商、账户是否有余额' },
       404: { error: '地址或模型不存在（404）', advice: '确认 baseURL 以 /v1 结尾；确认模型名在服务商处可用' },
-      429: { error: '请求被限流（429）', advice: 'Key 有效但触发限流，稍后重试或升级套餐' },
+      429: { error: '服务商并发受限或额度用尽（429）', advice: '请稍后重试，或在「服务商预设」切换其他服务商（如 DeepSeek/通义）' },
       402: { error: '余额不足（402）', advice: '请前往服务商控制台充值' }
     };
     const m = map[res.status] || { error: 'HTTP ' + res.status, advice: text.slice(0, 140) || '检查地址与网络' };
     return Object.assign({ ok: false, latency }, m);
   } catch (e) {
     const msg = String(e.message || e);
+    console.warn('[MoRay] 云端直连测试失败:', msg);
     let advice = '检查网络连接；若使用代理请确认代理可用；国内网络建议选择 DeepSeek/智谱/通义等服务商';
     // [BYOK] https/线上环境下直连常见 CORS 拦截 → 提示 Worker 代理
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
       advice += '。若控制台报 CORS 跨域：部署 Cloudflare Worker 代理后，把接口地址按 deploy/README 规则换成代理地址即可（设置页"跨域怎么办"帮助可一键拼接）';
+      // [2026-10-25 抓包定案] 最常见根因是代理开关未生效（后端短暂离线时会被自动回退为直连）
+      advice += '。也可在设置页「云端通道」点选「经本地后端代理」绕过浏览器跨域限制（注意：需按钮呈高亮激活态；后端短暂离线时会自动回退直连，需重新点选）';
     }
     return { ok: false, error: '网络错误：' + msg, advice };
   }
@@ -1290,7 +1328,10 @@ Onboarding.openV2 = function () {
       if (testBtn) testBtn.addEventListener('click', async () => {
         const base = box.querySelector('#ob2Base').value.trim();
         const key = box.querySelector('#ob2Key').value.trim();
-        await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true, openaiModel: 'deepseek-chat' });
+        // [2026-10-25 解耦修复] 原硬编码 openaiModel:'deepseek-chat'：用户在引导里填任意
+        // 服务商（如智谱）地址点测试，模型就被锁死成 DeepSeek 家的模型——已删除，
+        // 测试连接不再触碰模型字段（模型在下一步 ob2Model 下拉里由用户选）。
+        await MoraySettings.set({ openaiBaseURL: base, openaiAPIKey: key, openaiEnabled: true });
         const r = await testCloudConnectionDetailed();
         box.querySelector('#ob2CloudHint').innerHTML = r.ok
           ? `<span class="text-success">✓ 连接成功 · 延迟 ${r.latency}ms · ${escapeHtml(r.model || '')}</span>`

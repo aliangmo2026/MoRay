@@ -350,6 +350,64 @@ function isNonChatModel(name) {
   return NON_CHAT_MODEL_PREFIXES.some(p => s.startsWith(p));
 }
 
+/** [2026-10-25 统一下拉] 是否"云端模型"：不在本地 AI.models、非聊天/判定专用、且已配置
+ * openaiBaseURL 的模型名。判定为纯本地（不依赖 100 的加载时机，运行时调用）。
+ * 选中的云端模型经此判定切换到云端通道（AI.chat 透传 base/key + 钉 provider=cloud）。
+ * @param {string} name - 模型名
+ * @returns {boolean} 是否云端模型 */
+function isCloudModelName(name) {
+  const n = String(name || '').trim();
+  if (!n) return false;
+  try {
+    if (isNonChatModel(n) || isJudgeOnlyModel(n)) return false;
+    if ((AI.models || []).some(m => m && m.name === n)) return false;
+    return !!String(MoraySettings.get('openaiBaseURL') || '').trim();
+  } catch (e) { return false; }
+}
+
+/** [2026-10-25 统一下拉] 设置面板可选模型统一数据源：
+ * 1) 本地模型（AI.models 过滤 isNonChatModel + isJudgeOnlyModel，nomic/moray-laya-* 不外露）；
+ * 2) 已配置的云端模型（openaiBaseURL + openaiModel 齐备时追加一项，cloud 标记）。
+ * @returns {Array<{name:string, cloud:boolean}>} 可选模型列表 */
+function getAllSelectableModels() {
+  const out = [];
+  const seen = {};
+  (AI.models || []).forEach(m => {
+    const n = m && m.name;
+    if (!n || seen[n]) return;
+    if (isNonChatModel(n) || isJudgeOnlyModel(n)) return;
+    seen[n] = true;
+    out.push({ name: n, cloud: false });
+  });
+  try {
+    const cloudBase = String(MoraySettings.get('openaiBaseURL') || '').trim();
+    const cloudModel = String(MoraySettings.get('openaiModel') || '').trim();
+    if (cloudBase && cloudModel && !seen[cloudModel]) {
+      out.push({ name: cloudModel, cloud: true });
+    }
+  } catch (e) { /* 云端配置读取失败 → 只出本地 */ }
+  return out;
+}
+
+/** [2026-10-25 统一下拉] 生成 optgroup 分组的 option HTML（本地/云端两组；云端文本带 [云端] 前缀）。
+ * value 恒为裸模型名（不带前缀），路由配置与发请求链零转换。
+ * @param {string} current - 当前选中模型名（命中则 selected）
+ * @param {boolean} [withEmpty] - 是否首项带"（未配置）"空选项
+ * @returns {string} option/optgroup HTML */
+function selectableModelOptionsHtml(current, withEmpty) {
+  const list = getAllSelectableModels();
+  const optOf = (m) => {
+    const label = m.cloud ? '[云端] ' + m.name : m.name;
+    return `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  };
+  const local = list.filter(m => !m.cloud);
+  const cloud = list.filter(m => m.cloud);
+  let html = withEmpty ? '<option value="">（未配置）</option>' : '';
+  if (local.length) html += `<optgroup label="本地模型">${local.map(optOf).join('')}</optgroup>`;
+  if (cloud.length) html += `<optgroup label="云端模型">${cloud.map(optOf).join('')}</optgroup>`;
+  return html;
+}
+
 function localModelNames() {
   const seen = {};
   const out = [];
@@ -550,7 +608,10 @@ const TaskRouter = {
     const cfg = MoraySettings.get('routingConfig') || {};
     const conf = cfg[type] || {};
     const available = AI.models.map(m => m.name);
-    const pick = (name) => name && (available.includes(name) || AI.backend === 'openai') ? name : '';
+    // [2026-10-25 统一下拉] pick 放行云端模型：显式配置的 primary/fallback 是已配置云端模型
+    // （如 glm-4-flash）时不再被 available.includes(仅本地) 丢弃——注释语义"命中即用（可能为
+    // 云端）"至此真正成立；发请求链由 isCloudModelName 在 AI.chat 侧切云端通道。
+    const pick = (name) => name && (available.includes(name) || AI.backend === 'openai' || isCloudModelName(name)) ? name : '';
     const primary = pick(conf.primary);
     const fallback = pick(conf.fallback);
     if (primary) {
@@ -948,8 +1009,10 @@ const Gateway = {
       }
     }
     // [路由修复] 兜底：decision.model 必须非空合法字符串，否则回退默认模型
+    // [2026-10-25 统一下拉] 最后手段从 AI.models[0] 换 localModelNames()[0]：AI.models 首项
+    // 可能是 nomic-embed-text（冒名同型漏洞），兜底也必须走已过滤候选
     if (!decision || !decision.model) {
-      const fb = opts.model || MoraySettings.get('defaultModel') || (AI.models && AI.models[0] && AI.models[0].name) || '';
+      const fb = opts.model || MoraySettings.get('defaultModel') || localModelNames()[0] || '';
       const useDefault = !!(opts.model || MoraySettings.get('defaultModel'));
       const why = (!AI.models || !AI.models.length) ? '无可用模型' : '无本地模型';
       const src = useDefault ? '默认模型' : '首个可用模型';
@@ -957,8 +1020,9 @@ const Gateway = {
       decision = { model: fb, fallbacks: [], reason: type + '任务 → ' + why + '，使用' + src + (label ? ' ' + label : '') };
     }
     // [成本中心] 超预算自动降级：选最便宜可用模型（cheapest 始终为字符串，初始为当前决策模型）
+    // [2026-10-25 统一下拉] 候选换 localModelNames()（滤非聊天/判定专用），防超预算降级选中 nomic
     if (MoraySettings.get('autoDegrade') && typeof CostBudget !== 'undefined' && CostBudget.isOver()) {
-      const available = AI.models.map(m => m.name);
+      const available = localModelNames();
       if (available.length) {
         let cheapest = decision.model, minCost = Infinity;
         available.forEach(n => {
@@ -1190,7 +1254,20 @@ Gateway.chatStream = function (opts) {
         }
       }
       if (result === undefined) {
-        const fallbacks = routed.routeInfo ? routed.routeInfo.fallbacks : [];
+        let fallbacks = routed.routeInfo ? routed.routeInfo.fallbacks : [];
+        // [2026-10-25 任务B] 首选是云端且路由未配备用 → 失败（含智谱免费档 429 并发限流）
+        // 时自动补一个本地模型作为降级目标，不让云端瞬时故障把整轮对话卡死。
+        // 候选优先级：Agent 推荐最稳模型（qwen3.5:9b 系）> 过滤后的本地列表尾项。
+        if (!fallbacks.length && !isLocalModelName(effective.model)) {
+          let autoLocal = '';
+          if (typeof agentRecommendedModel === 'function') autoLocal = agentRecommendedModel();
+          if (!autoLocal) {
+            const lc = (typeof localModelNames === 'function' ? localModelNames() : [])
+              .filter(n => n && n !== effective.model);
+            autoLocal = lc.length ? lc[lc.length - 1] : '';
+          }
+          if (autoLocal) fallbacks = [autoLocal];
+        }
         if (fallbacks.length && effective.model !== fallbacks[0]) {
           const primaryWasCloud = !isLocalModelName(effective.model);
           const fallbackIsLocal = isLocalModelName(fallbacks[0]);
@@ -1550,12 +1627,12 @@ async function appendGatewaySettings() {
   const month = await UsageTracker.summarize('month');
   const meta = await gatewayMetaGet('__meta__', { routeStats: { byType: {}, byModel: {} } });
   const rs = meta.routeStats || { byType: {}, byModel: {} };
-  const models = AI.models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('');
   const rc = c.routingConfig || {};
-  const sel = (type, field, val) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route-${type}-${field}>
-    <option value="">（未配置）</option>${models}</select>`.replace(`data-route-${type}-${field}>`, `data-route-${type}-${field}>`).replace('</select>', '</select>');
+  // [2026-10-25 统一下拉] 智能路由下拉框数据源统一走 selectableModelOptionsHtml：
+  // 本地过滤（isNonChatModel 滤 nomic-embed-text 等 + isJudgeOnlyModel 滤 moray-laya-*）+
+  // 已配置云端模型入列 + optgroup 分组。（原 models/sel 两处直接 AI.models.map 的死代码一并清除）
   const routeSelect = (type, field, current) => `<select class="form-select" style="padding:4px 8px;font-size:12px" data-route="${type}.${field}">
-    <option value="">（未配置）</option>${AI.models.map(m => `<option value="${escapeHtml(m.name)}" ${current === m.name ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}</select>`;
+    ${selectableModelOptionsHtml(current, true)}</select>`;
 
   const maxDay = Math.max(1, ...Object.values(cacheStats.byDay || {}).map(d => Math.max(d.hits || 0, d.queries || 0)));
   const last7 = Object.keys(cacheStats.byDay).sort().slice(-7);

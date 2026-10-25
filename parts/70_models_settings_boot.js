@@ -357,7 +357,7 @@ const SettingsApp = {
                     <i data-lucide="plug" class="w-3.5 h-3.5"></i>前端直连
                   </button>
                 </div>
-                <div class="form-hint">代理模式下云端 API Key 保存在本地后端（server/.env），不会进入浏览器；后端离线时自动回退直连。</div>
+                <div class="form-hint">代理模式下请求经本地后端转发（解决浏览器直连被跨域拦截）：界面填写的 API Key 只随请求发往本机后端、不出本机；也可在 server/.env 固化转发地址与 Key（Key 完全不进浏览器）。后端离线时自动回退直连。</div>
               </div>
               <div>
                 <label class="form-label">默认模型</label>
@@ -916,16 +916,35 @@ const SettingsApp = {
     window.addEventListener('moray-backend-probed', syncSettingsUI);
     syncSettingsUI();
     // [V3 P1.2] 服务商预设填充
+    // [2026-10-25 连环触发修复] 原生 select 在键盘 ↑↓ / 滚轮扫过选项时会对每一项实时触发
+    // change：旧实现每项都立即改值+弹通知 → 扫一遍下拉就连环弹出所有服务商的「已填充」
+    // 提示，且输入框被最后扫过的项覆盖（与用户意图脱节）。修复：① 只按 sel.value 精确
+    // 匹配单个 preset（不遍历、不依赖 selectedIndex）；② 填充/通知防抖 400ms 合并连续
+    // 扫动，稳定后只对最终选中项生效一次；③ 同名项重复选中不重复弹通知。
     on($('providerPresetSel'), 'change', function () {
-      const opt = this.options[this.selectedIndex];
-      const docLink = $('providerDocLink');
-      if (!opt.dataset.base) { docLink.style.display = 'none'; return; }
-      $('setOpenaiBase').value = opt.dataset.base;
-      if (opt.dataset.model) $('setOpenaiModel').value = opt.dataset.model;
-      docLink.href = 'https://' + opt.dataset.doc;
-      docLink.textContent = opt.dataset.doc + ' ↗';
-      docLink.style.display = '';
-      showNotification('已填充 ' + opt.value, '填写 API Key 后点击「测试连接」', 'info', 2500);
+      const sel = this;
+      clearTimeout(sel.__presetFillTimer);
+      sel.__presetFillTimer = setTimeout(() => {
+        const name = String(sel.value || '');
+        const preset = (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === name);
+        const docLink = $('providerDocLink');
+        if (!docLink) return;
+        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址
+        if (!preset) { docLink.style.display = 'none'; return; }
+        $('setOpenaiBase').value = preset.base;
+        // [2026-10-25 解耦修复] 推荐模型仅在输入框为空时填入（首填便利）；用户已手填的
+        // 模型绝不被预设推荐顶掉——模型输入权完全交给用户
+        const modelInput = $('setOpenaiModel');
+        const fillModel = !String(modelInput.value || '').trim();
+        if (fillModel) modelInput.value = preset.models;
+        docLink.href = 'https://' + preset.doc;
+        docLink.textContent = preset.doc + ' ↗';
+        docLink.style.display = '';
+        if (sel.__presetLastNotified !== name) {
+          sel.__presetLastNotified = name;
+          showNotification('已填充 ' + name, fillModel ? '已填入地址与推荐模型，填写 API Key 后点击「测试连接」' : '已填入地址（模型保留你手填的值），填写 API Key 后点击「测试连接」', 'info', 2500);
+        }
+      }, 400);
     });
     // [V3 P1.2] Key 显示/隐藏 + trim
     on($('toggleKeyBtn'), 'click', () => {
