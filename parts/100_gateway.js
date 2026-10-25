@@ -336,12 +336,31 @@ function isJudgeOnlyModel(n) {
  * 均经 routingEligibleLocalNames() 消费，此处过滤即三分支全覆盖（候选数组尾部 unsized 追加
  * 曾使 complex 任务命中 moray-laya-fast，根因即此）。
  * @returns {string[]} 模型名数组 */
+/** [冒名修复 2026-10-25] 非聊天（embedding/reranker）模型前缀：此类模型会进 AI.models，
+ * 且无 ":Nb" 参数量后缀 → modelSizeB 为 null → TaskRouter.route 把它 concat 进候选数组尾部，
+ * complex 任务"取尾项"启发式（:557）会选中 nomic-embed-text 顶替聊天模型——气泡头部经
+ * onRoute 早期回调立即显示 embed 模型名，且请求真实发给它（同型事故：moray-laya-fast）。
+ * 名单来源：120_cost.js PRICE_TABLE[0].match（:14）中的 embedding 系关键词
+ * nomic/bge/mxbai/snowflake + 通用 'embed' 字面量 + 'rerank'（任务书点名，价格档无此词）；
+ * 同名单的 llava/bakllava/tinyllama/smollm/granite 为可聊天模型，不过滤。
+ * 匹配口径与 PRICE_TABLE 一致：模型名小写后 startsWith。 */
+const NON_CHAT_MODEL_PREFIXES = ['embed', 'nomic', 'bge', 'mxbai', 'snowflake', 'rerank'];
+function isNonChatModel(name) {
+  const s = String(name || '').toLowerCase();
+  return NON_CHAT_MODEL_PREFIXES.some(p => s.startsWith(p));
+}
+
 function localModelNames() {
   const seen = {};
   const out = [];
   (AI.models || []).forEach(m => {
     const n = m && m.name;
-    if (n && isLocalModelName(n) && !isJudgeOnlyModel(n) && !seen[n]) { seen[n] = true; out.push(n); }
+    if (!n || seen[n]) return;
+    if (isNonChatModel(n)) {
+      if (isLocalModelName(n)) console.debug('[router] 过滤非聊天模型: ' + n);
+      return;
+    }
+    if (isLocalModelName(n) && !isJudgeOnlyModel(n)) { seen[n] = true; out.push(n); }
   });
   return out;
 }
@@ -1277,7 +1296,19 @@ Gateway.runWithTools = async function (opts, onToolStep) {
   const exhaustedTools = new Set();
   let promptTotal = 0, completionTotal = 0;
   let costTotal = 0, savedTotal = 0, baselineTotal = 0;
-  const emit = (evt) => { steps[evt.index] = Object.assign({}, evt); if (onToolStep) onToolStep(Object.assign({}, evt)); };
+  // [冻结修复 2026-10-25] 工具轮中间轮无 onChunk → scheduleStreamPaint 不出帧 → 挂在流式
+  // 重绘帧里的 autoScroll 滚动也不触发，长工具执行期（单工具 5s+/每轮最长 180s）画面静止如死机。
+  // 步骤卡经 onToolStep 同步上屏后就地补一次滚动（同款 autoScroll 闸；不造 onChunk 假数据、
+  // 不模拟流式文本，只触发滚动）。scrollToMsgBottom 定义于 30_chat，运行时调用点必已加载。
+  const emit = (evt) => {
+    steps[evt.index] = Object.assign({}, evt);
+    if (onToolStep) {
+      onToolStep(Object.assign({}, evt));
+      if (MoraySettings.get('autoScroll') && typeof scrollToMsgBottom === 'function') {
+        try { scrollToMsgBottom(); } catch (e) { /* 滚动失败不影响工具链路 */ }
+      }
+    }
+  };
 
   // [Argus 深度研究] 显式点名 Argus 时由代码直接发起研究（不依赖模型是否愿意调工具）。
   // 背景：7B 级本机模型会跳过工具调用、直接编一个 session_id（实测 2/3、甚至 0/4），

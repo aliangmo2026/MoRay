@@ -1752,7 +1752,7 @@ async function buildRequestMessages(conv, extraContext) {
   const argusHasTool = typeof ToolRegistry !== 'undefined' &&
     ToolRegistry.listForRequest().some(t => t.function.name === 'detective_research');
   const argusNote = argusHasTool
-    ? '【Argus 深度研究】遇到"查资料 / 做调研 / 对比产品价格 / 了解行业信息"的请求时，你的第一个动作必须是调用 detective_research 工具（参数 question = 用户的问题），不要先回答、也不要先解释你打算做什么。\n' +
+    ? '【Argus 深度研究】遇到"查资料 / 做调研 / 对比产品价格 / 了解行业信息"的请求时，你的第一个动作必须是调用 detective_research 工具（参数 question = 用户的问题），不要先回答、也不要先解释你打算做什么。注意：若当前上下文已注入了 [相关个人文档知识]，则无需调用本工具，直接依据注入的内部知识作答。\n' +
       '· 如果对话里已经有一条 detective_research 的工具返回（系统可能已替你发起），就直接用它返回的 session_id，不要重复调用。\n' +
       '· session_id 只能来自工具返回。在本轮没有工具返回之前，绝对不要说"已启动研究任务"，也不要写出任何 id —— 编造的 id 会让用户去查一个不存在的任务。\n' +
       '· 拿到工具返回的 session_id 后，再告诉用户"已启动研究任务"并给出这个 id，说明研究需要几分钟；报告生成后系统会**自动把它贴进本轮对话**，所以不要让用户"稍后再来问一次"（用户想主动问也可以，那时再调 detective_status）。\n' +
@@ -1801,7 +1801,14 @@ async function buildRequestMessages(conv, extraContext) {
   console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', history.reduce((s, m) => s + estimateMessageTokens(m), 0), 'tok');
   // 上下文长度预算（估算 token），保留最近的历史
   // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，本地小显存一碰就死的根因在此
-  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - (MoraySettings.get('maxTokens') || 2048) - 100;
+  // [思考链预留 2026-10-25] Ollama 真实窗口曾被 compat 链路钳在 2048（探针实测），思考链与正文
+  // 同窗抢占：原公式只扣 maxTokens，think 开启时 reasoning 仍烧掉历史额度（深度思考=历史被截+
+  // 正文被挤空）。auto 档的 decideThinkFor 发生在本函数之后、裁剪点不可知，故按开启保守扣；
+  // off（reasoning_effort=none 实测真关思考）不扣。预留量 max(2000, maxTokens/2)：
+  // 默认档 2000，生成预算拉大时思考预留按比例放大。
+  const _genMax = MoraySettings.get('maxTokens') || 2048;
+  const thinkReserve = (MoraySettings.get('thinkMode') || 'auto') === 'off' ? 0 : Math.max(2000, Math.floor(_genMax / 2));
+  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - _genMax - thinkReserve - 100;
   // [上下文预算] 系统提示 + 本轮图片附件先扣预算：图片不进文本启发式，固定每张 1000 token 防超卖
   let used = estimateTokens(sys).tokens + (AppState.attachments || []).length * IMG_TOKEN_COST;
   const strategy = MoraySettings.get('truncationStrategy') || 'recent';
@@ -2118,6 +2125,11 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     const result = await promise;
     assistantMsg.content = result.content || assistantMsg.content;
     assistantMsg.reasoning = result.reasoning || assistantMsg.reasoning;
+    // [空正文守卫 2026-10-25] 思考链挤爆窗口时上游正常 200 但正文零 token（图三空白回复）：
+    // content 空 + reasoning 非空 → 兜底文案替代无声空白（完整思考过程仍在折叠面板可看）。
+    if (!String(assistantMsg.content || '').trim() && String(assistantMsg.reasoning || '').trim()) {
+      assistantMsg.content = '⚠️ 模型只输出了思考过程、正文为空（疑似上下文被思考链耗尽），建议重试或关闭深度思考。';
+    }
     assistantMsg.stats = result.stats;
     assistantMsg.tokens = result.stats.tokens || 0;
     // [阶段1 M3] 全部步骤结束：模型总结已输出 → 计划剩余待办步骤标记完成

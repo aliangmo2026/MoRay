@@ -385,7 +385,11 @@ const MorayArgusMode = (() => {
       }
       return;
     }
-    AppState.generating = true; // 复用发送守卫：直发期间不允许连发（genController 保持 null，停止按钮为安全空操作）
+    AppState.argusGenerating = true; // [冻结修复 2026-10-25] 不再复用 AppState.generating：
+    // 直发 finally 置 false 会短路 30_chat scheduleStreamPaint 双闸（:2009/:2013 判
+    // !AppState.generating 即弃帧），与主聊天流交错时正文冻结（状态行 tok/s 仍在跳）。
+    // 改独立标志保留"直发进行中"可观测性（genController 仍 null，停止按钮为安全空操作）；
+    // 代价：30_chat 发送守卫只查 generating，直发窗口内（研究启动数秒）主聊天连发不再被拦。
     try {
       const res = await ToolRegistry.run('detective_research', { question: q }, {});
       if (res && res.ok && res.data && res.data.session_id) {
@@ -409,7 +413,7 @@ const MorayArgusMode = (() => {
         showNotification('研究启动失败', String((e && e.message) || e).slice(0, 120), 'error', 5000);
       }
     } finally {
-      AppState.generating = false;
+      AppState.argusGenerating = false;
     }
   }
 

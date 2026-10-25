@@ -11110,7 +11110,7 @@ async function buildRequestMessages(conv, extraContext) {
   const argusHasTool = typeof ToolRegistry !== 'undefined' &&
     ToolRegistry.listForRequest().some(t => t.function.name === 'detective_research');
   const argusNote = argusHasTool
-    ? '【Argus 深度研究】遇到"查资料 / 做调研 / 对比产品价格 / 了解行业信息"的请求时，你的第一个动作必须是调用 detective_research 工具（参数 question = 用户的问题），不要先回答、也不要先解释你打算做什么。\n' +
+    ? '【Argus 深度研究】遇到"查资料 / 做调研 / 对比产品价格 / 了解行业信息"的请求时，你的第一个动作必须是调用 detective_research 工具（参数 question = 用户的问题），不要先回答、也不要先解释你打算做什么。注意：若当前上下文已注入了 [相关个人文档知识]，则无需调用本工具，直接依据注入的内部知识作答。\n' +
       '· 如果对话里已经有一条 detective_research 的工具返回（系统可能已替你发起），就直接用它返回的 session_id，不要重复调用。\n' +
       '· session_id 只能来自工具返回。在本轮没有工具返回之前，绝对不要说"已启动研究任务"，也不要写出任何 id —— 编造的 id 会让用户去查一个不存在的任务。\n' +
       '· 拿到工具返回的 session_id 后，再告诉用户"已启动研究任务"并给出这个 id，说明研究需要几分钟；报告生成后系统会**自动把它贴进本轮对话**，所以不要让用户"稍后再来问一次"（用户想主动问也可以，那时再调 detective_status）。\n' +
@@ -11159,7 +11159,14 @@ async function buildRequestMessages(conv, extraContext) {
   console.log('[MoRay ctx] 请求消息', history.length, '条 · 估算', history.reduce((s, m) => s + estimateMessageTokens(m), 0), 'tok');
   // 上下文长度预算（估算 token），保留最近的历史
   // [上下文预算] 读出夹上限：存量超限值（如 131072）也按物理上限计，本地小显存一碰就死的根因在此
-  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - (MoraySettings.get('maxTokens') || 2048) - 100;
+  // [思考链预留 2026-10-25] Ollama 真实窗口曾被 compat 链路钳在 2048（探针实测），思考链与正文
+  // 同窗抢占：原公式只扣 maxTokens，think 开启时 reasoning 仍烧掉历史额度（深度思考=历史被截+
+  // 正文被挤空）。auto 档的 decideThinkFor 发生在本函数之后、裁剪点不可知，故按开启保守扣；
+  // off（reasoning_effort=none 实测真关思考）不扣。预留量 max(2000, maxTokens/2)：
+  // 默认档 2000，生成预算拉大时思考预留按比例放大。
+  const _genMax = MoraySettings.get('maxTokens') || 2048;
+  const thinkReserve = (MoraySettings.get('thinkMode') || 'auto') === 'off' ? 0 : Math.max(2000, Math.floor(_genMax / 2));
+  const budget = Math.min(MoraySettings.get('contextLimit') || 8192, CONTEXT_LIMIT_MAX) - _genMax - thinkReserve - 100;
   // [上下文预算] 系统提示 + 本轮图片附件先扣预算：图片不进文本启发式，固定每张 1000 token 防超卖
   let used = estimateTokens(sys).tokens + (AppState.attachments || []).length * IMG_TOKEN_COST;
   const strategy = MoraySettings.get('truncationStrategy') || 'recent';
@@ -11476,6 +11483,11 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     const result = await promise;
     assistantMsg.content = result.content || assistantMsg.content;
     assistantMsg.reasoning = result.reasoning || assistantMsg.reasoning;
+    // [空正文守卫 2026-10-25] 思考链挤爆窗口时上游正常 200 但正文零 token（图三空白回复）：
+    // content 空 + reasoning 非空 → 兜底文案替代无声空白（完整思考过程仍在折叠面板可看）。
+    if (!String(assistantMsg.content || '').trim() && String(assistantMsg.reasoning || '').trim()) {
+      assistantMsg.content = '⚠️ 模型只输出了思考过程、正文为空（疑似上下文被思考链耗尽），建议重试或关闭深度思考。';
+    }
     assistantMsg.stats = result.stats;
     assistantMsg.tokens = result.stats.tokens || 0;
     // [阶段1 M3] 全部步骤结束：模型总结已输出 → 计划剩余待办步骤标记完成
@@ -19099,7 +19111,11 @@ const MorayArgusMode = (() => {
       }
       return;
     }
-    AppState.generating = true; // 复用发送守卫：直发期间不允许连发（genController 保持 null，停止按钮为安全空操作）
+    AppState.argusGenerating = true; // [冻结修复 2026-10-25] 不再复用 AppState.generating：
+    // 直发 finally 置 false 会短路 30_chat scheduleStreamPaint 双闸（:2009/:2013 判
+    // !AppState.generating 即弃帧），与主聊天流交错时正文冻结（状态行 tok/s 仍在跳）。
+    // 改独立标志保留"直发进行中"可观测性（genController 仍 null，停止按钮为安全空操作）；
+    // 代价：30_chat 发送守卫只查 generating，直发窗口内（研究启动数秒）主聊天连发不再被拦。
     try {
       const res = await ToolRegistry.run('detective_research', { question: q }, {});
       if (res && res.ok && res.data && res.data.session_id) {
@@ -19123,7 +19139,7 @@ const MorayArgusMode = (() => {
         showNotification('研究启动失败', String((e && e.message) || e).slice(0, 120), 'error', 5000);
       }
     } finally {
-      AppState.generating = false;
+      AppState.argusGenerating = false;
     }
   }
 
@@ -25561,12 +25577,31 @@ function isJudgeOnlyModel(n) {
  * 均经 routingEligibleLocalNames() 消费，此处过滤即三分支全覆盖（候选数组尾部 unsized 追加
  * 曾使 complex 任务命中 moray-laya-fast，根因即此）。
  * @returns {string[]} 模型名数组 */
+/** [冒名修复 2026-10-25] 非聊天（embedding/reranker）模型前缀：此类模型会进 AI.models，
+ * 且无 ":Nb" 参数量后缀 → modelSizeB 为 null → TaskRouter.route 把它 concat 进候选数组尾部，
+ * complex 任务"取尾项"启发式（:557）会选中 nomic-embed-text 顶替聊天模型——气泡头部经
+ * onRoute 早期回调立即显示 embed 模型名，且请求真实发给它（同型事故：moray-laya-fast）。
+ * 名单来源：120_cost.js PRICE_TABLE[0].match（:14）中的 embedding 系关键词
+ * nomic/bge/mxbai/snowflake + 通用 'embed' 字面量 + 'rerank'（任务书点名，价格档无此词）；
+ * 同名单的 llava/bakllava/tinyllama/smollm/granite 为可聊天模型，不过滤。
+ * 匹配口径与 PRICE_TABLE 一致：模型名小写后 startsWith。 */
+const NON_CHAT_MODEL_PREFIXES = ['embed', 'nomic', 'bge', 'mxbai', 'snowflake', 'rerank'];
+function isNonChatModel(name) {
+  const s = String(name || '').toLowerCase();
+  return NON_CHAT_MODEL_PREFIXES.some(p => s.startsWith(p));
+}
+
 function localModelNames() {
   const seen = {};
   const out = [];
   (AI.models || []).forEach(m => {
     const n = m && m.name;
-    if (n && isLocalModelName(n) && !isJudgeOnlyModel(n) && !seen[n]) { seen[n] = true; out.push(n); }
+    if (!n || seen[n]) return;
+    if (isNonChatModel(n)) {
+      if (isLocalModelName(n)) console.debug('[router] 过滤非聊天模型: ' + n);
+      return;
+    }
+    if (isLocalModelName(n) && !isJudgeOnlyModel(n)) { seen[n] = true; out.push(n); }
   });
   return out;
 }
@@ -26502,7 +26537,19 @@ Gateway.runWithTools = async function (opts, onToolStep) {
   const exhaustedTools = new Set();
   let promptTotal = 0, completionTotal = 0;
   let costTotal = 0, savedTotal = 0, baselineTotal = 0;
-  const emit = (evt) => { steps[evt.index] = Object.assign({}, evt); if (onToolStep) onToolStep(Object.assign({}, evt)); };
+  // [冻结修复 2026-10-25] 工具轮中间轮无 onChunk → scheduleStreamPaint 不出帧 → 挂在流式
+  // 重绘帧里的 autoScroll 滚动也不触发，长工具执行期（单工具 5s+/每轮最长 180s）画面静止如死机。
+  // 步骤卡经 onToolStep 同步上屏后就地补一次滚动（同款 autoScroll 闸；不造 onChunk 假数据、
+  // 不模拟流式文本，只触发滚动）。scrollToMsgBottom 定义于 30_chat，运行时调用点必已加载。
+  const emit = (evt) => {
+    steps[evt.index] = Object.assign({}, evt);
+    if (onToolStep) {
+      onToolStep(Object.assign({}, evt));
+      if (MoraySettings.get('autoScroll') && typeof scrollToMsgBottom === 'function') {
+        try { scrollToMsgBottom(); } catch (e) { /* 滚动失败不影响工具链路 */ }
+      }
+    }
+  };
 
   // [Argus 深度研究] 显式点名 Argus 时由代码直接发起研究（不依赖模型是否愿意调工具）。
   // 背景：7B 级本机模型会跳过工具调用、直接编一个 session_id（实测 2/3、甚至 0/4），
@@ -32651,7 +32698,7 @@ function argusSessionRecords() {
 const ARGUS_TOOLS = [
   {
     name: 'detective_research', label: 'Argus 深度研究',
-    description: '强制优先调用：只要用户要求查资料、做调研、对比产品/价格、了解行业信息（包括提到 "Argus"、"深度研究"、"帮我查一下"），就调用本工具，不要先用自己的记忆回答。调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。返回的 session_id 是研究任务的唯一凭证 —— 只有本工具返回的 id 才是真的。',
+    description: '强制优先调用：只要用户要求查资料、做调研、对比产品/价格、了解行业信息（包括提到 "Argus"、"深度研究"、"帮我查一下"），就调用本工具。若当前上下文中已注入了内部文档知识（如 [相关个人文档知识]），则不要调用本工具，直接依据内部知识回答；否则请调用本工具。调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。返回的 session_id 是研究任务的唯一凭证 —— 只有本工具返回的 id 才是真的。',
     parameters: {
       type: 'object',
       properties: {
