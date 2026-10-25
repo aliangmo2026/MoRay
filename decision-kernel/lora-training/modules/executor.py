@@ -244,7 +244,33 @@ async def execute_stream(goal: str, steps: List[Dict[str, Any]],
                        "attempt": attempt, "ts": _ts(),
                        "description": step.get("description", ""),
                        "input": json.loads(json.dumps(payload, ensure_ascii=False, default=str))}
-                result = await tool_registry.call_tool(step["tool"], payload)
+                if str(step.get("tool") or "").lower() == "decision":
+                    # [2026-10-24 规划层剥夺对齐] planner 命中内部知识时把 argus 步原位改写为
+                    # decision；单步计划与 L7.7 复合链走本老路径，此前不认 decision（call_tool
+                    # 无此 handler 必失败）。镜像 _execute_multi_steps 的决策分支（借
+                    # self_check._llm_json 本地执行）：planner 注入的内部知识文本即生成 Prompt，
+                    # 该步输出=最终答案。失败如实报错（code=-2，不重试改写以免 revise 毁掉
+                    # 注入的知识文本），绝不伪造工具结果。
+                    _t0d = time.perf_counter()
+                    _parsed = await self_check._llm_json(
+                        str(payload.get("system")
+                            or "你是任务执行引擎。只输出纯JSON对象，不要解释、不要代码块标记。"),
+                        str(payload.get("user") or payload.get("text") or goal
+                            or step.get("description", "")),
+                        fmt="json")
+                    if _parsed is None:
+                        result = {"ok": False, "tool": "decision", "data": None,
+                                  "error": {"code": -2,
+                                            "message": "decision 决策模型无应答或输出非JSON"},
+                                  "elapsed_ms": round((time.perf_counter() - _t0d) * 1000, 2)}
+                    else:
+                        result = {"ok": True, "tool": "decision",
+                                  "data": _parsed if isinstance(_parsed, str)
+                                  else json.dumps(_parsed, ensure_ascii=False, default=str),
+                                  "error": None,
+                                  "elapsed_ms": round((time.perf_counter() - _t0d) * 1000, 2)}
+                else:
+                    result = await tool_registry.call_tool(step["tool"], payload)
                 # [L7.7] 进度细化：retry_count（当前重试次数，0=首次尝试）+ 毫秒 ts
                 #        + 补齐 step_id/description/tool/status/data/error 全量事件字段
                 yield {"event": "step_result", "step_id": step["step_id"], "attempt": attempt,
