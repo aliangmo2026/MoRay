@@ -120,7 +120,7 @@ class HybridRecallTest(CorpusBase):
         id_a, id_b, id_c = self._seed()
         with mock.patch.object(memory_embed, "get_embedding", lambda t: [0.1] * 4), \
              mock.patch.object(memory_embed, "search_similar",
-                               lambda vec, k=10: [(id_b, 0.9)]):
+                               lambda vec, k=10, kind="corpus": [(id_b, 0.9)]):
             items = dt._hybrid_recall("代码风格偏好", limit=5)
         self.assertEqual(items[0]["id"], id_b)      # B 双通道命中 → RRF 第一
         self.assertEqual(items[0]["matches"], ["fts", "vec"])
@@ -134,7 +134,7 @@ class HybridRecallTest(CorpusBase):
         id_a, _id_b, id_c = self._seed()
         with mock.patch.object(memory_embed, "get_embedding", lambda t: [0.2] * 4), \
              mock.patch.object(memory_embed, "search_similar",
-                               lambda vec, k=10: [(id_c, 0.8)]):
+                               lambda vec, k=10, kind="corpus": [(id_c, 0.8)]):
             items = dt._hybrid_recall("代码风格偏好", limit=5)
         by_id = {it["id"]: it for it in items}
         self.assertIn(id_c, by_id)
@@ -183,7 +183,7 @@ class HybridRecallTest(CorpusBase):
         self.assertFalse(err, err)
         with mock.patch.object(memory_embed, "get_embedding", lambda t: [0.4] * 4), \
              mock.patch.object(memory_embed, "search_similar",
-                               lambda vec, k=10: [(mem_id, 0.9)]):
+                               lambda vec, k=10, kind="corpus": [(mem_id, 0.9)]):
             items = dt._hybrid_recall("代码风格偏好", limit=5)
         self.assertNotIn(mem_id, [it["id"] for it in items])
 

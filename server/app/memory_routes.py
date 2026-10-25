@@ -214,7 +214,7 @@ def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
     # 事件循环）。失败只记日志不影响入库：FTS 路兜底召回，backfill_embeddings
     # 随时补存量。spawn 内部全 fail-open，此处再兜一层保 insert 契约（id, ""）。
     try:
-        memory_embed.spawn_embed(mem_id, content)
+        memory_embed.spawn_embed(mem_id, content, kind)
     except Exception as e:  # noqa: BLE001
         logger.warning("[memory] spawn_embed 调度异常（mem_id=%s）：%s: %s",
                        mem_id, type(e).__name__, str(e)[:160])
@@ -379,7 +379,9 @@ async def memory_recall(request: Request):
         try:
             q_vec = memory_embed.get_embedding(query)
             if q_vec:
-                cand = dict(memory_embed.search_similar(q_vec, k=max(limit * 3, 15)))
+                # [vec kind 分区 2026-10-25] kind=None：召回白名单是 4 种 kind，
+                # vec0 元数据下推只支持单值等值，多 kind 白名单仍走回表过滤。
+                cand = dict(memory_embed.search_similar(q_vec, k=max(limit * 3, 15), kind=None))
                 if cand:
                     conn2 = _conn()
                     try:

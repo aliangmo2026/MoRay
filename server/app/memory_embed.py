@@ -13,7 +13,9 @@
   （fail-open：向量面缺失由 FTS 路兜底，backfill_embeddings 随时可补）。
 - 检索路径：search_similar——VEC_AVAILABLE 时 vec0 KNN（L2 距离换算 1/(1+d)），
   否则纯 Python 余弦暴力扫（零 numpy 兜底，任务书要求的死胡同防护）。
-- kind 白名单过滤由调用方（memory_routes.recall）回表执行，本模块只管向量面。
+- [vec kind 分区 2026-10-25] memory_vec 带 kind 元数据列（memory_bank.kind 同步
+  写入），search_similar(kind=...) 把过滤下推进 KNN（真过滤：先滤后取 top-k）；
+  不传 kind 时仍是全库混搜，白名单/多 kind 过滤仍由调用方回表执行。
 
 fail-open 总纪律：本模块任何失败都不允许影响记忆主链路（入库/删源/召回 FTS 面）。
 """
@@ -101,10 +103,12 @@ def get_embedding(text: str) -> list | None:
         return None
 
 
-def index_memory(mem_id: str, text: str) -> dict:
+def index_memory(mem_id: str, text: str, kind: str | None = None) -> dict:
     """同步嵌入并落库（回填脚本/测试用；在线路径走 spawn_embed）：
     UPDATE memory_bank.embedding + vec 表删旧插新，单事务。
-    行已不存在（并发删除）→ 回滚并清 vec 残留，返回 ok=False。"""
+    [vec kind 分区 2026-10-25] 新增 kind 参数（写入 memory_vec.kind 元数据列，
+    供 KNN 下推过滤）；缺省 None 时事务内回查 memory_bank（backfill/旧调用方
+    零适配兜底）。行已不存在（并发删除）→ 回滚并清 vec 残留，返回 ok=False。"""
     vec = get_embedding(text)
     if vec is None:
         return {"ok": False, "reason": "embedding_unavailable"}
@@ -131,10 +135,15 @@ def index_memory(mem_id: str, text: str) -> dict:
                     logger.warning("[memory_embed] 清 vec 残留异常（mem_id=%s）：%s",
                                    mem_id, str(e)[:120])
             return {"ok": False, "reason": "row_gone"}
+        if kind is None:
+            krow = conn.execute(
+                "SELECT kind FROM memory_bank WHERE id = ?", (mem_id,)).fetchone()
+            kind = krow["kind"] if krow else ""
         if memory_db.VEC_AVAILABLE:
             conn.execute("DELETE FROM memory_vec WHERE memory_id = ?", (mem_id,))
-            conn.execute("INSERT INTO memory_vec (memory_id, embedding) VALUES (?, ?)",
-                         (mem_id, blob))
+            conn.execute(
+                "INSERT INTO memory_vec (memory_id, kind, embedding) VALUES (?, ?, ?)",
+                (mem_id, str(kind or ""), blob))
         conn.commit()
         return {"ok": True}
     except Exception as e:  # noqa: BLE001 - fail-open
@@ -155,8 +164,9 @@ _embed_inflight = set()
 _embed_lock = threading.Lock()
 
 
-def spawn_embed(mem_id: str, text: str) -> None:
+def spawn_embed(mem_id: str, text: str, kind: str | None = None) -> None:
     """调度后台补嵌（fire-and-forget）：同 mem_id 在飞去重；线程异常只记日志。
+    [vec kind 分区 2026-10-25] kind 透传 index_memory（写入 memory_vec.kind）。
     MORAY_EMBED_AUTO=0 时整体跳过（隔离测试/关停嵌入面的总闸；召回面由
     backfill_embeddings 补）。"""
     import os
@@ -172,7 +182,7 @@ def spawn_embed(mem_id: str, text: str) -> None:
 
     def _work() -> None:
         try:
-            res = index_memory(mid, text)
+            res = index_memory(mid, text, kind)
             if not res.get("ok"):
                 logger.warning("[memory_embed] 后台补嵌未成（mem_id=%s）：%s",
                                mid, res.get("reason"))
@@ -192,21 +202,31 @@ def spawn_embed(mem_id: str, text: str) -> None:
                        mid, type(e).__name__, str(e)[:160])
 
 
-def search_similar(query_vec: list, k: int = 10) -> list:
+def search_similar(query_vec: list, k: int = 10, kind: str | None = None) -> list:
     """query 向量 → [(memory_id, 相关度分)]，分越大越相关（vec 路径 1/(1+L2)，
     兜底路径=余弦）。vec 可用走 KNN；任何环境异常降级纯 Python 暴力扫；
-    全挂返回 []（调用方降级纯 FTS）。kind 白名单由调用方回表过滤。"""
+    全挂返回 []（调用方降级纯 FTS）。
+    [vec kind 分区 2026-10-25] kind 非空时下推到 KNN 的 WHERE（vec0 元数据列
+    过滤，过滤发生在 top-k 截取之前=真过滤，sqlite-vec 0.1.9 实测）；兜底暴力
+    扫同步过滤。SQL 走两分支完整字面量（零拼接，Mimosa 纪律）。"""
     if not query_vec:
         return []
     if memory_db.VEC_AVAILABLE:
         try:
             conn = memory_db.connect()
             try:
-                rows = conn.execute(
-                    "SELECT memory_id, distance FROM memory_vec "
-                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (pack_vector(query_vec), int(k)),
-                ).fetchall()
+                if kind:
+                    rows = conn.execute(
+                        "SELECT memory_id, distance FROM memory_vec "
+                        "WHERE kind = ? AND embedding MATCH ? AND k = ? ORDER BY distance",
+                        (str(kind), pack_vector(query_vec), int(k)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT memory_id, distance FROM memory_vec "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (pack_vector(query_vec), int(k)),
+                    ).fetchall()
             finally:
                 conn.close()
             return [(r["memory_id"], 1.0 / (1.0 + float(r["distance"]))) for r in rows]
@@ -217,9 +237,16 @@ def search_similar(query_vec: list, k: int = 10) -> list:
     try:
         conn = memory_db.connect()
         try:
-            rows = conn.execute(
-                "SELECT id, embedding FROM memory_bank WHERE embedding IS NOT NULL"
-            ).fetchall()
+            if kind:
+                rows = conn.execute(
+                    "SELECT id, embedding FROM memory_bank "
+                    "WHERE embedding IS NOT NULL AND kind = ?",
+                    (str(kind),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, embedding FROM memory_bank WHERE embedding IS NOT NULL"
+                ).fetchall()
         finally:
             conn.close()
         scored = []
@@ -242,14 +269,14 @@ def backfill_embeddings(batch_pause: float = 0.05) -> dict:
     conn = memory_db.connect()
     try:
         rows = conn.execute(
-            "SELECT id, content FROM memory_bank WHERE embedding IS NULL "
+            "SELECT id, kind, content FROM memory_bank WHERE embedding IS NULL "
             "ORDER BY created_at ASC").fetchall()
     finally:
         conn.close()
     done = 0
     failed = 0
     for r in rows:
-        res = index_memory(r["id"], r["content"])
+        res = index_memory(r["id"], r["content"], r["kind"])
         if res.get("ok"):
             done += 1
         else:

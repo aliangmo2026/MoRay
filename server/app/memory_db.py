@@ -36,10 +36,46 @@ except ImportError:  # noqa: BLE001 - 未安装 sqlite-vec：走纯 Python 兜�
 _VEC_PROBED = False
 
 
+def _migrate_vec_kind(conn: sqlite3.Connection) -> None:
+    """[vec kind 分区 2026-10-25] 幂等迁移：旧版 memory_vec（无 kind 列）→ DROP +
+    按新 DDL 重建 + 事务内回灌，失败整体回滚（旧表原样保留）。
+    CREATE VIRTUAL TABLE IF NOT EXISTS 不会升级已存在的虚表，故先 sniff
+    sqlite_master：表不存在（首次建库）或 SQL 已含 kind（已迁移）→ 直接返回，
+    零改动零日志。回灌源 = memory_bank.embedding（源数据真身，BLOB 直接复用，
+    零重嵌入），kind 同表顺手取。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_vec'"
+    ).fetchone()
+    if row is None or "kind" in (row["sql"] or ""):
+        return
+    rows = conn.execute(
+        "SELECT id, kind, embedding FROM memory_bank WHERE embedding IS NOT NULL"
+    ).fetchall()
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TABLE memory_vec")
+        conn.execute(
+            "CREATE VIRTUAL TABLE memory_vec USING vec0("
+            "memory_id TEXT PRIMARY KEY, kind TEXT, embedding float[768])")
+        for r in rows:
+            conn.execute(
+                "INSERT INTO memory_vec (memory_id, kind, embedding) VALUES (?, ?, ?)",
+                (r["id"], r["kind"], r["embedding"]))
+        conn.commit()
+        _logger.warning("[vec-migrate] memory_vec 升级 kind 列完成：回灌 %d 行", len(rows))
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+
 def _load_vec(conn: sqlite3.Connection) -> None:
     """单连接装载 vec 扩展 + 幂等建虚表（DDL 内联字面量；维度与 EMBED_DIM 同步改）。
     首次失败即永久放弃（环境性缺 DLL/权限不会自愈，反复试只刷日志）；成功后每次
-    连接都静默重装（扩展是连接级作用域）。"""
+    连接都静默重装（扩展是连接级作用域）。
+    [vec kind 分区] 建表前先跑 _migrate_vec_kind（旧 schema 一次性升级）。"""
     global VEC_AVAILABLE, _VEC_PROBED
     if not VEC_AVAILABLE and _VEC_PROBED:
         return
@@ -47,7 +83,8 @@ def _load_vec(conn: sqlite3.Connection) -> None:
         conn.enable_load_extension(True)
         _sqlite_vec.load(conn)
         conn.enable_load_extension(False)
-        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(memory_id TEXT PRIMARY KEY, embedding float[768])")
+        _migrate_vec_kind(conn)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(memory_id TEXT PRIMARY KEY, kind TEXT, embedding float[768])")
         conn.commit()
         VEC_AVAILABLE = True
     except Exception as e:  # noqa: BLE001 - 降级纯 Python，不阻连接

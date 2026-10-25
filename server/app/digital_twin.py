@@ -91,11 +91,15 @@ def _hybrid_recall(query: str, limit: int = 3) -> list:
         fts_hits = [(r["id"], abs(float(r["bm25_rank"]))) for r in fts_rows]
 
         # ---- 向量通道（相关度降序；任何失败降级为空，不影响 FTS 面）----
+        # [vec kind 分区 2026-10-25] kind='corpus' 下推进 KNN 真过滤（先滤后取
+        # top-k，语料不再被非语料挤出榜），k 由 limit*3 收窄到 limit*2；
+        # 回表 corpus 过滤保留作双保险。
         vec_hits = []
         try:
             q_vec = memory_embed.get_embedding(query)
             if q_vec:
-                cand = dict(memory_embed.search_similar(q_vec, k=max(limit * 3, 15)))
+                cand = dict(memory_embed.search_similar(
+                    q_vec, k=max(limit * 2, 10), kind="corpus"))
                 if cand:
                     # 回表过滤 corpus：字面量 SQL 全扫 + Python 过滤（参数绑定纪律，
                     # 不做 IN 拼接；扫描规模 = 分身语料块数）

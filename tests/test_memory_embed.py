@@ -152,7 +152,8 @@ class IndexAndSearchTest(unittest.TestCase):
         self._patcher.stop()
 
     def test_index_then_search_hits(self):
-        res = memory_embed.index_memory("test-mem-1", "引号嵌套错误的修复要点")
+        res = memory_embed.index_memory("test-mem-1", "引号嵌套错误的修复要点",
+                                        kind="insight")
         self.assertTrue(res.get("ok"), res)
         hits = memory_embed.search_similar(_unit_vec(5), k=5)
         self.assertIn("test-mem-1", [hid for hid, _score in hits])
@@ -161,10 +162,93 @@ class IndexAndSearchTest(unittest.TestCase):
         self.assertGreater(score, 0.0)
         self.assertLessEqual(score, 1.0 + 1e-6)
 
+    def test_kind_filter_pushed_down(self):
+        """[vec kind 分区 2026-10-25] kind 下推：同 k 下正确 kind 命中、错 kind
+        零命中（vec0 元数据列真过滤实证）。"""
+        res = memory_embed.index_memory("test-mem-1", "引号嵌套错误的修复要点",
+                                        kind="insight")
+        self.assertTrue(res.get("ok"), res)
+        hits_hit = memory_embed.search_similar(_unit_vec(5), k=5, kind="insight")
+        self.assertIn("test-mem-1", [hid for hid, _s in hits_hit])
+        hits_miss = memory_embed.search_similar(_unit_vec(5), k=5, kind="corpus")
+        self.assertNotIn("test-mem-1", [hid for hid, _s in hits_miss])
+        # vec 行的 kind 列确实落库
+        conn = memory_db.connect()
+        try:
+            row = conn.execute(
+                "SELECT kind FROM memory_vec WHERE memory_id = ?",
+                ("test-mem-1",)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["kind"], "insight")
+
     def test_index_row_gone_is_failopen(self):
         res = memory_embed.index_memory("no-such-row", "任意文本")
         self.assertFalse(res.get("ok"))
         self.assertEqual(res.get("reason"), "row_gone")
+
+
+class VecKindMigrationTest(unittest.TestCase):
+    """[vec kind 分区 2026-10-25] _migrate_vec_kind 幂等：旧 schema（无 kind 列）
+    首次 connect 自动 DROP+重建+回灌；第二次 connect 零改动行数不变。
+    用独立临时库 + 裸 sqlite3 造旧世界（绕开 connect 的自动建表）。"""
+
+    def test_migrate_kind_idempotent(self):
+        db_path = TEST_DIR / "memory_migrate.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
+        import sqlite_vec
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.enable_load_extension(True)
+            sqlite_vec.load(raw)
+            raw.enable_load_extension(False)
+            raw.executescript(memory_db.SCHEMA)  # bank/FTS/self_state_log，无 vec
+            raw.execute(
+                "CREATE VIRTUAL TABLE memory_vec USING vec0("
+                "memory_id TEXT PRIMARY KEY, embedding float[768])")  # 旧 DDL
+            raw.execute("INSERT INTO memory_bank (id, kind, content) VALUES (?, ?, ?)",
+                        ("mig-1", "corpus", "语料A带嵌入"))
+            raw.execute("INSERT INTO memory_bank (id, kind, content) VALUES (?, ?, ?)",
+                        ("mig-2", "fact", "备忘B无嵌入"))
+            raw.execute("UPDATE memory_bank SET embedding = ? WHERE id = ?",
+                        (memory_embed.pack_vector([0.5] * DIM), "mig-1"))
+            raw.commit()
+        finally:
+            raw.close()
+
+        # 第一次 connect：sniff 旧 schema → 迁移。强制 VEC 探测重跑（进程内
+        # 可能已被其他测试置位）。
+        with mock.patch.object(config, "MEMORY_DB", str(db_path)), \
+             mock.patch.object(memory_db, "VEC_AVAILABLE", False), \
+             mock.patch.object(memory_db, "_VEC_PROBED", False):
+            conn = memory_db.connect()
+            try:
+                self.assertTrue(memory_db.VEC_AVAILABLE)
+                sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'memory_vec'"
+                ).fetchone()[0]
+                self.assertIn("kind", sql)
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM memory_vec").fetchone()[0], 1)
+                row = conn.execute(
+                    "SELECT memory_id, kind FROM memory_vec").fetchone()
+                self.assertEqual(row["memory_id"], "mig-1")
+                self.assertEqual(row["kind"], "corpus")
+            finally:
+                conn.close()
+
+            # 第二次 connect：幂等——新 schema 直接跳过，行数不变零报错
+            conn = memory_db.connect()
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM memory_vec").fetchone()[0], 1)
+                sql2 = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'memory_vec'"
+                ).fetchone()[0]
+                self.assertIn("kind", sql2)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
