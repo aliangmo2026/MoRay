@@ -2010,7 +2010,9 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     assistantMsg.think = think === true;
   }
   const genStart = performance.now();
-  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥60ms 才整段重绘 Markdown）
+  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥100ms 才整段重绘 Markdown；
+  // [性能收口 2026-10-26] 节流 60→100ms：每次落笔是全文 marked.parse+DOMPurify+整消息子树
+  // 重建，O(正文长度) 成本，降频 40% 显著减负，代价是文字到达略"块状"）
   let rafPending = false, lastStreamPaint = 0;
   const scheduleStreamPaint = () => {
     if (rafPending || !AppState.generating) return;
@@ -2019,15 +2021,21 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       rafPending = false;
       if (!AppState.generating) return; // 完成/停止后不再补画流式光标
       const now = performance.now();
-      if (now - lastStreamPaint < 60) {
-        setTimeout(scheduleStreamPaint, Math.max(1, 60 - (now - lastStreamPaint)));
+      if (now - lastStreamPaint < 100) {
+        setTimeout(scheduleStreamPaint, Math.max(1, 100 - (now - lastStreamPaint)));
         return;
       }
       lastStreamPaint = now;
       const ce = inner.querySelector('.ai-content');
       if (ce && ce.isConnected) {
         ce.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
-        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+        // [性能收口] 流式期间瞬时滚底：scrollTo({smooth}) 每帧重启一次平滑滚动动画，
+        // 叠加触发 scroll 事件与强制布局（125 isNearBottom 三连读），改为直接赋值；
+        // 手动"回到底部"按钮仍走 scrollToMsgBottom 的 smooth 不受影响
+        if (MoraySettings.get('autoScroll')) {
+          const sc = document.getElementById('chatNormalContent');
+          if (sc) sc.scrollTop = sc.scrollHeight;
+        }
       }
     });
   };
@@ -2095,7 +2103,7 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           ? `生成中 · ${Math.round((assistantMsg.content.length / 4) / Math.max(0.5, secs))} tok/s`
           : (assistantMsg.think === true && isThinkingModel(assistantMsg.model) ? '深度思考中' : '正在生成'));
       }
-      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥60ms 才真正整段重绘 Markdown），
+      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥100ms 才真正整段重绘 Markdown），
       // 避免每个 token 全量 reparse；代码高亮统一留到结束后的完整渲染，不在流式中逐 token 高亮。
       if (typingEl.isConnected) typingEl.remove();
       scheduleStreamPaint();
