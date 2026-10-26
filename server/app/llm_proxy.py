@@ -445,6 +445,10 @@ async def llm_chat(request: Request):
             if len(_twin_query) > 2:
                 _twin_items = _hybrid_recall(_twin_query, limit=3)
                 if _twin_items:
+                    # [P1-1 2026-10-26 QA 修复] 召回非空即强命中：置位物理剥夺标志。此前
+                    # 10-24b 取消阈值重构只删了旧阈值块里的置位、未在此分支补回，导致下方
+                    # tools 剥夺段（detective_research 摘除）成死代码。
+                    _twin_strong_hit = True
                     # [twin×argus 2026-10-24b 取消阈值] 实机验证 0.02 会误杀：RRF 融合分在
                     # 单路召回（仅 FTS 或仅向量命中一路）时天然极低，够答的内部知识也被放行
                     # 去外部搜索。改为"召回非空即强命中"——宁可剥夺外部搜索靠内部文档作答，
@@ -481,6 +485,13 @@ async def llm_chat(request: Request):
         model = requested or config.OLLAMA_MODEL
     elif provider == "custom_27b":
         model = requested or config.LOCAL_27B_MODEL_NAME
+    elif custom_base and requested:
+        # [P1-2 2026-10-26 QA 修复] BYOK（成对 base_url+api_key 且已过 SSRF 校验，见 :312-321
+        # 的 custom_base）：模型名原样透传给用户指定的上游——其可接受的模型集由该上游自己
+        # 决定，不能再套本地 _UPSTREAM_MODELS 白名单（此前 gpt-4o-mini/glm-4-flash 等被静默
+        # 改写成 deepseek-chat 或 400）。白名单只保留给"全局 .env 上游 + 本地模型名打到云端"
+        # 的兜底场景。
+        model = requested
     elif requested in _UPSTREAM_MODELS:
         model = requested
     else:

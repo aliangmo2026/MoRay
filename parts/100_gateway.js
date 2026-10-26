@@ -360,9 +360,23 @@ function isCloudModelName(name) {
   if (!n) return false;
   try {
     if (isNonChatModel(n) || isJudgeOnlyModel(n)) return false;
-    if ((AI.models || []).some(m => m && m.name === n)) return false;
+    const locals = (AI.models || []).filter(m => m && m.name);
+    // [2026-10-25 竞态修正] 本地清单不可用（探测中/被中止/纯离线）→ 不妄断"不在本地=云端"，
+    // 否则启动瞬间本地模型会被错标云端。纯云端场景不受影响：backend=openai 的透传与
+    // 显示判定各有独立条件（AI.chat 首条件、isLocalModelName 的 CostEngine 分支）。
+    if (!locals.length) return false;
+    if (locals.some(m => m.name === n)) return false;
     return !!String(MoraySettings.get('openaiBaseURL') || '').trim();
   } catch (e) { return false; }
+}
+
+/** [2026-10-25 显示修正] 经云端修正的"本地模型"判定。isLocalModelName 在 backend=ollama
+ * 时对**一切名字**恒 true（它回答的是"后端是 Ollama"，不是"这个名字是本地模型"）——凡对
+ * 具体模型名做本地/云端归类的显示与降级判定（输入台标签/气泡来源/唤醒提示/回退标注/
+ * 云端无备用补降级），必须先过 isCloudModelName，否则云端模型会被错标"本地优先"且
+ * 云端补降级分支永不触发。 */
+function isLocalChatModel(name) {
+  try { return !isCloudModelName(name) && isLocalModelName(name); } catch (e) { return false; }
 }
 
 /** [2026-10-25 统一下拉] 设置面板可选模型统一数据源：
@@ -538,9 +552,10 @@ function renderBreakerStatus() {
   }));
 }
 
-/** 模型来源文案：本地 / 云端（供路由 reason、回退标注与元问题上下文共用） */
+/** 模型来源文案：本地 / 云端（供路由 reason、回退标注与元问题上下文共用）
+ * [2026-10-25 显示修正] 换 isLocalChatModel：backend=ollama 时旧判定把云端模型也标"本地" */
 function modelSourceLabel(name) {
-  return isLocalModelName(name) ? '本地' : '云端';
+  return isLocalChatModel(name) ? '本地' : '云端';
 }
 
 /** 是否“当前用的什么模型 / 是否已切换模型 / 是不是某模型”类元问题。
@@ -1254,11 +1269,19 @@ Gateway.chatStream = function (opts) {
         }
       }
       if (result === undefined) {
+        // [P1-3 2026-10-26 QA 修复] 用户主动中止绝不进入降级链：AbortError 与"云端失败"
+        // 必须分流——否则"云端首选+自动补本地降级"形态下，点停止仍会幽灵跑完整轮备用
+        // 请求并把回退模型的完整回答渲染落库。保留原生 AbortError 形态（30_chat.js:2208
+        // 按 name==='AbortError' 走"[已停止生成]"分支）。
+        if (isUserAbort || (opts.signal && opts.signal.aborted)) {
+          throw (primaryErr && primaryErr.name === 'AbortError') ? primaryErr
+            : Object.assign(new Error('User aborted'), { name: 'AbortError' });
+        }
         let fallbacks = routed.routeInfo ? routed.routeInfo.fallbacks : [];
         // [2026-10-25 任务B] 首选是云端且路由未配备用 → 失败（含智谱免费档 429 并发限流）
         // 时自动补一个本地模型作为降级目标，不让云端瞬时故障把整轮对话卡死。
         // 候选优先级：Agent 推荐最稳模型（qwen3.5:9b 系）> 过滤后的本地列表尾项。
-        if (!fallbacks.length && !isLocalModelName(effective.model)) {
+        if (!fallbacks.length && !isLocalChatModel(effective.model)) {
           let autoLocal = '';
           if (typeof agentRecommendedModel === 'function') autoLocal = agentRecommendedModel();
           if (!autoLocal) {
@@ -1269,8 +1292,8 @@ Gateway.chatStream = function (opts) {
           if (autoLocal) fallbacks = [autoLocal];
         }
         if (fallbacks.length && effective.model !== fallbacks[0]) {
-          const primaryWasCloud = !isLocalModelName(effective.model);
-          const fallbackIsLocal = isLocalModelName(fallbacks[0]);
+          const primaryWasCloud = !isLocalChatModel(effective.model);
+          const fallbackIsLocal = isLocalChatModel(fallbacks[0]);
           usedFallback = true;
           const errText = String((primaryErr && primaryErr.message) || primaryErr || '');
           // 区分失败类型给用户可读文案；同类回退 10s 内只提示一次，避免每句刷屏
