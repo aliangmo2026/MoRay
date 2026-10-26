@@ -71,8 +71,9 @@
   /* Ease 动画曲线 */
   --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  /* Font 字体 */
-  --font-sans: "Inter", "SF Pro Text", system-ui, -apple-system, sans-serif;
+  /* Font 字体（[真实数据链路批 2026-10-26] 补中文无衬线栈：Inter 拉丁 + 鸿蒙/苹方/雅黑UI/思源
+     中文，消灭"Inter+系统兜底"的混排割裂；tailwind font-sans 工具类与 body 同源消费本令牌） */
+  --font-sans: "Inter", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei UI", "Noto Sans SC", system-ui;
   --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", ui-monospace, monospace;
   /* Animation 签名动效（A-1：aurora/bring 已随装饰归零移除）。
      [A-3b] 带 box-shadow 光环的骨架版 @keyframes beacon 已删，唯一生效版本在 135 §14 */
@@ -4848,7 +4849,7 @@ html[data-theme] body, html[data-theme] aside, html[data-theme] main, html[data-
     if (chatInput) {
       chatInput.addEventListener('input', function () {
         this.style.height = 'auto';
-        this.style.height = Math.min(this.scrollHeight, 128) + 'px';
+        this.style.height = Math.min(this.scrollHeight, 400) + 'px';
         updateInputStats(this.value);
         if (slashMenu) filterSlashItems(this.value);
       });
@@ -5134,9 +5135,12 @@ html[data-theme] body, html[data-theme] aside, html[data-theme] main, html[data-
 
   // ========== 输入框自动高度 ==========
   document.querySelectorAll('textarea').forEach(ta => {
+    // [性能收口 2026-10-26] 主输入框已有专属自动增高+统计监听（上方 chatInput 块），
+    // 此处再挂一份会造成每次敲键双份 forced reflow，跳过
+    if (ta.id === 'chatInputNormal') return;
     ta.addEventListener('input', function() {
       this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 128) + 'px';
+      this.style.height = Math.min(this.scrollHeight, 400) + 'px';
     });
   });
 
@@ -7401,18 +7405,41 @@ function isThinkingModel(name) {
 /** 全局 AI 客户端 @type {MorayAI} */
 const AI = new MorayAI();
 
-/** 请求性能历史（供监控图表），最多保留 40 条
- * @type {Array<{model:string, tokPerSec:number, firstMs:number, ok:boolean, ts:number}>} */
+/** 请求性能历史（供监控图表），最多保留 500 条。
+ * [真实数据链路 2026-10-26] 由纯内存（刷新即清零 → 成本中心/工作流监控恒 "--"）改为
+ * IndexedDB 落盘：settings 存储仓 key='perfHistory'（10_db 通用 getSetting/setSetting，
+ * 结构化克隆直存数组）。启动时异步回放并就地刷新监控 UI。 */
 const PerfHistory = [];
+const PERF_HISTORY_MAX = 500;
+const PERF_HISTORY_KEY = 'perfHistory';
 
-/** 记录一次请求性能
+/** 持久化 PerfHistory（旁路：任何失败静默，绝不影响记录本身）@returns {Promise<void>} */
+function _persistPerfHistory() {
+  try {
+    DB.setSetting(PERF_HISTORY_KEY, PerfHistory.slice(-PERF_HISTORY_MAX)).catch(() => {});
+  } catch (e) { /* DB 未就绪等场景静默 */ }
+}
+
+/** 启动回放：IndexedDB → 内存数组（异步；完成后刷新工作流页监控卡若已挂载） */
+(async function hydratePerfHistory() {
+  try {
+    const saved = await DB.getSetting(PERF_HISTORY_KEY, []);
+    if (Array.isArray(saved) && saved.length) {
+      saved.slice(-PERF_HISTORY_MAX).forEach(p => PerfHistory.push(p));
+      if (typeof updatePerfUI === 'function') updatePerfUI();
+    }
+  } catch (e) { /* 首开/库损坏静默 */ }
+})();
+
+/** 记录一次请求性能（内存 + 异步落盘双写）
  * @param {string} model - 模型名
  * @param {Object} stats - stats 对象
  * @param {boolean} ok - 是否成功
  * @returns {void} */
 function recordPerf(model, stats, ok) {
   PerfHistory.push({ model: model || '?', tokPerSec: (stats && stats.tokPerSec) || 0, firstMs: (stats && stats.firstMs) || 0, ok, ts: Date.now() });
-  if (PerfHistory.length > 40) PerfHistory.shift();
+  if (PerfHistory.length > PERF_HISTORY_MAX) PerfHistory.shift();
+  _persistPerfHistory();
 }
 
 /* ===================== UI 基础组件：模态框 / 确认框 ===================== */
@@ -7808,13 +7835,17 @@ body:has(#page-memory:not(.hidden)) #middleSidebar { display: none; }
 }
 .mem-src { font-size: 10px; color: var(--color-text-tertiary, #666666); }
 .mem-time { font-size: 10px; color: var(--color-text-tertiary, #666666); margin-left: auto; }
-.memcard-content {
-  margin-top: 2px; font-size: 13px; line-height: 1.6;
-  color: var(--color-text-primary, #ededed);
-  white-space: pre-wrap; word-break: break-word;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-}
-.memcard.is-open .memcard-content { display: block; -webkit-line-clamp: unset; }
+  .memcard-content {
+    margin-top: 2px; font-size: 13px; line-height: 1.6;
+    color: var(--color-text-primary, #ededed);
+    white-space: pre-wrap; word-break: break-word;
+    display: block; overflow: hidden;
+    /* [修复 2026-10-26] 折叠由 display/line-clamp 硬切改为 max-height 过渡动画：
+       2 行预览 ≈ 2×20.8px ≈ 42px；展开给大上限（超长正文仍完整可见） */
+    max-height: 42px;
+    transition: max-height 0.28s ease;
+  }
+  .memcard.is-open .memcard-content { max-height: 4000px; }
 .memcard-meta { margin-top: 8px; font-size: 10px; color: var(--color-text-tertiary, #666666); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mem-notice { font-size: 11px; color: var(--color-text-tertiary, #666666); }
 .mem-empty { padding: 24px 0; text-align: center; font-size: 12px; color: var(--color-text-tertiary, #666666); }
@@ -7985,6 +8016,12 @@ body:has(#page-memory:not(.hidden)) #middleSidebar { display: none; }
           if (!n || n.nodeType !== 1 || !n.classList) continue;
           if (!delBtn && n.classList.contains('mem-del')) delBtn = n;
           if (!card && n.classList.contains('memcard')) card = n;
+        }
+        // [修复 2026-10-26] composedPath 缺失或返回空数组时（部分内嵌容器/内核差异），
+        // 委托会静默失效 = 点击展开/收起无任何反应；回退 ev.target.closest 双保险
+        if (!delBtn && !card && ev.target && ev.target.nodeType === 1 && typeof ev.target.closest === 'function') {
+          delBtn = ev.target.closest('.mem-del');
+          card = ev.target.closest('.memcard');
         }
         if (delBtn && card) {
           const delId = card.getAttribute('data-mem-id') || '';
@@ -11406,7 +11443,9 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
     assistantMsg.think = think === true;
   }
   const genStart = performance.now();
-  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥60ms 才整段重绘 Markdown）
+  // [流式性能] 每个生成气泡独立的 rAF 合并调度（token 只标脏，≥100ms 才整段重绘 Markdown；
+  // [性能收口 2026-10-26] 节流 60→100ms：每次落笔是全文 marked.parse+DOMPurify+整消息子树
+  // 重建，O(正文长度) 成本，降频 40% 显著减负，代价是文字到达略"块状"）
   let rafPending = false, lastStreamPaint = 0;
   const scheduleStreamPaint = () => {
     if (rafPending || !AppState.generating) return;
@@ -11415,15 +11454,21 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
       rafPending = false;
       if (!AppState.generating) return; // 完成/停止后不再补画流式光标
       const now = performance.now();
-      if (now - lastStreamPaint < 60) {
-        setTimeout(scheduleStreamPaint, Math.max(1, 60 - (now - lastStreamPaint)));
+      if (now - lastStreamPaint < 100) {
+        setTimeout(scheduleStreamPaint, Math.max(1, 100 - (now - lastStreamPaint)));
         return;
       }
       lastStreamPaint = now;
       const ce = inner.querySelector('.ai-content');
       if (ce && ce.isConnected) {
         ce.innerHTML = renderMarkdown(assistantMsg.content) + '<span class="stream-cursor"></span>';
-        if (MoraySettings.get('autoScroll')) scrollToMsgBottom();
+        // [性能收口] 流式期间瞬时滚底：scrollTo({smooth}) 每帧重启一次平滑滚动动画，
+        // 叠加触发 scroll 事件与强制布局（125 isNearBottom 三连读），改为直接赋值；
+        // 手动"回到底部"按钮仍走 scrollToMsgBottom 的 smooth 不受影响
+        if (MoraySettings.get('autoScroll')) {
+          const sc = document.getElementById('chatNormalContent');
+          if (sc) sc.scrollTop = sc.scrollHeight;
+        }
       }
     });
   };
@@ -11492,7 +11537,7 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
           ? `生成中 · ${Math.round((assistantMsg.content.length / 4) / Math.max(0.5, secs))} tok/s`
           : (assistantMsg.think === true && isThinkingModel(assistantMsg.model) ? '深度思考中' : '正在生成'));
       }
-      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥60ms 才真正整段重绘 Markdown），
+      // 流式渲染：token 到达只标记脏帧，由 rAF 按帧合并（≥100ms 才真正整段重绘 Markdown），
       // 避免每个 token 全量 reparse；代码高亮统一留到结束后的完整渲染，不在流式中逐 token 高亮。
       if (typingEl.isConnected) typingEl.remove();
       scheduleStreamPaint();
@@ -30519,8 +30564,13 @@ const CostCenterApp = {
   },
 
   /** 汇总区间用量
+   * [真实数据链路 2026-10-26] 优先后端 usage_log 真值聚合（tokens=上游 eval_count/usage
+   * 块，金额按本页 PRICE_TABLE 换算）；后端离线/静态托管/接口异常自动回退旧 __usage__
+   * 前端管道，返回形状同构（{rows,sum,byModel}），渲染层零感知。
    * @returns {Promise<Object>} {rows, sum, byModel} */
   async aggregate() {
+    const remote = await this._aggregateRemote();
+    if (remote) return remote;
     const usage = await gatewayMetaGet('__usage__', { byDay: {} });
     const days = Object.keys(usage.byDay).sort();
     const now = Date.now();
@@ -30550,6 +30600,40 @@ const CostCenterApp = {
     return { rows: rows, sum: sum, byModel: byModel };
   },
 
+  /** 后端真值聚合：GET /api/cost/stats?days=N（llm_proxy 每次对话写 usage_log 的真 token）
+   * → 折叠成与旧管道同构的 {rows,sum,byModel}。金额=本页价目表×真值 tokens（后端无价目表）。
+   * @returns {Promise<Object|null>} 不可用时返回 null（调用方回退旧管道） */
+  async _aggregateRemote() {
+    const days = { today: 1, week: 7, month: 31, all: 3650 }[this.range] || 14;
+    const origin = (window.MorayBackend && window.MorayBackend.origin) || '';
+    try {
+      const resp = await fetch(origin + '/api/cost/stats?days=' + days, { cache: 'no-store' });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (!j || !j.ok || !j.data || !Array.isArray(j.data.rows)) return null;
+      const dayMap = {}, byModel = {};
+      j.data.rows.forEach(r => {
+        const pt = Number(r.prompt) || 0, ct = Number(r.completion) || 0;
+        const d = dayMap[r.date] = dayMap[r.date] || { day: r.date, cost: 0, baseline: 0, tokens: 0, requests: 0 };
+        d.cost = CostEngine.round(d.cost + CostEngine.estimateCost(r.model, pt, ct));
+        d.baseline = CostEngine.round(d.baseline + CostEngine.estimateBaseline(r.model, pt, ct));
+        d.tokens += pt + ct;
+        d.requests += Number(r.requests) || 0;
+        byModel[r.model] = (byModel[r.model] || 0) + pt + ct;
+      });
+      const rows = Object.keys(dayMap).sort().map(k => dayMap[k]);
+      const sum = rows.reduce((s, r) => ({
+        cost: s.cost + r.cost, baseline: s.baseline + r.baseline,
+        saved: s.saved + Math.max(0, CostEngine.round(r.baseline - r.cost)),
+        tokens: s.tokens + r.tokens, requests: s.requests + r.requests
+      }), { cost: 0, baseline: 0, saved: 0, tokens: 0, requests: 0 });
+      sum.cost = CostEngine.round(sum.cost);
+      sum.baseline = CostEngine.round(sum.baseline);
+      sum.saved = CostEngine.round(sum.saved);
+      return { rows: rows, sum: sum, byModel: byModel };
+    } catch (e) { return null; } // 后端离线/file:///网络异常 → 回退
+  },
+
   /** 刷新统计与图表
    * @returns {Promise<void>} */
   async refresh() {
@@ -30558,13 +30642,19 @@ const CostCenterApp = {
     const agg = await this.aggregate();
     const rows = agg.rows, sum = agg.sum, byModel = agg.byModel;
     const cacheStats = await GatewayCache.stats();
-    const usage = await gatewayMetaGet('__usage__', { byDay: {} });
-    const monthPrefix = dayKey().slice(0, 7);
+    // [真实数据链路] 今日/本月花费卡改由本次聚合行推导——后端真值路径下旧 __usage__
+    // 直读恒 0；两路径 rows 同构（saved 缺失时按 baseline-cost 兜底）。
+    const todayKey = dayKey();
+    const monthPrefix = todayKey.slice(0, 7);
     let monthCost = 0, monthSaved = 0;
-    Object.keys(usage.byDay || {}).forEach(k => {
-      if (k.startsWith(monthPrefix)) { monthCost += (usage.byDay[k].costCNY || 0); monthSaved += (usage.byDay[k].savedCNY || 0); }
+    rows.forEach(r => {
+      if (String(r.day).startsWith(monthPrefix)) {
+        monthCost += r.cost;
+        monthSaved += (r.saved != null ? r.saved : Math.max(0, r.baseline - r.cost));
+      }
     });
-    const todayCost = (usage.byDay[dayKey()] || {}).costCNY || 0;
+    const todayRow = rows.find(r => r.day === todayKey);
+    const todayCost = todayRow ? todayRow.cost : 0;
     const compSaved = Object.values(AppState._convMsgIndex || {}).reduce((s, arr) =>
       s + arr.reduce((a, m) => a + (m.compressionSaved || 0), 0), 0);
     const perf = PerfHistory || [];
@@ -37079,6 +37169,221 @@ html[data-theme="dark"] {
 .argus-mode-pill:hover { background: rgba(47, 124, 246, 0.16) !important; }
 `;
   document.head.appendChild(st);
+})();
+
+/* ===================== [136] modern_skin —— 现代极简统一皮肤层 =====================
+   职责边界（高度内聚，可整体删除回滚）：
+   1) 本分片是 PARTS 注入顺序中最后一个 <style> 注入方（assemble.py 排在 135 之后、
+      138/145/146 之前；这三者均不注入样式，故本层实际为最终覆盖层）。
+      所有规则带 !important，用于压过：骨架静态 CSS（moray-workbench.html <style> 块）、
+      135_ui_polish 的 UI 2.0 覆盖层、110_polish 的壁纸层、各分片运行时 append 的 style。
+   2) 覆盖内容五大块：
+      A. 品牌色统一极客蓝 #2f7cf6（令牌层重声明 + 骨架写死橙 rgba(229,115,74,…) 高频兜底）
+      B. 消息流极简化：AI 裸排版强化（去头像/行高 1.85）+ 用户气泡淡蓝胶囊化
+      C. 消息操作条默认全隐藏、悬停浮现（opacity 0→1 + pointer-events 隔离）
+      D. 三栏毛玻璃统一档（去阴影/统一 blur 24px/更通透底色）+ 输入台瘦身
+      E. §7 性能收口（掉帧排查 2026-10-26）：中栏/主区整列 backdrop-filter 关停（保留半透明
+         底色与左栏玻璃）+ 信标点撤永久合成层、历史消息脉冲停振、关键帧光环改蓝
+   3) 输入框自动增高上限 128→400 在骨架内联脚本（两处），本层补 CSS 侧
+      max-height:400px 否则 max-h-32 工具类会把 JS 结果夹回 128px。
+   4) 回滚：删除本文件 + 重跑 assemble.py 即可（或按 backup\modern_skin_pre_20261026
+      还原 135/骨架/assemble.py 三件套）。本分片不改任何 JS 行为，纯展示层。 */
+(function () {
+  const el = document.createElement('style');
+  el.id = 'morayModernSkin136';
+  el.textContent = `
+/* ---------- §1 品牌令牌统一：极客蓝 #2f7cf6（压过 00_theme 橙基线与 135 §38 同名声明） ---------- */
+:root,
+html[data-theme="dark"] {
+  --brand: #2f7cf6 !important;
+  --brand-hover: #1d4ed8 !important;
+  --brand-light: rgba(47, 124, 246, 0.10) !important;
+  --brand-text: #60a5fa !important;
+  --brand-on: #ffffff !important;
+  --accent: #2f7cf6 !important;
+  --glow-blue: rgba(47, 124, 246, 0.28) !important;
+  --color-brand: #2f7cf6 !important;
+  --color-brand-hover: #1d4ed8 !important;
+  --color-brand-subtle: rgba(47, 124, 246, 0.10) !important;
+  --color-brand-cobalt: #2f7cf6 !important;
+  --color-brand-cobalt-hover: #1d4ed8 !important;
+  --color-brand-violet: #2f7cf6 !important;
+  --color-brand-cyan: #2f7cf6 !important;
+  --brand-cobalt: #2f7cf6 !important;
+  --brand-cobalt-hover: #1d4ed8 !important;
+}
+html[data-theme="light"] {
+  --brand-text: #1e40af !important;
+  --brand-light: rgba(47, 124, 246, 0.10) !important;
+  --glow-blue: rgba(47, 124, 246, 0.22) !important;
+}
+
+/* ---------- §2 消息流极简化（DeepSeek 式裸排版） ----------
+   AI 侧 135 §"去气泡"已把底色/边框归零，本层在其上补三点：
+   ① 隐藏装饰头像（flex 布局下正文自动占满）② 行高 1.85 ③ 元信息行留白 */
+#chatMessagesNormal .msg-bubble > .msg-avatar { display: none !important; }
+#chatMessagesNormal .md-body { line-height: 1.85 !important; }
+#chatMessagesNormal .msg-bubble__ai-box { padding: 6px 0 !important; }
+/* 用户气泡：淡蓝圆角胶囊（覆盖 135 的 --brand-light 卡片形态） */
+#chatMessagesNormal .msg-bubble__user-box {
+  background: rgba(47, 124, 246, 0.12) !important;
+  border: 1px solid rgba(47, 124, 246, 0.20) !important;
+  border-radius: 20px !important;
+  padding: 10px 18px !important;
+}
+
+/* ---------- §3 消息操作条：默认全隐藏，悬停浮现 ----------
+   骨架只有 opacity 过渡（隐藏态仍可点中），这里补 pointer-events 隔离 + 0.2s 缓动 */
+#chatMessagesNormal .msg-actions {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: opacity 0.2s ease !important;
+}
+#chatMessagesNormal .msg-bubble:hover .msg-actions,
+#chatMessagesNormal .msg-bubble:focus-within .msg-actions {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+/* ---------- §4 三栏毛玻璃统一档：blur 24px / 去阴影 / 底色更通透 ---------- */
+#app > aside.bg-surface-deep {
+  background-color: rgba(16, 18, 26, 0.58) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  box-shadow: none !important;
+}
+#middleSidebar {
+  background-color: rgba(16, 18, 26, 0.40) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  box-shadow: none !important;
+}
+main.bg-surface-void {
+  background-color: rgba(16, 18, 26, 0.28) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: blur(24px) saturate(1.2) !important;
+  box-shadow: none !important;
+}
+html[data-theme="light"] #app > aside.bg-surface-deep {
+  background-color: rgba(255, 255, 255, 0.62) !important;
+}
+html[data-theme="light"] #middleSidebar {
+  background-color: rgba(255, 255, 255, 0.45) !important;
+}
+html[data-theme="light"] main.bg-surface-void {
+  background-color: rgba(255, 255, 255, 0.32) !important;
+}
+/* 壁纸档：模糊统一 24px；110 的橙色辉光环改蓝 */
+#app[data-wallpaper] { --wall-blur: 24px !important; --wall-glow-rgb: 47, 124, 246 !important; }
+#app[data-wallpaper] > aside.bg-surface-deep,
+#app[data-wallpaper] #middleSidebar { box-shadow: none !important; }
+
+/* ---------- §5 输入台瘦身 ----------
+   ① 隐藏提示文案与字/Token 统计（功能保留，仅不展示）
+   ② 工具行间距 6px、溢出改为换行而不是横向裁切
+   ③ textarea 上限 400px（配合骨架 JS 400；压过 max-h-32 工具类的 128px 夹断） */
+#coreInputContainer .input-stats-hint { display: none !important; }
+#coreInputContainer .input-stats-left { display: none !important; }
+#coreInputContainer .input-toolbar {
+  gap: 6px !important;
+  flex-wrap: wrap !important;
+  overflow-x: visible !important;
+  row-gap: 4px !important;
+}
+#coreInputContainer .input-toolbar-btn { border-radius: 8px !important; }
+#coreInputContainer .input-toolbar-divider { margin: 0 6px !important; }
+#chatInputNormal { max-height: 400px !important; }
+
+/* ---------- §6 残余橙兜底表（骨架写死 rgba(229,115,74,…) 的高频可见落点） ---------- */
+/* 欢迎页建议卡/快捷指令/工作流图标：骨架内联 style 写死橙底，!important 类规则可压内联 */
+.welcome-suggestion-icon,
+.slash-menu-item-icon,
+.workflow-icon {
+  background: rgba(47, 124, 246, 0.12) !important;
+  color: var(--brand-text) !important;
+}
+#newChatMoreMenu .command-item:hover { background: rgba(47, 124, 246, 0.10) !important; }
+.new-chat-main-btn:hover { box-shadow: 0 0 14px rgba(47, 124, 246, 0.35) !important; }
+.input-toolbar-btn:hover { background: rgba(47, 124, 246, 0.10) !important; color: var(--brand-text) !important; }
+/* 正文引用块/链接下划线/引用胶囊/消息操作激活态 */
+.md-body blockquote {
+  border-left-color: rgba(47, 124, 246, 0.6) !important;
+  background: rgba(47, 124, 246, 0.06) !important;
+}
+.md-body a { border-bottom-color: rgba(47, 124, 246, 0.4) !important; }
+.citation-chip { background: rgba(47, 124, 246, 0.10) !important; border-color: rgba(47, 124, 246, 0.25) !important; }
+.citation-chip:hover { background: rgba(47, 124, 246, 0.18) !important; }
+.msg-action-btn.active { background: rgba(47, 124, 246, 0.14) !important; }
+.argus-mode-pill:hover { background: rgba(47, 124, 246, 0.16) !important; }
+/* Laya 面板（92 运行时 style 写死 #E5734A 系） */
+.laya-agent-btn.on {
+  background: rgba(47, 124, 246, 0.16) !important;
+  color: #60a5fa !important;
+  border-color: rgba(47, 124, 246, 0.5) !important;
+}
+.laya-btn:hover,
+.laya-raw-btn:hover { border-color: rgba(47, 124, 246, 0.45) !important; color: #60a5fa !important; }
+.laya-tag { background: rgba(47, 124, 246, 0.07) !important; }
+.laya-tag:hover { border-color: rgba(47, 124, 246, 0.5) !important; color: #60a5fa !important; }
+.laya-sr .tt { color: #60a5fa !important; }
+.laya-chat-detail:hover { border-color: rgba(47, 124, 246, 0.5) !important; color: #60a5fa !important; }
+.laya-p-prog i { background: linear-gradient(90deg, #2f7cf6, #60a5fa) !important; }
+
+/* ---------- §7 性能收口（掉帧排查 2026-10-26） ----------
+   ① 只保留左栏一层毛玻璃；中栏/主区整列 backdrop-filter 全关（保留半透明底色，
+      通透度几乎不变，省掉两个整列 GPU 模糊 + 输入台对主区的链式二次采样）。
+      覆盖对象：135 §2 拆封印块（深浅双档）+ 110 壁纸三列规则 + 本层 §4 自身。
+   ② 信标点：撤 will-change 永久合成层；历史消息的永动脉冲（box-shadow 关键帧=每帧重绘）
+      全停，只留最新一条呼吸；关键帧光环保留但从写死橙 rgba(229,115,74,…) 改蓝。 */
+#middleSidebar,
+main.bg-surface-void,
+#app[data-wallpaper] #middleSidebar,
+#app[data-wallpaper] main.bg-surface-void {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+.beacon-dot { will-change: auto !important; }
+#chatMessagesNormal .msg-bubble:not(:last-child) .beacon-dot {
+  animation: none !important;
+  box-shadow: none !important;
+}
+@keyframes beacon {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(47, 124, 246, 0.45); }
+  50%      { opacity: 0.65; box-shadow: 0 0 0 4px rgba(47, 124, 246, 0); }
+}
+
+/* ---------- §8 字体与卡片质感（真实数据链路批 2026-10-26） ----------
+   ① 数字等宽：金额/统计/Token 计数统一 tabular-nums，数值变化时字符等宽不跳动。
+   ② 卡片去生硬边框：1px 描边降为极淡（浅色0.05/深色0.05 黑白系），改双层微阴影
+      （近沿 1px + 远沿 24px 大扩散）撑层次。覆盖对象与 135 §9 卡片族对齐，另含
+      .memcard（memory_browser 运行时内联定义）与 Tailwind border 工具类实例
+      （成本中心/工作流监控卡的 border border-line-ghost/60 —— border-color 覆盖即达成）。
+      135 §9 的 hover 规则无 !important，被本层静态阴影常驻压过 → 末尾补 hover 抬升。 */
+.font-mono, .monitor-stat-value, .cost-pill, .token-meter span,
+.input-stats-item .value, #costStatCards .text-sm { font-variant-numeric: tabular-nums; }
+.glass-card, .doc-card, .workflow-card, .memcard, .timestamp-card,
+.model-detail-card, .error-card, .card, .tl-card, .prompt-card, .snippet-card {
+  border-color: rgba(255, 255, 255, 0.05) !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 24px -12px rgba(0, 0, 0, 0.8) !important;
+}
+html[data-theme="light"] .glass-card, html[data-theme="light"] .doc-card,
+html[data-theme="light"] .workflow-card, html[data-theme="light"] .memcard,
+html[data-theme="light"] .timestamp-card, html[data-theme="light"] .model-detail-card,
+html[data-theme="light"] .error-card, html[data-theme="light"] .card,
+html[data-theme="light"] .tl-card, html[data-theme="light"] .prompt-card,
+html[data-theme="light"] .snippet-card {
+  border-color: rgba(0, 0, 0, 0.05) !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 8px 24px -12px rgba(0, 0, 0, 0.12) !important;
+}
+.glass-card:hover, .doc-card:hover, .workflow-card:hover, .memcard:hover {
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5), 0 12px 32px -12px rgba(0, 0, 0, 0.9) !important;
+}
+html[data-theme="light"] .glass-card:hover, html[data-theme="light"] .doc-card:hover,
+html[data-theme="light"] .workflow-card:hover, html[data-theme="light"] .memcard:hover {
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08), 0 12px 32px -12px rgba(0, 0, 0, 0.16) !important;
+}
+`;
+  document.head.appendChild(el);
 })();
 
 /* ============================================================

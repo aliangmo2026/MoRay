@@ -5,11 +5,13 @@
 - 非法 JSON / 缺字段 → 400；不存在 → 404
 """
 import json
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from . import crud
+from . import db as _db  # [真实数据链路 2026-10-26] usage_log 聚合只读
 
 router = APIRouter()
 
@@ -252,6 +254,39 @@ def event_snapshots_clear(event_type: str | None = None):
     except Exception as e:  # noqa: BLE001
         return _bad("db_error", f"清空失败：{e}", 500)
     return _ok({"cleared": n})
+
+
+# ---------------- [真实数据链路 2026-10-26] 成本统计聚合 ----------------
+@router.get("/api/cost/stats")
+def cost_stats(days: int = 14):
+    """从 usage_log 按 (date, model) 聚合真实用量，供成本中心渲染。
+
+    - days 夹紧 1..3650，cutoff 以 epoch 毫秒参数绑定下推（无 SQL 拼接）；
+    - 返回 (date, model) 粒度：前端据此折叠出"按日"与"按模型"两个视图，并用其
+      人民币价目表把真值 tokens 换算成金额（后端无价目表，cost_cny 恒 0.0 仅记事实）；
+    - 库表缺失/任何异常 → 500 带 code，前端按失败回退旧 __usage__ 管道。"""
+    days = max(1, min(int(days or 14), 3650))
+    cutoff_ms = int((time.time() - days * 86400) * 1000)
+    try:
+        conn = _db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT date, model, SUM(prompt_tokens) AS prompt, "
+                "SUM(completion_tokens) AS completion, COUNT(*) AS requests "
+                "FROM usage_log WHERE ts >= ? GROUP BY date, model ORDER BY date ASC",
+                (cutoff_ms,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"usage_log 聚合失败：{e}", 500)
+    return _ok({
+        "days": days,
+        "rows": [
+            {"date": r["date"], "model": r["model"], "prompt": r["prompt"] or 0,
+             "completion": r["completion"] or 0, "requests": r["requests"] or 0}
+            for r in rows
+        ],
+    })
 
 
 # ---------------- [Iris P0] ZCode 沙箱真实执行接口（2026-09-27） ----------------

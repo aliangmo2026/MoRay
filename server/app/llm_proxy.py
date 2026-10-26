@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config
 from . import cloud_budget_guard
+from . import db as _db  # [真实数据链路 2026-10-26] usage_log 落库
 
 router = APIRouter()
 _logger = logging.getLogger("moray.llm")
@@ -45,6 +46,60 @@ _default_bucket_warned: bool = False
 # [批次二·任务E] 27B 冷启动预热提示：每进程只吼一次。用 WARNING 级（本仓 root logger
 # 无 handler，INFO 会被静默丢弃——startup_budget_note 同一教训）；仅记日志，不碰响应体。
 _warmup_hint_logged: bool = False
+
+
+# ---------------- [真实数据链路 2026-10-26] 对话级用量落库（旁路） ----------------
+def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms: int) -> None:
+    """把一次对话的真实用量写入 usage_log（db.py SCHEMA 尾部建表）。
+
+    tokens 取上游真值（Ollama eval_count / OpenAI 兼容 usage 块）；cost_cny 后端无
+    价目表恒 0.0（金额由前端 CostEngine 按人民币价目表换算，后端只记事实）。
+    旁路原则：任何异常只落 DEBUG，绝不影响已成功的对话响应（同 settle/refund 惯例）。
+    SQL 为字面量 + ? 绑定（外部值绝不拼接）。"""
+    try:
+        conn = _db.connect()
+        try:
+            conn.execute(
+                "INSERT INTO usage_log (date, model, prompt_tokens, completion_tokens, cost_cny, ms, ts) "
+                "VALUES (?, ?, ?, ?, 0.0, ?, ?)",
+                (time.strftime("%Y-%m-%d"), str(model or "")[:120],
+                 max(0, int(prompt_tokens or 0)), max(0, int(completion_tokens or 0)),
+                 max(0, int(ms or 0)), int(time.time() * 1000)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响响应
+        _logger.debug("[usage_log] 写入失败（不影响响应）：%s: %s", type(e).__name__, e)
+
+
+def _scan_stream_usage(raw: bytes, capt: dict) -> None:
+    """流式透传途中轻量捕获 usage（只读，不改字节/不改 SSE 结构）。
+
+    行缓冲处理 TCP 分包：先按 \\n 切行，行内子串快筛（eval_count / "usage"）命中才
+    json.loads——无 usage 的普通 token 行零解析成本。capt 契约：
+    {buf:bytes, pt:int, ct:int, model:str}；Ollama 收尾行取 eval_count/prompt_eval_count，
+    OpenAI 兼容流收尾 chunk 取 usage 块；多行取 max 防乱序/重复。"""
+    capt["buf"] += raw
+    while b"\n" in capt["buf"]:
+        line, _, capt["buf"] = capt["buf"].partition(b"\n")
+        line = line.strip()
+        if not line or (b"eval_count" not in line and b'"usage"' not in line):
+            continue
+        try:
+            j = json.loads(line[5:] if line.startswith(b"data:") else line)
+        except Exception:  # noqa: BLE001 - 快筛命中但非 JSON（半行/注释）直接跳过
+            continue
+        if not isinstance(j, dict):
+            continue
+        if "eval_count" in j:  # Ollama /api/chat 收尾行
+            capt["pt"] = max(capt["pt"], int(j.get("prompt_eval_count") or 0))
+            capt["ct"] = max(capt["ct"], int(j.get("eval_count") or 0))
+            capt["model"] = capt["model"] or str(j.get("model") or "")
+        u = j.get("usage")
+        if isinstance(u, dict):  # OpenAI 兼容 chunk 收尾 usage 块
+            capt["pt"] = max(capt["pt"], int(u.get("prompt_tokens") or 0))
+            capt["ct"] = max(capt["ct"], int(u.get("completion_tokens") or 0))
+            capt["model"] = capt["model"] or str(j.get("model") or "")
 
 
 def _roll_budget_day() -> None:
@@ -652,6 +707,7 @@ async def llm_chat(request: Request):
 
     async def _non_stream():
         """非流式：[2026-09-30 本地优先强制] 本地失败只重试本地；云端降级必须过熔断闸门"""
+        _t0 = time.time()  # [真实数据链路] 端到端耗时计时点
         # 首次请求
         try:
             status, data, msg = await _do_request(upstream_url, upstream_headers, payload)
@@ -729,6 +785,9 @@ async def llm_chat(request: Request):
             except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响响应（同 _audit_budget_exceeded 惯例）
                 _logger.warning("[router] 云端预算结算失败（保留预扣 %.4f）：%s: %s",
                                 _cloud_permit.reserved_usd, type(e).__name__, e)
+        # [真实数据链路 2026-10-26] 非流式收尾：上游 usage 真值落 usage_log（旁路）
+        _record_usage_log(out["model"], out["usage"]["prompt_tokens"],
+                          out["usage"]["completion_tokens"], int((time.time() - _t0) * 1000))
         return out
 
     async def _stream():
@@ -819,8 +878,20 @@ async def llm_chat(request: Request):
                     except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响流式透传
                         _logger.warning("[router] 云端预算结算失败（流式，保留预扣 %.4f）：%s: %s",
                                         _cloud_permit.reserved_usd, type(e).__name__, e)
+                # [真实数据链路 2026-10-26] 透传途中行缓冲捕获 Ollama eval_count /
+                # OpenAI 兼容 usage 块，收尾写 usage_log（旁路，失败绝不中断透传）。
+                # 替换原裸 aiter_bytes 透传：多一次子串快筛，无 usage 的 token 行零 json 成本。
+                _t0 = time.time()
+                capt = {"buf": b"", "pt": 0, "ct": 0, "model": ""}
                 async for chunk in upstream.aiter_bytes():
+                    try:
+                        _scan_stream_usage(chunk, capt)
+                    except Exception:  # noqa: BLE001 - 捕获旁路异常绝不中断透传
+                        pass
                     yield chunk
+                if capt["pt"] or capt["ct"]:
+                    _record_usage_log(capt["model"] or model, capt["pt"], capt["ct"],
+                                      int((time.time() - _t0) * 1000))
                 return
         except asyncio.CancelledError:
             raise

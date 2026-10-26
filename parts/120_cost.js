@@ -286,8 +286,13 @@ const CostCenterApp = {
   },
 
   /** 汇总区间用量
+   * [真实数据链路 2026-10-26] 优先后端 usage_log 真值聚合（tokens=上游 eval_count/usage
+   * 块，金额按本页 PRICE_TABLE 换算）；后端离线/静态托管/接口异常自动回退旧 __usage__
+   * 前端管道，返回形状同构（{rows,sum,byModel}），渲染层零感知。
    * @returns {Promise<Object>} {rows, sum, byModel} */
   async aggregate() {
+    const remote = await this._aggregateRemote();
+    if (remote) return remote;
     const usage = await gatewayMetaGet('__usage__', { byDay: {} });
     const days = Object.keys(usage.byDay).sort();
     const now = Date.now();
@@ -317,6 +322,40 @@ const CostCenterApp = {
     return { rows: rows, sum: sum, byModel: byModel };
   },
 
+  /** 后端真值聚合：GET /api/cost/stats?days=N（llm_proxy 每次对话写 usage_log 的真 token）
+   * → 折叠成与旧管道同构的 {rows,sum,byModel}。金额=本页价目表×真值 tokens（后端无价目表）。
+   * @returns {Promise<Object|null>} 不可用时返回 null（调用方回退旧管道） */
+  async _aggregateRemote() {
+    const days = { today: 1, week: 7, month: 31, all: 3650 }[this.range] || 14;
+    const origin = (window.MorayBackend && window.MorayBackend.origin) || '';
+    try {
+      const resp = await fetch(origin + '/api/cost/stats?days=' + days, { cache: 'no-store' });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (!j || !j.ok || !j.data || !Array.isArray(j.data.rows)) return null;
+      const dayMap = {}, byModel = {};
+      j.data.rows.forEach(r => {
+        const pt = Number(r.prompt) || 0, ct = Number(r.completion) || 0;
+        const d = dayMap[r.date] = dayMap[r.date] || { day: r.date, cost: 0, baseline: 0, tokens: 0, requests: 0 };
+        d.cost = CostEngine.round(d.cost + CostEngine.estimateCost(r.model, pt, ct));
+        d.baseline = CostEngine.round(d.baseline + CostEngine.estimateBaseline(r.model, pt, ct));
+        d.tokens += pt + ct;
+        d.requests += Number(r.requests) || 0;
+        byModel[r.model] = (byModel[r.model] || 0) + pt + ct;
+      });
+      const rows = Object.keys(dayMap).sort().map(k => dayMap[k]);
+      const sum = rows.reduce((s, r) => ({
+        cost: s.cost + r.cost, baseline: s.baseline + r.baseline,
+        saved: s.saved + Math.max(0, CostEngine.round(r.baseline - r.cost)),
+        tokens: s.tokens + r.tokens, requests: s.requests + r.requests
+      }), { cost: 0, baseline: 0, saved: 0, tokens: 0, requests: 0 });
+      sum.cost = CostEngine.round(sum.cost);
+      sum.baseline = CostEngine.round(sum.baseline);
+      sum.saved = CostEngine.round(sum.saved);
+      return { rows: rows, sum: sum, byModel: byModel };
+    } catch (e) { return null; } // 后端离线/file:///网络异常 → 回退
+  },
+
   /** 刷新统计与图表
    * @returns {Promise<void>} */
   async refresh() {
@@ -325,13 +364,19 @@ const CostCenterApp = {
     const agg = await this.aggregate();
     const rows = agg.rows, sum = agg.sum, byModel = agg.byModel;
     const cacheStats = await GatewayCache.stats();
-    const usage = await gatewayMetaGet('__usage__', { byDay: {} });
-    const monthPrefix = dayKey().slice(0, 7);
+    // [真实数据链路] 今日/本月花费卡改由本次聚合行推导——后端真值路径下旧 __usage__
+    // 直读恒 0；两路径 rows 同构（saved 缺失时按 baseline-cost 兜底）。
+    const todayKey = dayKey();
+    const monthPrefix = todayKey.slice(0, 7);
     let monthCost = 0, monthSaved = 0;
-    Object.keys(usage.byDay || {}).forEach(k => {
-      if (k.startsWith(monthPrefix)) { monthCost += (usage.byDay[k].costCNY || 0); monthSaved += (usage.byDay[k].savedCNY || 0); }
+    rows.forEach(r => {
+      if (String(r.day).startsWith(monthPrefix)) {
+        monthCost += r.cost;
+        monthSaved += (r.saved != null ? r.saved : Math.max(0, r.baseline - r.cost));
+      }
     });
-    const todayCost = (usage.byDay[dayKey()] || {}).costCNY || 0;
+    const todayRow = rows.find(r => r.day === todayKey);
+    const todayCost = todayRow ? todayRow.cost : 0;
     const compSaved = Object.values(AppState._convMsgIndex || {}).reduce((s, arr) =>
       s + arr.reduce((a, m) => a + (m.compressionSaved || 0), 0), 0);
     const perf = PerfHistory || [];

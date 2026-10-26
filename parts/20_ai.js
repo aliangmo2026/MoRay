@@ -1031,18 +1031,41 @@ function isThinkingModel(name) {
 /** 全局 AI 客户端 @type {MorayAI} */
 const AI = new MorayAI();
 
-/** 请求性能历史（供监控图表），最多保留 40 条
- * @type {Array<{model:string, tokPerSec:number, firstMs:number, ok:boolean, ts:number}>} */
+/** 请求性能历史（供监控图表），最多保留 500 条。
+ * [真实数据链路 2026-10-26] 由纯内存（刷新即清零 → 成本中心/工作流监控恒 "--"）改为
+ * IndexedDB 落盘：settings 存储仓 key='perfHistory'（10_db 通用 getSetting/setSetting，
+ * 结构化克隆直存数组）。启动时异步回放并就地刷新监控 UI。 */
 const PerfHistory = [];
+const PERF_HISTORY_MAX = 500;
+const PERF_HISTORY_KEY = 'perfHistory';
 
-/** 记录一次请求性能
+/** 持久化 PerfHistory（旁路：任何失败静默，绝不影响记录本身）@returns {Promise<void>} */
+function _persistPerfHistory() {
+  try {
+    DB.setSetting(PERF_HISTORY_KEY, PerfHistory.slice(-PERF_HISTORY_MAX)).catch(() => {});
+  } catch (e) { /* DB 未就绪等场景静默 */ }
+}
+
+/** 启动回放：IndexedDB → 内存数组（异步；完成后刷新工作流页监控卡若已挂载） */
+(async function hydratePerfHistory() {
+  try {
+    const saved = await DB.getSetting(PERF_HISTORY_KEY, []);
+    if (Array.isArray(saved) && saved.length) {
+      saved.slice(-PERF_HISTORY_MAX).forEach(p => PerfHistory.push(p));
+      if (typeof updatePerfUI === 'function') updatePerfUI();
+    }
+  } catch (e) { /* 首开/库损坏静默 */ }
+})();
+
+/** 记录一次请求性能（内存 + 异步落盘双写）
  * @param {string} model - 模型名
  * @param {Object} stats - stats 对象
  * @param {boolean} ok - 是否成功
  * @returns {void} */
 function recordPerf(model, stats, ok) {
   PerfHistory.push({ model: model || '?', tokPerSec: (stats && stats.tokPerSec) || 0, firstMs: (stats && stats.firstMs) || 0, ok, ts: Date.now() });
-  if (PerfHistory.length > 40) PerfHistory.shift();
+  if (PerfHistory.length > PERF_HISTORY_MAX) PerfHistory.shift();
+  _persistPerfHistory();
 }
 
 /* ===================== UI 基础组件：模态框 / 确认框 ===================== */

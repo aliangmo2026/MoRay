@@ -84,13 +84,17 @@ body:has(#page-memory:not(.hidden)) #middleSidebar { display: none; }
 }
 .mem-src { font-size: 10px; color: var(--color-text-tertiary, #666666); }
 .mem-time { font-size: 10px; color: var(--color-text-tertiary, #666666); margin-left: auto; }
-.memcard-content {
-  margin-top: 2px; font-size: 13px; line-height: 1.6;
-  color: var(--color-text-primary, #ededed);
-  white-space: pre-wrap; word-break: break-word;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-}
-.memcard.is-open .memcard-content { display: block; -webkit-line-clamp: unset; }
+  .memcard-content {
+    margin-top: 2px; font-size: 13px; line-height: 1.6;
+    color: var(--color-text-primary, #ededed);
+    white-space: pre-wrap; word-break: break-word;
+    display: block; overflow: hidden;
+    /* [修复 2026-10-26] 折叠由 display/line-clamp 硬切改为 max-height 过渡动画：
+       2 行预览 ≈ 2×20.8px ≈ 42px；展开给大上限（超长正文仍完整可见） */
+    max-height: 42px;
+    transition: max-height 0.28s ease;
+  }
+  .memcard.is-open .memcard-content { max-height: 4000px; }
 .memcard-meta { margin-top: 8px; font-size: 10px; color: var(--color-text-tertiary, #666666); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mem-notice { font-size: 11px; color: var(--color-text-tertiary, #666666); }
 .mem-empty { padding: 24px 0; text-align: center; font-size: 12px; color: var(--color-text-tertiary, #666666); }
@@ -261,6 +265,12 @@ body:has(#page-memory:not(.hidden)) #middleSidebar { display: none; }
           if (!n || n.nodeType !== 1 || !n.classList) continue;
           if (!delBtn && n.classList.contains('mem-del')) delBtn = n;
           if (!card && n.classList.contains('memcard')) card = n;
+        }
+        // [修复 2026-10-26] composedPath 缺失或返回空数组时（部分内嵌容器/内核差异），
+        // 委托会静默失效 = 点击展开/收起无任何反应；回退 ev.target.closest 双保险
+        if (!delBtn && !card && ev.target && ev.target.nodeType === 1 && typeof ev.target.closest === 'function') {
+          delBtn = ev.target.closest('.mem-del');
+          card = ev.target.closest('.memcard');
         }
         if (delBtn && card) {
           const delId = card.getAttribute('data-mem-id') || '';
