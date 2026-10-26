@@ -257,7 +257,9 @@ function syncInputModelLabel() {
   const m = activeModelName() || currentConvModel();
   // [v3.15.13] 统一展示完整模型名（本地含 :tag），不再丢 tag
   // [Day22b] 顶栏那行"模型 · 本地优先/云端"小字已下线，模型身份随模型名并入这一行显示
-  const local = (typeof isLocalModelName === 'function') && isLocalModelName(m);
+  // [2026-10-25 显示修正] isLocalChatModel（经云端修正）：旧 isLocalModelName 在
+  // Ollama 在线时把选中的云端模型也标成"本地优先"
+  const local = (typeof isLocalChatModel === 'function' ? isLocalChatModel(m) : (typeof isLocalModelName === 'function' && isLocalModelName(m)));
   label.textContent = m ? (preciseModelName(m) + ' · ' + (local ? '本地优先' : '云端')) : '选择模型';
   if (wrap) wrap.title = m ? (m + (local ? '（本地模型 · 数据不出本机）' : '（云端模型 · 请求会离开本机）')) : '未检测到模型，请先在设置中配置后端';
   // [深度思考] 与模型标签同类时机刷新三态按钮
@@ -1519,7 +1521,8 @@ async function appendDeterministicMetaReply(conv, question) {
     } catch (e) { /* 路由失败则退回当前模型 */ }
   }
   model = preciseModelName(model || currentConvModel(conv));
-  const source = (typeof isLocalModelName === 'function' && isLocalModelName(model)) ? '本地 Ollama' : '云端 OpenAI 兼容';
+    // [2026-10-25 显示修正] 云端模型（如 glm 系）不再被 isLocalModelName 误标"本地 Ollama"
+    const source = (typeof isLocalChatModel === 'function' ? isLocalChatModel(model) : (typeof isLocalModelName === 'function' && isLocalModelName(model))) ? '本地 Ollama' : '云端 OpenAI 兼容';
   const picked = conv.userPickedModel === true;
   const parts = ['当前实际使用 ' + model + '（' + source + '）', picked ? '由你手动选择' : '由智能路由选择'];
   if (routeInfo && routeInfo.reason) parts.push('路由：' + routeInfo.reason);
@@ -2064,7 +2067,8 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
         // [TTFT 反馈] 实际模型确定后区分“已驻留”与“正在唤醒（冷加载）”
         (async () => {
           try {
-            if (typeof isLocalModelName !== 'function' || !isLocalModelName(assistantMsg.model)) return;
+            // [2026-10-25 显示修正] 唤醒提示只对真·本地模型；云端模型无"唤醒"概念
+            if (typeof isLocalChatModel !== 'function' || !isLocalChatModel(assistantMsg.model)) return;
             if (typeof ollamaLoadedModels !== 'function') return;
             const loaded = await ollamaLoadedModels();
             const st = hdr.querySelector('.gen-status-text');
@@ -2558,7 +2562,8 @@ function setupChatHeaderEvents() {
 function openChatSettings() {
   const conv = AppState.activeConv;
   if (!conv) { showNotification('提示', '请先打开一个会话', 'info'); return; }
-  const models = '<option value="">（跟随默认模型 / 自动路由）</option>' + AI.models.map(m => `<option value="${escapeHtml(m.name)}" ${conv.model === m.name ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('');
+  // [2026-10-25 统一数据源] 与智能路由/输入台弹层同源：滤非聊天模型 + 云端 optgroup 分组
+  const models = '<option value="">（跟随默认模型 / 自动路由）</option>' + selectableModelOptionsHtml(conv.model || '', false);
   const box = showModal(`
     <div class="form-row">
       <label class="form-label">会话模型</label>
