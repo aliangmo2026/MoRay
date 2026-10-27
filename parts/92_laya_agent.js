@@ -53,6 +53,23 @@
   }
   function agentOn() { return agentMode() === 'on'; }   // 兼容包装：旧调用点语义不变（仅 'on' 为 true）
 
+  /* ---------------- [2026-10-27 寒暄防呆闸] ----------------
+   * 事故背景：寒暄（"你好"）被意图链送进 Laya，规划层三级兜底生成"搜索[你好]"
+   * 外呼百度，返回无意义结果——体验灾难。本闸在 decideMode 之前一票否决：
+   *   1) 纯寒暄（任意长度，如"你好""hi!! 在吗""嗯。"）→ 强制纯聊天；
+   *   2) 极短且零任务信号（<5 字、无任何动词/技术指令词）→ 强制纯聊天。
+   * 含任务词的短句（"改bug""查价格""写个脚本"）永不命中——真任务零误伤。
+   * 与 Laya 规划层寒暄闸（task_planner casual 拦截）构成前后端双保险。 */
+  var CASUAL_GREETING_RE = /^(?:你好|您好|嗨|哈喽|哈罗|hello|hi+|hey|yo|早安|早上好|中午好|下午好|晚上好|晚安|在吗|在不在|在么|谢谢|多谢|感谢|再见|拜拜|辛苦了|okay?|嗯+|哦+|好的|收到|行|可以)[!！~～。．,.，\s]*$/i;
+  var TASK_HINT_RE = /(写|做|搞|弄|生成|创建|新建|构建|开发|修改|改|修复|修|优化|重构|分析|查|搜|找|调研|检索|搜索|统计|汇总|整理|计算|对比|评估|测试|调试|排查|运行|执行|跑|启动|部署|发布|编译|安装|下载|导出|导入|读取|写入|删除|保存|代码|脚本|程序|函数|模块|文件|目录|文件夹|数据|数据库|接口|api|日志|报错|错误|bug|报告|方案|文档|页面|组件|配置|环境|服务器|命令|任务|流程|架构|python|javascript|java|sql|价格|多少钱|资讯|新闻|政策|行情|趋势)/i;
+  function isCasualText(raw) {
+    var t = String(raw == null ? '' : raw).trim();
+    if (!t) return false;
+    if (CASUAL_GREETING_RE.test(t)) return true;   // 纯寒暄（含标点/空格尾缀）
+    return t.length < 5 && !TASK_HINT_RE.test(t);  // 极短且零任务信号
+  }
+  window.morayIsCasualText = isCasualText;   // 手工验收入口
+
   // [L7.8 前端 2026-10-01] auto 模式意图判定：调 8001 /api/intent/decide（超时 1500ms），失败降级 'chat'
   async function decideMode(raw) {
     /* 调 8001 /api/intent/decide，超时 1500ms，失败降级 'chat'；
@@ -110,6 +127,39 @@
   }
   function mdPlain(s) { return String(s == null ? '' : s).replace(/[`*_~#[\]>]/g, ''); }
   function clampStr(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n) + '…' : s; }
+
+  /* [JSON 剥壳 2026-10-27] 模型（微调 QA 系）习惯把答案包进 {"answer":"..."} 信封，
+   * answer 内还可能再嵌一层 JSON 字符串——不剥直接上屏就是聊天流里的原始 JSON 事故。
+   * 只认 answer / final_answer 字符串键（file/argus/zcode 等多键工具载荷天然不命中，
+   * 不会误伤 summarizeResult 的结构化分支）；剥出的文本若仍是 JSON 对象串 → 美化缩进
+   * 输出（那是用户要的数据本体，不再是信封）。与 30_chat.js 同名函数同款逻辑、各自自包含。 */
+  function unwrapAnswerEnvelope(raw) {
+    var orig = String(raw == null ? '' : raw);
+    var s = orig.trim();
+    if (s.charAt(0) !== '{' && s.charAt(0) !== '`') return orig;   // 快路径：非 JSON/围栏开头原样返回
+    var fence = s.match(/^```[a-zA-Z]*\s*\n([\s\S]*?)\n?\s*```$/);
+    if (fence) s = String(fence[1] || '').trim();   // 整段 ```json 包裹的信封同样剥
+    if (s.charAt(0) !== '{') return orig;   // 围栏内不是 JSON 信封（正常代码块）→ 原样保留
+    var KEYS = ['answer', 'final_answer'];
+    var val = s;
+    for (var i = 0; i < 3; i++) {   // 信封最多剥 3 层（answer 内再嵌 JSON 的连环壳）
+      if (val.charAt(0) !== '{') break;
+      var d = null;
+      try { d = JSON.parse(val); } catch (e) { break; }
+      if (!d || typeof d !== 'object' || Array.isArray(d)) break;
+      var picked = null;
+      for (var k = 0; k < KEYS.length; k++) {
+        if (typeof d[KEYS[k]] === 'string') { picked = d[KEYS[k]]; break; }
+      }
+      if (picked == null || !picked.trim()) break;
+      val = picked.trim();
+    }
+    if (!val || val === s || val === orig.trim()) return orig;
+    if (val.charAt(0) === '{' || val.charAt(0) === '[') {
+      try { return JSON.stringify(JSON.parse(val), null, 2); } catch (eP) { /* 半截 JSON 按文本交付 */ }
+    }
+    return val;
+  }
   function highlightCode(code) {
     var src = String(code || '');
     try {
@@ -129,15 +179,24 @@
     '.laya-agent-btn:hover{border-color:rgba(229,115,74,.45)}',
     '.laya-agent-btn.on{background:rgba(229,115,74,.16);color:#E5734A;border-color:rgba(229,115,74,.5)}',
     '.laya-agent-btn.auto{background:rgba(59,130,246,.16);color:#3B82F6;border-color:rgba(59,130,246,.5)}',
+    /* [极简蓝改造 2026-10-27] 面板壳脱离纯黑浮层：与 136 现代皮同配方毛玻璃
+     * （blur 24px saturate 1.2 + 半透明底）+ 极客蓝描边/悬停；浅色主题白玻璃覆盖。
+     * 保留面板本体（取消执行按钮的唯一入口 + 查看详情定位目标），只换皮不删功能。 */
     '#layaExecPanel{position:fixed;right:14px;top:64px;bottom:16px;width:352px;z-index:1200;',
-    'display:none;flex-direction:column;background:rgba(20,20,20,.97);border:1px solid #2a2a2a;border-radius:12px;',
-    'box-shadow:0 12px 40px rgba(0,0,0,.5);font-size:12px;color:#d4d4d4;overflow:hidden}',
+    'display:none;flex-direction:column;background:rgba(16,18,26,.58);',
+    '-webkit-backdrop-filter:blur(24px) saturate(1.2);backdrop-filter:blur(24px) saturate(1.2);',
+    'border:1px solid rgba(47,124,246,.22);border-radius:12px;',
+    'box-shadow:0 8px 28px rgba(0,0,0,.22);font-size:12px;color:#e5e7eb;overflow:hidden}',
+    'html[data-theme="light"] #layaExecPanel{background:rgba(255,255,255,.68);color:#1d1d1f;',
+    'border-color:rgba(47,124,246,.28);box-shadow:0 8px 24px rgba(31,41,55,.10)}',
     '#layaExecPanel.show{display:flex}',
     '#layaExecPanel.collapsed{display:none}',
     '.laya-reopen{position:fixed;right:14px;top:64px;z-index:1200;display:none;padding:8px 10px;',
-    'background:rgba(20,20,20,.95);border:1px solid #2a2a2a;border-radius:10px;cursor:pointer;color:#E5734A;font-size:14px}',
+    'background:rgba(16,18,26,.58);-webkit-backdrop-filter:blur(24px);backdrop-filter:blur(24px);',
+    'border:1px solid rgba(47,124,246,.3);border-radius:10px;cursor:pointer;color:#60a5fa;font-size:14px}',
+    'html[data-theme="light"] .laya-reopen{background:rgba(255,255,255,.68);color:#1e40af}',
     '.laya-reopen.show{display:block}',
-    '.laya-p-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #2a2a2a;flex-shrink:0}',
+    '.laya-p-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(47,124,246,.18);flex-shrink:0}',
     '.laya-p-title{font-weight:600;color:#e8e8e8}',
     '.laya-p-status{font-size:11px;padding:2px 8px;border-radius:999px}',
     '.laya-st-run{background:rgba(251,191,36,.15);color:#FBBF24}',
@@ -145,10 +204,10 @@
     '.laya-st-fail{background:rgba(248,113,113,.15);color:#f87171}',
     '.laya-st-cancel{background:rgba(156,163,175,.15);color:#9ca3af}',
     '.laya-p-collapse{margin-left:auto;background:none;border:none;color:#8a8a8a;cursor:pointer;font-size:14px;padding:2px 4px}',
-    '.laya-p-prog{height:4px;background:#242424;flex-shrink:0}',
-    '.laya-p-prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,#E5734A,#FBBF24);transition:width .3s}',
+    '.laya-p-prog{height:4px;background:rgba(47,124,246,.14);flex-shrink:0}',
+    '.laya-p-prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2f7cf6,#60a5fa);transition:width .3s}',
     '.laya-p-steps{flex:1;min-height:0;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
-    '.laya-step{border:1px solid #262626;border-radius:9px;padding:7px 9px;background:rgba(255,255,255,.02)}',
+    '.laya-step{border:1px solid rgba(47,124,246,.16);border-radius:9px;padding:7px 9px;background:rgba(255,255,255,.03)}',
     '.laya-step .row{display:flex;align-items:center;gap:7px;cursor:default}',
     '.laya-step.expandable .row{cursor:pointer}',
     '.laya-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#555}',
@@ -162,11 +221,11 @@
     '.laya-step .detail{display:none;margin-top:6px;padding:6px 8px;background:#181818;border-radius:6px;',
     'white-space:pre-wrap;word-break:break-all;max-height:160px;overflow:auto;color:#a8a8a8;font-size:11px}',
     '.laya-step.open .detail{display:block}',
-    '.laya-p-foot{border-top:1px solid #2a2a2a;padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}',
+    '.laya-p-foot{border-top:1px solid rgba(47,124,246,.18);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}',
     '.laya-p-elapsed{color:#8a8a8a;font-variant-numeric:tabular-nums}',
     '.laya-p-actions{margin-left:auto;display:flex;gap:6px}',
-    '.laya-btn{padding:3px 10px;border-radius:8px;border:1px solid #333;background:rgba(255,255,255,.04);color:#d4d4d4;font-size:11px;cursor:pointer}',
-    '.laya-btn:hover{border-color:#E5734A;color:#E5734A}',
+    '.laya-btn{padding:3px 10px;border-radius:8px;border:1px solid rgba(47,124,246,.28);background:rgba(47,124,246,.08);color:#dbeafe;font-size:11px;cursor:pointer}',
+    '.laya-btn:hover{border-color:rgba(47,124,246,.6);color:#60a5fa}',
     '.laya-btn.danger{border-color:rgba(248,113,113,.4);color:#f87171}',
     '.laya-btn.danger:hover{background:rgba(248,113,113,.12)}',
     '.laya-btn[hidden]{display:none}',
@@ -226,7 +285,18 @@
     '.laya-final{border-top:1px dashed #3a3a3a;margin-top:8px;padding-top:8px}',
     '.laya-final-h{font-weight:600;color:#e8e8e8;font-size:12px;margin-bottom:6px}',
     '.laya-flash{animation:layaFlash 1.4s ease 1}',
-    '@keyframes layaFlash{0%{background:rgba(229,115,74,.22)}100%{background:transparent}}',
+    '@keyframes layaFlash{0%{background:rgba(47,124,246,.20)}100%{background:transparent}}',
+    /* [极简蓝改造 · 浅色主题] 面板内文/卡片在白玻璃上的对比度覆盖（代码/日志块保持深底等宽） */
+    'html[data-theme="light"] #layaExecPanel .laya-step{background:rgba(255,255,255,.55);border-color:rgba(31,41,55,.12)}',
+    'html[data-theme="light"] #layaExecPanel .laya-step .desc,',
+    'html[data-theme="light"] #layaExecPanel .laya-txt,',
+    'html[data-theme="light"] #layaExecPanel .laya-kv .v{color:#1d1d1f}',
+    'html[data-theme="light"] #layaExecPanel .laya-kv .k,',
+    'html[data-theme="light"] #layaExecPanel .laya-step .tool,',
+    'html[data-theme="light"] #layaExecPanel .laya-p-elapsed,',
+    'html[data-theme="light"] #layaExecPanel .laya-cap{color:#6b7280}',
+    'html[data-theme="light"] #layaExecPanel .laya-kv{border-bottom-color:rgba(31,41,55,.10)}',
+    'html[data-theme="light"] #layaExecPanel .laya-btn{border-color:rgba(31,41,55,.18);background:rgba(47,124,246,.06);color:#1e40af}',
     '.laya-chat-detail{margin-top:10px;padding:3px 12px;border-radius:8px;font-size:11px;cursor:pointer;background:transparent;',
     'border:1px solid var(--color-line-ghost,rgba(127,127,127,.3));color:var(--color-text-secondary,#9ca3af);transition:all .18s}',
     '.laya-chat-detail:hover{border-color:rgba(229,115,74,.5);color:#E5734A}',
@@ -881,7 +951,9 @@
       var st = ev.status;
       if (st === 'success') {
         setStepStatus('成功', 'ok');
-        state.finalText = String(ev.result || '（无输出）');
+        // [JSON 剥壳 2026-10-27] final.result 先过信封清洗：聊天精简结论/面板最终块/复制/导出
+        // 四个消费方拿到的都是剥壳后的人类可读文本，原始 {"answer":...} 不再有机会上屏。
+        state.finalText = unwrapAnswerEnvelope(String(ev.result || '（无输出）'));
         // 完整结果只进面板（结构化渲染）；聊天只留状态+一句话结论（不重复数据）
         appendFinalBlock('最终结果' + (ev.note ? ' · ' + ev.note : ''),
           buildResultBlock(lastStepTool(ev), state.finalText));
@@ -1783,11 +1855,16 @@
         var raw = ((inp && inp.value) || '').trim();
         var m = agentMode();
         var finalMode = 'chat';
+        /* [2026-10-27 寒暄防呆闸] 寒暄/极短非任务文本 → 强制纯聊天：不进 decideMode、
+         * 不走 on 模式强制升级、不派发 Agent/ZCode 引擎，原生发送让主模型正常打招呼。
+         * （auto 模式下意图路由对"你好"本就判 chat；真正事故源是 on 档强制升级 +
+         * Laya 规划层"无信号→argus 搜索"三级兜底——本闸掐死最前端入口。） */
+        var casual = raw && isCasualText(raw);
         /* [2026-10-01 U-6-2] on/auto 统一走 decideMode：auto 语义不变（chat→聊天 /
          * agent→浮层 / code→卡片）；on 模式经判定分流（code→卡片、agent→浮层），
          * 判定为 chat 时按 on 语义强制改 agent（用户强制开 Agent 不回落纯聊天）。
          * 三态按钮与 off 路径（finalMode 恒 'chat' → 原生发送）不动。 */
-        if (raw && (m === 'on' || m === 'auto')) {
+        if (raw && !casual && (m === 'on' || m === 'auto')) {
           if (deciding) {
             showNotification('意图判定中', '上一条输入还在判定，请稍候', 'info', 1500);
             return;

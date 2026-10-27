@@ -21,6 +21,39 @@ function buildSystemPrompt() {
   return custom || DEFAULT_SYSTEM_PROMPT;
 }
 
+/** [JSON 剥壳 2026-10-27] 模型（微调 QA 系）习惯把答案包进 {"answer":"..."} 信封，
+ * answer 内还可能再嵌一层 JSON 字符串——塞进 renderMarkdown 前必须剥成人类可读文本，
+ * 绝不把原始 JSON 直接显示在对话框里。只认 answer / final_answer 字符串键（多键数据
+ * 载荷不命中，不误伤）；剥出的文本若仍是 JSON 对象串 → 美化缩进输出。
+ * 与 92_laya_agent.js 同名函数同款逻辑、各自自包含（parts 分片互不依赖的既有约定）。 */
+function unwrapAnswerEnvelope(raw) {
+  const orig = String(raw == null ? '' : raw);
+  let s = orig.trim();
+  if (s.charAt(0) !== '{' && s.charAt(0) !== '`') return orig;   // 快路径：非 JSON/围栏开头原样返回
+  const fence = s.match(/^```[a-zA-Z]*\s*\n([\s\S]*?)\n?\s*```$/);
+  if (fence) s = String(fence[1] || '').trim();   // 整段 ```json 包裹的信封同样剥
+  if (s.charAt(0) !== '{') return orig;   // 围栏内不是 JSON 信封（正常代码块）→ 原样保留
+  const KEYS = ['answer', 'final_answer'];
+  let val = s;
+  for (let i = 0; i < 3; i++) {   // 信封最多剥 3 层（answer 内再嵌 JSON 的连环壳）
+    if (val.charAt(0) !== '{') break;
+    let d = null;
+    try { d = JSON.parse(val); } catch (e) { break; }
+    if (!d || typeof d !== 'object' || Array.isArray(d)) break;
+    let picked = null;
+    for (const k of KEYS) {
+      if (typeof d[k] === 'string') { picked = d[k]; break; }
+    }
+    if (picked == null || !picked.trim()) break;
+    val = picked.trim();
+  }
+  if (!val || val === s || val === orig.trim()) return orig;
+  if (val.charAt(0) === '{' || val.charAt(0) === '[') {
+    try { return JSON.stringify(JSON.parse(val), null, 2); } catch (eP) { /* 半截 JSON 按文本交付 */ }
+  }
+  return val;
+}
+
 /** 全局应用状态 */
 const AppState = {
   /** 会话列表 @type {Array} */
@@ -2136,6 +2169,9 @@ async function generateAssistantReply(conv, extraContext, citations, genOpts) {
   try {
     const result = await promise;
     assistantMsg.content = result.content || assistantMsg.content;
+    // [JSON 剥壳 2026-10-27] 流式收尾统一清洗：模型输出 {"answer":"..."} 信封时剥出正文
+    // 再落库+渲染（原始 JSON 字符串禁止直接上屏；与 92 final 帧同款防御）。
+    assistantMsg.content = unwrapAnswerEnvelope(assistantMsg.content);
     assistantMsg.reasoning = result.reasoning || assistantMsg.reasoning;
     // [空正文守卫 2026-10-25] 思考链挤爆窗口时上游正常 200 但正文零 token（图三空白回复）：
     // content 空 + reasoning 非空 → 兜底文案替代无声空白（完整思考过程仍在折叠面板可看）。
