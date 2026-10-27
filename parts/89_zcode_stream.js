@@ -222,6 +222,9 @@
       /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
       '.mzs-artifact-card{display:flex;align-items:center;gap:8px;margin-top:6px;padding:7px 9px;',
       'border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      /* [Dogfood 2026-10-27] 整卡可点：有预览路径的卡给指针态+悬停反馈（原来只有小按钮活） */
+      '.mzs-artifact-card[data-preview-path]{cursor:pointer}',
+      '.mzs-artifact-card[data-preview-path]:hover{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.55)}',
       '.mzs-artifact-icon{flex-shrink:0;font-size:13px;line-height:1}',
       '.mzs-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
       'color:#DBEAFE;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:11px}',
@@ -231,7 +234,15 @@
       '.mzs-artifact-open:hover{background:rgba(96,165,250,.26)}',
       '.mzs-artifact-card[hidden],.mzs-file[hidden],.mzs-preview[hidden]{display:none}',
       '.mzs-file-more{margin-top:4px;background:transparent;border:none;color:#60A5FA;',
-      'font-size:11px;cursor:pointer;padding:0;font-family:inherit}'
+      'font-size:11px;cursor:pointer;padding:0;font-family:inherit}',
+      /* [2026-10-27 Diff 接入] 工具行下方折叠 Diff（内容行样式由 buildApprovalDiff 自带） */
+      '.mzs-diffwrap{padding-left:14px;border-bottom:1px solid #2a2a2a}',
+      '.mzs-diff{margin:3px 0 6px}',
+      '.mzs-diff>summary{cursor:pointer;color:#8a8a8a;font-size:10px;list-style:none;user-select:none}',
+      '.mzs-diff>summary::-webkit-details-marker{display:none}',
+      '.mzs-diff>summary:before{content:"\\25B8  ";color:#666}',
+      '.mzs-diff[open]>summary{color:#a3a3a3;margin-bottom:4px}',
+      '.mzs-diff[open]>summary:before{content:"\\25BE  "}'
     ].join('');
     document.head.appendChild(st);
   }
@@ -354,6 +365,35 @@
     try { s = JSON.stringify(input == null ? '' : input); } catch (e) { s = String(input == null ? '' : input); }
     if (!s || s === '""' || s === '{}' || s === '[]') return '';
     return '<span class="mzs-mono">' + esc(clip(s, 80)) + '</span>';
+  }
+
+  /** [2026-10-27 Diff 接入] tool.updated(scheduled) 的变更 Diff HTML：
+      Edit 取 input.old_str/new_str、Write 取 input.content（事件不带旧文件内容，
+      Write 按新文件口径 old='' 全 + 展示）；复用 125 分片的全局 buildApprovalDiff
+      （LCS 对齐 + 上下文压缩 + maxLines 闸，输出自带滚动容器）。
+      非变更工具 / 字段缺失 / 两串相同 / 函数不可用 → 空串（时间线与改造前一致）。
+      返回 <details class="mzs-diff"> 折叠块（默认收起，点「查看 Diff」展开）。 */
+  function toolDiffHtml(toolName, input) {
+    if (!input || typeof input !== 'object') return '';
+    let oldStr = null, newStr = null;
+    if (toolName === 'Edit') {
+      if (typeof input.new_str !== 'string') return '';
+      oldStr = (typeof input.old_str === 'string') ? input.old_str : '';
+      newStr = input.new_str;
+    } else if (toolName === 'Write') {
+      if (typeof input.content !== 'string') return '';
+      oldStr = '';
+      newStr = input.content;
+    } else {
+      return '';
+    }
+    if (oldStr === newStr || typeof buildApprovalDiff !== 'function') return '';
+    let inner = '';
+    try { inner = buildApprovalDiff(oldStr, newStr, 200); } catch (e) { return ''; }
+    if (!inner) return '';
+    return '<details class="mzs-diff"><summary>' +
+      (toolName === 'Write' ? '查看 Diff（Write 新内容）' : '查看 Diff') +
+      '</summary>' + inner + '</details>';
   }
 
   function isSubagent(obj, p) {
@@ -526,6 +566,10 @@
         }
         addRow({ dot: 'blue', emoji: '🔧', label: 'tool: ' + name,
                  sumHtml: subTag + toolInputSummaryHtml(p.input), time: t });
+        // [2026-10-27 Diff 接入] Edit 的 old_str/new_str、Write 的 content 不再丢弃：
+        // 有变更数据就在工具行下方挂折叠 Diff（复用 125 的 buildApprovalDiff）
+        const diffHtml = toolDiffHtml(p.toolName, p.input);
+        if (diffHtml) addRowHTML('<div class="mzs-diffwrap">' + diffHtml + '</div>');
       } else if (p.kind === 'started') {
         addRow({ dot: 'yellow', emoji: '⏵', label: 'running...', labelCls: 'dim', ind: true, time: t });
       } else if (p.kind === 'result') {
@@ -587,7 +631,7 @@
         const zcodePath = taskId
           ? 'zcode:' + String(taskId) + ':' + encodeURIComponent(name)
           : '';
-        html += '<div class="mzs-artifact-card"' + (folded ? ' hidden' : '') + '>' +
+        html += '<div class="mzs-artifact-card"' + (zcodePath ? ' data-preview-path="' + esc(zcodePath) + '" title="点击预览代码"' : '') + (folded ? ' hidden' : '') + '>' +
           '<span class="mzs-artifact-icon">📄</span>' +
           '<span class="mzs-artifact-path" title="' + esc(fp) + '">' + esc(name) + '</span>' +
           '<span class="mzs-artifact-meta">(' + entry.count + ' 次操作)</span>' +

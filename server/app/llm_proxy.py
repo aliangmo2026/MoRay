@@ -712,7 +712,24 @@ async def llm_chat(request: Request):
         try:
             status, data, msg = await _do_request(upstream_url, upstream_headers, payload)
         except (httpx.TimeoutException, httpx.HTTPError) as e:
-            status, data, msg = 599, None, type(e).__name__
+            # [2026-10-27 真感知#2] 超时子类（ReadTimeout/ConnectTimeout/PoolTimeout…）统一
+            # 归一为 TimeoutException，供下方报错分支区分"冷加载慢"与"真连不上"
+            status, data, msg = 599, None, ("TimeoutException" if isinstance(e, httpx.TimeoutException) else type(e).__name__)
+
+        # [2026-10-27 think 自愈·方案①] 400 "does not support thinking" → 剥思考字段重试一次
+        # （只一次防死循环；实测真凶 reasoning_effort，think 同剥）。仅本地档——云端 400 走
+        # 既有回冲/报错链。payload 与流式共用同一 dict，pop 后两条路径互不干扰（互斥执行）。
+        if (status == 400 and use_local
+                and "does not support thinking" in str(msg or "")
+                and ("think" in payload or "reasoning_effort" in payload)):
+            _stripped = [k for k in ("think", "reasoning_effort") if k in payload]
+            for _k in _stripped:
+                payload.pop(_k, None)
+            _logger.warning("[router] 非流式400不支持思考，剥 %s 自愈重试一次", "+".join(_stripped))
+            try:
+                status, data, msg = await _do_request(upstream_url, upstream_headers, payload)
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                status, data, msg = 599, None, ("TimeoutException" if isinstance(e, httpx.TimeoutException) else type(e).__name__)
 
         # 本地失败 → 重试本地（上限 _LOCAL_RETRY_MAX 次），不碰云端
         attempts = 0
@@ -722,7 +739,7 @@ async def llm_chat(request: Request):
             try:
                 status, data, msg = await _do_request(upstream_url, upstream_headers, payload)
             except (httpx.TimeoutException, httpx.HTTPError) as e:
-                status, data, msg = 599, None, type(e).__name__
+                status, data, msg = 599, None, ("TimeoutException" if isinstance(e, httpx.TimeoutException) else type(e).__name__)
 
         # 本地彻底失败 → [批次二·任务E + 批次二·5 任务1 红线] 本地 provider **无论熔断闸门状态
         # 都绝不降级云端**（本地失败静默切云端 = 偷偷计费 + 数据出本地机）；只如实报错：
@@ -734,6 +751,26 @@ async def llm_chat(request: Request):
                             f"27B 服务未启动，请先启动独立服务。（{config.LOCAL_27B_BASE_URL}，模型 "
                             f"{config.LOCAL_27B_MODEL_NAME}；失败原因：{msg}。"
                             f"也可切换回 provider=ollama。）")
+            # [2026-10-27 真感知#2 dogfooding] 超时≠服务不可用：模型冷加载常超请求窗口，
+            # 原文案把"慢"说成"挂"，与状态栏"Ollama 已连接"自相矛盾（实测误导用户重启服务）。
+            if msg == "TimeoutException":
+                _logger.warning("[router] Ollama 响应超时(status=%s)，按红线不降级云端", status)
+                return _err(503, "local_upstream_error",
+                            f"Ollama 响应超时（模型可能正在冷加载，通常需 10-30s），请稍后重试。"
+                            f"（{config.OLLAMA_BASE_URL}，模型 {model}）")
+            # [2026-10-27 真感知#2 连带] HTTP 层拒绝/错误（真实 4xx/5xx 状态码，非 599 异常
+            # 标记）≠服务没启动：如实转述上游原因。此前 400 "does not support thinking" 被套进
+            # "服务不可用+请确认 Ollama 已启动"模板 = 教科书式报错撒谎（dogfood 实测踩中）。
+            if status != 599:
+                if 400 <= status < 500:
+                    _logger.warning("[router] Ollama 上游 HTTP %s（4xx 拒绝），按红线不降级云端", status)
+                    return _err(503, "local_upstream_error",
+                                f"Ollama 拒绝了请求（HTTP {status}）：{msg}。"
+                                f"（{config.OLLAMA_BASE_URL}，模型 {model}）")
+                _logger.warning("[router] Ollama 上游 HTTP %s，按红线不降级云端", status)
+                return _err(503, "local_upstream_error",
+                            f"本地 Ollama 上游错误（HTTP {status}）：{msg}。请稍后重试。"
+                            f"（{config.OLLAMA_BASE_URL}，模型 {model}）")
             _logger.warning("[router] Ollama 失败(%s)，按红线不降级云端", status)
             return _err(503, "local_upstream_error",
                         f"本地 Ollama 服务不可用（{config.OLLAMA_BASE_URL}，模型 {model}；"
@@ -797,6 +834,7 @@ async def llm_chat(request: Request):
         attempt_headers = upstream_headers
         attempt_payload = payload
         local_tried = not use_local
+        _think_heal_done = False   # [2026-10-27 think 自愈·方案①] 400 剥思考字段只重试一次
 
         client = httpx.AsyncClient(timeout=_TIMEOUT)
         try:
@@ -817,10 +855,18 @@ async def llm_chat(request: Request):
                             yield f"data: {json.dumps({'ok': False, 'code': 'local_upstream_error', 'message': msg_27b})}\n\n"
                             yield "data: [DONE]\n\n"
                             return
-                        _logger.warning("[router] 流式 Ollama 连接失败(%s)，按红线不降级云端",
-                                        type(e).__name__)
-                        msg_local = (f"本地 Ollama 服务不可用（{config.OLLAMA_BASE_URL}，模型 {model}；"
-                                     f"失败原因：{type(e).__name__}）。请确认 Ollama 已启动后重试。")
+                        if isinstance(e, httpx.TimeoutException):
+                            # [2026-10-27 真感知#2 dogfooding] 超时（含冷加载）≠服务不可用：
+                            # 单独文案，绝不再把"慢"报成"挂"（ConnectError 才维持原文案）
+                            _logger.warning("[router] 流式 Ollama 响应超时(%s)，按红线不降级云端",
+                                            type(e).__name__)
+                            msg_local = (f"Ollama 响应超时（模型可能正在冷加载，通常需 10-30s），请稍后重试。"
+                                         f"（{config.OLLAMA_BASE_URL}，模型 {model}；失败原因：{type(e).__name__}）")
+                        else:
+                            _logger.warning("[router] 流式 Ollama 连接失败(%s)，按红线不降级云端",
+                                            type(e).__name__)
+                            msg_local = (f"本地 Ollama 服务不可用（{config.OLLAMA_BASE_URL}，模型 {model}；"
+                                         f"失败原因：{type(e).__name__}）。请确认 Ollama 已启动后重试。")
                         yield f"data: {json.dumps({'ok': False, 'code': 'local_upstream_error', 'message': msg_local})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -833,6 +879,21 @@ async def llm_chat(request: Request):
                     except Exception:  # noqa: BLE001
                         detail = "上游错误"
                     await upstream.aclose()
+
+                    # [2026-10-27 think 自愈·方案①] 400 "does not support thinking" → 剥掉
+                    # 思考控制字段立即重试一次（标志位防死循环）。实测真凶是 reasoning_effort
+                    # （think:true 单独下发 Ollama 实测放行），故两字段同剥——模型无关、免维护
+                    # 推理模型名单；命中本分支后 payload 已无思考字段，再 400 即如实报错。
+                    if (upstream.status_code == 400 and not _think_heal_done
+                            and "does not support thinking" in str(detail)
+                            and ("think" in attempt_payload or "reasoning_effort" in attempt_payload)):
+                        _think_heal_done = True
+                        _stripped = [k for k in ("think", "reasoning_effort") if k in attempt_payload]
+                        for _k in _stripped:
+                            attempt_payload.pop(_k, None)
+                        _logger.warning("[router] 上游400不支持思考，剥 %s 自愈重试一次",
+                                        "+".join(_stripped))
+                        continue
 
                     if not local_tried:
                         if provider == "custom_27b":
@@ -848,8 +909,14 @@ async def llm_chat(request: Request):
                         # [批次二·5 任务1 红线] Ollama HTTP 错误同样绝不降级云端
                         _logger.warning("[router] 流式 Ollama HTTP %s，按红线不降级云端",
                                         upstream.status_code)
-                        msg_local = (f"本地 Ollama 服务不可用（{config.OLLAMA_BASE_URL}，模型 {model}；"
-                                     f"失败原因：{detail}）。请确认 Ollama 已启动后重试。")
+                        # [2026-10-27 真感知#2 连带] HTTP 错误≠服务没启动：按 4xx/5xx 分流
+                        # 如实转述（如 400 "does not support thinking"），不再让用户去"确认已启动"
+                        if 400 <= upstream.status_code < 500:
+                            msg_local = (f"Ollama 拒绝了请求（HTTP {upstream.status_code}）：{detail}。"
+                                         f"（{config.OLLAMA_BASE_URL}，模型 {model}）")
+                        else:
+                            msg_local = (f"本地 Ollama 上游错误（HTTP {upstream.status_code}）：{detail}。"
+                                         f"请稍后重试。（{config.OLLAMA_BASE_URL}，模型 {model}）")
                         yield f"data: {json.dumps({'ok': False, 'code': 'local_upstream_error', 'message': msg_local})}\n\n"
                         yield "data: [DONE]\n\n"
                         return

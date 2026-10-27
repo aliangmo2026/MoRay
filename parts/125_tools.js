@@ -168,7 +168,7 @@ const ToolRegistry = {
       ? (art.bytes >= 1024 ? (art.bytes / 1024).toFixed(1) + ' KB' : art.bytes + ' B')
       : '';
     const meta = [art.action || '', size].filter(Boolean).join(' · ');
-    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2">' +
+    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2 cursor-pointer hover:opacity-90" data-preview-path="' + escapeHtml(path) + '" title="点击预览代码">' +
       '<i data-lucide="file-code" class="w-4 h-4 text-brand-cobalt shrink-0"></i>' +
       '<div class="min-w-0 flex-1">' +
       '<div class="text-[11px] text-text-primary font-medium truncate" title="' + escapeHtml(path) + '">' + escapeHtml(path) + '</div>' +

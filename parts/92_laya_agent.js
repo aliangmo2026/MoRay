@@ -70,6 +70,11 @@
   }
   window.morayIsCasualText = isCasualText;   // 手工验收入口
 
+  /* [2026-10-27 真感知#1 dogfooding] Agent 关档的"代码/文件任务"信号词（拒绝静默降级）。
+   * 与 TASK_HINT_RE 同源但收窄：动作词×代码物词同现，或"重构/编译"及语言名等显式
+   * 关键词——避免"查价格""看新闻"类纯聊天文本误报 ZCode 提示。 */
+  var OFF_CODE_HINT_RE = /((写|做|创建|新建|生成|修改|改|修复|优化|重构|开发|调试|跑|运行|执行|部署)\S{0,12}(代码|脚本|程序|函数|模块|类|接口|文件|单元测试|配置))|(重构|编译|二分查找)|\b(python|javascript|typescript|java|sql|rust|golang|c\+\+)\b/i;
+
   // [L7.8 前端 2026-10-01] auto 模式意图判定：调 8001 /api/intent/decide（超时 1500ms），失败降级 'chat'
   async function decideMode(raw) {
     /* 调 8001 /api/intent/decide，超时 1500ms，失败降级 'chat'；
@@ -1247,6 +1252,9 @@
       '.zcode-exec-card .zec-file-ops{color:var(--color-text-tertiary,#666);font-size:10px;flex-shrink:0}',
       /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
       '.zcode-exec-card .zec-artifact-card{display:flex;align-items:center;gap:8px;margin:4px 0;padding:6px 9px;border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      /* [Dogfood 2026-10-27] 整卡可点：有预览路径的卡给指针态+悬停反馈（原来只有小按钮活） */
+      '.zcode-exec-card .zec-artifact-card[data-preview-path]{cursor:pointer}',
+      '.zcode-exec-card .zec-artifact-card[data-preview-path]:hover{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.55)}',
       '.zcode-exec-card .zec-artifact-icon{flex-shrink:0;font-size:12px;line-height:1}',
       '.zcode-exec-card .zec-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-primary,#E0E0E0);font-family:ui-monospace,Consolas,monospace;font-size:11px}',
       '.zcode-exec-card .zec-artifact-meta{flex-shrink:0;color:var(--color-text-tertiary,#8a8a8a);font-size:10px}',
@@ -1465,7 +1473,7 @@
         var zcodePath = ex.taskId
           ? 'zcode:' + String(ex.taskId) + ':' + encodeURIComponent(fname)
           : '';
-        h.push('<div class="zec-artifact-card">' +
+        h.push('<div class="zec-artifact-card"' + (zcodePath ? ' data-preview-path="' + attr(zcodePath) + '" title="点击预览代码"' : '') + '>' +
           '<span class="zec-artifact-icon">📄</span>' +
           '<span class="zec-artifact-path" title="' + attr(f.path) + '">' + esc(fname) + '</span>' +
           '<span class="zec-artifact-meta">(' + f.count + ' 次操作)</span>' +
@@ -1860,6 +1868,12 @@
          * （auto 模式下意图路由对"你好"本就判 chat；真正事故源是 on 档强制升级 +
          * Laya 规划层"无信号→argus 搜索"三级兜底——本闸掐死最前端入口。） */
         var casual = raw && isCasualText(raw);
+        /* [2026-10-27 真感知#1 dogfooding] Agent 关档 + 代码/文件任务型输入 → 显式提示，
+         * 拒绝静默降级：输入台选着 ZCode 引擎但顶栏 Agent 关时，任务会无声落进普通
+         * 聊天，用户傻等到 25s 后的报错才发现（2026-10-27 实测）。只提示不拦截，聊天照发。 */
+        if (raw && !casual && m === 'off' && OFF_CODE_HINT_RE.test(raw)) {
+          showNotification('ZCode 未启用：已按普通聊天处理', '顶栏切「Agent 自动」可沙箱执行', 'info', 4500);
+        }
         /* [2026-10-01 U-6-2] on/auto 统一走 decideMode：auto 语义不变（chat→聊天 /
          * agent→浮层 / code→卡片）；on 模式经判定分流（code→卡片、agent→浮层），
          * 判定为 chat 时按 on 语义强制改 agent（用户强制开 Agent 不回落纯聊天）。

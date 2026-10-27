@@ -26,6 +26,7 @@ const MoraySettings = {
     openaiBaseURL: '',
     openaiAPIKey: '',              // 存储时混淆（见 obfuscate）
     openaiModel: '',
+    providerPreset: '',           // [Dogfood 2026-10-27] 服务商预设下拉记忆（上次选中的服务商名，''=未选 / 'custom'）
     openaiEnabled: false,
     defaultModel: '',
     compareModels: [],

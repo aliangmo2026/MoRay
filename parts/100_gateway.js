@@ -870,7 +870,11 @@ const HealthMonitor = {
         const res = await fetch(AI.ollamaURL + '/api/tags', { signal: ctrl.signal });
         clearTimeout(t);
         ok = res.ok;
-      } else if (MoraySettings.get('openaiEnabled') && AI.openaiBase) {
+      } else if (MoraySettings.get('openaiEnabled') && AI.openaiBase && MoraySettings.getAPIKey()) {
+        // [2026-10-27 真感知#3 dogfooding] 无浏览器侧 Key → 跳过外网探测（落到下方
+        // else → status=unknown）：直连 /models 必 401，每次启动 + 每 5 分钟打一次
+        // open.bigmodel.cn，控制台一片红引发隐私焦虑；.env 代理用户浏览器里同样没 Key，
+        // 直连探测本来就不代表真实通道（代理通道健康由后端负责）。
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 5000);
         const res = await fetch(AI.openaiBase + '/models', { headers: AI._openaiHeaders(), signal: ctrl.signal });

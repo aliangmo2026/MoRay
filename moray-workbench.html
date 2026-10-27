@@ -6400,6 +6400,7 @@ const MoraySettings = {
     openaiBaseURL: '',
     openaiAPIKey: '',              // 存储时混淆（见 obfuscate）
     openaiModel: '',
+    providerPreset: '',           // [Dogfood 2026-10-27] 服务商预设下拉记忆（上次选中的服务商名，''=未选 / 'custom'）
     openaiEnabled: false,
     defaultModel: '',
     compareModels: [],
@@ -16152,6 +16153,13 @@ const SettingsApp = {
     const c = MoraySettings.get();
     // [上下文预算] 滑条物理上限：存量超限值（如 131072）显示与滑块都夹到上限，本地小显存一碰就死
     const ctxLimit = Math.min(Number(c.contextLimit) || 8192, CONTEXT_LIMIT_MAX);
+    // [Dogfood 2026-10-27] 服务商预设回填：只认仍存在的预设名 / custom（已下架的旧值不回显成空白选框）
+    const presetBackfill = (() => {
+      const v = String(c.providerPreset || '');
+      if (!v) return '';
+      if (v === 'custom') return v;
+      return (typeof PROVIDER_PRESETS !== 'undefined' && PROVIDER_PRESETS.some(p => p.name === v)) ? v : '';
+    })();
     page.innerHTML = `
       <header class="h-14 px-5 flex items-center border-b border-line-ghost/50 flex-shrink-0">
         <h1 class="text-base font-semibold text-text-primary">设置</h1>
@@ -16232,8 +16240,8 @@ const SettingsApp = {
                 <div class="flex gap-2">
                   <select id="providerPresetSel" class="form-select" style="flex:1">
                     <option value="">— 选择服务商 —</option>
-                    ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" data-base="${escapeHtml(p.base)}" data-model="${escapeHtml(p.models)}" data-doc="${escapeHtml(p.doc)}">${escapeHtml(p.name)}</option>`).join('')}
-                    <option value="custom">自定义</option>
+                    ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" ${presetBackfill === p.name ? 'selected' : ''} data-base="${escapeHtml(p.base)}" data-model="${escapeHtml(p.models)}" data-doc="${escapeHtml(p.doc)}">${escapeHtml(p.name)}</option>`).join('')}
+                    <option value="custom" ${presetBackfill === 'custom' ? 'selected' : ''}>自定义</option>
                   </select>
                   <a id="providerDocLink" href="#" target="_blank" rel="noopener" class="btn-ghost px-3 rounded-lg text-[11px] border border-line-ghost flex items-center text-text-tertiary" style="display:none">控制台 ↗</a>
                 </div>
@@ -16715,13 +16723,22 @@ const SettingsApp = {
       this.classList.toggle('active');
       await MoraySettings.set('openaiEnabled', this.classList.contains('active'));
     });
-    on($('setOpenaiBase'), 'change', () => MoraySettings.set('openaiBaseURL', $('setOpenaiBase').value.trim()));
-    on($('setOpenaiModel'), 'change', () => {
+    // [Dogfood 2026-10-27 真感知] 原来三处 change 静默落库：用户改完地址/模型/Key 不知道
+    // 存没存上（“按钮是假的”体感来源之一）。各补一条 1.5s 轻提示，不回显 Key 内容。
+    on($('setOpenaiBase'), 'change', async () => {
+      await MoraySettings.set('openaiBaseURL', $('setOpenaiBase').value.trim());
+      showNotification('已保存', '接口地址已更新', 'success', 1500);
+    });
+    on($('setOpenaiModel'), 'change', async () => {
       const v = $('setOpenaiModel').value.trim();
       warnIfSuspiciousOpenaiModel(v);
-      MoraySettings.set('openaiModel', v);
+      await MoraySettings.set('openaiModel', v);
+      showNotification('已保存', v ? ('默认模型：' + v) : '默认模型已清空（跟随服务商）', 'success', 1500);
     });
-    on($('setOpenaiKey'), 'change', () => MoraySettings.set('openaiAPIKey', $('setOpenaiKey').value.trim()));
+    on($('setOpenaiKey'), 'change', async () => {
+      await MoraySettings.set('openaiAPIKey', $('setOpenaiKey').value.trim());
+      showNotification('已保存', 'API Key 已本地加密存储', 'success', 1500);
+    });
     on($('clearKeyBtn'), 'click', async () => {
       await MoraySettings.set({ openaiAPIKeyStored: '' });
       $('setOpenaiKey').value = '';
@@ -16835,8 +16852,12 @@ const SettingsApp = {
         const preset = (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === name);
         const docLink = $('providerDocLink');
         if (!docLink) return;
-        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址
-        if (!preset) { docLink.style.display = 'none'; return; }
+        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址（但选择态本身要记住）
+        if (!preset) {
+          docLink.style.display = 'none';
+          MoraySettings.set('providerPreset', name === 'custom' ? 'custom' : '').catch(() => { /* 落库失败下次再写 */ });
+          return;
+        }
         $('setOpenaiBase').value = preset.base;
         // [2026-10-25 解耦修复] 推荐模型仅在输入框为空时填入（首填便利）；用户已手填的
         // 模型绝不被预设推荐顶掉——模型输入权完全交给用户
@@ -16846,12 +16867,29 @@ const SettingsApp = {
         docLink.href = 'https://' + preset.doc;
         docLink.textContent = preset.doc + ' ↗';
         docLink.style.display = '';
+        // [Dogfood 2026-10-27 持久化根因修复] 预设选择必须落库：
+        // ① 记住下拉本身（刷新后回填 selected）；② 程序化改 input.value 不触发 change
+        //    事件 → 地址/模型不落库，刷新后一起丢，用户每次都要重选服务商。
+        const patch = { providerPreset: name, openaiBaseURL: preset.base };
+        if (fillModel) patch.openaiModel = preset.models;
+        MoraySettings.set(patch).catch(() => { /* 落库失败下次再写 */ });
         if (sel.__presetLastNotified !== name) {
           sel.__presetLastNotified = name;
-          showNotification('已填充 ' + name, fillModel ? '已填入地址与推荐模型，填写 API Key 后点击「测试连接」' : '已填入地址（模型保留你手填的值），填写 API Key 后点击「测试连接」', 'info', 2500);
+          showNotification('已填充 ' + name, (fillModel ? '已填入地址与推荐模型' : '已填入地址（模型保留你手填的值）') + '，选择已记住；填写 API Key 后点击「测试连接」', 'info', 2500);
         }
       }, 400);
     });
+    // [Dogfood 2026-10-27] 设置页重建后恢复预设的文档链接（选中态由模板 selected 回填）
+    try {
+      const selNow = $('providerPresetSel');
+      const pBack = selNow ? (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === selNow.value) : null;
+      if (pBack) {
+        const dl = $('providerDocLink');
+        dl.href = 'https://' + pBack.doc;
+        dl.textContent = pBack.doc + ' ↗';
+        dl.style.display = '';
+      }
+    } catch (e) { /* 链接恢复失败不影响设置页 */ }
     // [V3 P1.2] Key 显示/隐藏 + trim
     on($('toggleKeyBtn'), 'click', () => {
       const inp = $('setOpenaiKey');
@@ -21660,6 +21698,9 @@ window.MorayArgusMode = MorayArgusMode;
       /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
       '.mzs-artifact-card{display:flex;align-items:center;gap:8px;margin-top:6px;padding:7px 9px;',
       'border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      /* [Dogfood 2026-10-27] 整卡可点：有预览路径的卡给指针态+悬停反馈（原来只有小按钮活） */
+      '.mzs-artifact-card[data-preview-path]{cursor:pointer}',
+      '.mzs-artifact-card[data-preview-path]:hover{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.55)}',
       '.mzs-artifact-icon{flex-shrink:0;font-size:13px;line-height:1}',
       '.mzs-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
       'color:#DBEAFE;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:11px}',
@@ -22066,7 +22107,7 @@ window.MorayArgusMode = MorayArgusMode;
         const zcodePath = taskId
           ? 'zcode:' + String(taskId) + ':' + encodeURIComponent(name)
           : '';
-        html += '<div class="mzs-artifact-card"' + (folded ? ' hidden' : '') + '>' +
+        html += '<div class="mzs-artifact-card"' + (zcodePath ? ' data-preview-path="' + esc(zcodePath) + '" title="点击预览代码"' : '') + (folded ? ' hidden' : '') + '>' +
           '<span class="mzs-artifact-icon">📄</span>' +
           '<span class="mzs-artifact-path" title="' + esc(fp) + '">' + esc(name) + '</span>' +
           '<span class="mzs-artifact-meta">(' + entry.count + ' 次操作)</span>' +
@@ -22848,6 +22889,11 @@ window.MorayArgusMode = MorayArgusMode;
     return t.length < 5 && !TASK_HINT_RE.test(t);  // 极短且零任务信号
   }
   window.morayIsCasualText = isCasualText;   // 手工验收入口
+
+  /* [2026-10-27 真感知#1 dogfooding] Agent 关档的"代码/文件任务"信号词（拒绝静默降级）。
+   * 与 TASK_HINT_RE 同源但收窄：动作词×代码物词同现，或"重构/编译"及语言名等显式
+   * 关键词——避免"查价格""看新闻"类纯聊天文本误报 ZCode 提示。 */
+  var OFF_CODE_HINT_RE = /((写|做|创建|新建|生成|修改|改|修复|优化|重构|开发|调试|跑|运行|执行|部署)\S{0,12}(代码|脚本|程序|函数|模块|类|接口|文件|单元测试|配置))|(重构|编译|二分查找)|\b(python|javascript|typescript|java|sql|rust|golang|c\+\+)\b/i;
 
   // [L7.8 前端 2026-10-01] auto 模式意图判定：调 8001 /api/intent/decide（超时 1500ms），失败降级 'chat'
   async function decideMode(raw) {
@@ -24026,6 +24072,9 @@ window.MorayArgusMode = MorayArgusMode;
       '.zcode-exec-card .zec-file-ops{color:var(--color-text-tertiary,#666);font-size:10px;flex-shrink:0}',
       /* [ZCode 产物卡] Write/Edit 改动文件 → 蓝色卡片 + 应用内代码预览（复用 125 的 data-preview-path 委托） */
       '.zcode-exec-card .zec-artifact-card{display:flex;align-items:center;gap:8px;margin:4px 0;padding:6px 9px;border:1px solid rgba(96,165,250,.32);background:rgba(96,165,250,.10);border-radius:8px;min-width:0}',
+      /* [Dogfood 2026-10-27] 整卡可点：有预览路径的卡给指针态+悬停反馈（原来只有小按钮活） */
+      '.zcode-exec-card .zec-artifact-card[data-preview-path]{cursor:pointer}',
+      '.zcode-exec-card .zec-artifact-card[data-preview-path]:hover{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.55)}',
       '.zcode-exec-card .zec-artifact-icon{flex-shrink:0;font-size:12px;line-height:1}',
       '.zcode-exec-card .zec-artifact-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-primary,#E0E0E0);font-family:ui-monospace,Consolas,monospace;font-size:11px}',
       '.zcode-exec-card .zec-artifact-meta{flex-shrink:0;color:var(--color-text-tertiary,#8a8a8a);font-size:10px}',
@@ -24244,7 +24293,7 @@ window.MorayArgusMode = MorayArgusMode;
         var zcodePath = ex.taskId
           ? 'zcode:' + String(ex.taskId) + ':' + encodeURIComponent(fname)
           : '';
-        h.push('<div class="zec-artifact-card">' +
+        h.push('<div class="zec-artifact-card"' + (zcodePath ? ' data-preview-path="' + attr(zcodePath) + '" title="点击预览代码"' : '') + '>' +
           '<span class="zec-artifact-icon">📄</span>' +
           '<span class="zec-artifact-path" title="' + attr(f.path) + '">' + esc(fname) + '</span>' +
           '<span class="zec-artifact-meta">(' + f.count + ' 次操作)</span>' +
@@ -24639,6 +24688,12 @@ window.MorayArgusMode = MorayArgusMode;
          * （auto 模式下意图路由对"你好"本就判 chat；真正事故源是 on 档强制升级 +
          * Laya 规划层"无信号→argus 搜索"三级兜底——本闸掐死最前端入口。） */
         var casual = raw && isCasualText(raw);
+        /* [2026-10-27 真感知#1 dogfooding] Agent 关档 + 代码/文件任务型输入 → 显式提示，
+         * 拒绝静默降级：输入台选着 ZCode 引擎但顶栏 Agent 关时，任务会无声落进普通
+         * 聊天，用户傻等到 25s 后的报错才发现（2026-10-27 实测）。只提示不拦截，聊天照发。 */
+        if (raw && !casual && m === 'off' && OFF_CODE_HINT_RE.test(raw)) {
+          showNotification('ZCode 未启用：已按普通聊天处理', '顶栏切「Agent 自动」可沙箱执行', 'info', 4500);
+        }
         /* [2026-10-01 U-6-2] on/auto 统一走 decideMode：auto 语义不变（chat→聊天 /
          * agent→浮层 / code→卡片）；on 模式经判定分流（code→卡片、agent→浮层），
          * 判定为 chat 时按 on 语义强制改 agent（用户强制开 Agent 不回落纯聊天）。
@@ -26369,7 +26424,11 @@ const HealthMonitor = {
         const res = await fetch(AI.ollamaURL + '/api/tags', { signal: ctrl.signal });
         clearTimeout(t);
         ok = res.ok;
-      } else if (MoraySettings.get('openaiEnabled') && AI.openaiBase) {
+      } else if (MoraySettings.get('openaiEnabled') && AI.openaiBase && MoraySettings.getAPIKey()) {
+        // [2026-10-27 真感知#3 dogfooding] 无浏览器侧 Key → 跳过外网探测（落到下方
+        // else → status=unknown）：直连 /models 必 401，每次启动 + 每 5 分钟打一次
+        // open.bigmodel.cn，控制台一片红引发隐私焦虑；.env 代理用户浏览器里同样没 Key，
+        // 直连探测本来就不代表真实通道（代理通道健康由后端负责）。
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 5000);
         const res = await fetch(AI.openaiBase + '/models', { headers: AI._openaiHeaders(), signal: ctrl.signal });
@@ -31211,7 +31270,7 @@ const ToolRegistry = {
       ? (art.bytes >= 1024 ? (art.bytes / 1024).toFixed(1) + ' KB' : art.bytes + ' B')
       : '';
     const meta = [art.action || '', size].filter(Boolean).join(' · ');
-    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2">' +
+    return '<div class="artifact-card flex items-center gap-2 mt-2 rounded-lg border border-brand-cobalt/25 bg-brand-cobalt/15 px-3 py-2 cursor-pointer hover:opacity-90" data-preview-path="' + escapeHtml(path) + '" title="点击预览代码">' +
       '<i data-lucide="file-code" class="w-4 h-4 text-brand-cobalt shrink-0"></i>' +
       '<div class="min-w-0 flex-1">' +
       '<div class="text-[11px] text-text-primary font-medium truncate" title="' + escapeHtml(path) + '">' + escapeHtml(path) + '</div>' +

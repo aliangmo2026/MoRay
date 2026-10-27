@@ -246,6 +246,13 @@ const SettingsApp = {
     const c = MoraySettings.get();
     // [上下文预算] 滑条物理上限：存量超限值（如 131072）显示与滑块都夹到上限，本地小显存一碰就死
     const ctxLimit = Math.min(Number(c.contextLimit) || 8192, CONTEXT_LIMIT_MAX);
+    // [Dogfood 2026-10-27] 服务商预设回填：只认仍存在的预设名 / custom（已下架的旧值不回显成空白选框）
+    const presetBackfill = (() => {
+      const v = String(c.providerPreset || '');
+      if (!v) return '';
+      if (v === 'custom') return v;
+      return (typeof PROVIDER_PRESETS !== 'undefined' && PROVIDER_PRESETS.some(p => p.name === v)) ? v : '';
+    })();
     page.innerHTML = `
       <header class="h-14 px-5 flex items-center border-b border-line-ghost/50 flex-shrink-0">
         <h1 class="text-base font-semibold text-text-primary">设置</h1>
@@ -326,8 +333,8 @@ const SettingsApp = {
                 <div class="flex gap-2">
                   <select id="providerPresetSel" class="form-select" style="flex:1">
                     <option value="">— 选择服务商 —</option>
-                    ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" data-base="${escapeHtml(p.base)}" data-model="${escapeHtml(p.models)}" data-doc="${escapeHtml(p.doc)}">${escapeHtml(p.name)}</option>`).join('')}
-                    <option value="custom">自定义</option>
+                    ${(typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).map(p => `<option value="${escapeHtml(p.name)}" ${presetBackfill === p.name ? 'selected' : ''} data-base="${escapeHtml(p.base)}" data-model="${escapeHtml(p.models)}" data-doc="${escapeHtml(p.doc)}">${escapeHtml(p.name)}</option>`).join('')}
+                    <option value="custom" ${presetBackfill === 'custom' ? 'selected' : ''}>自定义</option>
                   </select>
                   <a id="providerDocLink" href="#" target="_blank" rel="noopener" class="btn-ghost px-3 rounded-lg text-[11px] border border-line-ghost flex items-center text-text-tertiary" style="display:none">控制台 ↗</a>
                 </div>
@@ -809,13 +816,22 @@ const SettingsApp = {
       this.classList.toggle('active');
       await MoraySettings.set('openaiEnabled', this.classList.contains('active'));
     });
-    on($('setOpenaiBase'), 'change', () => MoraySettings.set('openaiBaseURL', $('setOpenaiBase').value.trim()));
-    on($('setOpenaiModel'), 'change', () => {
+    // [Dogfood 2026-10-27 真感知] 原来三处 change 静默落库：用户改完地址/模型/Key 不知道
+    // 存没存上（“按钮是假的”体感来源之一）。各补一条 1.5s 轻提示，不回显 Key 内容。
+    on($('setOpenaiBase'), 'change', async () => {
+      await MoraySettings.set('openaiBaseURL', $('setOpenaiBase').value.trim());
+      showNotification('已保存', '接口地址已更新', 'success', 1500);
+    });
+    on($('setOpenaiModel'), 'change', async () => {
       const v = $('setOpenaiModel').value.trim();
       warnIfSuspiciousOpenaiModel(v);
-      MoraySettings.set('openaiModel', v);
+      await MoraySettings.set('openaiModel', v);
+      showNotification('已保存', v ? ('默认模型：' + v) : '默认模型已清空（跟随服务商）', 'success', 1500);
     });
-    on($('setOpenaiKey'), 'change', () => MoraySettings.set('openaiAPIKey', $('setOpenaiKey').value.trim()));
+    on($('setOpenaiKey'), 'change', async () => {
+      await MoraySettings.set('openaiAPIKey', $('setOpenaiKey').value.trim());
+      showNotification('已保存', 'API Key 已本地加密存储', 'success', 1500);
+    });
     on($('clearKeyBtn'), 'click', async () => {
       await MoraySettings.set({ openaiAPIKeyStored: '' });
       $('setOpenaiKey').value = '';
@@ -929,8 +945,12 @@ const SettingsApp = {
         const preset = (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === name);
         const docLink = $('providerDocLink');
         if (!docLink) return;
-        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址
-        if (!preset) { docLink.style.display = 'none'; return; }
+        // 「— 选择服务商 —」/「自定义」：只收起文档链接，不覆盖用户已填地址（但选择态本身要记住）
+        if (!preset) {
+          docLink.style.display = 'none';
+          MoraySettings.set('providerPreset', name === 'custom' ? 'custom' : '').catch(() => { /* 落库失败下次再写 */ });
+          return;
+        }
         $('setOpenaiBase').value = preset.base;
         // [2026-10-25 解耦修复] 推荐模型仅在输入框为空时填入（首填便利）；用户已手填的
         // 模型绝不被预设推荐顶掉——模型输入权完全交给用户
@@ -940,12 +960,29 @@ const SettingsApp = {
         docLink.href = 'https://' + preset.doc;
         docLink.textContent = preset.doc + ' ↗';
         docLink.style.display = '';
+        // [Dogfood 2026-10-27 持久化根因修复] 预设选择必须落库：
+        // ① 记住下拉本身（刷新后回填 selected）；② 程序化改 input.value 不触发 change
+        //    事件 → 地址/模型不落库，刷新后一起丢，用户每次都要重选服务商。
+        const patch = { providerPreset: name, openaiBaseURL: preset.base };
+        if (fillModel) patch.openaiModel = preset.models;
+        MoraySettings.set(patch).catch(() => { /* 落库失败下次再写 */ });
         if (sel.__presetLastNotified !== name) {
           sel.__presetLastNotified = name;
-          showNotification('已填充 ' + name, fillModel ? '已填入地址与推荐模型，填写 API Key 后点击「测试连接」' : '已填入地址（模型保留你手填的值），填写 API Key 后点击「测试连接」', 'info', 2500);
+          showNotification('已填充 ' + name, (fillModel ? '已填入地址与推荐模型' : '已填入地址（模型保留你手填的值）') + '，选择已记住；填写 API Key 后点击「测试连接」', 'info', 2500);
         }
       }, 400);
     });
+    // [Dogfood 2026-10-27] 设置页重建后恢复预设的文档链接（选中态由模板 selected 回填）
+    try {
+      const selNow = $('providerPresetSel');
+      const pBack = selNow ? (typeof PROVIDER_PRESETS !== 'undefined' ? PROVIDER_PRESETS : []).find(p => p.name === selNow.value) : null;
+      if (pBack) {
+        const dl = $('providerDocLink');
+        dl.href = 'https://' + pBack.doc;
+        dl.textContent = pBack.doc + ' ↗';
+        dl.style.display = '';
+      }
+    } catch (e) { /* 链接恢复失败不影响设置页 */ }
     // [V3 P1.2] Key 显示/隐藏 + trim
     on($('toggleKeyBtn'), 'click', () => {
       const inp = $('setOpenaiKey');
