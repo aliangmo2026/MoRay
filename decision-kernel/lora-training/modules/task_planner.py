@@ -408,6 +408,11 @@ def _rule_plan(goal: str) -> List[Dict[str, Any]]:
         if tool is None and steps:
             steps[-1]["description"] = (steps[-1]["description"] + "，" + desc)[:200]
             continue
+        # [2026-10-27 寒暄闸] 首子句为寒暄/极短非任务文本（"你好，帮我查xx"的"你好"）
+        # → 直接跳过，绝不落三级兜底（那是"搜索[你好]"事故的源头）。若全部子句都是
+        # 寒暄则 steps 为空——由 plan() 入口寒暄闸兜住，此处只可能出现在混合句。
+        if tool is None and _is_casual_text(desc):
+            continue
         if tool is None:      # 首子句且完全无信号 → 三级兜底（从具体到宽泛）
             # [2026-10-01 U-4] 三级兜底（原：有代码特征→zcode，否则→argus）
             # 问题：无信号的"创建 xxx"类任务被兜底给 argus 搜索，用户看到百度结果
@@ -541,11 +546,102 @@ def _validate_steps(steps: Any) -> List[Dict[str, Any]] | None:
     return out
 
 
+# ===================== [2026-10-27 寒暄闸·纯加性] =====================
+# 背景（现场实锤事故）："你好"被三级兜底打包成 argus 搜索步骤、真去外呼百度搜回
+# 无意义结果。寒暄/极短非任务文本在规划层就地拦截：不生成任何工具步骤（尤其 argus），
+# 由 /execute 短路成 success 帧把 reply 当普通对话回复——体验上等同纯聊天。
+# 与前端 92 寒暄闸（decideMode 前置白名单）构成双保险：前端拦交互路径，本闸拦
+# /execute 的一切直调方（自驱卡片、Laya 面板、API 调用）。
+_GREETING_TOKEN_RE = re.compile(
+    r"你好|您好|嗨|哈喽|哈罗|hello|hi+|hey|yo|早安|早上好|中午好|下午好|晚上好|晚安"
+    r"|在吗|在不在|在么|谢谢|多谢|感谢|再见|拜拜|辛苦了|okay?|嗯+|哦+|好的|收到|行|可以",
+    re.IGNORECASE)
+_RESIDUE_STRIP_RE = re.compile(r"[\s!！~～。．,.，;；:：?？!！()（）\[\]【】\"'“”]+")
+# 任务信号（动词/技术词）：命中即说明"极短文本"仍可能是真任务（"改bug""查价格"），
+# 绝不能被寒暄闸吞掉。
+_TASK_HINT_RE = re.compile(
+    r"写|做|搞|弄|生成|创建|新建|构建|开发|修改|改|修复|修|优化|重构|调整|完善"
+    r"|分析|查|搜|找|调研|检索|搜索|统计|汇总|整理|计算|对比|评估|测试|调试|排查"
+    r"|运行|执行|跑|启动|部署|发布|编译|安装|下载|导出|导入|读取|写入|删除|保存"
+    r"|代码|脚本|程序|函数|模块|文件|目录|文件夹|数据|数据库|接口|api|日志|报错"
+    r"|错误|bug|报告|方案|文档|页面|组件|配置|环境|服务器|命令|任务|流程|架构"
+    r"|python|javascript|java|sql|价格|多少钱|资讯|新闻|政策|行情|趋势",
+    re.IGNORECASE)
+
+_GREETING_REPLY = "你好呀！我在呢，有什么需要帮忙的吗？"
+_NEUTRAL_CASUAL_REPLY = ("这条消息看起来是闲聊，没有可执行的任务步骤；"
+                         "如果你想让我查询资料或执行操作，直接描述目标即可。")
+
+# ---- [2026-10-27 寒暄闸 v2·前缀判据] 寒暄开头网（与前端 92 同款） ----
+# 中文寒暄词后不设限（允许"moray"/英文/语气词后缀）；英文寒暄词须以非字母收尾，
+# 防 hi→history 这类词前缀误伤。点名式寒暄先剥 wake 词（"moray晚上好呀"）。
+_GREETING_CN_PREFIX_RE = re.compile(
+    r"^(?:你好|您好|嗨|哈喽|哈罗|早安|早上好|中午好|下午好|晚上好|晚安"
+    r"|在吗|在不在|在么|谢谢|多谢|感谢|再见|拜拜|辛苦了|嗯+|哦+|好的|收到|行|可以)")
+_GREETING_EN_PREFIX_RE = re.compile(r"^(?:hello|hi+|hey|yo)(?![a-z])", re.IGNORECASE)
+_WAKE_PREFIX_RE = re.compile(r"^(?:moray)\s*[，,!！~～。．,.:：、\s]*", re.IGNORECASE)
+
+
+def _is_greeting_opening(text: str) -> bool:
+    """以寒暄词开头 **且全文零任务动作词** → 寒暄文本（真任务永不命中）。
+
+    与前端 92 的 hasGreetingPrefix + TASK_HINT 判据保持同构，前后端双保险。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if _TASK_HINT_RE.search(t) is not None:
+        return False                      # "晚上好，帮我查价格" → 真任务，放行
+
+    def _hit(s: str) -> bool:
+        return bool(_GREETING_CN_PREFIX_RE.match(s) or _GREETING_EN_PREFIX_RE.match(s))
+
+    if _hit(t):
+        return True
+    stripped = _WAKE_PREFIX_RE.sub("", t, count=1)
+    return stripped != t and _hit(stripped)
+
+
+def _is_casual_text(text: str) -> bool:
+    """寒暄/极短非任务文本判定（真值=可作纯对话处理，绝不外呼工具）。
+
+    1) 剥掉全部寒暄词与语气/标点后无剩余 → 纯寒暄（"你好""hi!! 在吗""嗯。"）；
+    2) **寒暄开头网（前缀判据，2026-10-27 二次扩网）**：以寒暄词开头且全文零任务
+       动作词 → 纯聊天（"晚上好呀moray""hi moray""moray晚上好"——原 1) 是整句剥词
+       判据，后缀挂英文/语气词即漏网，实锤事故"晚上好呀moray"被拆去 argus 搜百度）；
+    3) 极短且零任务信号（<5 字、无任何动词/技术词）→ 非任务文本。
+    "写个脚本""改bug""查价格""晚上好，帮我查价格"等含任务信号的句子永不命中——
+    保真任务零误伤。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return False
+    residue = _GREETING_TOKEN_RE.sub("", t)
+    if not _RESIDUE_STRIP_RE.sub("", residue):
+        return True
+    if _is_greeting_opening(t):
+        return True
+    return len(t) < 5 and _TASK_HINT_RE.search(t) is None
+
+
 async def plan(goal: str) -> Dict[str, Any]:
     """入口：返回 {"steps": [...], "mode": "rule"|"llm"}。规则拆解恒作保底。"""
     goal = str(goal or "").strip()
     if not goal:
         return {"steps": [], "mode": "rule", "note": "goal 为空"}
+    # ---- [2026-10-27 寒暄闸 v2·最前置] 寒暄开头 + 全文零任务词 → 直接 casual 帧 ----
+    # 实锤事故："晚上好呀moray" 经整句剥词闸漏网 → 走到三级兜底 argus → 百度搜"晚上好"。
+    # 本分支放在 pattern/LLM/rule 一切拆解之前，杜绝"无信号 → 搜索"的弱智兜底。
+    if _is_greeting_opening(goal):
+        return {"steps": [], "mode": "casual", "casual": True,
+                "reply": _GREETING_REPLY,
+                "note": "寒暄开头且零任务词（v2 前缀闸），最前置拦截，严禁外呼 argus 等工具"}
+    # ---- [2026-10-27 寒暄闸] 整句寒暄/极短非任务文本 → 零工具步骤 + 对话式 reply ----
+    if _is_casual_text(goal):
+        return {"steps": [], "mode": "casual", "casual": True,
+                "reply": _GREETING_REPLY if _GREETING_TOKEN_RE.search(goal)
+                         else _NEUTRAL_CASUAL_REPLY,
+                "note": "寒暄/极短非任务文本，规划层拦截，严禁外呼 argus 等工具"}
     # ---- [L7.8 入口加判断·纯加性] 工程范式优先：命中即返回多步计划，未命中原逻辑一行不动 ----
     _pattern_steps = _match_task_pattern(goal)
     if _pattern_steps is not None:
@@ -559,11 +655,21 @@ async def plan(goal: str) -> Dict[str, Any]:
         llm = await _sc._llm_json(
             "你是任务规划器。把目标拆解为有序步骤，只输出纯JSON数组，每元素含 "
             "step_id(int)/description/tool(iris|argus|zcode|file)/input(对象)/expected_output。"
-            "不解释、不用代码块。", user)
+            "不解释、不用代码块。"
+            # [2026-10-27 寒暄死命令] 严禁小模型把寒暄拆成外呼工具步骤（实锤事故：
+            # "你好"被拆出 argus 搜索步）。空数组交由规则层，规划层寒暄闸另行拦截。
+            "死命令：如果任务目标仅为寒暄、打招呼或极短的非任务文本，直接输出空数组 []，"
+            "严禁生成任何外呼工具（尤其 argus 搜索）步骤。", user)
         steps = _validate_steps(llm) if isinstance(llm, list) else None
         if steps:
             return {"steps": await _gate_steps(steps, goal), "mode": "llm"}
-    return {"steps": await _gate_steps(_rule_plan(goal), goal), "mode": "rule"}
+    rule_steps = _rule_plan(goal)
+    if not rule_steps:
+        # [2026-10-27 寒暄闸] 混合句所有子句均被寒暄闸跳过 → 不落 executor 空步骤
+        # 红卡（"计划为空"failed 帧），改走对话式 reply（/execute 短路消费）。
+        return {"steps": [], "mode": "casual", "casual": True,
+                "reply": _NEUTRAL_CASUAL_REPLY, "note": "全部子句为寒暄，规划层拦截"}
+    return {"steps": await _gate_steps(rule_steps, goal), "mode": "rule"}
 
 
 # ===================== [新增代码·开始] L7.8 三种标准工程任务范式（2026-09-29，纯加性） =====================
