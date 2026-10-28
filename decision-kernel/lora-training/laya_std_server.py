@@ -283,6 +283,25 @@ async def execute(req: ExecuteRequest):
     if not str(req.goal or "").strip():
         return JSONResponse(status_code=400, content={"code": 400, "error": "goal 不能为空"})
     planned = await _planner.plan(req.goal)
+    # [2026-10-27 寒暄闸] casual 计划（寒暄/极短非任务文本，规划层零工具步骤）：
+    # 不进 executor——空步骤会渲染成红色"计划为空"失败卡，寒暄必须像纯聊天一样
+    # 拿到正常回复。短路成单帧 SSE：start + final(success)，reply 即对话内容。
+    if planned.get("casual"):
+        _reply = str(planned.get("reply") or "").strip() or "你好呀！"
+        _cid = req.execution_id or ("casual_" + str(int(time.time() * 1000)))
+
+        async def _casual_sse():
+            yield {"event": "start", "execution_id": _cid, "goal": req.goal[:300],
+                   "total_steps": 0, "max_retry": max(0, int(req.max_retry)),
+                   "ts": int(time.time() * 1000), "endpoints": {}}
+            yield {"event": "final", "status": "success", "result": _reply,
+                   "ts": int(time.time() * 1000), "execution_id": _cid, "steps": [],
+                   "note": planned.get("note", "")}
+
+        return StreamingResponse(
+            _sse(_casual_sse()),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     # [M3b 2026-10-02] 开闸（LAYA_MEMORY_RECALL=1）时结果先行召回一次长期记忆；
     # 关闸/失败/零命中 → None，executor 与执行链零感知。to_thread 包同步 httpx（不阻塞事件循环）。
     memory_context = None
