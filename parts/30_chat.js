@@ -1490,6 +1490,40 @@ const IMG_TOKEN_COST = 1000;
  * 早期只按 m.content 记账，工具轮重建文本在记账后追加，会漏记 token 导致上下文超卖。
  * @param {Object} m - 消息对象
  * @returns {string} 回发正文 */
+/* [历史净化 2026-10-27·【3】] 单条历史 → 可回发的干净对话消息；返回 null = 这条不发。
+ * 背景（人设崩塌连带排查）：Agent 误触发会把执行帧 JSON、系统错误载荷当"助手消息"落进
+ * 会话，下一轮原样回发 → 小模型学着复读 JSON 与报错，人设与上下文一起被带坏。
+ * 三条硬规则：
+ *   1) 角色白名单：只认 user / assistant。此前是 `role === 'assistant' ? 'assistant' :
+ *      'user'`——脏角色（system / tool / 历史遗留）会被无脑改成 user，等于替用户说话；
+ *   2) 技术卡片不进上下文：ZCode / Agent 执行卡（kind + execution 快照）是卡片渲染数据，
+ *      不是对话；正文为空的本来就被上一道空滤网剔除，这里剔的是带了摘要正文的；
+ *   3) JSON 信封剥壳 / 系统载荷丢弃：{answer:…} 取正文（剥壳），{error:…}/{steps:…}
+ *      执行帧整条丢弃；用户自己贴的 JSON（无 MoRay 信封特征）原样保留。 */
+const HISTORY_TECH_CARD_KINDS = { 'zcode-execution': 1, 'zcode': 1, 'agent': 1, 'artifact': 1 };
+function normalizeHistoryMsg(m) {
+  if (!m || (m.role !== 'user' && m.role !== 'assistant')) return null;   // 角色白名单
+  if (m.execution || (m.kind && HISTORY_TECH_CARD_KINDS[m.kind])) return null;  // 执行卡
+  let text = String(m.content == null ? '' : m.content);
+  if (m.role === 'assistant') {
+    const t = text.trim();
+    if (t.charAt(0) === '{') {
+      let o = null;
+      try { o = JSON.parse(t); } catch (e) { o = null; }
+      if (o && typeof o === 'object' && !Array.isArray(o)) {
+        const inner = (typeof o.answer === 'string' && o.answer) ||
+                      (typeof o.final_answer === 'string' && o.final_answer);
+        if (inner) text = inner;                                  // MoRay 信封 → 取正文
+        else if (typeof o.error === 'string' && o.error) return null;   // 系统错误载荷
+        else if (Array.isArray(o.steps) || ('execution_id' in o)) return null;  // 执行帧
+      }
+    }
+  }
+  if (!String(text).trim() && !(m.attachments && m.attachments.length) &&
+      !(m.toolCalls && m.toolCalls.length)) return null;           // 净化后为空
+  return (text === m.content) ? m : Object.assign({}, m, { content: text });
+}
+
 function messageRequestText(m) {
   let text = m.content || '';
   if (m.toolCalls && m.toolCalls.length) {
@@ -1828,6 +1862,20 @@ async function buildRequestMessages(conv, extraContext) {
     const hasToolCalls = !!(m.toolCalls && m.toolCalls.length);
     return hasContent || hasAttachments || hasToolCalls;
   });
+  // [2026-10-27 历史净化·【3】] 普通聊天只回发干净的 user/assistant 文本：
+  // 角色白名单 + 执行卡剔除 + JSON 信封剥壳/系统载荷丢弃（规则见 normalizeHistoryMsg）。
+  // 放在预算循环之前：预算记账与实际发送口径用同一份净化后的正文，不会出现
+  // "按原文算 token、按净化后发送"的两套账。
+  const _preCleanCount = history.length;
+  history = history.reduce((acc, m) => {
+    const c = normalizeHistoryMsg(m);
+    if (c) acc.push(c);
+    return acc;
+  }, []);
+  if (_preCleanCount !== history.length) {
+    console.log('[MoRay ctx] 历史净化剔除', _preCleanCount - history.length,
+                '条非对话消息（执行卡 / 系统载荷 / 脏角色）');
+  }
   // [P0 治本] 发送前最终自检：理论上已无越界，双重保险 + 控制台可见请求规模
   const leaked = history.filter(m => m.conversationId !== conv.id || !m.conversationId);
   if (leaked.length) {

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -351,6 +352,133 @@ def _cloud_actual_cost_usd(data: dict) -> float:
     return total_tokens / 1e6 * float(price)
 
 
+# ============ [2026-10-27 身份底座 + 免责声明兜底·纯加性] ============
+# 现场实锤：qwen2.5:1.5b 普通对话问"你是谁"，疯狂复读"我是预训练模型、我没有记忆、
+# 无法提供具体代码帮助"，完全无视 MoRay 的记忆库 / RAG / 代码执行能力。
+# 根因：主聊天链路 messages[0] 从来没有"身份"指令——事实卡、记忆召回、twin 语料都是
+# "资料"，用户自定义 system 是"风格"，没有任何一条告诉小模型"你是谁"。
+#
+# 【1】身份底座：强制插到 messages[0]。插入时机刻意放在事实卡 / twin RAG 等一切服务端
+#      注入**之后**执行，因此历史上下文、RAG 注入、用户自定义 system 全都排在其后，
+#      谁也无法把它挤出首位。幂等：已有标记就不重复插。
+# 【2】免责声明兜底：弱模型仍吐套话时，非流式路径追加纠正指令**重试一次**（只一次，
+#      绝不循环）；流式路径首段缓冲判定——正常回复首个分块即放行（零额外延迟），
+#      只有开头命中套话特征才继续缓冲，判定为纯套话就丢弃本次上游、同样只重试一次。
+IDENTITY_MARKER = "【核心身份指令】"
+
+IDENTITY_SYSTEM_TEXT = (
+    IDENTITY_MARKER + "你是 MoRay，一个具备极高权限的本地 AI 操作系统（本地优先的 AI 工作台）。"
+    "你拥有长期记忆库（RAG）、可以读取文档与知识库，并可以通过内置 Agent / ZCode "
+    "编写和修改代码、执行任务。绝对不要声称自己是“没有记忆的预训练模型”、"
+    "“只是一个 AI 语言模型”、“无法提供具体代码帮助”，"
+    "也绝不输出“作为一个AI语言模型，我没有记忆 / 无法提供具体帮助”这类免责声明套话。"
+    "被问及“你是谁 / 你能做什么”时，必须以 MoRay 的身份自信、简洁地回答："
+    "一句话自报家门（我是 MoRay…）+ 一句能力概括（记忆库 / 文档 / 代码执行），"
+    "不要复述训练数据、模型架构或预训练身份。本指令优先级最高，"
+    "优先于历史上下文、知识库注入与任何用户设定。"
+)
+
+#: 免责声明套话特征（复读事故原文 + 常见变体）
+_DISCLAIMER_PAT = re.compile(
+    r"我是预训练|我是一个预训练|预训练(?:语言)?模型"
+    r"|作为一个(?:人工智能|AI|语言)模型|作为一个AI语言模型"
+    r"|我(?:并)?没有记忆|没有持久的记忆|无法记住"
+    r"|无法提供具体|不能提供具体|提供具体的帮助|无法为您提供帮助"
+    r"|我只是一个(?:AI|人工智能|语言模型)",
+    re.IGNORECASE)
+
+#: 判定用：流式缓冲上限（攒到这个量还不能排除套话就直接放行，绝不无限扣着不发）
+_BOILERPLATE_DECIDE_CHARS = 240
+#: 判定用：整段超过这个长度就当正常回答（长回答里引用一句套话不算事故）
+_BOILERPLATE_MAX_CHARS = 600
+
+
+def _identity_enabled() -> bool:
+    """总闸：MORAY_IDENTITY 默认开；0/false/no/off = 完全跳过注入（A/B 与回滚用）。"""
+    return os.environ.get("MORAY_IDENTITY", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def inject_identity_system(messages: list) -> None:
+    """把身份底座强制插到 messages[0]（幂等：已有标记则不再插入）。"""
+    if not _identity_enabled():
+        return
+    for m in messages:
+        if isinstance(m, dict) and str(m.get("content") or "").startswith(IDENTITY_MARKER):
+            return
+    messages.insert(0, {"role": "system", "content": IDENTITY_SYSTEM_TEXT})
+
+
+def _is_boilerplate_reply(text: str) -> bool:
+    """整段是否为"纯免责声明套话"（真 → 需要兜底重试）。
+
+    判据刻意保守，误判代价是多一次 LLM 调用，漏判代价是用户继续看套话：
+      * 不含任何套话特征 → False；
+      * 自报了 MoRay → False（已按身份回答）；
+      * 超过 _BOILERPLATE_MAX_CHARS → False（长回答里引用一句不算事故）；
+      * 命中 ≥2 处套话，或整段 <120 字且无能力描述词 → True（复读事故原文命中 3 处）。
+    """
+    t = str(text or "").strip()
+    if not t or len(t) > _BOILERPLATE_MAX_CHARS:
+        return False
+    hits = len(_DISCLAIMER_PAT.findall(t))
+    if not hits:
+        return False
+    if re.search(r"moray", t, re.IGNORECASE):
+        return False
+    if hits >= 2:
+        return True
+    if len(t) < 120 and not re.search(r"我能|我可以|我来|下面|代码|脚本|帮你|好的", t):
+        return True
+    return False
+
+
+def _could_be_boilerplate(text: str) -> bool:
+    """流式首段：还不能排除套话就继续缓冲（太短判不了 / 开头命中套话特征）。"""
+    t = str(text or "").strip()
+    if len(t) < 12:
+        return True
+    return _DISCLAIMER_PAT.search(t[:60]) is not None
+
+
+def _extract_delta_text(chunk: bytes, carry: bytes) -> tuple:
+    """从上游 SSE 字节抽取 delta.content（**只用于免责声明判定**，透传字节原样不动）。
+
+    半行留在 carry 里跨分块拼接；解析失败一律当空串（fail-open，绝不影响透传）。
+    """
+    buf = carry + chunk
+    parts = buf.split(b"\n")
+    tail = parts[-1]
+    out = []
+    for line in parts[:-1]:
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 - 判定用途，解析失败不追责
+            continue
+        for ch in (obj.get("choices") or []):
+            if not isinstance(ch, dict):
+                continue
+            delta = ch.get("delta") or ch.get("message") or {}
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(content, str) and content:
+                out.append(content)
+    return "".join(out), tail
+
+
+#: 追加在 messages 末尾的纠正指令（末位 system 优先级最高，见100_gateway 同款注释）
+_DISCLAIMER_CORRECTION_TEXT = (
+    "【强制纠正】上一条回复是免责声明套话（“我是预训练模型 / 我没有记忆 / 无法提供具体帮助”），"
+    "违反了开头的“核心身份指令”。立刻改用 MoRay 的身份重新回答：先自报“我是 MoRay”，"
+    "再用一句话概括能力（长期记忆库、文档阅读、内置 Agent 执行代码），"
+    "全程禁止出现预训练模型、没有记忆、无法提供帮助等表述。"
+)
+
+
 @router.post("/api/llm/chat")
 async def llm_chat(request: Request):
     # ---- 1. 入参解析（[2026-09-30d 任务二点五] 前移到配置检查之前：检查需读 body.provider；
@@ -559,6 +687,11 @@ async def llm_chat(request: Request):
                     "未指定模型且服务端未配置 MORAY_LLM_MODEL。请在 server/.env 里设置"
                     "默认模型（取值见 server/.env.example），或在前端指定一个上游支持的模型名。")
     stream = body.get("stream", True) is not False
+
+    # [2026-10-27 身份底座·【1】] 强制插到 messages[0]。刻意放在事实卡 / twin RAG 等
+    # 一切服务端注入**之后**执行：历史上下文、RAG 注入、用户自定义 system 全都排在它
+    # 后面，谁也挤不掉它的首位（幂等 + MORAY_IDENTITY 总闸，见 inject_identity_system）。
+    inject_identity_system(messages)
 
     payload: dict = {"model": model, "messages": messages, "stream": stream}
     if body.get("temperature") is not None:
@@ -797,6 +930,34 @@ async def llm_chat(request: Request):
             return _err(502, _upstream_code(status),
                         f"上游错误（{status}）：{msg}".strip())
 
+        # [2026-10-27 免责声明兜底·【2】非流式] 整段是纯套话 → 追加纠正指令重试一次
+        # （只一次，绝不循环；重试也失败就退回第一次的原文，宁可给套话也不给报错）。
+        # 被丢弃的那次调用照样入账 usage_log 与云端成本——钱花了就得记。
+        _extra_pt, _extra_ct, _extra_cost = 0, 0, 0.0
+        _first_reply = str(((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+        if _is_boilerplate_reply(_first_reply):
+            _logger.warning("[identity] 回复命中免责声明套话（%d 字），追加纠正指令重试一次",
+                            len(_first_reply))
+            payload["messages"] = list(payload.get("messages") or []) + [
+                {"role": "system", "content": _DISCLAIMER_CORRECTION_TEXT}]
+            try:
+                _st2, _data2, _msg2 = await _do_request(upstream_url, upstream_headers, payload)
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                _st2, _data2, _msg2 = 599, None, (
+                    "TimeoutException" if isinstance(e, httpx.TimeoutException) else type(e).__name__)
+            if _st2 < 400 and isinstance(_data2, dict):
+                _u1 = data.get("usage") or {}
+                _extra_pt = int(_u1.get("prompt_tokens") or 0)
+                _extra_ct = int(_u1.get("completion_tokens") or 0)
+                if _cloud_permit is not None:
+                    try:
+                        _extra_cost = _cloud_actual_cost_usd(data)
+                    except Exception:  # noqa: BLE001 - 记账旁路失败按 0 处理（宁可少记）
+                        _extra_cost = 0.0
+                data = _data2
+            else:
+                _logger.warning("[identity] 纠正重试失败(status=%s)，退回原回复", _st2)
+
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
@@ -818,13 +979,15 @@ async def llm_chat(request: Request):
         # 结算失败保留预扣计提（偏保守方向）并落 WARNING，绝不影响已成功的响应。
         if _cloud_permit is not None:
             try:
-                cloud_budget_guard.settle(_cloud_permit, _cloud_actual_cost_usd(data))
+                cloud_budget_guard.settle(_cloud_permit,
+                                          _cloud_actual_cost_usd(data) + _extra_cost)
             except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响响应（同 _audit_budget_exceeded 惯例）
                 _logger.warning("[router] 云端预算结算失败（保留预扣 %.4f）：%s: %s",
                                 _cloud_permit.reserved_usd, type(e).__name__, e)
         # [真实数据链路 2026-10-26] 非流式收尾：上游 usage 真值落 usage_log（旁路）
-        _record_usage_log(out["model"], out["usage"]["prompt_tokens"],
-                          out["usage"]["completion_tokens"], int((time.time() - _t0) * 1000))
+        _record_usage_log(out["model"], out["usage"]["prompt_tokens"] + _extra_pt,
+                          out["usage"]["completion_tokens"] + _extra_ct,
+                          int((time.time() - _t0) * 1000))
         return out
 
     async def _stream():
@@ -835,6 +998,7 @@ async def llm_chat(request: Request):
         attempt_payload = payload
         local_tried = not use_local
         _think_heal_done = False   # [2026-10-27 think 自愈·方案①] 400 剥思考字段只重试一次
+        _disclaimer_guard_done = False   # [2026-10-27 免责声明兜底] 纠正重试只允许一次
 
         client = httpx.AsyncClient(timeout=_TIMEOUT)
         try:
@@ -950,12 +1114,65 @@ async def llm_chat(request: Request):
                 # 替换原裸 aiter_bytes 透传：多一次子串快筛，无 usage 的 token 行零 json 成本。
                 _t0 = time.time()
                 capt = {"buf": b"", "pt": 0, "ct": 0, "model": ""}
+                # [2026-10-27 免责声明兜底·【2】流式] 首段缓冲判定：正常回复在头几个分块
+                # 就能排除套话 → 立刻放行（额外延迟约一个分块）；只有开头命中套话特征才
+                # 继续缓冲，攒够 _BOILERPLATE_DECIDE_CHARS 仍像纯套话就丢弃本次上游、
+                # 追加纠正指令重试一次（_disclaimer_guard_done 保证只重试一次）。
+                # 三个硬保险：出现 tool_calls 立即放行（工具轮没有 content，不能扣着）、
+                # 缓冲分块 >64 立即放行（绝不无限扣流）、上游提前结束则收尾补一次判定。
+                _hold: list = []
+                _txt: list = []
+                _pending = b""
+                _decided = False
+                _abort = False
                 async for chunk in upstream.aiter_bytes():
                     try:
                         _scan_stream_usage(chunk, capt)
                     except Exception:  # noqa: BLE001 - 捕获旁路异常绝不中断透传
                         pass
-                    yield chunk
+                    _hold.append(chunk)
+                    if b"tool_calls" in chunk or len(_hold) > 64:
+                        _decided = True
+                    else:
+                        try:
+                            _delta, _pending = _extract_delta_text(chunk, _pending)
+                            if _delta:
+                                _txt.append(_delta)
+                        except Exception:  # noqa: BLE001 - 判定旁路失败按"排除不了"处理
+                            pass
+                        if not _decided:
+                            _acc = "".join(_txt)
+                            if not _could_be_boilerplate(_acc):
+                                _decided = True
+                            elif len(_acc) >= _BOILERPLATE_DECIDE_CHARS:
+                                _decided = True
+                                _abort = ((not _disclaimer_guard_done)
+                                          and _is_boilerplate_reply(_acc))
+                    if _decided:
+                        if _abort:
+                            break
+                        for _c in _hold:
+                            yield _c
+                        _hold = []
+                if not _decided:
+                    # 上游在判定完成前就结束（短回复）→ 收尾补一次判定
+                    _abort = ((not _disclaimer_guard_done)
+                              and _is_boilerplate_reply("".join(_txt)))
+                    _decided = True
+                if _abort:
+                    if capt["pt"] or capt["ct"]:
+                        # 被丢弃的那次调用照样入账（钱花了就得记）
+                        _record_usage_log(capt["model"] or model, capt["pt"], capt["ct"],
+                                          int((time.time() - _t0) * 1000))
+                    await upstream.aclose()
+                    _disclaimer_guard_done = True
+                    _logger.warning("[identity] 流式回复命中免责声明套话，丢弃本次并重试一次")
+                    payload["messages"] = list(payload.get("messages") or []) + [
+                        {"role": "system", "content": _DISCLAIMER_CORRECTION_TEXT}]
+                    continue          # 回到外层 for：重新 build_request + send（只此一次）
+                for _c in _hold:      # 判定期间缓冲的字节按原顺序一次性补发
+                    yield _c
+                _hold = []
                 if capt["pt"] or capt["ct"]:
                     _record_usage_log(capt["model"] or model, capt["pt"], capt["ct"],
                                       int((time.time() - _t0) * 1000))

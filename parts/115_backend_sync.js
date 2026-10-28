@@ -53,7 +53,9 @@
         });
         const j = await res.json().catch(() => null);
         if (!res.ok || !j || j.ok !== true) {
-          throw new Error((j && j.message) || ('后端返回 ' + res.status));
+          const err = new Error((j && j.message) || ('后端返回 ' + res.status));
+          err.status = res.status;          // [2026-10-27] 供上层按状态码分流（404 自愈用）
+          throw err;
         }
         return j;
       } finally { clearTimeout(timer); }
@@ -86,10 +88,31 @@
       return true;
     },
 
-    /** 推送会话更新（title/model/systemPrompt/userPickedModel/pinned） */
-    async pushConversationPatch(convId, patch) {
-      await this._req('PUT', '/api/conversations/' + encodeURIComponent(convId), patch);
-      return true;
+    /** 推送会话更新（title/model/systemPrompt/userPickedModel/pinned）
+     * [2026-10-27 修 404] 后端没有这条会话时（本地建会话那一刻后端离线 / 首推失败，
+     * 之后每次 PUT 都 404——conv_mtr9krgd_xwtyvc 实锤）不再永久失败：按 404 自愈，
+     * 用本地全会话改走 POST 创建（upsert 语义），本次 patch 一并合并进去。
+     * @param {string} convId - 会话ID
+     * @param {Object} patch - snake_case 增量
+     * @param {Object} [conv] - 包装层传入的本地会话全文（省一次 IndexedDB 读）
+     * @returns {Promise<boolean>} 后端是否成功 */
+    async pushConversationPatch(convId, patch, conv) {
+      try {
+        await this._req('PUT', '/api/conversations/' + encodeURIComponent(convId), patch);
+        return true;
+      } catch (e) {
+        if (!e || e.status !== 404) throw e;
+        const local = conv || await DB.getConversation(convId);
+        if (!local || !local.id) throw e;   // 本地也没有 → 维持原报错路径（标记待同步）
+        const merged = Object.assign({}, local);
+        if ('title' in patch) merged.title = patch.title;
+        if ('model' in patch) merged.model = patch.model;
+        if ('system_prompt' in patch) merged.systemPrompt = patch.system_prompt;
+        if ('user_picked_model' in patch) merged.userPickedModel = !!patch.user_picked_model;
+        if ('pinned' in patch) merged.pinned = !!patch.pinned;
+        await this.pushConversation(merged);
+        return true;
+      }
     },
 
     /** 推送删除会话 */
@@ -282,7 +305,8 @@
     if ('userPickedModel' in patch) p.user_picked_model = !!patch.userPickedModel;
     if ('pinned' in patch) p.pinned = !!patch.pinned;
     if ('syncStatus' in patch) return Promise.resolve(); // 同步状态不入后端
-    return BackendStore.pushConversationPatch(conv.id, p);
+    // [2026-10-27 修 404] 第三个参数带本地会话全文，404 自愈 upsert 不用再读一次 IndexedDB
+    return BackendStore.pushConversationPatch(conv.id, p, conv);
   });
   wrapDB('deleteConversation', (conv, args) => BackendStore.pushConversationDelete((conv && conv.id) || args[0]));
   wrapDB('putMessage', (msg) => BackendStore.pushMessage(msg));

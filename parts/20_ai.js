@@ -255,12 +255,17 @@ class MorayAI {
   }
 
   /** [速度优化] 后台预热指定模型：空载极短请求让 Ollama 提前加载并驻留 30m；失败静默
+   * [2026-10-27 修 ERR_ABORTED] 原 2500ms 硬 abort 在本地单槽位（OLLAMA_MAX_LOADED_MODELS=1）
+   * 下几乎每发必中：聊天模型常被 embedding/判定模型挤出，冷加载普遍 >2.5s → abort 必触发，
+   * 网络面板每轮发送挂一条 POST /api/chat ERR_ABORTED 红字；且加载被拦腰斩断后，紧随其后的
+   * 真实请求还得从头再等。改为让预热自然跑完（Gateway.ensureWarmup 本就串行等它，总时延
+   * 不变），120s 兜底只在 Ollama 真僵死时触发——那时这条红字本身就是有效诊断信息。
    * @param {string} model - 模型名 */
   async warmupModel(model) {
     try {
       if (this.backend !== 'ollama' || !model) return;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 2500);
+      const timer = setTimeout(() => ctrl.abort(), 120000);
       const res = await fetch(this.ollamaURL + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
