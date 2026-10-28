@@ -58,15 +58,35 @@
    * 外呼百度，返回无意义结果——体验灾难。本闸在 decideMode 之前一票否决：
    *   1) 纯寒暄（任意长度，如"你好""hi!! 在吗""嗯。"）→ 强制纯聊天；
    *   2) 极短且零任务信号（<5 字、无任何动词/技术指令词）→ 强制纯聊天。
+   * [2026-10-27 二次扩网·"晚上好呀moray"实锤复盘] 上面两道都是**整句**判据，双双漏网：
+   *   ① CASUAL_GREETING_RE 要求"整句 = 寒暄词 + 标点/空格"，后缀挂"呀moray"即不匹配；
+   *   ② 长度闸是 <5 字，9 字的"晚上好呀moray"直接越过。
+   * 漏网后 on 档把 decideMode 判出的 chat 强制升级成 agent → Laya → argus 搜"晚上好"。
+   *   3) **寒暄开头网（前缀判据，本次新增）**：文本以寒暄词开头 + 全文零任务动作词
+   *      → 一律强制纯聊天，绝不进 decideMode。允许英文/点名后缀（"moray晚上好呀"
+   *      "hi moray"）、允许语气词尾缀；一旦含任务词（"晚上好，帮我查价格"）立刻放行真任务。
    * 含任务词的短句（"改bug""查价格""写个脚本"）永不命中——真任务零误伤。
    * 与 Laya 规划层寒暄闸（task_planner casual 拦截）构成前后端双保险。 */
   var CASUAL_GREETING_RE = /^(?:你好|您好|嗨|哈喽|哈罗|hello|hi+|hey|yo|早安|早上好|中午好|下午好|晚上好|晚安|在吗|在不在|在么|谢谢|多谢|感谢|再见|拜拜|辛苦了|okay?|嗯+|哦+|好的|收到|行|可以)[!！~～。．,.，\s]*$/i;
   var TASK_HINT_RE = /(写|做|搞|弄|生成|创建|新建|构建|开发|修改|改|修复|修|优化|重构|分析|查|搜|找|调研|检索|搜索|统计|汇总|整理|计算|对比|评估|测试|调试|排查|运行|执行|跑|启动|部署|发布|编译|安装|下载|导出|导入|读取|写入|删除|保存|代码|脚本|程序|函数|模块|文件|目录|文件夹|数据|数据库|接口|api|日志|报错|错误|bug|报告|方案|文档|页面|组件|配置|环境|服务器|命令|任务|流程|架构|python|javascript|java|sql|价格|多少钱|资讯|新闻|政策|行情|趋势)/i;
+  /* 寒暄开头网：中文寒暄词后不设限（"moray"/英文后缀都算寒暄）；英文寒暄词须以
+   * 非字母收尾，防 hi→history / hello→helloworld 这类词前缀误伤。 */
+  var GREETING_CN_PREFIX_RE = /^(?:你好|您好|嗨|哈喽|哈罗|早安|早上好|中午好|下午好|晚上好|晚安|在吗|在不在|在么|谢谢|多谢|感谢|再见|拜拜|辛苦了|嗯+|哦+|好的|收到|行|可以)/;
+  var GREETING_EN_PREFIX_RE = /^(?:hello|hi+|hey|yo)(?![a-z])/i;
+  /* 点名式寒暄："moray晚上好呀" / "moray, hi" —— 先剥 wake 词再套前缀网。 */
+  var WAKE_PREFIX_RE = /^(?:moray)\s*[，,!！~～。．,.:：、\s]*/i;
+  function hasGreetingPrefix(t) {
+    function hit(s) { return GREETING_CN_PREFIX_RE.test(s) || GREETING_EN_PREFIX_RE.test(s); }
+    if (hit(t)) return true;
+    var s = t.replace(WAKE_PREFIX_RE, '');   // 无匹配时原样返回
+    return s !== t && hit(s);
+  }
   function isCasualText(raw) {
     var t = String(raw == null ? '' : raw).trim();
     if (!t) return false;
-    if (CASUAL_GREETING_RE.test(t)) return true;   // 纯寒暄（含标点/空格尾缀）
-    return t.length < 5 && !TASK_HINT_RE.test(t);  // 极短且零任务信号
+    if (CASUAL_GREETING_RE.test(t)) return true;              // 整句寒暄（含标点/空格尾缀）
+    if (hasGreetingPrefix(t)) return !TASK_HINT_RE.test(t);   // 寒暄开头 + 零任务词 → 纯聊天
+    return t.length < 5 && !TASK_HINT_RE.test(t);             // 极短且零任务信号
   }
   window.morayIsCasualText = isCasualText;   // 手工验收入口
 
@@ -1894,9 +1914,11 @@
           } else if (finalMode === 'code') {
             showNotification('意图判定：代码任务', '转交 ZCode 沙箱执行，过程在对话流展示', 'info', 1600);
           }
-          // [2026-10-01 U-6-2] on 模式：忽略 decideMode 的 'chat' 结果（用户强制 agent）
-          // 'code' → 卡片；'agent' → 浮层；'chat' → 强制改 'agent'（on 语义）
-          if (m === 'on' && finalMode === 'chat') {
+          // [2026-10-01 U-6-2] on 模式：'code' → 卡片；'agent' → 浮层。
+          // [2026-10-27 硬防线·三] 'chat' 不再无条件强制升级成 agent——原实现把
+          // "晚上好呀moray"判出的 chat 硬升 agent → Laya → argus 搜"晚上好"（实锤事故）。
+          // 现在只有出现明确任务信号（TASK_HINT_RE 命中）才升 agent：非特定指令不传 Laya。
+          if (m === 'on' && finalMode === 'chat' && TASK_HINT_RE.test(raw)) {
             finalMode = 'agent';
           }
         }
