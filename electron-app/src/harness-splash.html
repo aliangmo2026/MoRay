@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>MoRay</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; background: #0a0a0a; color: #e5e7eb;
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; overflow: hidden; }
+    /* 无边框窗口：启动屏阶段整页即拖拽区（页内无按钮，无 no-drag 需求） */
+    .wrap { height: 100%; display: flex; align-items: center; justify-content: center;
+      -webkit-app-region: drag; cursor: default; user-select: none; }
+    .card { text-align: center; max-width: 560px; padding: 0 24px; }
+    .logo { width: 64px; height: 64px; border-radius: 17px; background: #3272ED;
+      display: flex; align-items: center; justify-content: center; margin: 0 auto 22px;
+      animation: pulse 2.1s ease-in-out infinite; }
+    .logo svg { width: 34px; height: 34px; }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(50, 114, 237, 0.45); }
+      50%      { transform: scale(1.045); box-shadow: 0 0 0 18px rgba(50, 114, 237, 0); }
+    }
+    .name { font-size: 24px; font-weight: 600; letter-spacing: 0.05em; }
+    .status { margin-top: 12px; font-size: 13px; color: #8b93a3; word-break: break-all; }
+    .spinner { width: 16px; height: 16px; border: 2px solid #22262e; border-top-color: #3272ED;
+      border-radius: 50%; margin: 20px auto 0; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .hint { margin-top: 18px; font-size: 12px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4.8 18.6V7l7.2 9.2 7.2-9.2v11.6" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="name">MoRay OS</div>
+      <div class="status" id="splash-status">MoRay OS 正在唤醒…</div>
+      <div class="spinner"></div>
+      <div class="hint" id="splash-hint" hidden>按 F5 重新拉起 dsh，或查看日志里的 token 地址。</div>
+    </div>
+  </div>
+</body>
+</html>

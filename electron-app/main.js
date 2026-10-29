@@ -15,12 +15,18 @@
  *
  * 核心原则：只给现有网页套原生窗口外壳，不修改任何原有前端页面；
  *           不修改 v36 启动器本身——只调用。
+ *
+ * [方案2 2026-10-29] Harness 接管：
+ *   默认窗口不再加载旧版工作台壳，而是由本进程 spawn dsh web、从输出里抓
+ *   "dsh web: http://127.0.0.1:3080/?token=..." 的完整地址，直接 loadURL。
+ *   token 每次 dsh 重启都会重生成，所以每次启动都重新抓（不缓存 token）。
+ *   旧版工作台壳保留为逃生舱：MORAY_SHELL_LEGACY=1 / MORAY_HARNESS=0。
  * ============================================================ */
 
 'use strict';
 
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog } = require('electron');
-const { spawn, exec } = require('child_process');
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell } = require('electron');
+const { spawn, exec, execFile } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -58,6 +64,103 @@ const OPEN_DEVTOOLS = false;
 // 桌面版/服务形态在跑，壳无权带走它。
 const KILL_PORTS = [8000, 8001, 8004, 8005, 8010, 9301];
 
+/* ============================================================
+ *  [方案2 2026-10-29] Harness 前台：壳自己拉起 dsh web 并抓 token
+ *
+ *  - 默认：窗口直接加载 dsh web（Harness，MoRay 换皮版），旧版工作台壳退役
+ *  - 逃生舱：MORAY_SHELL_LEGACY=1 或 MORAY_HARNESS=0 回到旧版工作台窗口
+ *  - dsh 的输出 tee 到 HARNESS_LOG，token 每轮重启都会变，所以每轮都重新抓
+ * ============================================================ */
+
+const HARNESS_DISABLED = process.env.MORAY_HARNESS === '0';
+const LEGACY_SHELL = HARNESS_DISABLED || process.env.MORAY_SHELL_LEGACY === '1';
+const HARNESS_CWD = process.env.MORAY_HARNESS_CWD || 'D:\\moray-v2';
+const HARNESS_PORT = 3080;
+const HARNESS_LOG = path.join(HARNESS_CWD, 'logs', 'dsh-web.log');
+const HARNESS_BOOT_TIMEOUT_MS = 60_000;   // 机器忙/冷启动时 dsh 可能 >30s，给足预算
+const HARNESS_TOKEN_RE = /(http:\/\/127\.0\.0\.1:3080\/\?token=[A-Za-z0-9_-]+)/;
+const SPLASH_FILE = path.join(__dirname, 'src', 'harness-splash.html');
+
+/* ============================================================
+ *  [2026-10-30 沉浸式无边框] Harness 页面注入层
+ *  - 拖拽区：主列 <header>（dsh 顶栏）+ 侧栏落款行（*_logoRow——CSS module
+ *    哈希前缀会随构建变、_logoRow 后缀稳定，故用 [class*=] 匹配）
+ *  - 顶栏内所有可交互元素 no-drag，防"点按钮变成拖窗口"
+ *  - 右上角注入 _ □ × 三钮（#moray-win-controls），经 preload-harness.js
+ *    桥到 win:minimize / win:toggle-maximize / win:close（三选对话框照走）
+ *  - header 右侧预留 152px 内边距给控制条（原 28px，右上按钮簇整体左移）
+ *  选择器与几何实测于 1280×720（header 76px 高、最右按钮 x=1268），
+ *  dsh 前端大改版时需重新探针复核。
+ * ============================================================ */
+const FRAME_CSS = `
+header { -webkit-app-region: drag; }
+[class*="logoRow"] { -webkit-app-region: drag; }
+header button, header a, header input, header select, header textarea, header label,
+header [role="button"], header [role="tab"], header [role="combobox"],
+header [role="menuitem"], header [role="tablist"] { -webkit-app-region: no-drag; }
+[class*="logoRow"] button, [class*="logoRow"] a, [class*="logoRow"] input,
+[class*="logoRow"] [role="button"] { -webkit-app-region: no-drag; }
+header { padding-right: 152px !important; }
+#moray-win-controls { position: fixed; top: 0; right: 0; width: 126px; height: 40px;
+  display: flex; align-items: stretch; z-index: 2147483000; -webkit-app-region: no-drag;
+  font-family: "Segoe UI", system-ui, sans-serif; }
+#moray-win-controls button { flex: 1 1 0; min-width: 0; border: 0; margin: 0; padding: 0;
+  border-radius: 0; background: transparent; color: #9aa3b5; cursor: default;
+  display: flex; align-items: center; justify-content: center; -webkit-app-region: no-drag; }
+#moray-win-controls button svg { width: 13px; height: 13px; display: block; }
+#moray-win-controls button:hover { background: rgba(50, 114, 237, 0.22); color: #e8ecf6; }
+#moray-win-controls button[data-act="close"]:hover { background: #e5484d; color: #fff; }
+`;
+const FRAME_JS = `(function(){
+  if (window.__morayFrameControls) return { already: true };
+  window.__morayFrameControls = true;
+  var bar = document.createElement('div');
+  bar.id = 'moray-win-controls';
+  var mk = function (act, label, d) {
+    var b = document.createElement('button');
+    b.setAttribute('data-act', act);
+    b.setAttribute('title', label);
+    b.setAttribute('aria-label', label);
+    b.innerHTML = '<svg viewBox="0 0 12 12" fill="none" aria-hidden="true">' +
+      '<path d="' + d + '" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    return b;
+  };
+  bar.appendChild(mk('minimize', '最小化', 'M1.5 6h9'));
+  bar.appendChild(mk('maximize', '最大化 / 还原', 'M1.8 1.8h8.4v8.4H1.8z'));
+  bar.appendChild(mk('close', '关闭', 'M2 2l8 8M10 2l-8 8'));
+  bar.addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (!b || !window.morayWindow) return;
+    var act = b.getAttribute('data-act');
+    if (act === 'minimize') window.morayWindow.minimize();
+    else if (act === 'maximize') window.morayWindow.toggleMaximize();
+    else if (act === 'close') window.morayWindow.close();
+  });
+  document.body.appendChild(bar);
+  return { injected: true, buttons: bar.children.length };
+})()`;
+
+// 注入拖拽区与窗口控制（仅对 3080 页面生效；splash 是 file: 自动跳过）。
+// did-finish-load 每次触发都会先撤旧 CSS 再重注，F5 刷新后依然在。
+let frameCssKey = null;
+async function applyFrameOverlay() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const wc = mainWindow.webContents;
+  const url = wc.getURL() || '';
+  if (!url.startsWith('http://127.0.0.1:3080')) return;
+  try {
+    if (frameCssKey) {
+      try { await wc.removeInsertedCSS(frameCssKey); } catch (err) { /* 旧页已导航时忽略 */ }
+      frameCssKey = null;
+    }
+    frameCssKey = await wc.insertCSS(FRAME_CSS);
+    const r = await wc.executeJavaScript(FRAME_JS, true);
+    harnessLog(`frame overlay injected ${JSON.stringify(r)}`);
+  } catch (err) {
+    harnessLog(`frame overlay 注入失败：${err.message}`);
+  }
+}
+
 // 壳内的标签页清单（只管展示与健康探测；服务由 v36 启动器负责拉起）
 //   id / name / port / healthPath / url —— url 即 webview 加载地址
 const PAGES = [
@@ -68,14 +171,17 @@ const PAGES = [
     healthPath: '/api/health',
     url: 'http://127.0.0.1:8000/'
   },
-  {
-    id: 'laya',
-    name: 'Laya 引擎',
-    port: 8001,
-    healthPath: '/health',
-    // Laya 无独立 UI，展示 FastAPI 自带接口文档
-    url: 'http://127.0.0.1:8001/docs'
-  },
+  // [2026-10-23 摘除] Laya 引擎标签已删：中枢工作台(8000)已是唯一入口，底层引擎
+  // 在聊天框切换（多引擎热插拔），侧栏独立切页按钮冗余。Laya 8001 服务照常由
+  // v36 启动器拉起——KILL_PORTS 含 8001，且 v36 与 KILL_PORTS 均不读本数组。
+  // {
+  //   id: 'laya',
+  //   name: 'Laya 引擎',
+  //   port: 8001,
+  //   healthPath: '/health',
+  //   // Laya 无独立 UI，展示 FastAPI 自带接口文档
+  //   url: 'http://127.0.0.1:8001/docs'
+  // },
   {
     id: 'argus',
     name: 'Argus 情报',
@@ -287,6 +393,235 @@ async function killAllServicePorts() {
 }
 
 /* ============================================================
+ *  Harness（dsh web）生命周期：拉起 -> 抓 token -> 交给窗口
+ * ============================================================ */
+
+let dshChild = null;   // 壳自己拉起的 dsh 进程（node -> npx-cli -> dsh）
+
+function harnessLog(msg) {
+  launcherLog('[harness] ' + msg);
+}
+
+/** 用参数数组结束进程树，完全不经过 shell */
+function taskkillTree(pid) {
+  return new Promise((resolve) => {
+    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());
+  });
+}
+
+/** 结束监听某端口的进程树，并等待端口释放 */
+async function killPort(port) {
+  const pids = await getPidsListeningOnPort(port);
+  for (const pid of pids) await taskkillTree(pid);
+  if (pids.length) {
+    harnessLog(`端口 ${port}: PID ${pids.join(', ')} -> taskkill /T /F`);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+}
+
+/** 停掉壳自己拉起的 dsh 进程树 + 3080 上的监听者 */
+async function stopHarness() {
+  const child = dshChild;
+  dshChild = null;
+  if (child && !child.killed) await taskkillTree(child.pid);
+  await killPort(HARNESS_PORT);
+}
+
+/**
+ * 解析 node + npm 的 npx-cli.js：直接 spawn 参数数组，不经 cmd / shell。
+ * 可用 MORAY_NODE_EXE / MORAY_NPX_CLI 覆盖（非标准 Node 安装时）。
+ * @returns {{ node: string, npx: string } | null}
+ */
+function resolveNpxLauncher() {
+  const candidates = [];
+  if (process.env.MORAY_NODE_EXE && process.env.MORAY_NPX_CLI) {
+    candidates.push({ node: process.env.MORAY_NODE_EXE, npx: process.env.MORAY_NPX_CLI });
+  }
+  const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+  const nodeExe = path.join(programFiles, 'nodejs', 'node.exe');
+  const npmBin = path.join(programFiles, 'nodejs', 'node_modules', 'npm', 'bin');
+  candidates.push({ node: nodeExe, npx: path.join(npmBin, 'npx-cli.js') });
+  candidates.push({ node: nodeExe, npx: path.join(npmBin, 'npx.js') });
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate.node) && fs.existsSync(candidate.npx)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * 启动 dsh web，监听 stdout/stderr 抓首行带 token 的地址。
+ * 输出同时 tee 到 HARNESS_LOG，壳外排查只看一个文件。
+ * @returns {Promise<string|null>} token URL；超时/提前退出返回 null
+ */
+function spawnHarness() {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HARNESS_CWD)) {
+      harnessLog(`Harness 工作区不存在：${HARNESS_CWD}`);
+      resolve(null);
+      return;
+    }
+    const launcher = resolveNpxLauncher();
+    if (!launcher) {
+      harnessLog('找不到 node + npx-cli.js，无法启动 dsh（可设 MORAY_NODE_EXE / MORAY_NPX_CLI）');
+      resolve(null);
+      return;
+    }
+    try { fs.mkdirSync(path.dirname(HARNESS_LOG), { recursive: true }); } catch (err) {}
+    const stream = fs.createWriteStream(HARNESS_LOG, { flags: 'a' });
+    harnessLog(`==== spawn: ${launcher.node} ${launcher.npx} -y @deepseek-ai/dsh@alpha web --no-open ====`);
+
+    let settled = false;
+    let carry = '';
+    const finish = (url) => {
+      if (settled) return;
+      settled = true;
+      resolve(url);
+    };
+
+    const child = spawn(launcher.node,
+      [launcher.npx, '-y', '@deepseek-ai/dsh@alpha', 'web', '--no-open'],
+      {
+        cwd: HARNESS_CWD,
+        env: Object.assign({}, process.env, {
+          // MoRay 网关只校验这个占位凭据存在；真实云端 key 只在 server/.env。
+          // 允许用户用自己的环境变量覆盖，源码不落任何真实凭据。
+          MORAY_LOCAL_KEY: process.env.MORAY_LOCAL_KEY || 'moray-local',
+          // 遥测进程级总闸（cordis.patch.yml 已拔根，此处双保险）。
+          DSH_TELEMETRY_DISABLED: '1'
+        }),
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    dshChild = child;
+
+    const scan = (chunk) => {
+      const text = chunk.toString('utf8');
+      stream.write(text);
+      const matched = (carry + text).match(HARNESS_TOKEN_RE);
+      carry = (carry + text).slice(-512);   // token 行可能被 chunk 切断
+      if (!matched) return;
+      // 只接受本机 Harness 地址：协议/主机/端口/token 全部校验后再规范化为新 URL，
+      // 绝不把子进程输出原样当导航目标。
+      let target = null;
+      try {
+        const parsed = new URL(matched[1]);
+        const token = parsed.searchParams.get('token');
+        if (parsed.protocol === 'http:' && parsed.hostname === '127.0.0.1'
+            && parsed.port === String(HARNESS_PORT) && token) {
+          target = parsed.toString();
+        }
+      } catch (err) {
+        target = null;
+      }
+      if (!target) return;
+      if (!settled) {
+        harnessLog('token URL captured');
+        finish(target);
+      } else if (mainWindow && !mainWindow.isDestroyed()
+          && mainWindow.webContents.getURL().startsWith('file:')) {
+        // [2026-10-29] 超时后 token 才到：窗口还停在 splash 就自动切过去。
+        harnessLog('token URL captured (late)');
+        mainWindow.loadURL(target).catch((err) => harnessLog(`迟到 token 加载失败：${err.message}`));
+      }
+    };
+    child.stdout.on('data', scan);
+    child.stderr.on('data', scan);
+    child.on('exit', (code) => {
+      harnessLog(`dsh 进程退出 code=${code}`);
+      if (dshChild === child) dshChild = null;
+      try { stream.end(); } catch (err) {}
+      finish(null);
+    });
+    child.on('error', (err) => {
+      harnessLog(`dsh spawn 失败：${err.message}`);
+      if (dshChild === child) dshChild = null;
+      try { stream.end(); } catch (err2) {}
+      finish(null);
+    });
+    setTimeout(() => {
+      if (!settled) harnessLog(`token 抓取超时（${HARNESS_BOOT_TIMEOUT_MS / 1000}s）`);
+      finish(null);
+    }, HARNESS_BOOT_TIMEOUT_MS);
+  });
+}
+
+/** 杀掉旧实例 -> 重新拉起 -> 返回 token URL（null = 失败） */
+async function ensureHarnessReady() {
+  if (LEGACY_SHELL) return null;
+  await stopHarness();
+  return spawnHarness();
+}
+
+/** 主窗口 Harness 启动流程：splash 已显示，抓到地址后整页切过去 */
+async function bootHarnessWindow() {
+  const url = await ensureHarnessReady();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (url) {
+    try {
+      await mainWindow.loadURL(url);
+      harnessLog('Harness 已加载');
+      // 一行 DPI/视口诊断：高分屏缩放异常时先看这里
+      try {
+        const diag = await mainWindow.webContents.executeJavaScript(
+          '({innerWidth:window.innerWidth, dpr:window.devicePixelRatio, scrollWidth:document.documentElement.scrollWidth})'
+        );
+        harnessLog(`viewport ${JSON.stringify(diag)} content ${JSON.stringify(mainWindow.getContentBounds())} zoom ${mainWindow.webContents.getZoomFactor()}`);
+      } catch (err) { /* 诊断失败不影响主流程 */ }
+      return;
+    } catch (err) {
+      harnessLog(`Harness loadURL 失败：${err.message}`);
+    }
+  }
+  await showHarnessFallback();
+}
+
+/** 超时兜底：留在 splash 上给出日志路径，并弹窗提示手动取 token */
+async function showHarnessFallback() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    await mainWindow.webContents.executeJavaScript(
+      "(function(){var s=document.getElementById('splash-status');" +
+      'if(s){s.textContent=' + JSON.stringify('没有拿到访问令牌，请查看日志：' + HARNESS_LOG) + ';}' +
+      "var h=document.getElementById('splash-hint');if(h){h.hidden=false;}})()"
+    );
+  } catch (err) { /* splash 未就绪时忽略 */ }
+  dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: 'Harness 未就绪',
+    message: '没有在限定时间内拿到 dsh web 的访问令牌。',
+    detail: `日志：${HARNESS_LOG}\n手动取出 "dsh web: http://127.0.0.1:3080/?token=..." 那一行，\n或按 F5 重试（会重新拉起 dsh）。`,
+    buttons: ['知道了']
+  });
+}
+
+/** 托盘「重启 Harness」：重抓 token 后原地刷新 */
+async function restartHarness() {
+  const url = await ensureHarnessReady();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (url) {
+    try { await mainWindow.loadURL(url); } catch (err) { harnessLog(`重启后加载失败：${err.message}`); }
+  } else {
+    await showHarnessFallback();
+  }
+}
+
+/** 托盘「重启全部服务」：停 6 服务 + Harness -> 并行拉起 -> 加载新 token 页 */
+async function restartEverything() {
+  await killAllServicePorts();
+  if (LEGACY_SHELL) {
+    await launchAll();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reloadIgnoringCache();
+    return;
+  }
+  const launch = launchAll();          // 8000 与 dsh 并行：dsh 的模型目录来自配置声明，不依赖 8000 先就绪
+  const url = await ensureHarnessReady();
+  await launch;
+  if (mainWindow && !mainWindow.isDestroyed() && url) {
+    try { await mainWindow.loadURL(url); } catch (err) { harnessLog(`重载失败：${err.message}`); }
+  }
+}
+
+/* ============================================================
  *  启动编排：调起启动器 -> 等 8000 -> 补探其余标签页
  * ============================================================ */
 
@@ -317,9 +652,10 @@ async function launchAll() {
  *  关闭决策：对话框三选 + 记忆
  * ============================================================ */
 
-/** 完全退出：杀 6 服务（不含 Ollama）后退出壳 */
+/** 完全退出：杀 6 服务（不含 Ollama）+ dsh，然后退出壳 */
 async function doQuitAll() {
   isQuitting = true;
+  await stopHarness();
   await killAllServicePorts();
   app.quit();
 }
@@ -351,8 +687,8 @@ async function handleShellClose() {
     const { response, checkboxChecked } = await dialog.showMessageBox(mainWindow, {
       type: 'question',
       title: '退出 MoRay',
-      message: '要退出桌面端。七个本地服务怎么处理？',
-      detail: '「完全退出」停掉除 Ollama 外的 6 个本地服务；「保留后台自转」则服务继续跑，只关壳。',
+      message: '要退出桌面端。本地服务与 Harness 怎么处理？',
+      detail: '「完全退出」停掉除 Ollama 外的 6 个本地服务和 Harness；「保留后台自转」则它们继续跑，只关壳。',
       buttons: ['完全退出（停止所有服务）', '保留后台自转（服务继续跑）', '取消'],
       defaultId: 1,
       cancelId: 2,
@@ -387,16 +723,32 @@ function createWindow() {
     height: 820,
     minWidth: 960,
     minHeight: 640,
-    frame: false,                  // 无边框，使用自定义标题栏
+    // [2026-10-30 沉浸式] Harness 模式隐藏原生标题栏：titleBarStyle 'hidden'
+    // 保留 DWM 阴影/圆角/边缘缩放；拖拽区与最小/最大/关闭按钮由
+    // did-finish-load 注入层接管（FRAME_CSS + FRAME_JS + preload-harness.js）。
+    frame: LEGACY_SHELL ? false : true,
+    titleBarStyle: LEGACY_SHELL ? 'default' : 'hidden',
+    title: 'MoRay',
     show: false,
-    backgroundColor: '#f4f5f8',    // [UI 2.0 步骤7] 对齐浅色玻璃底：启动瞬间不闪黑
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,      // 上下文隔离（安全）
-      nodeIntegration: false,      // 渲染进程不直接开 Node
-      webviewTag: true,            // 启用 <webview> 原样嵌入现有网页
-      spellcheck: false
-    }
+    backgroundColor: LEGACY_SHELL ? '#f4f5f8' : '#0a0a0a',
+    webPreferences: LEGACY_SHELL
+      ? {
+          preload: path.join(__dirname, 'preload.js'),
+          contextIsolation: true,      // 上下文隔离（安全）
+          nodeIntegration: false,      // 渲染进程不直接开 Node
+          webviewTag: true,            // 启用 <webview> 原样嵌入现有网页
+          spellcheck: false
+        }
+      : {
+          // Harness 是普通网页：不开 Node、不开 webview；preload 只桥接
+          // 窗口控制三通道（沉浸式无边框需要），页面其余能力照旧隔离。
+          preload: path.join(__dirname, 'preload-harness.js'),
+          contextIsolation: true,
+          nodeIntegration: false,
+          webviewTag: false,
+          sandbox: true,
+          spellcheck: false
+        }
   });
 
   // Win11 磨砂玻璃材质（Electron 30+；非 Win11 或关闭时自动跳过）
@@ -408,7 +760,39 @@ function createWindow() {
     }
   }
 
-  mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+  if (LEGACY_SHELL) {
+    mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+  } else {
+    // 先上 splash（秒开），token 抓到后整页切 Harness
+    mainWindow.loadFile(SPLASH_FILE);
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown') return;
+      const key = String(input.key || '').toLowerCase();
+      if (key === 'f5' || (input.control && key === 'r')) {
+        event.preventDefault();
+        // splash 阶段（file:）F5 = 重新拉起 dsh；Harness 已加载 = 普通刷新
+        if (mainWindow.webContents.getURL().startsWith('file:')) {
+          restartHarness().catch((err) => harnessLog(`F5 重试失败：${err.message}`));
+        } else {
+          mainWindow.webContents.reload();
+        }
+      } else if (key === 'f12') {
+        event.preventDefault();
+        mainWindow.webContents.toggleDevTools();
+      }
+    });
+    // 同源（3080）弹窗放行；外链交给系统浏览器
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:\/\/(127\.0\.0\.1|localhost):3080\//i.test(url)) return { action: 'allow' };
+      if (/^https?:\/\//i.test(url)) { shell.openExternal(url).catch(() => {}); }
+      return { action: 'deny' };
+    });
+    // [2026-10-30 沉浸式] 页面每次加载完成后注入拖拽区 + 窗口控制（F5 刷新也在内）
+    mainWindow.webContents.on('did-finish-load', () => {
+      applyFrameOverlay().catch(() => {});
+    });
+    bootHarnessWindow().catch((err) => console.error('[harness] 启动异常：', err));
+  }
 
   // 调试：启动时自动打开开发者工具（F12 可手动切换）
   if (OPEN_DEVTOOLS) {
@@ -468,8 +852,26 @@ function createTray() {
 function buildTrayMenu() {
   // 开机自启仅在打包后可用（开发模式下指向的是 electron.exe，没意义）
   const openAtLogin = app.isPackaged ? app.getLoginItemSettings().openAtLogin : false;
-  const menu = Menu.buildFromTemplate([
-    { label: '打开工作台', click: () => showWindow() },
+  const items = [
+    { label: LEGACY_SHELL ? '打开工作台' : '打开 MoRay', click: () => showWindow() }
+  ];
+  if (!LEGACY_SHELL) {
+    items.push({
+      label: '重新加载界面',
+      click: () => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
+      }
+    });
+    items.push({
+      label: '重启 Harness（重新抓 token）',
+      click: () => { restartHarness().catch((err) => console.error('[harness] 重启失败：', err)); }
+    });
+  }
+  items.push(
+    {
+      label: '重启全部服务',
+      click: () => { restartEverything().catch((err) => console.error('[restart] 失败：', err)); }
+    },
     {
       label: '最小化到托盘',
       click: () => {
@@ -496,8 +898,8 @@ function buildTrayMenu() {
       }
     },
     { label: '退出程序', click: () => handleShellClose() }
-  ]);
-  tray.setContextMenu(menu);
+  );
+  tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
 /**
@@ -575,8 +977,7 @@ ipcMain.handle('app:set-autostart', (_event, enabled) => {
 
 // 侧边栏「重启全部服务」/ splash「重试」：按端口杀 6 服务 -> 重调 v36 启动器
 ipcMain.handle('app:restart', async () => {
-  await killAllServicePorts();
-  await launchAll();
+  await restartEverything();
   return true;
 });
 
@@ -672,6 +1073,9 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    // Harness 模式不需要 Electron 默认的 File/Edit/View 菜单条：原生标题栏已够用
+    if (!LEGACY_SHELL) Menu.setApplicationMenu(null);
+
     // [M4b 收尾 2026-10-02] 壳启动时清 persist:moray 分区 HTTP 缓存，
     // 保证 webview 加载时 HTML 走网络拿最新版，触发 SW 更新检查。
     // 仅清 HTTP disk cache，不动 SW CacheStorage / IndexedDB / LocalStorage。
