@@ -52,6 +52,13 @@ db.init_db()
 BOILERPLATE = ("我是预训练语言模型，我没有记忆，每次对话都是全新的，"
                "也无法提供具体的代码帮助。")
 GOOD_REPLY = "我是 MoRay，你的本地 AI 助手，拥有长期记忆库并可通过内置 Agent 执行代码。"
+#: [2026-10-29 身份叛变] r1:7b 实测泄漏原文（会带 DeepSeek/深度求索）
+IDENTITY_LEAK = "您好！我是由中国的深度求索（DeepSeek）公司开发的智能助手DeepSeek-R1。"
+#: 身份追问的固定口径（llm_proxy 兜底后用户实际看到的那句）
+from server.app.llm_proxy import IDENTITY_CANONICAL_REPLY  # noqa: E402
+
+#: 非身份类 user 消息：免责声明重试只在这种问题上生效（身份类改走固定口径）
+NON_IDENTITY_ASK = "帮我改一下这段 Python 代码"
 
 
 def _chat_payload(content: str) -> dict:
@@ -299,7 +306,8 @@ class NonStreamTests(IdentityBase):
 
     def test_11_boilerplate_triggers_one_correction_retry(self):
         _FakeClient.replies = [BOILERPLATE, GOOD_REPLY]
-        r = self.client.post("/api/llm/chat", json=_body())
+        r = self.client.post("/api/llm/chat", json=_body(
+            [{"role": "user", "content": NON_IDENTITY_ASK}]))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json().get("content"), GOOD_REPLY)  # 拿到纠正后的回复
         self.assertEqual(len(_FakeClient.payloads), 2)         # 只重试一次
@@ -310,10 +318,50 @@ class NonStreamTests(IdentityBase):
 
     def test_12_retry_once_only_even_if_still_boilerplate(self):
         _FakeClient.replies = [BOILERPLATE, BOILERPLATE]
-        r = self.client.post("/api/llm/chat", json=_body())
+        r = self.client.post("/api/llm/chat", json=_body(
+            [{"role": "user", "content": NON_IDENTITY_ASK}]))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(_FakeClient.payloads), 2)         # 绝不循环
         self.assertEqual(r.json().get("content"), BOILERPLATE)
+
+
+class IdentityPolicyTests(IdentityBase):
+    """[2026-10-29 身份叛变] 身份追问只认“我是 MoRay”，沾厂商名/答空直接换固定口径。"""
+
+    def test_13_identity_vendor_leak_replaced_with_canonical(self):
+        _FakeClient.replies = [IDENTITY_LEAK]
+        r = self.client.post("/api/llm/chat", json=_body())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("content"), IDENTITY_CANONICAL_REPLY)
+        self.assertEqual(len(_FakeClient.payloads), 1)          # 不重试，省一次生成
+
+    def test_14_identity_empty_answer_replaced_with_canonical(self):
+        _FakeClient.replies = [""]
+        r = self.client.post("/api/llm/chat", json=_body())
+        self.assertEqual(r.json().get("content"), IDENTITY_CANONICAL_REPLY)
+
+    def test_15_identity_clean_answer_passes_through(self):
+        _FakeClient.replies = [GOOD_REPLY]
+        r = self.client.post("/api/llm/chat", json=_body())
+        self.assertEqual(r.json().get("content"), GOOD_REPLY)
+        self.assertEqual(len(_FakeClient.payloads), 1)
+
+    def test_23_identity_stream_leak_replaced_with_canonical(self):
+        _FakeClient.mode = "stream"
+        _FakeClient.stream_replies = [IDENTITY_LEAK]
+        raw = self.client.post("/api/llm/chat", json=_body(stream=True)).text
+        self.assertEqual(len(_FakeClient.payloads), 1)
+        text = _joined_content(raw)
+        self.assertEqual(text, IDENTITY_CANONICAL_REPLY)
+        self.assertNotIn("DeepSeek", text)
+        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
+
+    def test_24_identity_stream_empty_answer_replaced(self):
+        _FakeClient.mode = "stream"
+        _FakeClient.stream_replies = [""]
+        raw = self.client.post("/api/llm/chat", json=_body(stream=True)).text
+        self.assertEqual(_joined_content(raw), IDENTITY_CANONICAL_REPLY)
+        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
 
 
 # ---------------------------------------------------------------- 端到端：流式
@@ -337,7 +385,8 @@ class StreamTests(IdentityBase):
 
     def test_21_boilerplate_stream_retried_once(self):
         _FakeClient.stream_replies = [BOILERPLATE, GOOD_REPLY]
-        raw = self._collect(_body(stream=True))
+        raw = self._collect(_body(
+            [{"role": "user", "content": NON_IDENTITY_ASK}], stream=True))
         self.assertEqual(len(_FakeClient.payloads), 2)         # 丢弃套话 + 重试一次
         text = _joined_content(raw)
         self.assertNotIn("我是预训练", text)                   # 套话没有流给客户端
