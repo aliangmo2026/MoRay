@@ -14,5 +14,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('morayWindow', {
   minimize: () => ipcRenderer.send('win:minimize'),
   toggleMaximize: () => ipcRenderer.send('win:toggle-maximize'),
-  close: () => ipcRenderer.send('win:close')
+  close: () => ipcRenderer.send('win:close'),
+  // [2026-10-31 云端网关] 保存服务商后自动重启 Harness 以加载新模型。
+  // 仍是无参动作：页面不能传任何参数，也不能触达其它 IPC 通道。
+  restartHarness: () => ipcRenderer.invoke('harness:restart')
 });

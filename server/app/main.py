@@ -229,6 +229,9 @@ app = FastAPI(title="MoRay 本地薄后端", version=config.VERSION, lifespan=li
 app.include_router(llm_router)
 app.include_router(api_router)
 app.include_router(agent_tools_router)
+# [2026-10-30 动态多厂商] UI 增删云端服务商：/api/cloud/providers（独立前缀，不影响既有匹配）
+from .cloud_providers import router as cloud_providers_router  # noqa: E402
+app.include_router(cloud_providers_router)
 # [Argus 深度研究] 同源代理：前端工具 → /api/argus/* → 本机 Argus（默认 8010）。
 # 独立路径前缀，与既有 /api/* 不冲突；放在 mcp_router 之前保持既有匹配顺序不变。
 app.include_router(argus_router)

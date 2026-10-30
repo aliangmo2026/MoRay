@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config
 from . import cloud_budget_guard
+from . import cloud_providers  # [2026-10-30 动态多厂商] UI 注册表：按名字/模型动态选上游
 from . import db as _db  # [真实数据链路 2026-10-26] usage_log 落库
 
 router = APIRouter()
@@ -869,6 +870,11 @@ async def llm_chat(request: Request):
     # provider=cloud → 维持原白名单兜底（云端网关只认 _UPSTREAM_MODELS）。
     requested = str(body.get("model") or "").strip()
     provider, provider_source = _resolve_body_provider(request, body)
+    # [2026-10-30 动态多厂商] 请求头点名了 UI 注册表里的服务商 → 走云端分支，
+    # 闸门/预算/身份底座全部复用，不绕过。
+    _target_header = str(request.headers.get("X-Moray-Target-Provider") or "").strip().lower()
+    if _target_header and cloud_providers.lookup_by_name(_target_header):
+        provider = "cloud"
     if provider == "ollama":
         model = requested or config.OLLAMA_MODEL
     elif provider == "custom_27b":
@@ -879,6 +885,9 @@ async def llm_chat(request: Request):
         # 决定，不能再套本地 _UPSTREAM_MODELS 白名单（此前 gpt-4o-mini/glm-4-flash 等被静默
         # 改写成 deepseek-chat 或 400）。白名单只保留给"全局 .env 上游 + 本地模型名打到云端"
         # 的兜底场景。
+        model = requested
+    elif requested and cloud_providers.lookup_by_model(requested):
+        # 注册表里的模型：名字原样透传，上游由 pick_target 按 头/名字 解析
         model = requested
     elif requested in _UPSTREAM_MODELS:
         model = requested
@@ -1017,6 +1026,9 @@ async def llm_chat(request: Request):
         _logger.info("[router] 云端预算预扣 permit=%s est=%.4f",
                      _cloud_permit.permit_id, _cloud_permit.reserved_usd)
         use_local = False
+        # [2026-10-30 动态多厂商] 注册表里点名/命中模型的厂商优先于 .env 单槽位；
+        # 仍然走同一条云端链路（闸门/预算/身份/审计不变）。
+        _dyn_target = cloud_providers.pick_target(request, model)
         # [2026-10-25 BYOK 透传] 界面透传的 base/key 优先于 .env（已过 SSRF 校验）；
         # 未透传时行为与改动前完全一致（.env 固定转发目标）。
         if custom_base:
@@ -1028,6 +1040,16 @@ async def llm_chat(request: Request):
             upstream_model = model
             _logger.info("[router] 云端路由 → %s (前端透传, key=%s)",
                          custom_base, _mask_key(custom_key))
+        elif _dyn_target:
+            upstream_url = str(_dyn_target["base_url"]).rstrip("/") + "/chat/completions"
+            upstream_headers = {
+                "Authorization": "Bearer " + str(_dyn_target["api_key"]),
+                "Content-Type": "application/json",
+            }
+            upstream_model = model
+            _logger.info("[router] 动态厂商路由 → %s (provider=%s, key=%s)",
+                         _dyn_target["base_url"], _dyn_target["name"],
+                         _mask_key(str(_dyn_target["api_key"])))
         else:
             upstream_url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
             upstream_headers = {
@@ -1700,6 +1722,14 @@ async def openai_list_models():
     if config.ENABLE_CLOUD_API:
         for _mid in ("deepseek-chat", "deepseek-reasoner"):
             data.append({"id": _mid, "object": "model", "created": now, "owned_by": "moray-cloud"})
+        # 4) [2026-10-30 动态多厂商] UI 注册表里的模型（经本网关转发，owned_by 标厂商标识）
+        try:
+            for _mid, _owner, _display in cloud_providers.all_models():
+                data.append({"id": _mid, "object": "model", "created": now,
+                             "owned_by": "moray:%s" % _owner})
+        except Exception as _e:  # noqa: BLE001 - 注册表读失败只降级
+            _logger.info("[v1-models] 动态厂商注册表不可读，跳过：%s: %s",
+                         type(_e).__name__, str(_e)[:120])
 
     return JSONResponse({"object": "list", "data": data})
 

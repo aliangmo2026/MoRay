@@ -159,6 +159,108 @@ const FRAME_JS = `(function(){
   return { injected: true, buttons: bar.children.length };
 })()`;
 
+/* [2026-10-30 云端网关收口 / 2026-10-31 加锁] 屏蔽 Harness 原生的服务商管理：
+ *  - 入口：「添加模型提供商」「第三方模型提供商」「自定义模型 API」整块隐藏；
+ *  - 列表：原生"模型"页里每个服务商行的「编辑 / 删除」一并隐藏——原生编辑能改
+ *    baseURL，等于绕过 8000（身份底座/记忆/预算全失效），必须堵死；
+ *  - 兜底：万一结构变化按钮还在，捕获阶段拦截点击并提示去「云端网关」。
+ * 作用域用页面锚点「填入各提供商的…」锁定，避免误伤 Agent 预设等其它页的编辑按钮。 */
+const PROVIDER_GUARD_JS = `(function(){
+  if (window.__morayProviderGuard) return { already: true };
+  window.__morayProviderGuard = true;
+  var BANNED = ['第三方模型提供商', '自定义模型 API', '添加模型提供商'];
+  var ACTIONS = ['编辑', '删除'];
+  var ANCHOR = '填入各提供商的 API 密钥';
+  function textOf(el){ return ((el && el.textContent) || '').trim(); }
+  function hitBanned(t){
+    for (var i = 0; i < BANNED.length; i++) if (t === BANNED[i] || t.indexOf(BANNED[i]) === 0) return true;
+    return false;
+  }
+  function hide(target){
+    try { target.style.setProperty('display','none','important'); target.setAttribute('data-moray-hidden-provider','1'); } catch (e) {}
+  }
+  /** 原生"模型"设置页容器：靠唯一的提示文案定位，找不到就退化为整个 dialog。 */
+  function modelsScope(){
+    var nodes = document.querySelectorAll('div,section,main');
+    for (var i = 0; i < nodes.length; i++) {
+      var t = textOf(nodes[i]);
+      if (t.indexOf(ANCHOR) === -1) continue;
+      if (t.length > 4000) continue;            // 太外层的容器不算
+      return nodes[i];
+    }
+    return null;
+  }
+  function toast(msg){
+    try {
+      var old = document.getElementById('moray-provider-toast');
+      if (old) old.parentNode && old.parentNode.removeChild(old);
+      var d = document.createElement('div');
+      d.id = 'moray-provider-toast';
+      d.textContent = msg;
+      d.style.cssText = 'position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:2147483001;' +
+        'background:rgba(24,26,33,.96);color:#e8ecf6;border:1px solid rgba(50,114,237,.55);' +
+        'border-radius:10px;padding:10px 16px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.45)';
+      document.body.appendChild(d);
+      setTimeout(function(){ try { d.parentNode && d.parentNode.removeChild(d); } catch (e) {} }, 2800);
+    } catch (e) {}
+  }
+  function sweep(root, scope){
+    try {
+      if (!root || root.nodeType !== 1) return;
+      var list = [root].concat([].slice.call(root.querySelectorAll('button,[role="button"],[role="tab"],[role="menuitem"],li,a')));
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i];
+        if (el.hasAttribute('data-moray-hidden-provider')) continue;
+        var t = textOf(el);
+        if (!t) continue;
+        if (t.length <= 40 && hitBanned(t)) {
+          hide(el.closest('button,[role="tab"],[role="menuitem"],[role="button"],li') || el);
+          continue;
+        }
+        if (ACTIONS.indexOf(t) === -1) continue;
+        if (!scope || !scope.contains(el)) continue;   // 只在原生"模型"页里动手
+        hide(el.closest('button,[role="button"],a') || el);
+      }
+    } catch (e) {}
+  }
+  function sweepAll(){
+    // 设置面板没开就什么都不做：聊天流式渲染每帧都有 DOM 变更，不能在这里扫全页。
+    var dlg = document.querySelector('[role="dialog"]');
+    if (!dlg) return;
+    sweep(dlg, null);                 // 禁用入口：整个设置弹窗
+    var scope = modelsScope();
+    if (scope) sweep(scope, scope);   // 编辑/删除：只在原生"模型"页里动手
+  }
+  var pending = false;
+  function schedule(){
+    if (pending) return;
+    pending = true;
+    setTimeout(function(){ pending = false; sweepAll(); }, 150);
+  }
+  function boot(){
+    schedule();
+    new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  }
+  // 兜底：按钮若因结构变化逃过隐藏，点击在捕获阶段直接拦住。
+  document.addEventListener('click', function(ev){
+    try {
+      if (!document.querySelector('[role="dialog"]')) return;
+      var el = ev.target && ev.target.closest ? ev.target.closest('button,[role="button"],a') : null;
+      if (!el) return;
+      if (ACTIONS.indexOf(textOf(el)) === -1) return;
+      var scope = modelsScope();
+      if (!scope || !scope.contains(el)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.stopImmediatePropagation();
+      toast('模型服务商已由 MoRay 云端网关统一管理，请前往「云端网关」操作');
+    } catch (e) {}
+  }, true);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  return { injected: true, banned: BANNED.length };
+})()`;
+
 // 注入拖拽区与窗口控制（仅对 3080 页面生效；splash 是 file: 自动跳过）。
 // did-finish-load 每次触发都会先撤旧 CSS 再重注，F5 刷新后依然在。
 let frameCssKey = null;
@@ -175,6 +277,8 @@ async function applyFrameOverlay() {
     frameCssKey = await wc.insertCSS(FRAME_CSS);
     const r = await wc.executeJavaScript(FRAME_JS, true);
     harnessLog(`frame overlay injected ${JSON.stringify(r)}`);
+    const guard = await wc.executeJavaScript(PROVIDER_GUARD_JS, true);
+    harnessLog(`provider guard ${JSON.stringify(guard)}`);
   } catch (err) {
     harnessLog(`frame overlay 注入失败：${err.message}`);
   }
@@ -1168,6 +1272,19 @@ ipcMain.handle('app:set-autostart', (_event, enabled) => {
 ipcMain.handle('app:restart', async () => {
   await restartEverything();
   return true;
+});
+
+// [2026-10-31 云端网关] 面板保存后自动重启 Harness：
+// 只做 dsh 重启 + 重抓 token（不动 6 个本地服务），走的是托盘「重启 Harness」同一条路径。
+ipcMain.handle('harness:restart', async () => {
+  if (LEGACY_SHELL) return { ok: false, error: '旧版工作台壳无 Harness' };
+  try {
+    await restartHarness();
+    return { ok: true };
+  } catch (err) {
+    harnessLog(`harness:restart 失败：${err && err.message}`);
+    return { ok: false, error: String((err && err.message) || err) };
+  }
 });
 
 /* ============================================================
