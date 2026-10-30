@@ -47,9 +47,15 @@ TOOLS = [
     {"type": "function", "function": {"name": "search_text", "description": "d", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "regex": {"type": "boolean"}}}}},
     {"type": "function", "function": {"name": "edit_file", "description": "d", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "submit_plan", "description": "d", "parameters": {"type": "object", "properties": {"steps": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "tool": {"type": "string"}}}}}}}},
+    # [Argus 接入] 研究工具：与 parts/125_tools.js 的 ARGUS_TOOLS 同名同参，请求体与真实前端一致
+    {"type": "function", "function": {"name": "detective_research", "description": "调用 Argus 深度研究模块，自动搜索、抓取网页、交叉验证，生成带引用的研究报告。", "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}},
+    {"type": "function", "function": {"name": "detective_status", "description": "查询 Argus 研究任务的当前状态和进度。", "parameters": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]}}},
 ]
 
 SIDE_EFFECTS = {"write_file", "run_command", "edit_file"}
+#: [Argus 接入] 研究工具不经 /api/agent/tool（那是本机文件/命令通道），
+#: 走同源 /api/argus/*；它们不是副作用工具，不需要审批
+ARGUS_TOOLS = {"detective_research", "detective_status"}
 
 # ---------------------------------------------------------------- mock 上游
 
@@ -94,6 +100,17 @@ SCENARIOS = {
         {"tool_calls": [{"name": "edit_file", "arguments": {"path": "e2e_edit.txt", "old_str": "DDD", "new_str": "X"}}]},
         {"content": "好的，已取消编辑，文件内容保持不变。"},
     ],
+    # [Argus 接入] 研究启动 → 模型告知 session_id
+    "s10_argus_research": [
+        {"tool_calls": [{"name": "detective_research", "arguments": {"question": "Cursor 价格"}}]},
+        {"content": "已启动 Argus 研究任务，session_id = argusmock0001，研究需要几分钟，稍后可查进度。"},
+    ],
+    # [Argus 接入] 进度查询两次：第一次 running，第二次 done 且报告就绪（正文回灌）
+    "s11_argus_status": [
+        {"tool_calls": [{"name": "detective_status", "arguments": {"session_id": "argusmock0001"}}]},
+        {"tool_calls": [{"name": "detective_status", "arguments": {"session_id": "argusmock0001"}}]},
+        {"content": "研究已完成：Cursor Pro 版约 $20/月（来源 cursor.com/pricing）。"},
+    ],
 }
 
 mock_state = {"scenario": None, "idx": 0}
@@ -136,6 +153,7 @@ class MockLLM(BaseHTTPRequestHandler):
             with lock:
                 mock_requests.append({
                     "has_tools": has_tools,
+                    "tool_names": [(t.get("function") or {}).get("name") for t in (body.get("tools") or [])],
                     "n_msgs": len(msgs),
                     "roles": [m.get("role") for m in msgs],
                     "assistant_tool_calls": [
@@ -208,6 +226,87 @@ def start_mock():
     raise RuntimeError("mock upstream failed to start")
 
 
+# ---------------------------------------------------------------- mock Argus
+# [Argus 接入] 用一个假 Argus 顶替 8010 上的真服务：契约测试要的是"转发是否忠实、
+# 回灌格式是否合规"，不是"真的跑一次研究"——真研究既慢又会真的调模型/抓网页，
+# 放进回归套件里每跑一次都产生副作用。真服务的联调由 test_moray_controls_argus.py
+# （Moray→Argus 冒烟）与 /api/argus/health 探针覆盖。
+MOCK_ARGUS_PORT = 8896
+MOCK_ARGUS_BASE = "http://127.0.0.1:%d" % MOCK_ARGUS_PORT
+#: 假 Argus 的剧本：session_id 固定，status 先 running、第 2 次查询起 done 且报告就绪
+MOCK_ARGUS_SESSION = "argusmock0001"
+argus_state = {"orchestrate_bodies": [], "status_calls": 0}
+
+
+class MockArgus(BaseHTTPRequestHandler):
+    def _json(self, obj, status=200):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(n) or b"{}")
+        if self.path == "/api/argus/orchestrate":
+            with lock:
+                argus_state["orchestrate_bodies"].append(body)
+            return self._json({"session_id": MOCK_ARGUS_SESSION, "status": "pending"})
+        if self.path == "/__ctl_reset":
+            with lock:
+                argus_state["orchestrate_bodies"].clear()
+                argus_state["status_calls"] = 0
+            return self._json({"ok": True})
+        return self._json({"detail": "not found"}, 404)
+
+    def do_GET(self):  # noqa: N802
+        if self.path.startswith("/api/argus/status/"):
+            sid = self.path.rsplit("/", 1)[-1]
+            if sid != MOCK_ARGUS_SESSION:
+                return self._json({"detail": "session not found"}, 404)
+            with lock:
+                argus_state["status_calls"] += 1
+                calls = argus_state["status_calls"]
+            done = calls >= 2
+            return self._json({
+                "status": "done" if done else "running",
+                "progress": "研究完成" if done else "正在检索",
+                "session_id": sid, "question": "Cursor 价格",
+                "event_count": 12 if done else 3, "report_ready": done,
+            })
+        if self.path.endswith("/report"):
+            sid = self.path.split("/")[3] if self.path.startswith("/api/sessions/") else ""
+            if sid != MOCK_ARGUS_SESSION:
+                return self._json({"detail": "session not found"}, 404)
+            return self._json({
+                "ready": True,
+                "markdown": "# Cursor 价格\n\nPro 版 $20/月，个人版 $20/月，团队版 $40/用户/月。[来源：cursor.com/pricing]",
+                "summary": "Cursor 价格", "body": "Pro 版 $20/月。[来源：cursor.com/pricing]",
+                "citations": [{"url": "https://cursor.com/pricing", "title": "Cursor Pricing"}],
+            })
+        if self.path == "/api/health":
+            return self._json({"status": "ok"})
+        return self._json({"detail": "not found"}, 404)
+
+    def log_message(self, *a):  # noqa: N802
+        pass
+
+
+def start_mock_argus():
+    srv = ThreadingHTTPServer(("127.0.0.1", MOCK_ARGUS_PORT), MockArgus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    for _ in range(40):
+        try:
+            httpx.post(MOCK_ARGUS_BASE + "/__ctl_reset", timeout=1)
+            return srv
+        except Exception:
+            time.sleep(0.2)
+    raise RuntimeError("mock argus failed to start")
+
+
+
 # ---------------------------------------------------------------- 协议模拟器
 
 def agent_tool(client, name, args, approved=None, decision=None):
@@ -219,6 +318,46 @@ def agent_tool(client, name, args, approved=None, decision=None):
         body["decision"] = decision
     r = client.post("/api/agent/tool", json=body, timeout=60)
     return r.status_code, r.json()
+
+
+def argus_tool(client, name, args):
+    """调后端 /api/argus/*（对应前端 parts/125_tools.js 的 argusToolRun + 两个工具 run()）。
+
+    detective_status 在 report_ready 时会再取一次报告正文（前端同样两步），
+    这里 1:1 复刻，回灌内容才与真机一致。
+    """
+    if name == "detective_research":
+        r = client.post("/api/argus/orchestrate", json={"question": args.get("question")}, timeout=60)
+        j = r.json()
+        if not j.get("ok"):
+            return r.status_code, j
+        d = j["data"]
+        return r.status_code, {"ok": True, "data": {
+            "session_id": d["session_id"], "status": d.get("status") or "running",
+            "question": d.get("question") or args.get("question"),
+            "note": "研究已在 Argus 后台启动。请把 session_id = %s 告诉用户。" % d["session_id"],
+        }}
+    if name == "detective_status":
+        sid = str(args.get("session_id") or "")
+        r = client.get("/api/argus/status/" + sid, timeout=60)
+        j = r.json()
+        if not j.get("ok"):
+            return r.status_code, j
+        d = j["data"]
+        out = {"session_id": d.get("session_id") or sid, "status": d.get("status"),
+               "progress": d.get("progress"), "report_ready": bool(d.get("report_ready")),
+               "question": d.get("question") or ""}
+        if d.get("report_ready"):
+            rr = client.get("/api/argus/report/" + sid, timeout=60).json()
+            rr = rr.get("data") or {}
+            md = str(rr.get("markdown") or rr.get("body") or "")
+            out["report"] = md[:6000]
+            out["citations"] = (rr.get("citations") or [])[:20]
+            out["note"] = "研究已完成。请基于 report 正文回答用户，并按 citations 标注来源。"
+        else:
+            out["note"] = "研究仍在进行中。" if d.get("status") != "failed" else "研究失败（Argus 侧报错）。"
+        return r.status_code, {"ok": True, "data": out}
+    return 404, {"ok": False, "message": "未知 Argus 工具 " + name}
 
 
 def run_agent_loop(client, user_text, max_rounds=8, deny_tools=None):
@@ -268,7 +407,10 @@ def run_agent_loop(client, user_text, max_rounds=8, deny_tools=None):
                              "content": json.dumps(result, ensure_ascii=False)})
                 continue
             step = {"name": name, "args": args, "status": None, "result": None, "needsApproval_seen": False}
-            if name in SIDE_EFFECTS and name not in deny_tools:
+            if name in ARGUS_TOOLS:
+                # [Argus 接入] 研究与进度查询：同源 /api/argus/*，无审批环节
+                sc, sj = argus_tool(client, name, args)
+            elif name in SIDE_EFFECTS and name not in deny_tools:
                 # 双保险：先无 approved → 必须 needsApproval
                 sc, sj = agent_tool(client, name, args)
                 step["needsApproval_seen"] = bool(sj.get("needsApproval"))
@@ -323,6 +465,7 @@ def main():
         f.write("内容B素材")
 
     mock = start_mock()
+    mock_argus = start_mock_argus()
     with TestClient(app) as client:
         health = client.get("/api/health").json()
         check("T0 后端启动(临时库) build=%s" % health.get("build"), health.get("ok") is True and health.get("counts", {}).get("conversations") == 0, health)
@@ -458,7 +601,90 @@ def main():
         sc, sj = agent_tool(client, "find_files", {"path": "..\\..\\windows"}, approved=True)
         check("SEC find_files 越界拒绝（M2 抽检）", sc == 200 and sj.get("ok") is False and sj.get("code") == "unsafe", sj)
 
+        # ================= [Argus 接入] 研究工具闭环 =================        # 用假 Argus（8896）顶替真服务：契约测试要确定性，真研究既慢又有副作用。
+        # 真服务联调见 test_moray_controls_argus.py + /api/argus/health。
+        from app import config as app_config
+        saved_argus_base = app_config.ARGUS_BASE_URL
+        app_config.ARGUS_BASE_URL = MOCK_ARGUS_BASE
+        try:
+            # ---- 场景10：detective_research → 代理转发 → session_id 回灌给模型 ----
+            httpx.post(MOCK_BASE + "/__ctl", json={"scenario": "s10_argus_research"}, timeout=5)
+            httpx.post(MOCK_ARGUS_BASE + "/__ctl_reset", timeout=5)
+            r10 = run_agent_loop(client, "用 Argus 查一下 Cursor 价格")
+            s10 = r10["tool_steps"][0] if r10["tool_steps"] else {}
+            check("S10 请求体带 Argus 工具定义（tools 注入生效）",
+                  {"detective_research", "detective_status"}.issubset(set(mock_requests[0]["tool_names"] or [])),
+                  mock_requests[0]["tool_names"])
+            check("S10 detective_research 执行成功且不需审批",
+                  s10.get("name") == "detective_research" and s10.get("status") == "ok"
+                  and s10.get("needsApproval_seen") is False, s10)
+            check("S10 代理把 question 原样转发给 Argus",
+                  argus_state["orchestrate_bodies"] == [{"question": "Cursor 价格"}],
+                  argus_state["orchestrate_bodies"])
+            check("S10 工具结果带回 Argus 的 session_id",
+                  (s10.get("result") or {}).get("session_id") == MOCK_ARGUS_SESSION, s10.get("result"))
+            s10_toolmsg = (mock_requests[-1]["tool_msgs"] or [{}])[0].get("content", "")
+            check("S10 回灌 role:tool 消息含 session_id",
+                  MOCK_ARGUS_SESSION in s10_toolmsg and "研究已在 Argus 后台启动" in s10_toolmsg,
+                  s10_toolmsg[:220])
+            check("S10 最终答复引用 session_id",
+                  MOCK_ARGUS_SESSION in (r10["final_text"] or ""), r10["final_text"])
+
+            # ---- 场景11：detective_status 两轮 → running 无报告 → done 带正文 ----
+            httpx.post(MOCK_BASE + "/__ctl", json={"scenario": "s11_argus_status"}, timeout=5)
+            httpx.post(MOCK_ARGUS_BASE + "/__ctl_reset", timeout=5)
+            r11 = run_agent_loop(client, "argusmock0001 这个研究好了吗")
+            names11 = [s["name"] for s in r11["tool_steps"]]
+            check("S11 两次 detective_status 顺序执行",
+                  names11 == ["detective_status", "detective_status"], names11)
+            first11, second11 = r11["tool_steps"][0], r11["tool_steps"][1]
+            check("S11 第一轮 running 且不带报告",
+                  (first11["result"] or {}).get("status") == "running"
+                  and "report" not in (first11["result"] or {}), first11["result"])
+            check("S11 第二轮 done、报告正文与引用齐全",
+                  (second11["result"] or {}).get("status") == "done"
+                  and "20/月" in (second11["result"] or {}).get("report", "")
+                  and bool((second11["result"] or {}).get("citations")), second11["result"])
+            s11_toolmsg = (mock_requests[-1]["tool_msgs"] or [{}])[-1].get("content", "")
+            check("S11 报告正文回灌给模型（含引用）",
+                  "20/月" in s11_toolmsg and "cursor.com/pricing" in s11_toolmsg, s11_toolmsg[:260])
+
+            # ---- 场景12：Argus 不在线 → 明确的 argus_offline，链路不崩 ----
+            app_config.ARGUS_BASE_URL = "http://127.0.0.1:59996"
+            httpx.post(MOCK_BASE + "/__ctl", json={"scenario": "s10_argus_research"}, timeout=5)
+            r12 = run_agent_loop(client, "用 Argus 查一下 Cursor 价格")
+            s12 = r12["tool_steps"][0] if r12["tool_steps"] else {}
+            check("S12 Argus 离线 → 工具步骤失败并给出启动提示",
+                  s12.get("status") == "error" and "未启动" in str(s12.get("result")), s12)
+            off_msg = (mock_requests[-1]["tool_msgs"] or [{}])[0].get("content", "")
+            check("S12 模型收到『错误：…start_argus.bat』并如实收尾",
+                  off_msg.startswith("错误：") and "start_argus.bat" in off_msg, off_msg[:240])
+        finally:
+            app_config.ARGUS_BASE_URL = saved_argus_base
+
+        # ---- [Argus 接入] 前端接线静态自证（浏览器侧逻辑不在本套件运行范围内，
+        #      这里只断言"代码里确实存在"，行为验证见浏览器联调记录）----
+        parts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "parts")
+        src125 = open(os.path.join(parts_dir, "125_tools.js"), encoding="utf-8-sig").read()
+        src100 = open(os.path.join(parts_dir, "100_gateway.js"), encoding="utf-8-sig").read()
+        src030 = open(os.path.join(parts_dir, "30_chat.js"), encoding="utf-8-sig").read()
+        check("ARG 前端注册 detective_research / detective_status",
+              "'detective_research'" in src125 and "'detective_status'" in src125
+              and "ARGUS_TOOLS.forEach(t => ToolRegistry.register(t))" in src125)
+        check("ARG 工具走同源 /api/argus/*（避开 8010 的 CORS）",
+              "/api/argus/orchestrate" in src125 and "/api/argus/status/" in src125
+              and "/api/argus/report/" in src125)
+        check("ARG 显式点名 Argus 时由代码直接发起（不依赖模型是否调工具）",
+              "argusExplicitQuestion" in src125 and "argusExplicitQuestion(msgs)" in src100)
+        check("ARG System Prompt 能力通告（杜绝『我没有 Argus 这个工具』）",
+              "【Argus 深度研究】" in src030 and "detective_research" in src030)
+        check("ARG 后端暴露 4 个 /api/argus/* 路由",
+              all(p in client.get("/openapi.json").json()["paths"]
+                  for p in ("/api/argus/health", "/api/argus/orchestrate",
+                            "/api/argus/status/{session_id}", "/api/argus/report/{session_id}")))
+
     mock.shutdown()
+    mock_argus.shutdown()
     # 清理
     import shutil
     shutil.rmtree(WORKSPACE, ignore_errors=True)

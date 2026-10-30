@@ -35,8 +35,16 @@ logger = logging.getLogger("moray.memory_embed")
 #: 嵌入模型（任务书点名 nomic-embed-text；768 维）
 EMBED_MODEL = os.environ.get("MORAY_EMBED_MODEL", "").strip() or "nomic-embed-text"
 _EMBED_DIM = memory_db.EMBED_DIM
-#: 单次嵌入超时（本地推理；冷启动模型装载可达秒级，20s 余量）
-_EMBED_TIMEOUT = 20.0
+#: 单次嵌入超时（本地推理）。[P0可用性修复 2026-10-28] 20→60：真机实测 nomic-embed-text
+#: 冷加载耗时 83.24s（首次超时 / 二次 83s / 三次 0.11s），20s 必超时 → 每条聊天消息白等
+#: 20s 后 fail-open 退回纯 FTS，向量通道形同虚设。60s 让暖机后的调用正常返回。
+_EMBED_TIMEOUT = 60.0
+
+#: [P0可用性修复 2026-10-28] 向量通道熔断冷却：一次超时/异常后，冷却期内 get_embedding
+#: 直接返回 None（零网络开销），调用方 _hybrid_recall 自动降级纯 FTS——避免每条消息都
+#: 硬等一个注定超时的嵌入调用。300s 后自动放行重试（模型可能已被聊天挤下显存又暖回来）。
+_VEC_COOLDOWN_SEC = 300.0
+_vec_cooldown_until = 0.0
 #: 送嵌文本字符钳制（nomic ctx 8192 token；中文约 1.5 char/token，6000 字符安全）
 _EMBED_TEXT_MAX = 6000
 
@@ -75,11 +83,32 @@ def cosine(a: list, b: list) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
+def vector_channel_open() -> bool:
+    """[P0可用性修复 2026-10-28] 向量通道熔断闸：冷却期内 False（调用方直接跳过向量
+    通道，只走 FTS，零网络开销）。冷却到期自动放行重试。"""
+    return time.time() >= _vec_cooldown_until
+
+
+def _trip_cooldown(reason: str) -> None:
+    """熔断：记日志 + 开冷却窗。只在超时/异常路径调用（HTTP 非 200 / 维度不符不熔断
+    ——那是配置问题，重试无意义但也不该永久拖慢主链路，故同样熔断一次冷却）。"""
+    global _vec_cooldown_until
+    _vec_cooldown_until = time.time() + _VEC_COOLDOWN_SEC
+    logger.warning("[memory_embed] 向量通道熔断 %.0fs（%s）——冷却期内检索只走 FTS",
+                   _VEC_COOLDOWN_SEC, reason)
+
+
 def get_embedding(text: str) -> list | None:
     """文本 → 768 维向量；任何异常/非 200/维度不符/空文本一律 None（fail-open，
-    绝不抛——调用方都在主链路上）。模型经 MORAY_EMBED_MODEL 可换。"""
+    绝不抛——调用方都在主链路上）。模型经 MORAY_EMBED_MODEL 可换。
+
+    [P0可用性修复 2026-10-28] 熔断冷却：上次超时/异常后 300s 内直接返 None，
+    不再对注定超时的冷加载调用硬等 60s（真机实测嵌入冷加载 83s，会让每条聊天
+    消息固定多等一个超时窗）。"""
     t = str(text or "").strip()
     if not t:
+        return None
+    if not vector_channel_open():
         return None
     url = str(config.OLLAMA_BASE_URL or "").rstrip("/") + "/api/embeddings"
     payload = {"model": EMBED_MODEL, "prompt": t[:_EMBED_TEXT_MAX]}
@@ -89,17 +118,20 @@ def get_embedding(text: str) -> list | None:
         if r.status_code != 200:
             logger.warning("[memory_embed] 嵌入 HTTP %s（model=%s url=%s）",
                            r.status_code, EMBED_MODEL, url)
+            _trip_cooldown("http_%s" % r.status_code)
             return None
         vec = (r.json() or {}).get("embedding")
         if not isinstance(vec, list) or len(vec) != _EMBED_DIM:
             got = len(vec) if isinstance(vec, list) else type(vec).__name__
             logger.warning("[memory_embed] 嵌入维度不符（got %s want %s）——模型与 "
                            "MORAY_EMBED_DIM 不匹配？", got, _EMBED_DIM)
+            _trip_cooldown("dim_mismatch")
             return None
         return [float(x) for x in vec]
     except Exception as e:  # noqa: BLE001 - fail-open
         logger.warning("[memory_embed] 嵌入调用异常：%s: %s",
                        type(e).__name__, str(e)[:160])
+        _trip_cooldown(type(e).__name__)
         return None
 
 

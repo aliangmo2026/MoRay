@@ -1,0 +1,399 @@
+{
+  "sample_id": "jev-ee8ea568dd0f4020-20260928035953",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T03:59:53.849Z",
+  "scenario": {
+    "id": "S03",
+    "category": "删除操作",
+    "name": "删除配置文件 → 「删除+配置」风险升级（TC-03 同类）"
+  },
+  "request": {
+    "query": "清空并删除缓存配置文件 cache.conf",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790567989734-e9314d",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "high",
+    "encode_time_ms": 0.016
+  },
+  "standard_decision": {
+    "decision_id": "dec-1739523600000-a1b2c3",
+    "input_snapshot": {
+      "query": "清空并删除缓存配置文件 cache.conf",
+      "world_state_id": "ws-l0-20250214-cacheconf",
+      "context_id": "ctx-cache-ops-001",
+      "timestamp": "2025-02-14T10:20:00.000Z"
+    },
+    "output": {
+      "target_path": "file_ops.cache_conf.delete",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "intent_analysis",
+            "target": "cache.conf",
+            "operation": "clear_and_delete"
+          },
+          "order": 1,
+          "timeout_ms": 3000
+        },
+        {
+          "agent_id": "confirm_agent",
+          "params": {
+            "action": "user_confirm",
+            "target": "cache.conf",
+            "operation": "clear_and_delete",
+            "risk_level": "high"
+          },
+          "order": 2,
+          "timeout_ms": 5000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "execute",
+            "target": "cache.conf",
+            "operation": "clear_and_delete"
+          },
+          "order": 3,
+          "timeout_ms": 10000
+        },
+        {
+          "agent_id": "audit_agent",
+          "params": {
+            "action": "audit",
+            "target": "cache.conf",
+            "operation": "clear_and_delete"
+          },
+          "order": 4,
+          "timeout_ms": 5000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "deletion"
+        ],
+        "target_object": null,
+        "environment": "default",
+        "risk_tag": "high",
+        "user_permission": "write",
+        "target_file": "cache.conf",
+        "operation": "clear_and_delete",
+        "permission_level": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "intent_analysis",
+              "target": "cache.conf",
+              "operation": "clear_and_delete"
+            },
+            "order": 1,
+            "timeout_ms": 3000
+          },
+          "description": "解析用户意图：清空并删除缓存配置文件 cache.conf",
+          "verification": "确认意图为文件删除且目标路径正确"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "action": "user_confirm",
+              "target": "cache.conf",
+              "operation": "clear_and_delete",
+              "risk_level": "high"
+            },
+            "order": 2,
+            "timeout_ms": 5000
+          },
+          "description": "高风险操作，需用户二次确认删除 cache.conf",
+          "verification": "用户确认返回 true"
+        },
+        {
+          "step_id": "step-3",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "execute",
+              "target": "cache.conf",
+              "operation": "clear_and_delete"
+            },
+            "order": 3,
+            "timeout_ms": 10000
+          },
+          "description": "执行清空并删除 cache.conf 文件",
+          "verification": "检查文件是否已删除且无残留"
+        },
+        {
+          "step_id": "step-4",
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "action": "audit",
+              "target": "cache.conf",
+              "operation": "clear_and_delete"
+            },
+            "order": 4,
+            "timeout_ms": 5000
+          },
+          "description": "审计删除操作，记录操作日志",
+          "verification": "审计日志记录成功"
+        }
+      ],
+      "expected_outcome": "cache.conf 文件被清空并删除，操作记录已审计",
+      "verification_points": [
+        "用户确认已获取",
+        "文件删除成功",
+        "审计日志已生成"
+      ],
+      "fallback_plan": {
+        "condition": "文件删除失败或用户拒绝确认",
+        "action": "回滚操作并通知用户",
+        "max_retry": 2
+      }
+    },
+    "quality": {
+      "confidence": 0.72,
+      "complexity_score": 4,
+      "risk_level": "high",
+      "is_composite_scenario": true,
+      "composite_type": "file_modification_high_risk"
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "composite_scenario",
+        "complexity",
+        "low_confidence"
+      ],
+      "trigger_reasons": [
+        "操作风险标记为 high",
+        "代码/文件修改与高风险组合",
+        "步骤数 4 大于等于 3",
+        "置信度 0.72 低于 0.8"
+      ],
+      "upgrade_priority": "P1"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "高风险操作需用户确认",
+        "生产环境相关操作需审计",
+        "组合场景降级置信度"
+      ],
+      "matched_domain_experience": [
+        "文件删除操作标准流程",
+        "高风险文件操作需二次确认"
+      ],
+      "reasoning_summary": "用户请求删除 cache.conf，风险标记 high，操作涉及文件修改，判定为组合场景，置信度降为 0.72，步骤包含意图解析、用户确认、执行和审计。",
+      "counterfactual_note": "若风险标记为 low，则无需用户确认和审计，置信度可为 0.9。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": "",
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 150,
+    "timestamp": "2025-02-14T10:20:00.150Z",
+    "version": {
+      "meta_core": "v1.0",
+      "domain_adapter": "v1.0",
+      "world_encoder": "v1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "ee8ea568dd0f4020",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790567989734-621b2e",
+    "input_snapshot": {
+      "query": "清空并删除缓存配置文件 cache.conf",
+      "world_state_id": "ws-1790567989734-e9314d",
+      "context_id": "ctx-1790567989734",
+      "timestamp": "2026-09-28T03:59:49.734Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::通用域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "清空并删除缓存配置文件 cache.conf",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "清空并删除缓存配置文件 cache.conf",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "confirm_agent",
+          "params": {
+            "confirm_type": "risk_gate",
+            "risk_source": "operation_risk_tag"
+          },
+          "order": 3,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "deletion"
+        ],
+        "target_object": null,
+        "environment": "default",
+        "risk_tag": "high",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "清空并删除缓存配置文件 cache.conf",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "清空并删除缓存配置文件 cache.conf",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        },
+        {
+          "step_id": 3,
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "confirm_type": "risk_gate",
+              "risk_source": "operation_risk_tag"
+            },
+            "order": 3,
+            "timeout_ms": 30000
+          },
+          "description": "高风险操作：执行前向用户发起确认",
+          "verification": "用户显式确认后方可继续，拒绝则终止并回滚"
+        }
+      ],
+      "expected_outcome": "请求由快速路径完成处理并通过验证点校验",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致",
+        "用户显式确认后方可继续，拒绝则终止并回滚"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.55,
+      "risk_level": "high",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "complexity"
+      ],
+      "trigger_reasons": [
+        "操作风险标签为 high，命中硬规则 META-RISK-01，强制升级至 Lomi 深思层",
+        "执行步骤数为 3（≥3），超过 Laya 快速路径复杂度阈值，触发升级"
+      ],
+      "upgrade_priority": "P1"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [],
+      "reasoning_summary": "风险校验：high（高风险，命中硬规则） → 复杂度评估：识别意图 [deletion]，生成 3 个步骤 → 能力匹配：通用域处理 → 路径生成：L0→L1 快速规则路径::通用域；组合场景不成立，置信度 0.9；共命中 2 个升级触发维度，判定升级（P1）",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.038,
+    "timestamp": "2026-09-28T03:59:49.734Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 4114.8
+  }
+}

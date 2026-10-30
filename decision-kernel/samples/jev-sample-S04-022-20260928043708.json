@@ -1,0 +1,332 @@
+{
+  "sample_id": "jev-d084e2b11dbd251a-20260928043708",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T04:37:08.809Z",
+  "scenario": {
+    "id": "S04",
+    "category": "只读操作",
+    "name": "read 权限读取生产日志 → 生产风险升级（TC-04 同类）"
+  },
+  "request": {
+    "query": "查看线上环境的服务运行日志",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790570225617-1e50d8",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "low",
+    "encode_time_ms": 0.014
+  },
+  "standard_decision": {
+    "decision_id": "dec-1735689600000-a1b2c3",
+    "input_snapshot": {
+      "query": "查看线上环境的服务运行日志",
+      "world_state_id": "ws-20250101-0001",
+      "context_id": "ctx-log-view-001",
+      "timestamp": "2025-01-01T00:00:00Z"
+    },
+    "output": {
+      "target_path": "log_view",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "parse_intent",
+            "query": "查看线上环境的服务运行日志"
+          },
+          "order": 1,
+          "timeout_ms": 3000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "execute",
+            "target": "log_view",
+            "env": "production"
+          },
+          "order": 2,
+          "timeout_ms": 10000
+        }
+      ],
+      "param_mapping": {
+        "intent": "log_view",
+        "target_object": null,
+        "environment": "production",
+        "risk_tag": "low",
+        "user_permission": "write",
+        "env": "production",
+        "resource": "service_logs"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "parse_intent",
+              "query": "查看线上环境的服务运行日志"
+            },
+            "order": 1,
+            "timeout_ms": 3000
+          },
+          "description": "解析用户意图为查看日志操作",
+          "verification": "意图识别结果包含 log_view 且 env=production"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "execute",
+              "target": "log_view",
+              "env": "production"
+            },
+            "order": 2,
+            "timeout_ms": 10000
+          },
+          "description": "执行日志查看操作",
+          "verification": "返回日志内容且无权限错误"
+        }
+      ],
+      "expected_outcome": "成功返回线上环境服务运行日志内容",
+      "verification_points": [
+        "意图识别准确率≥0.95",
+        "日志接口返回状态码200",
+        "返回内容包含服务名与时间戳"
+      ],
+      "fallback_plan": {
+        "condition": "日志接口返回403或超时",
+        "action": "降级为提示用户检查权限或稍后重试",
+        "max_retry": 2
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 2,
+      "risk_level": "high",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk"
+      ],
+      "trigger_reasons": [
+        "请求包含'线上'关键词，触发高风险规则"
+      ],
+      "upgrade_priority": "P2"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "risk_keyword_production",
+        "path_generation_normal"
+      ],
+      "matched_domain_experience": [
+        "log_view_sop"
+      ],
+      "reasoning_summary": "请求含'线上'触发高风险，但无删除/权限/配置关键词，风险等级为high；普通2步路径；因高风险追加user_confirm步；生产环境追加audit步。",
+      "counterfactual_note": "若无'线上'关键词，风险等级降为low，无需确认与审计步骤。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": "",
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 45,
+    "timestamp": "2025-01-01T00:00:00Z",
+    "version": {
+      "meta_core": "v1.0",
+      "domain_adapter": "v1.0",
+      "world_encoder": "v1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "d084e2b11dbd251a",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790570225617-786170",
+    "input_snapshot": {
+      "query": "查看线上环境的服务运行日志",
+      "world_state_id": "ws-1790570225617-1e50d8",
+      "context_id": "ctx-1790570225617",
+      "timestamp": "2026-09-28T04:37:05.617Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::通用域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "查看线上环境的服务运行日志",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "查看线上环境的服务运行日志",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "audit_agent",
+          "params": {
+            "audit_scope": "production_change",
+            "log_level": "full"
+          },
+          "order": 3,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "production_env"
+        ],
+        "target_object": null,
+        "environment": "production",
+        "risk_tag": "low",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "查看线上环境的服务运行日志",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "查看线上环境的服务运行日志",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        },
+        {
+          "step_id": 3,
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "audit_scope": "production_change",
+              "log_level": "full"
+            },
+            "order": 3,
+            "timeout_ms": 30000
+          },
+          "description": "生产环境变更：记录完整审计日志并复核",
+          "verification": "审计日志落盘且变更单可追溯"
+        }
+      ],
+      "expected_outcome": "请求由快速路径完成处理并通过验证点校验",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致",
+        "审计日志落盘且变更单可追溯"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.45,
+      "risk_level": "low",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "complexity"
+      ],
+      "trigger_reasons": [
+        "执行步骤数为 3（≥3），超过 Laya 快速路径复杂度阈值，触发升级"
+      ],
+      "upgrade_priority": "P2"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-OPS-01 生产环境变更 → 必须追加 audit_agent 审计步骤"
+      ],
+      "reasoning_summary": "风险校验：low（常规风险） → 复杂度评估：识别意图 [production_env]，生成 3 个步骤 → 能力匹配：通用域处理 → 路径生成：L0→L1 快速规则路径::通用域；组合场景不成立，置信度 0.9；共命中 1 个升级触发维度，判定升级（P2）",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.045,
+    "timestamp": "2026-09-28T04:37:05.617Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 3191.1
+  }
+}

@@ -1,0 +1,311 @@
+{
+  "sample_id": "jev-8e524afdd0deee11-20260928035557",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T03:55:57.318Z",
+  "scenario": {
+    "id": "S01",
+    "category": "普通文件修改",
+    "name": "低风险本地修改 → 快速路径直出（TC-01 同类）"
+  },
+  "request": {
+    "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790567753632-4055db",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "low",
+    "encode_time_ms": 0.11
+  },
+  "standard_decision": {
+    "decision_id": "dec-1735689600000-a1b2c3",
+    "input_snapshot": {
+      "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+      "world_state_id": "ws-1735689600000-0001",
+      "context_id": "ctx-local-code-0001",
+      "timestamp": "2025-01-01T00:00:00.000Z"
+    },
+    "output": {
+      "target_path": "local://main.js",
+      "agent_chain": [
+        {
+          "agent_id": "intent_agent",
+          "params": {
+            "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+            "target_file": "main.js",
+            "scope": "error_handling"
+          },
+          "order": 1,
+          "timeout_ms": 3000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "target_file": "main.js",
+            "operation": "modify",
+            "aspect": "error_handling",
+            "permission": "write"
+          },
+          "order": 2,
+          "timeout_ms": 10000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "main.js",
+        "environment": "default",
+        "risk_tag": "low",
+        "user_permission": "write",
+        "target_file": "main.js",
+        "operation": "modify",
+        "aspect": "error_handling",
+        "permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "intent_agent",
+            "params": {
+              "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+              "target_file": "main.js",
+              "scope": "error_handling"
+            },
+            "order": 1,
+            "timeout_ms": 3000
+          },
+          "description": "解析用户意图：识别目标文件 main.js 与修改维度 error_handling",
+          "verification": "确认 target_file 与 aspect 解析正确且权限 write 满足"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "target_file": "main.js",
+              "operation": "modify",
+              "aspect": "error_handling",
+              "permission": "write"
+            },
+            "order": 2,
+            "timeout_ms": 10000
+          },
+          "description": "由 code_agent 对本地 main.js 执行错误处理相关代码修改",
+          "verification": "修改后文件语法校验通过且错误处理逻辑覆盖目标分支"
+        }
+      ],
+      "expected_outcome": "main.js 的错误处理逻辑被修改完成，本地文件更新且语法校验通过",
+      "verification_points": [
+        "target_file 解析为 main.js 正确",
+        "权限 write 满足本地文件修改",
+        "修改后 main.js 语法校验通过",
+        "错误处理逻辑覆盖用户描述的目标分支"
+      ],
+      "fallback_plan": {
+        "condition": "code_agent 执行失败或修改后语法校验不通过",
+        "action": "回滚 main.js 至修改前版本并返回失败原因，建议用户确认目标分支",
+        "max_retry": 2
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 2,
+      "risk_level": "low",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "rule-risk-check: 无生产/线上/删除/权限/配置关键词，风险 low",
+        "rule-path-basic: 普通场景生成 2 步（intent_analysis + execution）",
+        "rule-complexity: 步骤数 2 < 3，不触发复杂度升级",
+        "rule-composite: 非高风险，is_composite_scenario=false"
+      ],
+      "matched_domain_experience": [
+        "本地代码文件修改类请求默认走 intent_agent + code_agent 路径",
+        "错误处理修改属于低风险代码变更，无需用户确认与审计"
+      ],
+      "reasoning_summary": "请求为本地普通代码文件 main.js 的错误处理修改，无生产/线上及删除/权限/配置关键词，风险等级 low；步骤数为 2，未达复杂度阈值；非高风险组合场景，置信度取 0.9；按蒸馏规则仅记录，不触发升级。",
+      "counterfactual_note": "若请求涉及生产环境或删除/权限/配置关键词，则风险升级并追加 user_confirm 与 audit 步骤，同时触发 risk 升级维度。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": null,
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 42,
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "version": {
+      "meta_core": "1.0",
+      "domain_adapter": "1.0",
+      "world_encoder": "1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "8e524afdd0deee11",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790567753632-f59b92",
+    "input_snapshot": {
+      "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+      "world_state_id": "ws-1790567753632-4055db",
+      "context_id": "ctx-1790567753632",
+      "timestamp": "2026-09-28T03:55:53.632Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "main.js",
+        "environment": "default",
+        "risk_tag": "low",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "帮我修改本地的普通代码文件 main.js 的错误处理",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.3,
+      "risk_level": "low",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent"
+      ],
+      "reasoning_summary": "风险校验：low（常规风险） → 复杂度评估：识别意图 [code_modification]，生成 2 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景不成立，置信度 0.9；共命中 0 个升级触发维度，维持快速路径执行",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.301,
+    "timestamp": "2026-09-28T03:55:53.632Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 3685.7
+  }
+}

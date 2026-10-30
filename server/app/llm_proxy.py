@@ -747,7 +747,10 @@ async def llm_chat(request: Request):
         _warn_default_bucket()  # [Day24.11] 不带 session_id 的调用方共用一个桶 → 告警一次
     _session_calls[session_id] = _session_calls.get(session_id, 0) + 1
     count = _session_calls[session_id]
-    if count > limit:
+    # [2026-10-30 解除死限制] limit<=0 视为"不限次数"：多智能体（Argus/Iris）单轮常
+    # 触发 30+ 次工具调用，硬熔断会把整会话锁死且切模型也无法恢复（额度按 session 算）。
+    # 守卫必须是 `limit > 0 and ...`——否则 limit=0 时 count>0 恒真，会拒绝一切请求。
+    if limit > 0 and count > limit:
         _logger.warning("[budget] session %s exceeded: %d/%d", session_id, count, limit)
         _audit_budget_exceeded(session_id, count, limit)
         return JSONResponse(status_code=429, content={

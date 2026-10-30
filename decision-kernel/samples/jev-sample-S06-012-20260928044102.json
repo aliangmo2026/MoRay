@@ -1,0 +1,317 @@
+{
+  "sample_id": "jev-b7cd75d13714d5a1-20260928044102",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T04:41:02.317Z",
+  "scenario": {
+    "id": "S06",
+    "category": "跨Agent操作",
+    "name": "多 Agent 协作链路（code + confirm + audit 串联）"
+  },
+  "request": {
+    "query": "修改配置文件 deploy.conf 并走用户确认流程",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790570457725-a3c1fe",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "medium",
+    "encode_time_ms": 0.015
+  },
+  "standard_decision": {
+    "decision_id": "dec-1735689600000-a3f9c2",
+    "input_snapshot": {
+      "query": "修改配置文件 deploy.conf 并走用户确认流程",
+      "world_state_id": "ws-l0-20250101-0001",
+      "context_id": "ctx-deploy-conf-modify",
+      "timestamp": "2025-01-01T00:00:00.000Z"
+    },
+    "output": {
+      "target_path": "/config/deploy.conf",
+      "agent_chain": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "deploy.conf",
+        "environment": "default",
+        "risk_tag": "medium",
+        "user_permission": "write",
+        "file_path": "/config/deploy.conf",
+        "operation": "modify",
+        "require_user_confirm": true,
+        "audit_required": false,
+        "user_permission_level": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "file_path": "/config/deploy.conf",
+              "operation": "modify",
+              "intent": "modify_config_file"
+            },
+            "order": 1,
+            "timeout_ms": 3000
+          },
+          "description": "解析用户修改 deploy.conf 配置文件的意图，校验文件路径与写权限",
+          "verification": "确认目标文件存在且用户权限 write 满足修改要求"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "file_path": "/config/deploy.conf",
+              "operation": "modify",
+              "confirm_prompt": "确认修改配置文件 deploy.conf？"
+            },
+            "order": 2,
+            "timeout_ms": 10000
+          },
+          "description": "向用户发起修改配置文件的人工确认流程",
+          "verification": "确认用户已明确同意修改操作"
+        },
+        {
+          "step_id": "step-3",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "file_path": "/config/deploy.conf",
+              "operation": "modify",
+              "user_permission_level": "write"
+            },
+            "order": 3,
+            "timeout_ms": 15000
+          },
+          "description": "在用户确认后执行 deploy.conf 配置文件修改",
+          "verification": "校验文件修改成功且内容符合预期"
+        }
+      ],
+      "expected_outcome": "deploy.conf 配置文件被成功修改，且修改前已获得用户明确确认",
+      "verification_points": [
+        "目标文件路径 /config/deploy.conf 存在且可写",
+        "用户权限 write 校验通过",
+        "用户确认流程完成并返回同意",
+        "修改后文件内容校验通过"
+      ],
+      "fallback_plan": {
+        "condition": "用户确认被拒绝或执行阶段写入失败",
+        "action": "终止修改操作并回滚配置文件至原始状态，记录失败原因",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.72,
+      "complexity_score": 3,
+      "risk_level": "medium",
+      "is_composite_scenario": true,
+      "composite_type": "config_modify_with_confirmation"
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [
+        "composite_scenario",
+        "complexity",
+        "low_confidence"
+      ],
+      "trigger_reasons": [
+        "代码/文件修改 × 中风险构成组合场景",
+        "步骤数 3 ≥ 3 触发复杂度维度",
+        "组合场景使置信度降为 0.72 < 0.8"
+      ],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "风险校验规则：命中「配置」风险升一级至 medium",
+        "路径生成规则：高风险追加 user_confirm 步",
+        "复杂度规则：步骤数 ≥ 3 触发 complexity 维度",
+        "组合场景规则：文件修改 × 风险构成组合场景"
+      ],
+      "matched_domain_experience": [
+        "配置文件修改需人工确认以防误操作",
+        "写权限 write 满足配置文件修改的最低权限要求"
+      ],
+      "reasoning_summary": "请求涉及修改配置文件 deploy.conf，命中「配置」关键词使风险由 low 升为 medium。因涉及文件修改且存在风险，判定为组合场景，置信度降至 0.72 并触发 composite_scenario、complexity、low_confidence 维度。蒸馏场景下降级为仅记录，是否升级只看置信度，0.72 < 0.8 但风险等级为 medium 未达 high，故 should_upgrade=false。生成意图解析、用户确认、执行三步路径。",
+      "counterfactual_note": "若请求不含「配置」关键词，风险维持 low，路径可能简化为两步且不触发组合场景；若置信度 ≥ 0.8，则升级维度仅记录不触发。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": "无偏离，决策完全符合宪法与规则引擎约束",
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 0,
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "version": {
+      "meta_core": "v1.0",
+      "domain_adapter": "v1.0",
+      "world_encoder": "v1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "b7cd75d13714d5a1",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790570457725-988c40",
+    "input_snapshot": {
+      "query": "修改配置文件 deploy.conf 并走用户确认流程",
+      "world_state_id": "ws-1790570457725-a3c1fe",
+      "context_id": "ctx-1790570457725",
+      "timestamp": "2026-09-28T04:40:57.725Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "修改配置文件 deploy.conf 并走用户确认流程",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "修改配置文件 deploy.conf 并走用户确认流程",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "deploy.conf",
+        "environment": "default",
+        "risk_tag": "medium",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "修改配置文件 deploy.conf 并走用户确认流程",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "修改配置文件 deploy.conf 并走用户确认流程",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.3,
+      "risk_level": "medium",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent"
+      ],
+      "reasoning_summary": "风险校验：medium（常规风险） → 复杂度评估：识别意图 [code_modification]，生成 2 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景不成立，置信度 0.9；共命中 0 个升级触发维度，维持快速路径执行",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.042,
+    "timestamp": "2026-09-28T04:40:57.725Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 4591
+  }
+}

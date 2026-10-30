@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iris 视觉智能体 · 报错截图修复</title>
+<!-- ============================================================
+     Iris MVP 工作台（D:\Iris\web\index.html）
+     布局来源：兜底方案 = Argus 三栏布局模板（D:\Argus\argus\web\index.html，
+     只读复用结构：.app 分栏 / .panel 面板 / ghost·primary 按钮 / .timeline 流水 /
+     内联 SVG 图标 / 零 CDN 外链 / 系统字体栈）。
+     配色规范：MoRay 00_theme.js 令牌（极简深灰 + 暖橙），全局唯一强调色 #E5734A；
+     浅色覆盖值取自 parts/135_ui_polish.js:311-338 的 html[data-theme="light"] 令牌。
+     接口来源：阶段0审计（D:\Iris\docs\pre_audit.md）确认的真实地址——
+       POST /api/llm/chat（llm_proxy.py:156，多模态 messages 原样透传 + 预算熔断）
+       GET  /api/engines/list（local_adapter.py:226，只读引擎申报）
+     零新增后端、零框架依赖；LLM 返回内容一律 textContent 渲染，无注入面。
+     ============================================================ -->
+<link rel="stylesheet" href="./assets/iris.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ============================ 页头：返回 + 标题 + 主题 ============================ -->
+  <header class="topbar panel">
+    <button type="button" id="back-btn" class="ghost" title="返回 MoRay 应用中心（等价 exit）">
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path d="M19 12H5m0 0l6-6m-6 6l6 6" fill="none" stroke="currentColor" stroke-width="1.8"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      返回
+    </button>
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <circle cx="12" cy="12" r="2.6" fill="currentColor" opacity="0.9"/>
+      </svg>
+      <h1>Iris 视觉智能体 · 报错截图修复</h1>
+    </div>
+    <span class="env-tag" id="env-tag">—</span>
+    <button type="button" id="theme-btn" class="ghost" title="切换深浅主题（与 MoRay 规范同步）">
+      <svg id="theme-icon-moon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+      </svg>
+      <svg id="theme-icon-sun" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" hidden>
+        <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10l1.4 1.4m0-12.8l-1.4 1.4m-10 10l-1.4 1.4"
+              fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <span id="theme-label">深色</span>
+    </button>
+  </header>
+
+  <main class="columns">
+
+    <!-- ============================ 左栏：图片上传区 ============================ -->
+    <section class="col-upload" aria-label="图片上传区">
+      <div class="col-head">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" fill="none" stroke="currentColor" stroke-width="1.7"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>报错截图</span>
+      </div>
+
+      <!-- [P6 阶段2] 输入通道 Tab（任务书 P6 阶段2：「上传截图 / 粘贴日志」并列；两通道互斥，
+           切换即清空对侧暂存输入。通道逻辑与互斥守卫见 assets/iris.js [P6] 段） -->
+      <div class="p6-tabs" id="p6-input-tabs" role="tablist" aria-label="排错输入通道切换">
+        <button type="button" class="p6-tab is-active" id="p6-tab-image" role="tab" aria-selected="true">上传截图</button>
+        <button type="button" class="p6-tab" id="p6-tab-text" role="tab" aria-selected="false">粘贴日志</button>
+      </div>
+
+      <!-- [P6 阶段2/3/4] 纯文本排错通道：日志粘贴/拖入 .log/.txt/.err → 噪音剥离/分段合并 →
+           配置专项（YAML/JSON/Dockerfile/.env/Nginx 规则层 + 语法状态/错误行跳转/Diff）与
+           命令行专项（bash/PowerShell/cmd 识别 + 危险命令警示）→ 复用诊断→修复→验证全链 -->
+      <section class="panel p6-text" id="p6-text-panel" aria-label="粘贴日志输入">
+        <textarea id="p6-text" class="p6-textarea mono" rows="12" spellcheck="false"
+          placeholder="直接粘贴报错文本，自动识别类型：&#10;· Python Traceback / Java Stack / Node.js 报错 / GCC 等编译日志&#10;· 配置文件（YAML · JSON · Dockerfile · .env · Nginx）→ 规则层先行检测，可零模型直接修复&#10;· 命令行 / Shell 报错（bash · PowerShell · cmd）→ 跨 Shell 等价修复&#10;也可直接拖拽 .log / .txt / .err 文件导入。纯文本路径跳过 OCR，每次分析仅 1 次模型调用。"></textarea>
+        <div class="p6-status" id="p6-status" hidden></div>
+        <div class="p6-findings" id="p6-findings" hidden></div>
+        <div class="p6-rulebar" id="p6-rulebar" hidden></div>
+        <div class="p6-diff" id="p6-diff" hidden></div>
+        <div class="p6-text-actions">
+          <button type="button" id="p6-analyze-btn" class="primary" disabled
+                  title="跳过 OCR 直接进入 诊断→修复→验证 链路（复用 P2-P5 全部能力：分级/长日志/Diff/排查引擎/三档方案/风险自检）">
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+              <path d="M8 5l11 7-11 7z" fill="currentColor"/>
+            </svg>
+            开始诊断（跳过 OCR）
+          </button>
+          <button type="button" id="p6-load-ocr-btn" class="ghost"
+                  title="把截图路径的 OCR 文本载入文本框，可二次编辑后重新分析（互通）">载入OCR文本</button>
+          <button type="button" id="p6-shot-btn" class="ghost"
+                  title="将文本内容渲染为 PNG 截图存档下载（纯前端，零模型调用）">转截图存档</button>
+          <button type="button" id="p6-clear-btn" class="ghost">清空文本</button>
+        </div>
+        <p class="hint">Ctrl+Enter 快速开始诊断；与截图通道互斥（切换即清空对侧暂存）；规则层命中的格式错误可零模型调用直接修复并对比 Diff。</p>
+      </section>
+
+      <div class="dropzone panel" id="dropzone" tabindex="0" role="button"
+           aria-label="上传报错截图：点击选择、拖拽或粘贴，支持 png/jpg，5MB 以内">
+        <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true">
+          <rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <circle cx="8.6" cy="10" r="1.6" fill="currentColor" opacity="0.85"/>
+          <path d="M3 16.5l4.6-4.2a1.6 1.6 0 0 1 2.2 0L15 17.4m-1.4-1.3l2.1-1.9a1.6 1.6 0 0 1 2.2 0L21 17.2"
+                fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <p class="dz-main">点击选择 / 拖拽 / 粘贴截图</p>
+        <p class="dz-sub">png · jpg · jpeg，5MB 以内（自动预处理增强，可框选裁剪）</p>
+        <input type="file" id="file-input" accept="image/png,image/jpeg" hidden>
+      </div>
+
+      <div class="preview panel" id="preview-panel" hidden>
+        <div class="preview-head">
+          <span class="file-name" id="file-name">—</span>
+          <span class="file-size mono" id="file-size">—</span>
+          <!-- [P1] 手动框选裁剪入口（任务书 2.1.1：保留手动裁剪入口，支持用户框选识别区域） -->
+          <button type="button" id="crop-btn" class="ghost" title="在截图上框选报错文本区域，只识别选中部分">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M6 2v14a2 2 0 0 0 2 2h14M2 6h14a2 2 0 0 1 2 2v14" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            框选裁剪
+          </button>
+          <button type="button" id="remove-btn" class="ghost" title="删除重传">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m3 0l-1 13a1.6 1.6 0 0 1-1.6 1.5H8.6A1.6 1.6 0 0 1 7 20L6 7"
+                    fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            删除重传
+          </button>
+        </div>
+        <img id="preview-img" alt="报错截图预览">
+        <!-- [P1] 框选裁剪覆盖层：拖拽画矩形 → 应用裁剪（iris.js 处理坐标换算） -->
+        <div class="crop-layer" id="crop-layer" hidden>
+          <div class="crop-sel" id="crop-sel" hidden>
+            <span class="crop-size mono" id="crop-size"></span>
+          </div>
+          <p class="crop-tip">按住鼠标拖拽框选识别区域，松开后点击「应用裁剪」</p>
+          <div class="crop-actions">
+            <button type="button" id="crop-apply" class="primary" disabled>应用裁剪</button>
+            <button type="button" id="crop-cancel" class="ghost">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="upload-actions">
+        <!-- [P1] 预处理增强开关（任务书 2.1：自动裁剪/CLAHE/红字增强/二值化/超分，纯 Canvas） -->
+        <div class="enhance-row" id="enhance-row">
+          <label class="enhance-label" for="enhance-mode">预处理</label>
+          <select id="enhance-mode" class="enhance-select" title="上传后自动执行的画质增强策略（识别精准度优化）">
+            <option value="auto" selected>自动增强（推荐）</option>
+            <option value="off">关闭增强（原图直传）</option>
+            <option value="bin">黑白二值化（浅色 IDE）</option>
+          </select>
+        </div>
+        <p class="pipe-meta mono" id="pipe-meta" hidden></p>
+        <button type="button" id="analyze-btn" class="primary" disabled>
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+            <path d="M8 5l11 7-11 7z" fill="currentColor"/>
+          </svg>
+          <span id="analyze-label">开始分析</span>
+        </button>
+        <!-- [P5 阶段2] 智能排查入口：多轮自动排查根因（≤5 轮，复用既有网关与预算桶，纯前端编排）。
+             默认隐藏，上传截图后可用；与单次修复互斥（state.running 闸），详见 assets/iris.js [P5] 段 -->
+        <button type="button" id="debug-btn" class="ghost" hidden
+                title="自动多轮排查：复现→根因枚举→逐一验证→结论收敛（最多 5 轮，预算上限 12 次模型调用）">
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.7"/>
+            <path d="M21 21l-4.3-4.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M8.5 11a2.5 2.5 0 1 1 5 0c0 1.6-1.3 1.9-1.6 3M11.8 16.5h.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span id="debug-btn-label">智能排查（多轮定位根因）</span>
+        </button>
+        <!-- [P5 阶段3] 分级方案生成入口：对当前修复代码生成 快速/规范/兼容 三档方案（1 次模型调用） -->
+        <button type="button" id="plans-btn" class="ghost" hidden
+                title="基于当前报错与诊断上下文，生成快速修复 / 规范修复 / 兼容修复三档方案并择优推荐">
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+            <path d="M4 6h16M4 12h10M4 18h7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M17 15.5l2.5 2.5 3.5-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span id="plans-btn-label">生成分级方案（快速/规范/兼容）</span>
+        </button>
+        <!-- [P1] 分阶段进度提示（任务书 4.3：上传中→预处理中→识别中→诊断中→验证中） -->
+        <div class="progress-strip mono" id="progress-strip" hidden>
+          <span data-stage="upload">上传</span><i></i>
+          <span data-stage="prep">预处理</span><i></i>
+          <span data-stage="ocr">识别</span><i></i>
+          <span data-stage="diag">诊断</span><i></i>
+          <span data-stage="verify">验证</span>
+        </div>
+        <p class="hint" id="img-hint">上传成功后自动开始：预处理 → OCR 识别 → 根因诊断 → 修复代码 → ZCode 验证</p>
+        <!-- [P1] 本地分析历史（任务书 4.1：localStorage 最近 20 条，回看/复用/删除） -->
+        <details class="advanced" id="history-box">
+          <summary>分析历史（本机保存最近 20 条）</summary>
+          <!-- [P7 阶段2] 知识库工具条：全文搜索/错误类型+语言+时间筛选/排序/仅收藏（逻辑见 assets/iris.js [P7] 段） -->
+          <div class="p7-kb-bar" id="p7-kb-bar">
+            <input type="search" id="p7-kb-search" class="text-input mono" placeholder="搜索 报错信息/根因/修复代码" autocomplete="off" spellcheck="false">
+            <select id="p7-kb-type" class="enhance-select" title="按错误类型筛选"><option value="">全部类型</option></select>
+            <select id="p7-kb-lang" class="enhance-select" title="按语言筛选"><option value="">全部语言</option></select>
+            <select id="p7-kb-time" class="enhance-select" title="按时间范围筛选">
+              <option value="0">全部时间</option><option value="7">近 7 天</option><option value="30">近 30 天</option>
+            </select>
+            <select id="p7-kb-sort" class="enhance-select" title="排序方式">
+              <option value="ts">按时间</option><option value="uses">按使用次数</option><option value="sev">按严重程度</option>
+            </select>
+            <label class="p7-kb-favlabel" title="只看收藏记录（收藏项容量治理时优先保留）"><input type="checkbox" id="p7-kb-fav"> 仅看收藏</label>
+            <span class="p7-kb-stat mono" id="p7-kb-stat"></span>
+          </div>
+          <div id="history-list" class="history-list"></div>
+          <div class="history-foot">
+            <!-- [P7 阶段4] 历史快速操作：JSON 备份导出 / 按当前筛选结果批量删除（二次确认） -->
+            <button type="button" id="p7-history-json" class="ghost" title="一键导出全部知识库为 JSON 备份文件（本机下载）">导出 JSON 备份</button>
+            <button type="button" id="p7-kb-batchdel" class="ghost" title="删除当前搜索/筛选命中的全部记录（需二次确认；不受影响的收藏请先取消筛选）">批量删除筛选结果</button>
+            <button type="button" id="history-clear" class="ghost">清空历史</button>
+          </div>
+        </details>
+        <!-- [P2 4.1] 轻量批量分析（最多 3 张，队列依次执行；结果按错误严重程度排序） -->
+        <details class="advanced" id="batch-box">
+          <summary>批量分析（最多 3 张，队列依次执行）</summary>
+          <div class="batch-body">
+            <button type="button" id="batch-pick" class="ghost">
+              <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                <rect x="3" y="5" width="14" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                <path d="M7 21h12a2 2 0 0 0 2-2V9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+              选择报错截图（≤3 张）
+            </button>
+            <input type="file" id="batch-input" accept="image/png,image/jpeg" multiple hidden>
+            <!-- [P7 阶段4] 批量文件夹导入：仅处理报错截图与 .log/.txt/.err，过滤后 ≤10 个复用批量队列（超限整批拒绝引导分批） -->
+            <button type="button" id="p7-folder-btn" class="ghost" title="导入整个文件夹：自动过滤非图片/非日志文件，最多 10 个（也可直接把文件夹拖到页面任意位置）">导入文件夹（截图+日志 ≤10）</button>
+            <input type="file" id="p7-folder-input" webkitdirectory multiple hidden>
+            <p class="batch-hint" id="batch-hint">多张截图加入队列后依次「预处理 → OCR → 诊断 → 分级」，结果按严重程度排序。</p>
+            <div id="batch-list" class="batch-list"></div>
+            <div class="batch-foot" id="batch-foot" hidden>
+              <button type="button" id="batch-export" class="ghost">全部导出 Markdown</button>
+            </div>
+          </div>
+        </details>
+        <!-- [P7 阶段4] 快捷键设置：查看/改绑/禁用；浏览器保留键自动跳过并标注（不劫持原生行为） -->
+        <details class="advanced" id="p7-keys-box">
+          <summary>快捷键设置（冲突自动避让）</summary>
+          <div class="p7-keys-list" id="p7-keys-list"></div>
+          <p class="hint">改绑：点击键位输入框后按下新组合；F12 / Ctrl+W / Ctrl+T / Ctrl+Shift+I 等浏览器保留键会被拒绝。设置仅存本机。</p>
+        </details>
+        <details class="advanced">
+          <summary>高级：模型覆盖</summary>
+          <input type="text" id="model-override" class="text-input mono" placeholder="留空 = 网关默认模型"
+                 spellcheck="false" autocomplete="off">
+        </details>
+      </div>
+    </section>
+
+    <!-- ============================ 中栏：分析日志区 ============================ -->
+    <section class="col-console" aria-label="分析日志区">
+      <div class="col-head">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M7 9l3 3-3 3M13 15h4" fill="none" stroke="currentColor" stroke-width="1.6"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>分析日志</span>
+        <span class="counter mono" id="log-counter">0</span>
+        <button type="button" id="clear-log-btn" class="ghost" title="清空日志">清空</button>
+      </div>
+      <div class="timeline panel mono" id="timeline" role="log" aria-live="polite">
+        <p class="timeline-empty">等待截图。上传报错截图后，全流程节点将在此实时输出。</p>
+      </div>
+    </section>
+
+    <!-- ============================ 右栏：结果输出区 ============================ -->
+    <section class="col-report" aria-label="结果输出区">
+      <div class="col-head">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <path d="M4 19.5V6a2 2 0 0 1 2-2h13v13.5H6a2 2 0 0 0-2 2zm0 0A2.5 2.5 0 0 0 6.5 22H19"
+                fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>修复结果</span>
+        <span class="zcode-chip" id="zcode-chip" hidden>
+          <span class="dot" id="zcode-dot"></span><span id="zcode-chip-text">ZCode</span>
+        </span>
+      </div>
+
+      <!-- [P2 3.1] 视图 Tab（修复结果 / 修复对比）：默认修复结果，切换仅做 display 切换 -->
+      <div class="view-tabs" id="view-tabs" hidden>
+        <button type="button" class="view-tab is-active" id="tab-result" role="tab" aria-selected="true">修复结果</button>
+        <button type="button" class="view-tab" id="tab-diff" role="tab" aria-selected="false">修复对比</button>
+        <label class="diff-only-label" id="diff-only-label" hidden>
+          <input type="checkbox" id="diff-only"> 仅看改动行
+        </label>
+      </div>
+
+      <!-- [P1] 轮次条（任务书 3.2：轮次标识清晰、分区展示、一键回到第1轮、清空重开） -->
+      <div class="round-bar" id="round-bar" hidden>
+        <div class="round-tabs" id="round-tabs" role="tablist"></div>
+        <button type="button" id="round-restart" class="ghost" title="清空所有轮次记录，回到初始状态">清空重开</button>
+      </div>
+
+      <div class="report-scroll panel" id="report-scroll">
+        <div class="placeholder" id="report-placeholder">
+          <svg viewBox="0 0 48 48" width="52" height="52" aria-hidden="true">
+            <path d="M13 6h13l9 9v26a3 3 0 0 1-3 3H13a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3z"
+                  fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M26 6v9h9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M18 30l5 5 9-10" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <p>等待分析完成…</p>
+        </div>
+
+        <!-- [P1] 轮次容器：每轮结果分区动态渲染（textContent 零注入，iris.js 填充） -->
+        <div id="rounds-wrap" hidden></div>
+
+        <!-- [P7 阶段2] 相似报错推荐：新分析完成后自动匹配历史 Top3 解法，一键复用（iris.js [P7] 渲染，默认隐藏） -->
+        <section class="panel p7-reco" id="p7-reco" hidden aria-label="相似报错推荐"></section>
+
+        <!-- [P7 阶段3] 本地源文件查看器：报错行 ±5 行上下文红色高亮、行号点击跳转、
+             「应用修复」Diff 二次确认后写入、写入前内存备份可撤销（内容由 iris.js [P7-2] 渲染，默认隐藏） -->
+        <section class="panel p7-filesec" id="p7-filesec" hidden aria-label="本地源文件查看器">
+          <div class="p5-panel-head">
+            <span class="p5-panel-title">📂 本地源文件</span>
+            <span class="p7-file-name mono" id="p7-file-name">—</span>
+            <span class="p7-file-warn" id="p7-file-warn" hidden></span>
+            <span class="p5-panel-spacer"></span>
+            <button type="button" id="p7-file-reload" class="ghost" title="从磁盘重新读取该文件">重新读取</button>
+            <button type="button" id="p7-file-apply" class="ghost" title="将当前修复代码写入本地文件（先 Diff 预览，再确认；写入前自动内存备份原文）">应用修复…</button>
+            <button type="button" id="p7-file-close" class="ghost" title="关闭查看器（不改变文件）">关闭</button>
+          </div>
+          <div class="p7-file-view mono" id="p7-file-view" tabindex="0" role="document" aria-label="源文件内容（报错行高亮）"></div>
+          <div class="p7-file-diff" id="p7-file-diff" hidden></div>
+          <div class="p7-file-actions" id="p7-file-actions" hidden>
+            <span class="p7-file-acttip">⚠ 写入将以修复代码整体替换本地文件内容；左侧 Diff 为磁盘原文，确认无误后再点「确认写入」。</span>
+            <button type="button" id="p7-write-confirm" class="primary">确认写入本地文件</button>
+            <button type="button" id="p7-write-cancel" class="ghost">取消</button>
+            <button type="button" id="p7-write-undo" class="ghost" hidden title="把写入前内存备份的原文件内容写回">撤销写入（恢复原文）</button>
+          </div>
+        </section>
+
+        <!-- [P2 3.1] Diff 对比视图容器（iris.js 渲染：左右分栏 + 行级增删改高亮 + 同步滚动） -->
+        <div id="diff-wrap" hidden></div>
+
+        <!-- [P5 阶段2] 智能排查面板：状态机进度 + 轮次流 + 三层根因（可展开） + 排查日志。
+             内容由 iris.js [P5] IrisDebug 渲染（textContent 零注入），默认隐藏 -->
+        <section class="panel p5-debug" id="p5-debug-panel" hidden aria-label="智能排查面板">
+          <div class="p5-panel-head">
+            <span class="p5-panel-title">🔍 智能排查</span>
+            <span class="p5-state-chip" id="p5-debug-state-chip">待启动</span>
+            <span class="p5-progress-note mono" id="p5-debug-progress"></span>
+            <span class="p5-panel-spacer"></span>
+            <button type="button" id="p5-debug-pause-btn" class="ghost" hidden>暂停</button>
+            <button type="button" id="p5-debug-resume-btn" class="ghost" hidden>继续</button>
+            <button type="button" id="p5-debug-abort-btn" class="ghost" hidden>终止</button>
+            <button type="button" id="p5-debug-close-btn" class="ghost" title="收起排查面板">收起</button>
+          </div>
+          <div class="p5-rounds" id="p5-debug-rounds"></div>
+          <div class="p5-cause" id="p5-debug-cause"></div>
+        </section>
+
+        <!-- [P5 阶段3] 三档分级方案面板：方案切换 Tab + 根因/优缺点/场景/风险 + 独立操作
+             （执行验证/复制/发送/风险自检）+ 方案间 Diff + 择优推荐徽标。
+             内容由 iris.js [P5] 渲染，默认隐藏 -->
+        <section class="panel p5-plans" id="p5-plans-panel" hidden aria-label="分级修复方案">
+          <div class="p5-panel-head">
+            <span class="p5-panel-title">🧩 分级修复方案</span>
+            <span class="p5-panel-spacer"></span>
+            <button type="button" id="p5-plans-manual-btn" class="ghost" hidden
+                    title="终止排查并采用当前选中的规范方案作为手动修复轮次（写入修复轮次后可继续修复/执行验证）">切换为手动修复</button>
+            <button type="button" id="p5-plans-close-btn" class="ghost" title="收起方案面板">收起</button>
+          </div>
+          <div class="p5-plan-tabs" id="p5-plan-tabs" role="tablist"></div>
+          <div class="p5-plan-body" id="p5-plan-body"></div>
+          <div class="p5-plan-diff" id="p5-plan-diff" hidden>
+            <div class="p5-plan-diff-bar">
+              <span>Diff 对比：</span>
+              <select id="p5-diff-left" class="enhance-select"></select>
+              <span>vs</span>
+              <select id="p5-diff-right" class="enhance-select"></select>
+              <button type="button" id="p5-diff-render-btn" class="ghost">对比</button>
+              <button type="button" id="p5-diff-close-btn" class="ghost">关闭对比</button>
+            </div>
+            <div id="p5-plan-diff-cols"></div>
+          </div>
+        </section>
+
+        <!-- [P5 阶段4] 修复风险自检面板：纯前端静态检测（语法/变量/边界/硬编码/类型五类），
+             零模型调用；结果区渲染有新代码时自动执行，也可对当前轮手动触发 -->
+        <section class="panel p5-risk" id="p5-risk-panel" hidden aria-label="修复风险自检">
+          <div class="p5-panel-head">
+            <span class="p5-panel-title">🛡 修复风险自检</span>
+            <span class="p5-risk-level-chip" id="p5-risk-level">—</span>
+            <span class="p5-panel-spacer"></span>
+            <label class="diff-only-label" title="结果区代码更新后自动重新检测（纯前端，零模型消耗）">
+              <input type="checkbox" id="p5-risk-auto" checked> 自动
+            </label>
+            <button type="button" id="p5-risk-recheck-btn" class="ghost">重新自检</button>
+            <button type="button" id="p5-risk-close-btn" class="ghost" title="收起风险面板">收起</button>
+          </div>
+          <div class="p5-risk-meta mono" id="p5-risk-meta"></div>
+          <div class="p5-risk-list" id="p5-risk-list"></div>
+        </section>
+
+        <div class="report-actions" id="report-actions" hidden>
+          <button type="button" id="copy-code-btn" class="primary">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <path d="M5 15V5a1 1 0 0 1 1-1h9" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            </svg>
+            一键复制代码
+          </button>
+          <button type="button" id="copy-all-btn" class="ghost">复制全部</button>
+          <button type="button" id="copy-run-btn" class="ghost" hidden>复制执行结果</button>
+          <!-- [P2 4.2] 单条修复记录导出 Markdown（纯前端生成 .md 并触发下载） -->
+          <button type="button" id="export-md-btn" class="ghost" title="导出本条修复记录为 Markdown 报告（含截图缩略图/根因/方案/代码/执行结果）">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16" fill="none" stroke="currentColor" stroke-width="1.7"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            导出 Markdown
+          </button>
+          <!-- [P7 阶段4] 导出格式扩展：GitHub Issue / GitLab 工单 Markdown、PDF（window.print + 打印 CSS，零第三方库） -->
+          <button type="button" id="export-gh-btn" class="ghost" title="导出 GitHub Issue 格式 Markdown（标题/复现步骤/报错截图/修复方案/环境信息，可直接粘贴）">GitHub Issue</button>
+          <button type="button" id="export-gl-btn" class="ghost" title="导出 GitLab 工单格式 Markdown（同构模板，适配 GitLab 语法）">GitLab 工单</button>
+          <button type="button" id="export-pdf-btn" class="ghost" title="打印报告（在打印预览中选择「另存为 PDF」）">PDF 报告</button>
+          <!-- [P4 4.2] 发送到对话：把当前修复结果一键回传主对话（localStorage 草稿 + 跳转，
+               消费端为主对话 87_iris_bridge.js P4 模块；不自动发送，由用户确认） -->
+          <button type="button" id="send-to-chat-btn" class="ghost" hidden
+                  title="把当前修复结果摘要发回 MoRay 主对话（填入输入框草稿，确认后发送）">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" fill="none" stroke="currentColor" stroke-width="1.7"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            发送到对话
+          </button>
+          <!-- [P1] 多轮迭代入口（任务书 3.2：传入上一轮执行结果与报错信息继续修复） -->
+          <button type="button" id="continue-fix-btn" class="ghost" hidden
+                  title="基于上一轮执行结果中的报错信息继续迭代修复（最多 3 轮）">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M4 12a8 8 0 1 1 2.3 5.6M4 18v-5h5" fill="none" stroke="currentColor"
+                    stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            继续修复
+          </button>
+          <button type="button" id="sync-zcode-btn" class="ghost" title="在 ZCode 沙箱白名单目录（D:\MoRay\workspace\zcode_sandbox）内真实执行修复代码（POST /api/engines/zcode/run）；接口不可用时自动降级为静态校验">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <path d="M7 9l3 3-3 3M13 15h4" fill="none" stroke="currentColor" stroke-width="1.6"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span id="sync-zcode-label">执行验证（ZCode 沙箱）</span>
+          </button>
+          <!-- [P7 阶段3] 本地文件联动入口：仅当诊断提取到文件路径且浏览器支持 File System Access API 时显示；
+               不支持的浏览器隐藏按钮并给出一次性说明（assets/iris.js [P7-2] 段控制显隐） -->
+          <button type="button" id="p7-open-file-btn" class="ghost" hidden
+                  title="打开报错对应的本地源文件（File System Access API，由你手动选择授权；句柄仅存本机，数据不出本地）">
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            </svg>
+            打开源文件
+          </button>
+          <span id="p7-fs-hint" class="p7-fs-hint" hidden>当前浏览器不支持本地文件联动，推荐 Chrome/Edge</span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- [P7 阶段4] PDF 报告打印容器：仅 @media print 显示（window.print + 打印 CSS，零第三方库） -->
+<div class="p7-print" id="p7-print" aria-hidden="true"></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<!-- [P1] 全页面拖拽热区遮罩（任务书 4.3：扩大拖拽上传热区，支持全页面拖拽） -->
+<div class="drag-veil" id="drag-veil" hidden>
+  <div class="drag-veil-inner">
+    <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+      <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" fill="none" stroke="currentColor" stroke-width="1.6"
+            stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <p>松开鼠标，导入报错截图</p>
+  </div>
+</div>
+
+<!-- highlight.js：自 MoRay vendor/highlight.min.js 原样复用（BSD-3-Clause，未修改） -->
+<script src="./assets/highlight.min.js"></script>
+<script src="./assets/iris.js"></script>
+</body>
+</html>

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoRay 决策内核 v1.0 · 可视化调试面板</title>
+<style>
+  /* ============ 深色科技风基础 ============ */
+  :root {
+    --bg: #070b14;
+    --card: #0d1524;
+    --card2: #111c30;
+    --border: #1e2c47;
+    --text: #d7e3f4;
+    --muted: #7d90ad;
+    --cyan: #22d3ee;
+    --purple: #a78bfa;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --orange: #fb923c;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(900px 400px at 15% -5%, rgba(34,211,238,.08), transparent 60%),
+      radial-gradient(900px 400px at 85% 0%, rgba(167,139,250,.08), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    min-height: 100vh;
+    padding: 28px 4vw 60px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  /* ============ 页头 ============ */
+  header { margin-bottom: 22px; }
+  header h1 {
+    font-size: 22px; font-weight: 700; letter-spacing: 1px;
+    background: linear-gradient(90deg, var(--cyan), var(--purple));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+  /* ============ 卡片通用 ============ */
+  .card {
+    background: linear-gradient(180deg, var(--card2), var(--card));
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.35);
+  }
+  .card h2 {
+    font-size: 14px; font-weight: 600; color: var(--cyan);
+    letter-spacing: 1px; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card h2::before { content: ""; width: 4px; height: 14px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--cyan), var(--purple)); }
+
+  /* ============ 顶部操作区 ============ */
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: stretch; }
+  .controls input[type=text] {
+    flex: 1 1 420px; background: #0a101d; border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); padding: 12px 14px; font-size: 14px;
+    outline: none; transition: border-color .15s;
+  }
+  .controls input[type=text]:focus { border-color: var(--cyan); }
+  .controls select {
+    background: #0a101d; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); padding: 0 12px; font-size: 14px; outline: none; cursor: pointer;
+  }
+  .controls button {
+    background: linear-gradient(90deg, #0891b2, #7c3aed); color: #fff;
+    border: 0; border-radius: 8px; padding: 0 26px; font-size: 14px; font-weight: 600;
+    cursor: pointer; letter-spacing: 2px; transition: opacity .15s, transform .1s;
+  }
+  .controls button:hover { opacity: .9; }
+  .controls button:active { transform: scale(.98); }
+  .controls button:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+
+  /* ============ 概览卡片 ============ */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .stat {
+    background: #0a101d; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .stat .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .stat .value { font-size: 20px; font-weight: 700; }
+  .stat .sub { color: var(--muted); font-size: 12px; margin-top: 6px; word-break: break-all; }
+  .badge { display: inline-block; padding: 3px 12px; border-radius: 999px; font-size: 14px; font-weight: 700; }
+  .risk-low      { background: rgba(52,211,153,.15); color: var(--green); border: 1px solid rgba(52,211,153,.4); }
+  .risk-medium   { background: rgba(251,191,36,.15); color: var(--amber); border: 1px solid rgba(251,191,36,.4); }
+  .risk-high     { background: rgba(251,146,60,.15); color: var(--orange); border: 1px solid rgba(251,146,60,.45); }
+  .risk-critical { background: rgba(248,113,113,.15); color: var(--red); border: 1px solid rgba(248,113,113,.5); }
+  .yes { color: var(--red); } .no { color: var(--green); }
+  .bar { height: 6px; border-radius: 3px; background: #16233c; margin-top: 10px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--cyan), var(--purple)); }
+
+  /* ============ 步骤流（时间线 + 连接线） ============ */
+  .flow { position: relative; padding-left: 26px; }
+  .flow::before {
+    content: ""; position: absolute; left: 8px; top: 8px; bottom: 8px; width: 2px;
+    background: linear-gradient(180deg, var(--cyan), var(--purple)); opacity: .5;
+  }
+  .step { position: relative; margin-bottom: 14px; }
+  .step:last-child { margin-bottom: 0; }
+  .step::before {
+    content: ""; position: absolute; left: -24px; top: 6px; width: 12px; height: 12px;
+    border-radius: 50%; background: var(--bg); border: 2px solid var(--cyan);
+    box-shadow: 0 0 8px rgba(34,211,238,.6);
+  }
+  .step-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .step-no { font-weight: 700; color: var(--purple); font-size: 14px; }
+  .tag { font-size: 12px; padding: 2px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--text); background: #0a101d; }
+  .tag.type { color: var(--cyan); border-color: rgba(34,211,238,.35); }
+  .tag.agent { color: var(--amber); border-color: rgba(251,191,36,.35); font-family: Consolas, monospace; }
+  .step-desc { color: var(--text); font-size: 13px; margin-top: 6px; }
+  .step-veri { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .step-dep { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .step-dep b { color: var(--purple); font-weight: 600; }
+
+  /* ============ 触发详情 ============ */
+  .trigger { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+    background: #0a101d; border: 1px solid var(--border); border-left: 3px solid var(--red);
+    border-radius: 8px; margin-bottom: 10px; }
+  .trigger:last-child { margin-bottom: 0; }
+  .trigger .dim { flex-shrink: 0; font-size: 12px; font-weight: 700; color: var(--red);
+    background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.4);
+    padding: 2px 10px; border-radius: 999px; margin-top: 1px; }
+  .trigger .why { font-size: 13px; color: var(--text); }
+  .ok-note { color: var(--green); font-size: 13px; padding: 10px 12px;
+    background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.3); border-radius: 8px; }
+
+  /* ============ 可解释性 ============ */
+  .rule-list { list-style: none; }
+  .rule-list li { font-size: 13px; padding: 7px 10px; margin-bottom: 6px;
+    background: #0a101d; border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); border-left: 3px solid var(--purple); }
+  .rule-list.exp li { border-left-color: var(--cyan); }
+  .para { font-size: 13px; line-height: 1.8; color: var(--text); margin-top: 12px;
+    background: #0a101d; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .para .p-title { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
+  .empty { color: var(--muted); font-size: 13px; }
+
+  /* ============ 原始 JSON 折叠区 ============ */
+  details.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none;
+    padding: 4px 0; outline: none; }
+  details.raw summary:hover { color: var(--cyan); }
+  details.raw pre {
+    margin-top: 12px; background: #060a12; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 520px;
+    color: #9fb6d4; font-family: Consolas, "Courier New", monospace;
+  }
+  #result { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>MoRay 决策内核 v1.0 · 可视化调试面板</h1>
+    <p>请求输入 → Layer 0 世界状态编码 → Layer 1 Laya 快速决策 → 标准 DecisionResult（全链路复用核心模块，零侵入）</p>
+  </header>
+
+  <!-- ============ 顶部操作区 ============ -->
+  <div class="card">
+    <h2>决策请求</h2>
+    <div class="controls">
+      <input type="text" id="query" placeholder="输入用户请求，例如：帮我修改生产环境的配置文件" />
+      <select id="permission" title="用户权限等级">
+        <option value="read">read（只读）</option>
+        <option value="write" selected>write（读写）</option>
+        <option value="admin">admin（管理员）</option>
+      </select>
+      <button id="go">生成决策</button>
+    </div>
+    <div class="hint">纯规则引擎本地决策，毫秒级返回；可尝试「删除配置」「生产环境」「深度推理」等关键词观察升级触发。</div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div id="result">
+    <!-- ============ 概览卡片 ============ -->
+    <div class="card">
+      <h2>决策概览</h2>
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <!-- ============ 执行步骤流 ============ -->
+    <div class="card">
+      <h2>执行步骤流（agent_chain · 按序执行）</h2>
+      <div class="flow" id="flow"></div>
+    </div>
+
+    <!-- ============ 触发详情卡 ============ -->
+    <div class="card">
+      <h2>升级触发详情</h2>
+      <div id="triggers"></div>
+    </div>
+
+    <!-- ============ 可解释性卡 ============ -->
+    <div class="card">
+      <h2>可解释性溯源</h2>
+      <ul class="rule-list" id="metaRules"></ul>
+      <ul class="rule-list exp" id="domainExp"></ul>
+      <div class="para" id="reasoning"></div>
+      <div class="para" id="counterfactual"></div>
+    </div>
+
+    <!-- ============ 原始 JSON 折叠区 ============ -->
+    <div class="card">
+      <details class="raw">
+        <summary>▸ 展开查看完整 DecisionResult 原始 JSON</summary>
+        <pre id="rawJson"></pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ---------- 中文标签映射（仅展示层，不参与决策） ---------- */
+const STEP_TYPE_CN = { intent_analysis: '意图解析', execution: '执行操作', user_confirm: '用户确认', audit: '安全审计' };
+const TRIGGER_CN = { risk: '风险维度', composite_scenario: '组合场景维度', complexity: '复杂度维度', low_confidence: '低置信度维度', deep_reasoning: '显式深度推理' };
+const RISK_CN = { low: '低风险 LOW', medium: '中风险 MEDIUM', high: '高风险 HIGH', critical: '极高风险 CRITICAL' };
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* ---------- 渲染：概览 ---------- */
+function renderStats(d) {
+  const q = d.quality, u = d.upgrade, ws = d.debug_world_state;
+  const riskCls = 'risk-' + (q.risk_level || 'low');
+  $('stats').innerHTML = [
+    `<div class="stat"><div class="label">风险等级</div>
+       <div class="value"><span class="badge ${riskCls}">${esc(RISK_CN[q.risk_level] || q.risk_level)}</span></div></div>`,
+    `<div class="stat"><div class="label">决策置信度</div>
+       <div class="value">${esc(q.confidence)}</div>
+       <div class="bar"><i style="width:${Math.round(q.confidence * 100)}%"></i></div>
+       <div class="sub">复杂度评分 ${esc(q.complexity_score)}</div></div>`,
+    `<div class="stat"><div class="label">是否组合场景</div>
+       <div class="value ${q.is_composite_scenario ? 'yes' : 'no'}">${q.is_composite_scenario ? '是' : '否'}</div>
+       <div class="sub">${esc(q.composite_type || '非组合，单一路径处理')}</div></div>`,
+    `<div class="stat"><div class="label">是否升级至深思层</div>
+       <div class="value ${u.should_upgrade ? 'yes' : 'no'}">${u.should_upgrade ? '升级' : '直出'}</div>
+       <div class="sub">命中 ${u.trigger_types.length} 个触发维度</div></div>`,
+    `<div class="stat"><div class="label">升级优先级</div>
+       <div class="value">${esc(u.upgrade_priority.toUpperCase())}</div>
+       <div class="sub">执行步骤 ${d.output.step_sequence.length} 步 · 耗时 ${esc(d.latency_ms)} ms</div></div>`,
+    ws ? `<div class="stat"><div class="label">L0 世界状态编码</div>
+       <div class="value" style="font-size:15px">${esc(ws.operation_risk_tag)} · ${esc(ws.user_permission_level)}</div>
+       <div class="sub">Agent 可用 ${esc(ws.agent_availability.healthy_count)}/${esc(ws.agent_availability.total)}（${esc(ws.agent_availability.ratio * 100)}%）· 编码 ${esc(ws.encode_time_ms)} ms</div></div>` : '',
+  ].join('');
+}
+
+/* ---------- 渲染：步骤流（连接线由 CSS 时间线绘制） ---------- */
+function renderFlow(d) {
+  const steps = d.output.step_sequence;
+  $('flow').innerHTML = steps.map((s, i) => {
+    const prev = i > 0 ? steps[i - 1] : null;
+    const params = JSON.stringify(s.agent_call.params);
+    return `<div class="step">
+      <div class="step-head">
+        <span class="step-no">STEP ${s.step_id}</span>
+        <span class="tag type">${esc(STEP_TYPE_CN[s.step_type] || s.step_type)}</span>
+        <span class="tag agent">@${esc(s.agent_call.agent_id)}</span>
+        <span class="tag">超时 ${s.agent_call.timeout_ms}ms</span>
+      </div>
+      <div class="step-desc">${esc(s.description)}</div>
+      <div class="step-veri">✓ 验证点：${esc(s.verification)}</div>
+      <div class="step-dep">${prev
+        ? `依赖前置：<b>STEP ${prev.step_id}（@${esc(prev.agent_call.agent_id)}）</b> 完成后串行执行`
+        : '<b>链起点</b>，无前置依赖'}</div>
+      <div class="step-dep" style="font-family:Consolas,monospace">参数：${esc(params)}</div>
+    </div>`;
+  }).join('');
+}
+
+/* ---------- 渲染：升级触发详情 ---------- */
+function renderTriggers(d) {
+  const u = d.upgrade;
+  if (!u.trigger_types.length) {
+    $('triggers').innerHTML = '<div class="ok-note">✔ 未命中任何升级触发维度，维持 Laya 快速路径直出。</div>';
+    return;
+  }
+  $('triggers').innerHTML = u.trigger_types.map((t, i) =>
+    `<div class="trigger"><span class="dim">${esc(TRIGGER_CN[t] || t)}</span>
+       <span class="why">${esc(u.trigger_reasons[i] || '')}</span></div>`).join('');
+}
+
+/* ---------- 渲染：可解释性 ---------- */
+function renderExplain(d) {
+  const e = d.explainability;
+  $('metaRules').innerHTML = e.matched_meta_rules.length
+    ? '<li>📐 元决策规则</li>' + e.matched_meta_rules.map((r) => `<li>${esc(r)}</li>`).join('')
+    : '<li class="empty">未命中元决策规则</li>';
+  $('domainExp').innerHTML = e.matched_domain_experience.length
+    ? '<li>🧭 领域经验</li>' + e.matched_domain_experience.map((r) => `<li>${esc(r)}</li>`).join('')
+    : '<li style="background:none;border:0;padding:0"><span class="empty">未命中领域经验条目</span></li>';
+  $('reasoning').innerHTML = `<span class="p-title">推理摘要</span>${esc(e.reasoning_summary)}`;
+  $('counterfactual').innerHTML = `<span class="p-title">反事实检验</span>${esc(e.counterfactual_note)}`;
+}
+
+/* ---------- 主流程：发起决策请求 ---------- */
+async function decide() {
+  const query = $('query').value.trim();
+  $('err').textContent = '';
+  if (!query) { $('err').textContent = '请先输入请求文本。'; return; }
+  const btn = $('go');
+  btn.disabled = true; btn.textContent = '决策中…';
+  try {
+    const res = await fetch('/api/decide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, permission: $('permission').value }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status) + (data.detail ? '：' + data.detail : ''));
+    renderStats(data); renderFlow(data); renderTriggers(data); renderExplain(data);
+    $('rawJson').textContent = JSON.stringify(data, null, 2);
+    $('result').style.display = 'block';
+  } catch (err) {
+    $('err').textContent = '请求失败：' + err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '生成决策';
+  }
+}
+$('go').addEventListener('click', decide);
+$('query').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') decide(); });
+</script>
+</body>
+</html>

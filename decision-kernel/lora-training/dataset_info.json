@@ -1,0 +1,20 @@
+{
+  "moray_lora_train": {
+    "file_name": "output/train.jsonl",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "user",
+      "response": "assistant",
+      "system": "system"
+    }
+  },
+  "moray_lora_val": {
+    "file_name": "output/val.jsonl",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "user",
+      "response": "assistant",
+      "system": "system"
+    }
+  }
+}

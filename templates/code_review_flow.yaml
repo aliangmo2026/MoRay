@@ -1,0 +1,59 @@
+# ============================================================
+# code_review_flow —— 代码快速审查任务模板（L5.0 阶段5，2026-09-28）。
+# 三步（任务书 5.1）：
+#   collect_recent   fs_recent_files（新步骤类型：mtime 倒序取最近源码 + 内容片段，
+#                    默认 3 文件 × 2000 字符，压在引擎 _trim 8000 上限之下）
+#   llm_review       llm_chat（新步骤类型：通用网关调用，token 预算累计/熔断天然生效）
+#   generate_report  审查结论 + 问题清单落 review_report.md
+# 入参 params：project_dir / project_id
+# 诚实降级：空项目 → collect_recent 抛 NO_SOURCE_FILES → 模板 failed + human_intervention。
+# ============================================================
+name: code_review_flow
+version: 1
+description: 最近修改代码 → LLM 快速审查（潜在 bug/坏味道/安全）→ 问题清单报告
+
+defaults:
+  retries: 1
+  timeout: 180
+
+steps:
+  - id: collect_recent
+    type: fs_recent_files
+    timeout: 30
+    args:
+      project_dir: "{{params.project_dir}}"
+      suffixes: [".py", ".js", ".ts"]
+      max_files: 3
+      max_bytes_each: 2000
+
+  - id: llm_review
+    type: llm_chat
+    timeout: 240
+    args:
+      temperature: 0.1
+      prompt: |
+        你是资深代码审查专家（研究级精度）。下面是项目 {{params.project_id}} 最近修改的源码文件
+        （按最后修改时间倒序，超长按配额截断）。请做一次快速但严格的代码审查，输出 Markdown：
+        1. 问题清单：每条含 序号、严重程度（高/中/低）、文件:大致行号、问题描述（潜在 bug、
+           坏味道、安全隐患）、修复建议。没有问题就明确写"未发现明显问题"。
+        2. 总体评价（两三句话）。
+        只评代码本身，不要复述全文。
+        —— 待审文件（内容片段）——
+        {{steps.collect_recent.output.files_text}}
+
+  - id: generate_report
+    type: report
+    timeout: 30
+    args:
+      path: "{{work_dir}}/review_report.md"
+      content: |
+        # MoRay 代码审查报告 · {{params.project_id}}
+        任务：code_review_flow（工作目录 {{work_dir}}，全流程 {{elapsed_sec}}s）
+
+        ## 覆盖的最近改动文件
+        {{steps.collect_recent.output.summary}}
+
+        ## 审查结论
+        {{steps.llm_review.output.content}}
+
+        —— 由 MoRay 任务模板引擎（engine/task_runner.py）自动生成

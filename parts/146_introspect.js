@@ -454,7 +454,8 @@
     pending_approval: { label: '待审批', cls: 'text-text-tertiary' },
     dispatched: { label: '执行中…', cls: 'text-brand-cyan' },
     done: { label: '已完成', cls: 'text-success' },
-    failed: { label: '失败', cls: 'text-error' }
+    failed: { label: '失败', cls: 'text-error' },
+    abandoned: { label: '已放弃', cls: 'text-error' }  /* [v3 失败重试] retry_count 超限终态 */
   };
   var GOAL_BTN_DISABLED_CLS = 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-tertiary opacity-50 cursor-default';
 
@@ -478,7 +479,7 @@
     const sm = goalStatusMeta(st);
     // 终态卡只留徽章（历史只读）；dispatched 按钮置灰不删（第四段契约）；待审批可操作
     const graying = st === 'dispatched';
-    const btns = (st === 'done' || st === 'failed') ? '' :
+    const btns = (st === 'done' || st === 'failed' || st === 'abandoned') ? '' :
       '<button type="button" data-goal-act="run" data-goal-id="' + esc(gid) + '"' +
       (graying ? ' disabled' : '') +
       ' class="' + (graying ? GOAL_BTN_DISABLED_CLS : 'text-[11px] px-2 py-1 rounded-md border border-line-ghost text-text-secondary hover:text-brand-cyan hover:bg-surface-panel') + '">' +
@@ -495,7 +496,9 @@
       esc(goal) + '</div>' +
       '<div class="text-[11px] text-text-tertiary mt-0.5">' +
       '<span data-goal-status-badge class="' + esc(sm.cls) + '">' + esc(sm.label) + '</span> · 生成于 ' +
-      esc(agoLabel(it.created_at) || it.created_at || '—') + '</div></div>' +
+      esc(agoLabel(it.created_at) || it.created_at || '—') +
+      (Number(it.retry_count) > 0 ? ' · <span class="text-warning">失败重试 #' + esc(Number(it.retry_count)) + '</span>' : '') +
+      '</div></div>' +
       '<div class="flex items-center gap-1.5 flex-shrink-0">' + btns + '</div></div>';
   }
 

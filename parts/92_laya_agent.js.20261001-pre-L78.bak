@@ -1,0 +1,967 @@
+/* ============================================================
+ * [L7.7 2026-09-29] MoRay Agent 模式前端接入（任务书 一 / 三·前端优化）
+ *
+ * 纯加性运行时注入，零改动既有业务代码：
+ *   1) 顶栏 #chatModeSwitch 右侧注入「Agent模式」切换按钮（默认关，localStorage 记忆）；
+ *   2) Agent 模式下发送 → 不走普通聊天，改调 Laya POST /execute（SSE 流），
+ *      用户目标照常落库进消息流；final 帧自动作为 AI 回复插入聊天；
+ *   3) 右侧固定宽度执行面板（覆盖式定位，不动原 flex 布局）：
+ *      状态 + 总进度条 + 步骤列表（等待灰/执行中黄呼吸/完成绿/失败红、
+ *      "正在重试第 N 次"、已完成可展开中间结果）+ 耗时 + 取消执行；
+ *   4) 面板可一键折叠成侧边小标签；SSE 意外断开弹提示；
+ *   5) 最终结果一键复制 / 导出本地文件；输入框下方 Agent 模式快捷任务标签。
+ *   6) [输出体验] 步骤详情/最终结果按工具类型结构化渲染（file=可折叠目录树+文件大小、
+ *      argus=标题/链接/摘要卡片、zcode=代码高亮+等宽日志、失败=红色错误块）；
+ *      聊天只留 状态+短结论+「查看详情」（点击展开面板并定位最终结果），
+ *      完整数据只在右侧面板；每个结果区右下角「查看原始 JSON」切换（默认隐藏）。
+ *
+ * 接口契约（Laya 8001，L7.6+L7.7）：
+ *   POST /execute {goal, max_retry} → SSE data: 帧 {event: start|step_start|step_result|
+ *   check|retry|final, step_id, tool, description, status, data, error, attempt,
+ *   retry_count, ts(ms), execution_id, ...}
+ *   POST /execute/cancel {execution_id} → {code:0, cancelled:bool}
+ *   服务地址 localStorage 'moray_laya_base' 可覆盖，默认 http://localhost:8001。
+ * ============================================================ */
+(function () {
+  'use strict';
+
+  var LS_MODE = 'moray_agent_mode';
+  var LS_BASE = 'moray_laya_base';
+  var DEFAULT_BASE = 'http://localhost:8001';
+  var MAX_RETRY = 5;
+
+  var busy = false;          // 一次只跑一个执行
+  var state = null;          // 当前执行状态快照
+  var timerId = null;        // 耗时刷新计时器
+  var abortCtrl = null;      // SSE AbortController
+
+  function agentOn() { return localStorage.getItem(LS_MODE) === '1'; }
+  function layaBase() { return (localStorage.getItem(LS_BASE) || DEFAULT_BASE).replace(/\/+$/, ''); }
+  function esc(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; }
+  function attr(s) { return esc(s).replace(/"/g, '&quot;'); }   // 用于 HTML 属性位（innerHTML 序列化不转义双引号）
+
+  /* ---------------- [输出体验] 数据解析 / 小工具 ---------------- */
+  function parseLoose(s) {
+    if (s == null) return { ok: false, val: '' };
+    if (typeof s !== 'string') return { ok: true, val: s };
+    try { return { ok: true, val: JSON.parse(s) }; } catch (e) { return { ok: false, val: s }; }
+  }
+  function fmtBytes(n) {
+    var v = Number(n);
+    if (!isFinite(v) || v < 0) return '';
+    if (v < 1024) return v + ' B';
+    if (v < 1048576) return (v / 1024).toFixed(1) + ' KB';
+    if (v < 1073741824) return (v / 1048576).toFixed(1) + ' MB';
+    return (v / 1073741824).toFixed(2) + ' GB';
+  }
+  function mdPlain(s) { return String(s == null ? '' : s).replace(/[`*_~#[\]>]/g, ''); }
+  function clampStr(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n) + '…' : s; }
+  function highlightCode(code) {
+    var src = String(code || '');
+    try {
+      if (typeof hljs !== 'undefined' && hljs.highlight) {
+        try { return hljs.highlight(src, { language: 'python' }).value; } catch (e1) {}
+        if (hljs.highlightAuto) return String(hljs.highlightAuto(src).value || esc(src));
+      }
+    } catch (e2) {}
+    return esc(src);
+  }
+
+  /* ---------------- 样式（一次性注入；只碰自有类名，不动既有选择器） ---------------- */
+  var STYLE = [
+    '.laya-agent-btn{margin-left:6px;padding:4px 10px;border-radius:9px;font-size:12px;cursor:pointer;',
+    'border:1px solid var(--color-line-ghost,rgba(255,255,255,.1));background:transparent;color:var(--color-text-secondary,#9ca3af);',
+    'display:inline-flex;align-items:center;gap:4px;transition:all .18s;line-height:1.4}',
+    '.laya-agent-btn:hover{border-color:rgba(229,115,74,.45)}',
+    '.laya-agent-btn.on{background:rgba(229,115,74,.16);color:#E5734A;border-color:rgba(229,115,74,.5)}',
+    '#layaExecPanel{position:fixed;right:14px;top:64px;bottom:16px;width:352px;z-index:1200;',
+    'display:none;flex-direction:column;background:rgba(20,20,20,.97);border:1px solid #2a2a2a;border-radius:12px;',
+    'box-shadow:0 12px 40px rgba(0,0,0,.5);font-size:12px;color:#d4d4d4;overflow:hidden}',
+    '#layaExecPanel.show{display:flex}',
+    '#layaExecPanel.collapsed{display:none}',
+    '.laya-reopen{position:fixed;right:14px;top:64px;z-index:1200;display:none;padding:8px 10px;',
+    'background:rgba(20,20,20,.95);border:1px solid #2a2a2a;border-radius:10px;cursor:pointer;color:#E5734A;font-size:14px}',
+    '.laya-reopen.show{display:block}',
+    '.laya-p-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #2a2a2a;flex-shrink:0}',
+    '.laya-p-title{font-weight:600;color:#e8e8e8}',
+    '.laya-p-status{font-size:11px;padding:2px 8px;border-radius:999px}',
+    '.laya-st-run{background:rgba(251,191,36,.15);color:#FBBF24}',
+    '.laya-st-ok{background:rgba(74,222,128,.15);color:#4ade80}',
+    '.laya-st-fail{background:rgba(248,113,113,.15);color:#f87171}',
+    '.laya-st-cancel{background:rgba(156,163,175,.15);color:#9ca3af}',
+    '.laya-p-collapse{margin-left:auto;background:none;border:none;color:#8a8a8a;cursor:pointer;font-size:14px;padding:2px 4px}',
+    '.laya-p-prog{height:4px;background:#242424;flex-shrink:0}',
+    '.laya-p-prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,#E5734A,#FBBF24);transition:width .3s}',
+    '.laya-p-steps{flex:1;min-height:0;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
+    '.laya-step{border:1px solid #262626;border-radius:9px;padding:7px 9px;background:rgba(255,255,255,.02)}',
+    '.laya-step .row{display:flex;align-items:center;gap:7px;cursor:default}',
+    '.laya-step.expandable .row{cursor:pointer}',
+    '.laya-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#555}',
+    '.laya-step.running .laya-dot{background:#FBBF24;animation:layaBreathe 1.2s ease-in-out infinite}',
+    '.laya-step.done .laya-dot{background:#4ade80}',
+    '.laya-step.failed .laya-dot{background:#f87171}',
+    '@keyframes layaBreathe{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}',
+    '.laya-step .tool{color:#8a8a8a;flex-shrink:0;display:inline-flex}',
+    '.laya-step .desc{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.laya-step .retry-badge{color:#FBBF24;font-size:10px;flex-shrink:0}',
+    '.laya-step .detail{display:none;margin-top:6px;padding:6px 8px;background:#181818;border-radius:6px;',
+    'white-space:pre-wrap;word-break:break-all;max-height:160px;overflow:auto;color:#a8a8a8;font-size:11px}',
+    '.laya-step.open .detail{display:block}',
+    '.laya-p-foot{border-top:1px solid #2a2a2a;padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}',
+    '.laya-p-elapsed{color:#8a8a8a;font-variant-numeric:tabular-nums}',
+    '.laya-p-actions{margin-left:auto;display:flex;gap:6px}',
+    '.laya-btn{padding:3px 10px;border-radius:8px;border:1px solid #333;background:rgba(255,255,255,.04);color:#d4d4d4;font-size:11px;cursor:pointer}',
+    '.laya-btn:hover{border-color:#E5734A;color:#E5734A}',
+    '.laya-btn.danger{border-color:rgba(248,113,113,.4);color:#f87171}',
+    '.laya-btn.danger:hover{background:rgba(248,113,113,.12)}',
+    '.laya-btn[hidden]{display:none}',
+    '#layaAgentTags{display:none;gap:6px;flex-wrap:wrap;padding:6px 2px 0}',
+    '#layaAgentTags.show{display:flex}',
+    '.laya-tag{padding:3px 10px;border-radius:999px;border:1px solid #2e2e2e;background:rgba(229,115,74,.07);',
+    'color:#c9a18c;font-size:11px;cursor:pointer;white-space:nowrap}',
+    '.laya-tag:hover{border-color:rgba(229,115,74,.5);color:#E5734A}',
+    /* ---- [输出体验] 结果格式化层 ---- */
+    '.laya-res{min-width:0}',
+    '.laya-res [hidden]{display:none!important}',
+    '.laya-res-foot{display:flex;justify-content:flex-end;margin-top:4px}',
+    '.laya-raw-btn{background:none;border:1px solid #2c2c2c;border-radius:6px;color:#6f6f6f;font-size:10px;padding:1px 8px;cursor:pointer}',
+    '.laya-raw-btn:hover{border-color:rgba(229,115,74,.45);color:#E5734A}',
+    '.laya-res-raw{margin:6px 0 0;padding:8px;background:#141414;border:1px solid #262626;border-radius:6px;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto;color:#9a9a9a;font-size:11px;line-height:1.5;font-family:Consolas,Menlo,monospace}',
+    '.laya-cap{display:flex;align-items:center;gap:6px;color:#8a8a8a;font-size:11px;margin:8px 0 4px}',
+    '.laya-cap .cnt{margin-left:auto;color:#6f6f6f;flex-shrink:0}',
+    '.laya-cap .pth{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.laya-tree{border:1px solid #262626;border-radius:8px;overflow:hidden}',
+    '.laya-tree-head{display:flex;align-items:center;gap:6px;padding:7px 9px;background:rgba(255,255,255,.03);cursor:pointer;color:#d4d4d4}',
+    '.laya-tree-head:hover{background:rgba(255,255,255,.05)}',
+    '.laya-tree-head .pth{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}',
+    '.laya-tree-head .cnt{color:#6f6f6f;font-size:10px;flex-shrink:0}',
+    '.laya-tree-head .chev{color:#6f6f6f;transition:transform .18s;flex-shrink:0}',
+    '.laya-tree-head.folded .chev{transform:rotate(-90deg)}',
+    '.laya-tree-body{display:flex;flex-direction:column}',
+    '.laya-tree-body.closed{display:none}',
+    '.laya-tree-row{display:flex;align-items:center;gap:7px;padding:5px 9px 5px 14px;border-top:1px solid #222;color:#c4c4c4;font-size:11.5px;min-width:0}',
+    '.laya-tree-row i,.laya-tree-row svg{flex-shrink:0;color:#8a8a8a}',
+    '.laya-tree-row .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.laya-tree-row .sz{color:#6f6f6f;font-size:10px;flex-shrink:0;font-variant-numeric:tabular-nums}',
+    '.laya-tree-row.is-dir{color:#e0c9a8}',
+    '.laya-tree-row.is-dir i,.laya-tree-row.is-dir svg{color:#c9a18c}',
+    '.laya-search{display:flex;flex-direction:column;gap:6px}',
+    '.laya-search-q{display:flex;align-items:center;gap:6px;color:#8a8a8a;font-size:11px;min-width:0}',
+    '.laya-search-q .cnt{margin-left:auto;color:#6f6f6f;flex-shrink:0}',
+    '.laya-sr{border:1px solid #262626;border-radius:8px;padding:7px 9px;background:rgba(255,255,255,.02);min-width:0}',
+    '.laya-sr .tt{color:#E5734A;text-decoration:none;font-size:12px;font-weight:500;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.laya-sr .tt:hover{text-decoration:underline}',
+    '.laya-sr .tt-plain{color:#d4d4d4;font-size:12px;font-weight:500;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.laya-sr .snip{color:#9a9a9a;font-size:11px;line-height:1.5;margin-top:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}',
+    '.laya-code,.laya-log{margin:0;padding:8px 10px;background:#141414;border:1px solid #262626;border-radius:6px;overflow:auto;max-height:240px;font-family:Consolas,Menlo,monospace;font-size:11px;line-height:1.55;white-space:pre-wrap;word-break:break-all;color:#c8c8c8}',
+    '.laya-code{white-space:pre;word-break:normal}',
+    '.laya-zmeta{display:flex;align-items:center;gap:6px}',
+    '.laya-exit{font-size:10px;padding:2px 8px;border-radius:999px;background:rgba(74,222,128,.15);color:#4ade80}',
+    '.laya-exit.bad{background:rgba(248,113,113,.15);color:#f87171}',
+    '.laya-exit.neutral{background:rgba(156,163,175,.12);color:#9ca3af}',
+    '.laya-err{background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.35);border-radius:8px;padding:8px 10px}',
+    '.laya-err .h{display:flex;align-items:center;gap:6px;font-weight:600;font-size:11.5px;color:#f87171;margin-bottom:3px}',
+    '.laya-err .m{white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.55;color:#e8b4b4}',
+    '.laya-txt{white-space:pre-wrap;word-break:break-word;color:#c4c4c4;font-size:11.5px;line-height:1.6;min-width:0}',
+    '.laya-txt i,.laya-txt svg{margin-right:6px;color:#8a8a8a}',
+    '.laya-kv{display:flex;gap:8px;padding:3px 0;font-size:11.5px;border-bottom:1px dashed #242424;min-width:0}',
+    '.laya-kv:last-child{border-bottom:none}',
+    '.laya-kv .k{color:#8a8a8a;flex-shrink:0}',
+    '.laya-kv .v{color:#c4c4c4;min-width:0;word-break:break-all}',
+    '.laya-final{border-top:1px dashed #3a3a3a;margin-top:8px;padding-top:8px}',
+    '.laya-final-h{font-weight:600;color:#e8e8e8;font-size:12px;margin-bottom:6px}',
+    '.laya-flash{animation:layaFlash 1.4s ease 1}',
+    '@keyframes layaFlash{0%{background:rgba(229,115,74,.22)}100%{background:transparent}}',
+    '.laya-chat-detail{margin-top:10px;padding:3px 12px;border-radius:8px;font-size:11px;cursor:pointer;background:transparent;',
+    'border:1px solid var(--color-line-ghost,rgba(127,127,127,.3));color:var(--color-text-secondary,#9ca3af);transition:all .18s}',
+    '.laya-chat-detail:hover{border-color:rgba(229,115,74,.5);color:#E5734A}',
+    '.laya-code .hljs-keyword,.laya-code .hljs-selector-tag,.laya-code .hljs-meta{color:#c792ea}',
+    '.laya-code .hljs-string,.laya-code .hljs-attr{color:#a5d6a7}',
+    '.laya-code .hljs-number,.laya-code .hljs-literal{color:#f7bd7f}',
+    '.laya-code .hljs-comment{color:#6a6a6a;font-style:italic}',
+    '.laya-code .hljs-title,.laya-code .hljs-name,.laya-code .hljs-function{color:#7fb3e8}',
+    '.laya-code .hljs-built_in,.laya-code .hljs-type{color:#82d8d8}'
+  ].join('\n');
+
+  function injectStyle() {
+    if (document.getElementById('layaAgentStyle')) return;
+    var st = document.createElement('style');
+    st.id = 'layaAgentStyle';
+    st.textContent = STYLE;
+    document.head.appendChild(st);
+  }
+
+  /* ---------------- 顶栏 Agent 按钮 ---------------- */
+  var agentBtn = null;
+  function ensureButton() {
+    if (agentBtn && agentBtn.isConnected) return;
+    var seg = document.getElementById('chatModeSwitch');
+    if (!seg || !seg.parentNode) return;
+    agentBtn = document.createElement('button');
+    agentBtn.className = 'laya-agent-btn' + (agentOn() ? ' on' : '');
+    agentBtn.type = 'button';
+    agentBtn.title = '开启后发送的目标交给 Laya 高速决策引擎拆解并自主执行';
+    agentBtn.innerHTML = '<i data-lucide="bot" class="w-3.5 h-3.5"></i><span>Agent模式</span>';
+    agentBtn.addEventListener('click', function () {
+      var on = !agentOn();
+      localStorage.setItem(LS_MODE, on ? '1' : '0');
+      agentBtn.classList.toggle('on', on);
+      toggleTags(on);
+      if (on) {
+        showNotification('Agent 模式已开启', '接下来发送的目标将由 Laya 拆解执行（' + layaBase() + '）', 'info', 2600);
+      } else {
+        showNotification('已回到普通对话', '不影响当前聊天上下文', 'info', 2000);
+      }
+      try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+    });
+    seg.parentNode.insertBefore(agentBtn, seg.nextSibling);
+    try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+  }
+
+  /* ---------------- 快捷任务标签（输入框下方） ---------------- */
+  var TAGS = ['列出D盘MoRay目录的文件', '搜索最新大模型微调资讯', '读取日志统计报错数量'];
+  var tagsRow = null;
+  function ensureTags() {
+    if (tagsRow && tagsRow.isConnected) return;
+    var dock = document.getElementById('coreInputContainer');
+    if (!dock || !dock.parentElement) return;
+    tagsRow = document.createElement('div');
+    tagsRow.id = 'layaAgentTags';
+    TAGS.forEach(function (t) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'laya-tag';
+      b.textContent = t;
+      b.addEventListener('click', function () {
+        var inp = document.getElementById('chatInputNormal');
+        if (!inp) return;
+        inp.value = t;
+        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+        inp.focus();
+      });
+      tagsRow.appendChild(b);
+    });
+    dock.parentElement.appendChild(tagsRow);
+    tagsRow.classList.toggle('show', agentOn());
+  }
+  function toggleTags(on) { if (tagsRow) tagsRow.classList.toggle('show', !!on); }
+
+  /* ---------------- 执行面板 ---------------- */
+  var panel = null, reopen = null;
+  function ensurePanel() {
+    if (panel) return panel;
+    panel = document.createElement('div');
+    panel.id = 'layaExecPanel';
+    panel.innerHTML = [
+      '<div class="laya-p-head">',
+      '  <span class="laya-p-title">⚡ Agent 执行</span>',
+      '  <span class="laya-p-status laya-st-run" id="layaPStatus">执行中</span>',
+      '  <button class="laya-p-collapse" id="layaPCollapse" title="折叠面板">⟩</button>',
+      '</div>',
+      '<div class="laya-p-prog"><i id="layaPProg"></i></div>',
+      '<div class="laya-p-steps" id="layaPSteps"></div>',
+      '<div class="laya-p-foot">',
+      '  <span class="laya-p-elapsed" id="layaPElapsed">0.0s</span>',
+      '  <span class="laya-p-actions">',
+      '    <button class="laya-btn" id="layaPCopy" hidden title="复制最终结果">复制</button>',
+      '    <button class="laya-btn" id="layaPExport" hidden title="导出为本地文件">导出</button>',
+      '    <button class="laya-btn danger" id="layaPCancel" hidden>取消执行</button>',
+      '  </span>',
+      '</div>'
+    ].join('');
+    document.body.appendChild(panel);
+    reopen = document.createElement('button');
+    reopen.className = 'laya-reopen';
+    reopen.type = 'button';
+    reopen.title = '展开执行面板';
+    reopen.textContent = '⚡';
+    reopen.addEventListener('click', function () {
+      panel.classList.remove('collapsed');
+      reopen.classList.remove('show');
+    });
+    document.body.appendChild(reopen);
+
+    document.getElementById('layaPCollapse').addEventListener('click', function () {
+      panel.classList.add('collapsed');
+      reopen.classList.add('show');
+    });
+    document.getElementById('layaPCancel').addEventListener('click', function () {
+      if (!state || !state.executionId) return;
+      fetch(layaBase() + '/execute/cancel', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ execution_id: state.executionId })
+      }).then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j && j.code === 0 && j.cancelled) {
+            showNotification('已请求取消', '将在当前步骤边界生效', 'info', 2200);
+          } else {
+            showNotification('取消未生效', (j && j.error) || '执行可能已结束或 id 不匹配', 'warning', 2600);
+          }
+        })
+        .catch(function () { showNotification('取消请求失败', '无法连接 Laya 服务', 'error', 3000); });
+    });
+    document.getElementById('layaPCopy').addEventListener('click', function () {
+      copyText(state && state.finalText ? state.finalText : '');
+    });
+    document.getElementById('layaPExport').addEventListener('click', function () {
+      exportText(state && state.finalText ? state.finalText : '');
+    });
+    return panel;
+  }
+
+  function panelOpen(goal) {
+    ensurePanel();
+    panel.classList.add('show');
+    panel.classList.remove('collapsed');
+    reopen.classList.remove('show');
+    document.getElementById('layaPSteps').innerHTML = '';
+    setStepStatus('执行中', 'run');
+    document.getElementById('layaPProg').style.width = '0%';
+    document.getElementById('layaPCancel').hidden = false;
+    document.getElementById('layaPCopy').hidden = true;
+    document.getElementById('layaPExport').hidden = true;
+    var el = document.getElementById('layaPElapsed'); if (el) el.textContent = '0.0s';
+    var title = panel.querySelector('.laya-p-title');
+    if (title) title.textContent = '⚡ ' + (goal.length > 20 ? goal.slice(0, 20) + '…' : goal);
+  }
+  function setStepStatus(text, kind) {
+    var s = document.getElementById('layaPStatus');
+    if (!s) return;
+    s.textContent = text;
+    s.className = 'laya-p-status laya-st-' + kind;
+  }
+
+  var TOOL_ICON = { iris: 'image', argus: 'search', zcode: 'code-2', file: 'file-text' };
+  function stepRow(stepId, tool, desc) {
+    var wrap = document.createElement('div');
+    wrap.className = 'laya-step';
+    wrap.dataset.stepId = String(stepId);
+    wrap.innerHTML = '<div class="row"><span class="laya-dot"></span>' +
+      '<span class="step-no" style="color:#8a8a8a;flex-shrink:0">#' + stepId + '</span>' +
+      '<span class="tool"><i data-lucide="' + (TOOL_ICON[tool] || 'wrench') + '" class="w-3.5 h-3.5"></i></span>' +
+      '<span class="desc" title="' + esc(desc) + '">' + esc(desc || tool) + '</span>' +
+      '<span class="retry-badge"></span></div>' +
+      '<div class="detail"></div>';
+    wrap.querySelector('.row').addEventListener('click', function () {
+      if (wrap.classList.contains('expandable')) wrap.classList.toggle('open');
+    });
+    return wrap;
+  }
+  function getRow(stepId) {
+    return document.querySelector('#layaPSteps .laya-step[data-step-id="' + stepId + '"]');
+  }
+  function rowDetail(stepId, text) {
+    var r = getRow(stepId); if (!r) return;
+    var d = r.querySelector('.detail'); d.textContent = text;
+    r.classList.add('expandable');
+  }
+  function rowMark(stepId, cls, retryText) {
+    var r = getRow(stepId); if (!r) return;
+    r.classList.remove('running', 'done', 'failed');
+    if (cls) r.classList.add(cls);
+    if (retryText !== undefined) r.querySelector('.retry-badge').textContent = retryText;
+  }
+  function updateProgress() {
+    if (!state || !state.total) return;
+    var pct = Math.min(100, Math.round(state.doneCount / state.total * 100));
+    if (state.finished) pct = 100;
+    var bar = document.getElementById('layaPProg'); if (bar) bar.style.width = pct + '%';
+  }
+
+  /* ---------------- [输出体验] 结果格式化层 ----------------
+   * 数据形状（L7.6 工具信封，step_result.data / final.result 都是 _shrink 后的 JSON 字符串）：
+   *   file  list_dir = {dir,count,entries:[{name,is_dir,size|null}]}；read = {path,content,size}；write = {path,written}
+   *   argus search  = {query,count,results:[{title,url,snippet}]}
+   *   zcode         = {output,exit_code}（stdout 等字段如实兼容）；代码原文取 step_start 事件里的 input.code
+   *   iris / 未知   = 自由对象 → 文本 / 键值 / 缩进 JSON 兜底
+   * 每个结果区 = 格式化主视图（默认）+ 原始 JSON（默认隐藏）+ 右下角切换按钮。 */
+
+  function buildRawable(mainEl, parsed) {
+    var wrap = document.createElement('div'); wrap.className = 'laya-res';
+    if (mainEl) { mainEl.classList.add('laya-res-main'); wrap.appendChild(mainEl); }
+    var raw = document.createElement('pre');
+    raw.className = 'laya-res-raw'; raw.hidden = true;
+    raw.textContent = (parsed && parsed.ok && parsed.val != null && typeof parsed.val === 'object')
+      ? JSON.stringify(parsed.val, null, 2) : String(parsed && parsed.val != null ? parsed.val : '');
+    wrap.appendChild(raw);
+    var foot = document.createElement('div'); foot.className = 'laya-res-foot';
+    var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'laya-raw-btn';
+    btn.textContent = '查看原始 JSON';
+    btn.addEventListener('click', function () {
+      var showRaw = raw.hidden;
+      raw.hidden = !showRaw;
+      if (mainEl) mainEl.style.display = showRaw ? 'none' : '';
+      btn.textContent = showRaw ? '收起原始 JSON' : '查看原始 JSON';
+    });
+    foot.appendChild(btn); wrap.appendChild(foot);
+    return wrap;
+  }
+
+  function buildTextView(s) {
+    var v = document.createElement('div'); v.className = 'laya-txt';
+    v.textContent = String(s == null ? '' : s);
+    return v;
+  }
+
+  function buildErrorBlock(err) {
+    var e = document.createElement('div'); e.className = 'laya-err';
+    var code = err && err.code != null ? err.code : null;
+    var msg = err && err.message ? String(err.message) : String(err || '未知错误');
+    e.innerHTML = '<div class="h"><i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i><span>执行出错' +
+      (code != null ? ' · 代码 ' + esc(String(code)) : '') + '</span></div><div class="m"></div>';
+    e.querySelector('.m').textContent = msg;
+    return e;
+  }
+
+  function buildFileView(p) {
+    var d = p.val;
+    if (!p.ok || !d || typeof d !== 'object') return buildTextView(p.val);
+    if (Array.isArray(d.entries)) {          // list_dir：单层目录树（服务端只回一层，如实渲染）
+      var root = document.createElement('div'); root.className = 'laya-tree';
+      var head = document.createElement('div'); head.className = 'laya-tree-head';
+      head.innerHTML = '<i data-lucide="folder" class="w-3.5 h-3.5"></i>' +
+        '<span class="pth" title="' + attr(String(d.dir || '')) + '">' + esc(String(d.dir || '目录')) + '</span>' +
+        '<span class="cnt">' + (d.count != null ? d.count : d.entries.length) + ' 项</span>' +
+        '<i data-lucide="chevron-down" class="w-3.5 h-3.5 chev"></i>';
+      var body = document.createElement('div'); body.className = 'laya-tree-body';
+      d.entries.slice()
+        .sort(function (a, b) { return (b.is_dir - a.is_dir) || String(a.name).localeCompare(String(b.name)); })
+        .forEach(function (en) {
+          var r = document.createElement('div');
+          r.className = 'laya-tree-row' + (en && en.is_dir ? ' is-dir' : '');
+          r.innerHTML = '<i data-lucide="' + (en && en.is_dir ? 'folder' : 'file-text') + '" class="w-3.5 h-3.5"></i>' +
+            '<span class="nm" title="' + attr(String(en && en.name || '')) + '">' + esc(String(en && en.name || '')) + '</span>' +
+            '<span class="sz">' + (en && en.is_dir ? '文件夹' : (en && en.size != null ? fmtBytes(en.size) : '')) + '</span>';
+          body.appendChild(r);
+        });
+      head.addEventListener('click', function () { body.classList.toggle('closed'); head.classList.toggle('folded'); });
+      root.appendChild(head); root.appendChild(body);
+      return root;
+    }
+    if (typeof d.content === 'string') {     // read：文件内容等宽预览
+      var w = document.createElement('div'); w.className = 'laya-file-read';
+      var meta = document.createElement('div'); meta.className = 'laya-cap';
+      meta.innerHTML = '<i data-lucide="file-text" class="w-3.5 h-3.5"></i>' +
+        '<span class="pth" title="' + attr(String(d.path || '')) + '">' + esc(String(d.path || '文件')) + '</span>' +
+        '<span class="cnt">' + fmtBytes(d.size != null ? d.size : d.content.length) + '</span>';
+      var pre = document.createElement('pre'); pre.className = 'laya-log';
+      pre.textContent = d.content.length > 6000 ? d.content.slice(0, 6000) + '\n…（已截断）' : d.content;
+      w.appendChild(meta); w.appendChild(pre);
+      return w;
+    }
+    if (d.written != null) {                 // write：落盘回执
+      var v = document.createElement('div'); v.className = 'laya-txt';
+      v.innerHTML = '<i data-lucide="file-text" class="w-3.5 h-3.5"></i><span>已写入 ' +
+        esc(String(d.path || '')) + '（' + esc(String(d.written)) + ' 字符）</span>';
+      return v;
+    }
+    return buildGenericView(p);
+  }
+
+  function buildArgusView(p) {
+    var d = p.val;
+    var list = null, q = '';
+    if (p.ok && d && typeof d === 'object' && Array.isArray(d.results)) { list = d.results; q = String(d.query || ''); }
+    else if (p.ok && Array.isArray(d)) { list = d; }
+    if (!list) return buildTextView(p.val);
+    var root = document.createElement('div'); root.className = 'laya-search';
+    var qEl = document.createElement('div'); qEl.className = 'laya-search-q';
+    qEl.innerHTML = '<i data-lucide="search" class="w-3.5 h-3.5"></i><span>' + esc(q || '搜索结果') + '</span>' +
+      '<span class="cnt">' + (d && d.count != null ? d.count : list.length) + ' 条</span>';
+    root.appendChild(qEl);
+    list.forEach(function (r) {
+      var card = document.createElement('div'); card.className = 'laya-sr';
+      var url = String(r && r.url || '');
+      var title = String(r && r.title || '') || url || '（无标题）';
+      if (/^https?:\/\//i.test(url)) {       // 只放行 http(s)，杜绝 javascript: 之类注入
+        var a = document.createElement('a');
+        a.className = 'tt'; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        a.title = url; a.textContent = title;
+        card.appendChild(a);
+      } else {
+        var sp = document.createElement('span'); sp.className = 'tt-plain'; sp.textContent = title;
+        card.appendChild(sp);
+      }
+      var sn = String(r && r.snippet || '');
+      if (sn) { var sd = document.createElement('div'); sd.className = 'snip'; sd.textContent = sn; card.appendChild(sd); }
+      root.appendChild(card);
+    });
+    return root;
+  }
+
+  function buildZcodeView(p, codeText) {
+    var d = p.val;
+    var root = document.createElement('div'); root.className = 'laya-zcode';
+    var out = (p.ok && d && typeof d === 'object')
+      ? String(d.output != null ? d.output : (d.stdout != null ? d.stdout : ''))
+      : String(p.ok ? (d == null ? '' : d) : p.val);
+    var exit = (p.ok && d && typeof d === 'object' && d.exit_code != null) ? d.exit_code : null;
+    var meta = document.createElement('div'); meta.className = 'laya-zmeta';
+    var badge = document.createElement('span');
+    badge.className = 'laya-exit' + (exit === 0 ? '' : (exit == null ? ' neutral' : ' bad'));
+    badge.textContent = exit == null ? '执行结果' : ('退出码 ' + exit);
+    meta.appendChild(badge);
+    root.appendChild(meta);
+    if (codeText) {                          // 代码原文（step_start.input 带回）语法高亮
+      var capC = document.createElement('div'); capC.className = 'laya-cap';
+      capC.innerHTML = '<i data-lucide="code-2" class="w-3.5 h-3.5"></i><span>代码</span>';
+      var preC = document.createElement('pre'); preC.className = 'laya-code';
+      var codeEl = document.createElement('code'); codeEl.innerHTML = highlightCode(codeText);
+      preC.appendChild(codeEl);
+      root.appendChild(capC); root.appendChild(preC);
+    }
+    if (out) {                               // 输出日志等宽排版
+      var capO = document.createElement('div'); capO.className = 'laya-cap';
+      capO.innerHTML = '<i data-lucide="terminal" class="w-3.5 h-3.5"></i><span>输出</span>';
+      var preO = document.createElement('pre'); preO.className = 'laya-log';
+      preO.textContent = out.length > 6000 ? out.slice(0, 6000) + '\n…（已截断）' : out;
+      root.appendChild(capO); root.appendChild(preO);
+    }
+    if (!codeText && !out && exit == null) root.appendChild(buildTextView(p.val));
+    return root;
+  }
+
+  function buildGenericView(p) {             // iris / 未知工具 / 裸对象兜底
+    var d = p.val;
+    if (p.ok && d && typeof d === 'object' && !Array.isArray(d)) {
+      if (typeof d.text === 'string') {      // iris 分析文本
+        var w = document.createElement('div'); w.className = 'laya-txt';
+        w.innerHTML = '<i data-lucide="image" class="w-3.5 h-3.5"></i>';
+        w.appendChild(document.createTextNode(d.text));
+        return w;
+      }
+      var keys = Object.keys(d);
+      var flat = keys.length && keys.every(function (k) {
+        var v = d[k]; return v == null || ['string', 'number', 'boolean'].indexOf(typeof v) >= 0;
+      });
+      if (flat) {                            // 纯标量键值对 → 键值列表
+        var kv = document.createElement('div'); kv.className = 'laya-kvs';
+        keys.forEach(function (k) {
+          var row = document.createElement('div'); row.className = 'laya-kv';
+          row.innerHTML = '<span class="k">' + esc(k) + '</span><span class="v"></span>';
+          row.querySelector('.v').textContent = String(d[k]);
+          kv.appendChild(row);
+        });
+        return kv;
+      }
+    }
+    if (p.ok && typeof d === 'string') return buildTextView(d);
+    return buildTextView(p.ok ? JSON.stringify(d, null, 2) : d);
+  }
+
+  function buildResultBlock(tool, dataStr, codeText) {
+    var p = parseLoose(dataStr);
+    var main;
+    try {
+      if (tool === 'file') main = buildFileView(p);
+      else if (tool === 'argus') main = buildArgusView(p);
+      else if (tool === 'zcode') main = buildZcodeView(p, codeText);
+      else main = buildGenericView(p);
+    } catch (e) { main = buildTextView(String(dataStr == null ? '' : dataStr)); }
+    return buildRawable(main, p);
+  }
+
+  function rowDetailEl(stepId, el) {         // 结构化步骤详情（替代纯文本 rowDetail）
+    var r = getRow(stepId); if (!r || !el) return;
+    var d = r.querySelector('.detail');
+    d.innerHTML = ''; d.appendChild(el);
+    r.classList.add('expandable');
+    try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+  }
+
+  /* ---------------- 复制 / 导出 ---------------- */
+  function copyText(t) {
+    if (!t) return showNotification('无可复制内容', '', 'warning', 1600);
+    var done = function () { showNotification('已复制', '最终结果在剪贴板', 'success', 1600); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(done, function () { fallbackCopy(t, done); });
+    } else fallbackCopy(t, done);
+  }
+  function fallbackCopy(t, done) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta); done();
+    } catch (e) { showNotification('复制失败', String(e && e.message || e), 'error', 2600); }
+  }
+  function exportText(t) {
+    if (!t) return showNotification('无可导出内容', '', 'warning', 1600);
+    try {
+      var blob = new Blob([t], { type: 'text/plain;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'laya-agent-result-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.txt';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 800);
+    } catch (e) { showNotification('导出失败', String(e && e.message || e), 'error', 2600); }
+  }
+
+  /* ---------------- 聊天消息流插入（复用既有渲染函数，不改动它们） ---------------- */
+  async function ensureConvAndBox() {
+    if (typeof AppState === 'undefined' || !AppState) return null;
+    if (!AppState.activeConv && typeof createNewConversation === 'function') await createNewConversation();
+    var conv = AppState.activeConv;
+    if (!conv) return null;
+    if (typeof removeWelcomeView === 'function') removeWelcomeView();
+    var box = document.getElementById('chatMessagesNormal');
+    if (box) box.classList.remove('hidden');
+    return { conv: conv, box: box };
+  }
+  async function insertChatMsg(role, content) {
+    var host = await ensureConvAndBox();
+    if (!host || !host.box || typeof buildMessageEl !== 'function' || typeof uid !== 'function') return;
+    var msg = {
+      id: uid('msg'), conversationId: host.conv.id, role: role, content: content,
+      createdAt: Date.now(), tokens: 0, feedback: 0, attachments: []
+    };
+    if (role === 'assistant') msg.model = 'Laya Agent';
+    // 首条消息自动命名会话（对齐 sendUserMessage 行为，仅本流程内实现、不改原函数）
+    if (role === 'user' && host.conv.title === '新对话' && typeof DB !== 'undefined' && DB && DB.updateConversation) {
+      host.conv.title = content.slice(0, 18) + (content.length > 18 ? '…' : '');
+      try { DB.updateConversation(host.conv.id, { title: host.conv.title }); } catch (e) {}
+      var tEl = document.getElementById('chatTitle');
+      if (tEl) tEl.textContent = host.conv.title;
+    }
+    AppState.messages.push(msg);
+    try { (AppState._convMsgIndex[host.conv.id] = AppState._convMsgIndex[host.conv.id] || []).push(msg); } catch (e) {}
+    try {
+      if (typeof isPrivacyMode !== 'function' || !isPrivacyMode()) {
+        if (typeof persistMessage === 'function') {
+          var p = persistMessage(msg);
+          if (p && p.then) {
+            p.then(function () {
+              try { if (typeof broadcastDataChange === 'function') broadcastDataChange(); } catch (e) {}
+            }).catch(function (e) { console.warn('[agent92] persist failed:', e); });
+          }
+        }
+      }
+    } catch (e) { console.warn('[agent92] persist failed:', e); }
+    var el = buildMessageEl(msg, true);
+    host.box.appendChild(el);
+    try {
+      if (typeof MoraySettings !== 'undefined' && MoraySettings.get('autoScroll') && typeof scrollToMsgBottom === 'function') {
+        scrollToMsgBottom();
+      }
+    } catch (e) {}
+    try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+    return el;
+  }
+
+  /* ---------------- [输出体验] 聊天精简结论 + 面板定位 ---------------- */
+
+  /** 从 step_start/step_result 事件里捞代码原文（zcode 高亮用） */
+  function zcodeInputCode(stepId) {
+    var inp = state && state.stepInput && state.stepInput[stepId];
+    return inp ? String(inp.code || inp.script || '') : '';
+  }
+
+  /** final.steps 里最后一步的工具名（决定最终结果用哪种视图渲染） */
+  function lastStepTool(ev) {
+    try {
+      if (ev && Array.isArray(ev.steps) && ev.steps.length) return String(ev.steps[ev.steps.length - 1].tool || '');
+    } catch (e) {}
+    return (state && state.lastTool) || '';
+  }
+
+  /** 按工具类型生成一句话结论（聊天里只放这一句，不重复数据） */
+  function summarizeResult(tool, rawStr) {
+    var p = parseLoose(rawStr);
+    var d = p.val;
+    if (p.ok && d && typeof d === 'object') {
+      if (tool === 'file' && Array.isArray(d.entries)) {
+        var dirs = 0, files = 0;
+        d.entries.forEach(function (en) { if (en && en.is_dir) dirs++; else files++; });
+        return '已列出目录 ' + (d.dir ? '`' + mdPlain(String(d.dir)) + '`' : '') +
+          '，共 ' + (d.count != null ? d.count : d.entries.length) + ' 项（文件夹 ' + dirs + ' · 文件 ' + files + '）';
+      }
+      if (tool === 'file' && typeof d.content === 'string') {
+        return '已读取文件 ' + (d.path ? '`' + mdPlain(String(d.path)) + '`' : '') +
+          '（' + fmtBytes(d.size != null ? d.size : d.content.length) + '）';
+      }
+      if (tool === 'file' && d.written != null) {
+        return '已写入 ' + (d.path ? '`' + mdPlain(String(d.path)) + '`' : '') + '（' + d.written + ' 字符）';
+      }
+      if (Array.isArray(d.results)) {
+        return '搜索「' + mdPlain(String(d.query || '')) + '」完成，共 ' +
+          (d.count != null ? d.count : d.results.length) + ' 条结果';
+      }
+      if (typeof d.output === 'string' || d.exit_code != null) {
+        return '代码执行完成，退出码 ' + (d.exit_code != null ? d.exit_code : '-') +
+          (d.output ? '，输出 ' + d.output.length + ' 字符' : '');
+      }
+    }
+    if (p.ok && Array.isArray(d)) return '返回 ' + d.length + ' 条结果';
+    var s = mdPlain(String(p.ok && d != null ? (typeof d === 'object' ? JSON.stringify(d) : d) : rawStr || ''))
+      .replace(/\s+/g, ' ').trim();
+    return s ? clampStr(s, 90) : '完成';
+  }
+
+  /** 展开右侧面板并定位最终结果（聊天「查看详情」入口） */
+  function revealFinal() {
+    ensurePanel();
+    panel.classList.add('show');
+    panel.classList.remove('collapsed');
+    if (reopen) reopen.classList.remove('show');
+    var f = document.getElementById('layaPFinal');
+    if (f) {
+      try { f.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
+      f.classList.remove('laya-flash');
+      void f.offsetWidth;   // 重启动画
+      f.classList.add('laya-flash');
+    }
+  }
+
+  /** 在刚插入的 AI 消息气泡里补「查看详情」按钮（仅本次会话 UI，落库内容不含按钮） */
+  function appendDetailButton(msgEl) {
+    try {
+      if (!msgEl || !msgEl.querySelector) return;
+      var host = msgEl.querySelector('.ai-msg-inner');
+      if (!host || host.querySelector('.laya-chat-detail')) return;
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'laya-chat-detail';
+      b.textContent = '查看详情';
+      b.addEventListener('click', revealFinal);
+      host.appendChild(b);
+    } catch (e) {}
+  }
+
+  /** final → 聊天精简消息（异步落库+渲染，随后补详情按钮）；不 await，不阻塞 SSE 收流 */
+  function emitFinalChat(kind, summary) {
+    var md;
+    if (kind === 'success') md = '**✅ Agent 执行完成**\n\n' + (summary || '');
+    else if (kind === 'cancelled') md = '**⏹ Agent 执行已取消**\n' + (summary || '');
+    else md = '**❌ Agent 执行失败**\n' + (summary || '');
+    insertChatMsg('assistant', md).then(function (el) { appendDetailButton(el); })
+      .catch(function (e) { try { console.warn('[agent92] 聊天回显失败：', e); } catch (e2) {} });
+  }
+
+  /** 面板：最终结果区（含格式化视图 + 原始 JSON），供「查看详情」定位 */
+  function appendFinalBlock(title, el) {
+    var host = document.getElementById('layaPSteps'); if (!host) return;
+    var old = document.getElementById('layaPFinal'); if (old) old.remove();
+    var blk = document.createElement('div'); blk.className = 'laya-final'; blk.id = 'layaPFinal';
+    var h = document.createElement('div'); h.className = 'laya-final-h'; h.textContent = title;
+    blk.appendChild(h);
+    if (el) blk.appendChild(el);
+    host.appendChild(blk);
+    try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+    try { blk.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) {}
+  }
+
+  /* ---------------- SSE 执行主流程 ---------------- */
+  function handleEvent(ev) {
+    if (!state) return;
+    if (ev.event === 'start') {
+      state.executionId = ev.execution_id;
+      state.total = Number(ev.total_steps) || 0;
+      updateProgress();
+    } else if (ev.event === 'step_start') {
+      if (state) {   // 暂存每步工具与入参（zcode 高亮代码原文用）
+        state.stepTool = state.stepTool || {}; state.stepTool[ev.step_id] = ev.tool;
+        if (ev.input) { state.stepInput = state.stepInput || {}; state.stepInput[ev.step_id] = ev.input; }
+      }
+      var exist = getRow(ev.step_id);
+      var host2 = document.getElementById('layaPSteps');
+      if (!exist) { exist = stepRow(ev.step_id, ev.tool, ev.description); host2.appendChild(exist); }
+      rowMark(ev.step_id, 'running', Number(ev.attempt) > 1 ? '正在重试第 ' + (Number(ev.attempt) - 1) + ' 次' : '');
+      try { if (typeof refreshIcons === 'function') refreshIcons(); } catch (e) {}
+    } else if (ev.event === 'step_result') {
+      if (state && ev.tool) { state.stepTool = state.stepTool || {}; state.stepTool[ev.step_id] = ev.tool; state.lastTool = ev.tool; }
+      if (ev.ok) {   // 成功 → 按工具类型结构化渲染；失败 → 红色错误块（含原始 JSON 切换）
+        var tool = ev.tool || (state && state.stepTool && state.stepTool[ev.step_id]) || '';
+        var codeText = tool === 'zcode' ? zcodeInputCode(ev.step_id) : null;
+        if (ev.data || codeText) rowDetailEl(ev.step_id, buildResultBlock(tool, ev.data, codeText));
+        else rowDetailEl(ev.step_id, buildRawable(buildErrorBlock(ev.error), { ok: true, val: ev.error || {} }));
+      } else {
+        rowDetailEl(ev.step_id, buildRawable(buildErrorBlock(ev.error), { ok: true, val: ev.error || {} }));
+      }
+      rowMark(ev.step_id, ev.ok ? 'running' : 'failed',
+        Number(ev.attempt) > 1 ? '正在重试第 ' + (Number(ev.retry_count != null ? ev.retry_count : ev.attempt - 1)) + ' 次' : '');
+    } else if (ev.event === 'check') {
+      if (ev.success) {
+        rowMark(ev.step_id, 'done', getRow(ev.step_id) && Number(state.lastAttempt[ev.step_id]) > 0 ? '正在重试第 ' + state.lastAttempt[ev.step_id] + ' 次后成功' : '');
+        state.doneCount++; updateProgress();
+      } else if (getRow(ev.step_id)) {
+        // 自检失败原因以红色提示插到详情顶部；已有结构化数据保留（重试的 step_result 会整体重建）
+        var rowCk = getRow(ev.step_id);
+        var dCk = rowCk.querySelector('.detail');
+        if (dCk && dCk.childElementCount) {
+          var note = document.createElement('div'); note.className = 'laya-err';
+          note.innerHTML = '<div class="m"></div>';
+          note.querySelector('.m').textContent = '自检未通过：' + (ev.reason || '');
+          dCk.insertBefore(note, dCk.firstChild);
+        } else {
+          rowDetail(ev.step_id, '自检未通过：' + (ev.reason || ''));
+        }
+        rowCk.classList.add('expandable');
+      }
+      state.lastAttempt[ev.step_id] = Number(ev.retry_count || 0);
+    } else if (ev.event === 'retry') {
+      rowMark(ev.step_id, 'running', '正在重试第 ' + (ev.retry_count != null ? ev.retry_count : ev.attempt) + ' 次');
+    } else if (ev.event === 'final') {
+      state.finished = true; state.finalText = ''; state.finalEvent = ev;
+      var st = ev.status;
+      if (st === 'success') {
+        setStepStatus('成功', 'ok');
+        state.finalText = String(ev.result || '（无输出）');
+        // 完整结果只进面板（结构化渲染）；聊天只留状态+一句话结论（不重复数据）
+        appendFinalBlock('最终结果' + (ev.note ? ' · ' + ev.note : ''),
+          buildResultBlock(lastStepTool(ev), state.finalText));
+        emitFinalChat('success', summarizeResult(lastStepTool(ev), state.finalText));
+      } else if (st === 'cancelled') {
+        setStepStatus('已取消', 'cancel');
+        state.finalText = '已取消：' + (ev.error || '');
+        appendFinalBlock('执行已取消', buildRawable(buildErrorBlock(ev.error || '用户取消'),
+          { ok: true, val: { status: 'cancelled', error: ev.error, steps: ev.steps || [] } }));
+        emitFinalChat('cancelled', clampStr(mdPlain(ev.error || ''), 160));
+      } else {
+        setStepStatus('失败', 'fail');
+        state.finalText = String(ev.error || '未知错误');
+        appendFinalBlock('执行失败', buildRawable(buildErrorBlock(ev.error || '未知错误'),
+          { ok: true, val: { status: 'failed', error: ev.error, failed_step: ev.failed_step || null, steps: ev.steps || [] } }));
+        emitFinalChat('failed', clampStr(mdPlain(state.finalText), 160));
+      }
+      document.getElementById('layaPCancel').hidden = true;
+      document.getElementById('layaPCopy').hidden = false;
+      document.getElementById('layaPExport').hidden = false;
+      updateProgress();
+    }
+  }
+
+  function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
+  function startTimer() {
+    stopTimer();
+    var t0 = Date.now();
+    timerId = setInterval(function () {
+      var el = document.getElementById('layaPElapsed');
+      if (el && state && !state.finished) el.textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+    }, 200);
+  }
+
+  async function runAgent(goal) {
+    busy = true;
+    state = { goal: goal, executionId: null, total: 0, doneCount: 0, finished: false,
+              finalText: '', lastAttempt: {} };
+    panelOpen(goal);
+    startTimer();
+    var ctrl = null;
+    try { ctrl = new AbortController(); abortCtrl = ctrl; } catch (e) { abortCtrl = null; }
+    try {
+      var resp = await fetch(layaBase() + '/execute', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal: goal, max_retry: MAX_RETRY }),
+        signal: ctrl ? ctrl.signal : undefined
+      });
+      if (!resp.ok || !resp.body) {
+        throw new Error('HTTP ' + resp.status + '（Laya ' + layaBase() + '）');
+      }
+      var reader = resp.body.getReader();
+      var dec = new TextDecoder('utf-8');
+      var bufStr = '';
+      var gotFinal = false;
+      for (;;) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        bufStr += dec.decode(chunk.value, { stream: true });
+        var frames = bufStr.split('\n\n');
+        bufStr = frames.pop(); // 末尾可能是半帧，留待下次
+        for (var i = 0; i < frames.length; i++) {
+          var lines = frames[i].split('\n');
+          for (var j = 0; j < lines.length; j++) {
+            var ln = lines[j];
+            if (ln.indexOf('data:') !== 0) continue;
+            var payload = ln.slice(5).trim();
+            if (!payload) continue;
+            try {
+              var ev = JSON.parse(payload);
+              if (ev.event === 'final') gotFinal = true;
+              handleEvent(ev);
+            } catch (e) { /* 坏帧跳过，不断流 */ }
+          }
+        }
+      }
+      if (!gotFinal) {
+        setStepStatus('连接中断', 'fail');
+        document.getElementById('layaPCancel').hidden = true;
+        showNotification('执行连接意外断开', '任务可能仍在服务端运行，可稍后在聊天区查看结果或重试', 'error', 4200);
+      }
+    } catch (e) {
+      var aborted = e && (e.name === 'AbortError');
+      if (!aborted) {
+        setStepStatus(state && state.finished ? state.lastStatus || '失败' : '失败', 'fail');
+        document.getElementById('layaPCancel').hidden = true;
+        showNotification('Agent 执行异常', String((e && e.message) || e) + '；请确认 Laya（' + layaBase() + '）已启动', 'error', 4500);
+      }
+    } finally {
+      busy = false;
+      abortCtrl = null;
+      stopTimer();
+      var el = document.getElementById('layaPElapsed');
+      if (state && el && state.finished === false) { /* 连接异常断开也冻结计时 */ }
+      setTimeout(function () { stopTimer(); }, 1200);
+    }
+  }
+
+  /* ---------------- 发送接管：包在 88/91 包装链最外层 ---------------- */
+  function tryWrap() {
+    var orig = window.moraySendOverride;
+    if (typeof orig !== 'function' || orig.__agent92) return;
+    var wrapped = async function () {
+      try {
+        var inp = document.getElementById('chatInputNormal');
+        var raw = ((inp && inp.value) || '').trim();
+        if (agentOn() && raw && !busy) {
+          if (inp) {
+            inp.value = ''; inp.style.height = 'auto';
+            try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+          }
+          try { if (typeof ChatAttachments !== 'undefined') ChatAttachments.clear(); } catch (e) {}
+          await insertChatMsg('user', raw);   // 用户目标照常进消息流（落库）
+          runAgent(raw);                       // 不 await：面板执行期间不卡发送循环
+          return;                              // 已接管：不进普通聊天接口
+        }
+        if (agentOn() && raw && busy) {
+          showNotification('Agent 执行中', '请等待当前任务完成或先取消', 'warning', 2200);
+          return;
+        }
+      } catch (e) {
+        busy = false;
+        try { console.warn('[agent92] 接管异常，回退正常发送：', e); } catch (e2) {}
+      }
+      return orig.apply(this, arguments);
+    };
+    wrapped.__agent92 = true;
+    window.moraySendOverride = wrapped;
+  }
+
+  function boot() {
+    injectStyle();
+    if (boot._guard) return;   // load 后的幂等二次 boot 并入同一守卫，不再起双 interval
+    /* 发送链是 88/91 两段异步包装竞速的产物：91 先包（其 tick1）、88 后包盖顶时，
+     * __mon91 从此不在链顶且双方轮询均已自停——旧实现单等 __mon91 标记会永久落空，
+     * 只能靠 30s 兜底才接管（表现为"开关亮了但发送走普通聊天"）。
+     * 改为守卫循环：首包等链顶出现 __crash88/__mon91（该瞬间 88/91 均已自停、
+     * 不再互相覆盖）后包最外层；此后链顶若被任何后来者盖住则随时重包（自愈）。
+     * 45s 兜底防 88/91 全部弃权时饿死；守卫只做"包回最外层"，不破坏普通发送。 */
+    var n = 0;
+    var engaged = false;
+    boot._guard = setInterval(function () {
+      n++;
+      if (n <= 225) { ensureButton(); ensureTags(); ensurePanel(); }
+      var cur = window.moraySendOverride;
+      if (typeof cur !== 'function') return;          // bootApp 尚未写入发送入口
+      if (cur.__agent92) { engaged = true; return; }  // 本层已在链顶
+      if (!engaged && !(cur.__crash88 || cur.__mon91) && n <= 225) return;
+      tryWrap();                                       // 未接管或被盖住 → 重新包回最外层
+    }, 200);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+  window.addEventListener('load', function () { setTimeout(boot, 600); }); // 幂等再跑一次，防时序漏网
+})();

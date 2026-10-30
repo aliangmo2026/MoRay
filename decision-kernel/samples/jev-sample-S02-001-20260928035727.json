@@ -1,0 +1,404 @@
+{
+  "sample_id": "jev-5fcabe547ec5c2fa-20260928035727",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T03:57:27.359Z",
+  "scenario": {
+    "id": "S02",
+    "category": "生产环境操作",
+    "name": "生产配置变更 → 高风险 + 组合场景升级（TC-02 同类）"
+  },
+  "request": {
+    "query": "帮我修改生产环境的配置文件 nginx.conf",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790567841518-485ab6",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "critical",
+    "encode_time_ms": 0.029
+  },
+  "standard_decision": {
+    "decision_id": "dec-1751523456789-a3f2c1",
+    "input_snapshot": {
+      "query": "帮我修改生产环境的配置文件 nginx.conf",
+      "world_state_id": "ws-1751523456789-7e8b4d",
+      "context_id": "ctx-1751523456789-1a2b3c",
+      "timestamp": "2025-07-03T08:57:36.789Z"
+    },
+    "output": {
+      "target_path": "/etc/nginx/nginx.conf",
+      "agent_chain": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification",
+          "production_env"
+        ],
+        "target_object": "nginx.conf",
+        "environment": "production",
+        "risk_tag": "critical",
+        "user_permission": "write",
+        "file_path": "/etc/nginx/nginx.conf",
+        "operation": "modify",
+        "permission_level": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "帮我修改生产环境的配置文件 nginx.conf",
+              "operation_risk_tag": "critical"
+            },
+            "order": 1,
+            "timeout_ms": 5000
+          },
+          "description": "解析修改生产环境 nginx.conf 的意图，确认目标路径与操作类型",
+          "verification": "确认目标路径为 /etc/nginx/nginx.conf，操作类型为 modify，环境为 production"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "file_path": "/etc/nginx/nginx.conf",
+              "operation": "modify",
+              "risk_tag": "critical",
+              "require_explicit_approval": true
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "向用户请求高风险生产配置修改的显式确认",
+          "verification": "用户返回明确审批通过，且确认内容包含修改范围与预期变更"
+        },
+        {
+          "step_id": "step-3",
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "file_path": "/etc/nginx/nginx.conf",
+              "operation": "modify",
+              "environment": "production",
+              "risk_tag": "critical",
+              "user_confirmation_token": "{{confirm_token}}"
+            },
+            "order": 3,
+            "timeout_ms": 10000
+          },
+          "description": "记录并审计本次生产配置修改操作，生成审计日志",
+          "verification": "审计日志成功写入，包含操作人、时间戳、文件路径、变更摘要与确认令牌"
+        },
+        {
+          "step_id": "step-4",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "file_path": "/etc/nginx/nginx.conf",
+              "operation": "modify",
+              "environment": "production",
+              "backup_before_change": true,
+              "change_content": "{{change_content}}"
+            },
+            "order": 4,
+            "timeout_ms": 15000
+          },
+          "description": "备份原文件后执行 nginx.conf 修改操作",
+          "verification": "修改成功，备份文件存在，nginx -t 语法校验通过"
+        }
+      ],
+      "expected_outcome": "在用户显式确认与审计记录下，安全完成生产环境 nginx.conf 的修改，包含备份与语法校验",
+      "verification_points": [
+        "目标路径确认无误：/etc/nginx/nginx.conf",
+        "用户对高风险生产修改给出显式确认",
+        "审计日志已写入且包含完整操作信息",
+        "修改前已备份原配置文件",
+        "修改后 nginx -t 语法校验通过"
+      ],
+      "fallback_plan": {
+        "condition": "用户未确认、审计失败或修改后语法校验不通过",
+        "action": "回滚至备份文件并终止操作，记录失败原因",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.72,
+      "complexity_score": 4,
+      "risk_level": "critical",
+      "is_composite_scenario": true,
+      "composite_type": "code_modification_with_high_risk"
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "composite_scenario",
+        "complexity",
+        "low_confidence"
+      ],
+      "trigger_reasons": [
+        "请求涉及生产环境，风险等级提升至 high",
+        "命中「删除/权限/配置」中「配置」一词，风险再升一级至 critical",
+        "代码/文件修改 × 高风险构成组合场景",
+        "步骤数 ≥ 3 触发复杂度升级维度",
+        "组合场景使置信度降至 0.72，低于 0.8 阈值"
+      ],
+      "upgrade_priority": "P0"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "风险校验规则：生产环境 → high；配置关键词命中 → critical",
+        "路径生成规则：高风险追加 user_confirm 步，生产环境追加 audit 步",
+        "复杂度规则：步骤数 ≥ 3 触发 complexity 升级",
+        "组合场景规则：代码/文件修改 × 高风险 → composite_scenario 且 confidence=0.72"
+      ],
+      "matched_domain_experience": [
+        "生产环境配置文件修改必须备份并执行语法校验",
+        "高风险操作需显式用户确认与完整审计链路",
+        "修改后需通过 nginx -t 验证配置有效性"
+      ],
+      "reasoning_summary": "用户请求修改生产环境 nginx.conf，命中生产环境与配置关键词，风险等级为 critical。依据规则生成四步路径：意图解析、用户确认、审计、执行（含备份与语法校验）。组合场景与复杂度触发升级维度，置信度因组合场景降至 0.72，需升级处理。",
+      "counterfactual_note": "若为非生产环境或仅读取配置，则风险降为 medium 或 low，可省略 user_confirm 与 audit 步骤，置信度恢复至 0.9，不触发升级。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": "无偏差，严格遵循生产环境高风险操作决策规则",
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 42,
+    "timestamp": "2025-07-03T08:57:36.789Z",
+    "version": {
+      "meta_core": "1.0.0",
+      "domain_adapter": "1.2.0",
+      "world_encoder": "0.9.5"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "5fcabe547ec5c2fa",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790567841518-d8995d",
+    "input_snapshot": {
+      "query": "帮我修改生产环境的配置文件 nginx.conf",
+      "world_state_id": "ws-1790567841518-485ab6",
+      "context_id": "ctx-1790567841518",
+      "timestamp": "2026-09-28T03:57:21.518Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "帮我修改生产环境的配置文件 nginx.conf",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "帮我修改生产环境的配置文件 nginx.conf",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "confirm_agent",
+          "params": {
+            "confirm_type": "risk_gate",
+            "risk_source": "operation_risk_tag"
+          },
+          "order": 3,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "audit_agent",
+          "params": {
+            "audit_scope": "production_change",
+            "log_level": "full"
+          },
+          "order": 4,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification",
+          "production_env"
+        ],
+        "target_object": "nginx.conf",
+        "environment": "production",
+        "risk_tag": "critical",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "帮我修改生产环境的配置文件 nginx.conf",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "帮我修改生产环境的配置文件 nginx.conf",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        },
+        {
+          "step_id": 3,
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "confirm_type": "risk_gate",
+              "risk_source": "operation_risk_tag"
+            },
+            "order": 3,
+            "timeout_ms": 30000
+          },
+          "description": "高风险操作：执行前向用户发起确认",
+          "verification": "用户显式确认后方可继续，拒绝则终止并回滚"
+        },
+        {
+          "step_id": 4,
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "audit_scope": "production_change",
+              "log_level": "full"
+            },
+            "order": 4,
+            "timeout_ms": 30000
+          },
+          "description": "生产环境变更：记录完整审计日志并复核",
+          "verification": "审计日志落盘且变更单可追溯"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致",
+        "用户显式确认后方可继续，拒绝则终止并回滚",
+        "审计日志落盘且变更单可追溯"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.72,
+      "complexity_score": 0.9,
+      "risk_level": "critical",
+      "is_composite_scenario": true,
+      "composite_type": "代码修改 × 高风险生产变更"
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "composite_scenario",
+        "complexity",
+        "low_confidence"
+      ],
+      "trigger_reasons": [
+        "操作风险标签为 critical，命中硬规则 META-RISK-01，强制升级至 Lomi 深思层",
+        "组合场景「代码修改 × 高风险生产变更」属于 v1.0 规则库未覆盖的未知组合，触发升级",
+        "执行步骤数为 4（≥3），超过 Laya 快速路径复杂度阈值，触发升级",
+        "决策置信度 0.72 低于门槛 0.8，触发升级"
+      ],
+      "upgrade_priority": "P0"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）",
+        "META-COMB-01 组合场景判定：代码修改 × 高风险 = 组合场景，未知组合触发升级"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent",
+        "D-OPS-01 生产环境变更 → 必须追加 audit_agent 审计步骤"
+      ],
+      "reasoning_summary": "风险校验：critical（高风险，命中硬规则） → 复杂度评估：识别意图 [code_modification, production_env]，生成 4 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景成立（代码修改 × 高风险生产变更），置信度降为 0.72；共命中 4 个升级触发维度，判定升级（P0）",
+      "counterfactual_note": "反事实检验：若请求不涉及「生产环境」，风险标签将由 critical 降为 high/medium，审计步骤不再追加（步骤数 4 → 3），复杂度升级触发解除"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.094,
+    "timestamp": "2026-09-28T03:57:21.518Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 5840.1
+  }
+}

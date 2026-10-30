@@ -161,7 +161,11 @@ def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
     session_id = str(session_id or "default").strip()[:128]
 
     # [v1 写入校验 2026-10-13] source × kind 矩阵：未知 source 或越界 kind 一律拒绝
-    if kind not in _SOURCE_KIND_MATRIX.get(source, ()):
+    # [P0可用性修复 2026-10-28] source 支持"命名空间:子标识"形态（如 digital_twin:文档名），
+    # 矩阵按命名空间根键校验，既保住许可矩阵语义，又让语料可按文档隔离入库/检索。
+    # 含":"的 source 才走根键回退，纯 source（manual/reflection/…）行为零变化。
+    _ns_key = source.split(":", 1)[0] if ":" in source else source
+    if kind not in _SOURCE_KIND_MATRIX.get(_ns_key, ()):
         # [v1 批3 2026-10-13] 拒绝留痕：ERROR → "moray" logger → logs/moray_errors.log，
         # 本行即 GET /api/memory/rejections 的唯一数据源（拒绝不再静默消失）
         logger.error("[memory_reject] %s", json.dumps(

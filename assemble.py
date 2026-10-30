@@ -14,7 +14,7 @@ PARTS = ['parts/00_theme.js',
          'parts/100_gateway.js', 'parts/110_polish.js',
          'parts/115_backend_sync.js',
          'parts/120_cost.js', 'parts/125_tools.js', 'parts/130_search.js',
-         'parts/135_ui_polish.js', 'parts/138_timeline.js', 'parts/145_chat_rails.js', 'parts/146_introspect.js']
+         'parts/135_ui_polish.js', 'parts/136_modern_skin.js', 'parts/138_timeline.js', 'parts/145_chat_rails.js', 'parts/146_introspect.js']
 
 chunks = []
 for p in PARTS:

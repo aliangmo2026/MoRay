@@ -1,0 +1,295 @@
+{
+  "sample_id": "jev-5c059c85c3c118d5-20260928032910",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T03:29:10.669Z",
+  "scenario": {
+    "id": "S01",
+    "category": "普通文件修改",
+    "name": "低风险本地修改 → 快速路径直出（TC-01 同类）"
+  },
+  "request": {
+    "query": "调整一下 utils.js 函数的注释格式",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790566150669-c1e862",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "low",
+    "encode_time_ms": 0.066
+  },
+  "standard_decision": {
+    "decision_id": "dec-1790566150669-942cc4",
+    "input_snapshot": {
+      "query": "调整一下 utils.js 函数的注释格式",
+      "world_state_id": "ws-1790566150669-c1e862",
+      "context_id": "ctx-1790566150669",
+      "timestamp": "2026-09-28T03:29:10.669Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "调整一下 utils.js 函数的注释格式",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "调整一下 utils.js 函数的注释格式",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "utils.js",
+        "environment": "default",
+        "risk_tag": "low",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "调整一下 utils.js 函数的注释格式",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "调整一下 utils.js 函数的注释格式",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.3,
+      "risk_level": "low",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent"
+      ],
+      "reasoning_summary": "风险校验：low（常规风险） → 复杂度评估：识别意图 [code_modification]，生成 2 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景不成立，置信度 0.9；共命中 0 个升级触发维度，维持快速路径执行",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.155,
+    "timestamp": "2026-09-28T03:29:10.669Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "decision_origin": "rule-engine-dryrun",
+  "dedup_fingerprint": "5c059c85c3c118d5",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790566150669-942cc4",
+    "input_snapshot": {
+      "query": "调整一下 utils.js 函数的注释格式",
+      "world_state_id": "ws-1790566150669-c1e862",
+      "context_id": "ctx-1790566150669",
+      "timestamp": "2026-09-28T03:29:10.669Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "调整一下 utils.js 函数的注释格式",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "调整一下 utils.js 函数的注释格式",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "utils.js",
+        "environment": "default",
+        "risk_tag": "low",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "调整一下 utils.js 函数的注释格式",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "调整一下 utils.js 函数的注释格式",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.3,
+      "risk_level": "low",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent"
+      ],
+      "reasoning_summary": "风险校验：low（常规风险） → 复杂度评估：识别意图 [code_modification]，生成 2 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景不成立，置信度 0.9；共命中 0 个升级触发维度，维持快速路径执行",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.155,
+    "timestamp": "2026-09-28T03:29:10.669Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": null
+}

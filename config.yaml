@@ -1,0 +1,31 @@
+# MoRay 项目配置文件（L7.5 Laya联动 2026-09-29 首次引入 YAML 配置面）
+# 惯例说明：本仓历史配置全走 server/.env + 环境变量（config.py 一次性读常量）；
+# config.yaml 是任务书指定的 laya_link 配置面，由 engine/laya_connector.py 独立消费
+# （mtime 热加载，改完即生效无需重启）；同名环境变量（MORAY_LAYA_*）优先级更高，
+# 便于隔离实例/CI 显式注入。删除本文件 = 全部回落内置默认（与 laya_link 关闭态等价）。
+#
+# [L7.5.1 架构评审补充] 熔断参数由初版 3次/300s 收紧为评审指定的
+# "连续5次→临时熔断30秒、到期自动试探恢复、试探失败则延长熔断时间"：
+# fuse_threshold=5、fuse_duration_s=30、新增 fuse_max_s（延长上限，指数翻倍）。
+# 新增 confidence_threshold：低于该置信度的决策 MoRay 侧不采纳（自动降级原生）。
+
+laya_link:
+  # 联动总闸（第一铁则3：默认关闭）。false = 调度旁路+事件回调双双不生效，
+  # 执行链路逐字节等同 L7.0 原生；也可用 MORAY_LAYA_LINK=1/0 临时覆盖。
+  enabled: true
+  # Laya 高速决策引擎地址（已独立部署的标准服务）
+  host: "127.0.0.1"
+  port: 8001
+  # 下行调度接口超时（毫秒，第一铁则4：超时即静默降级走原生链路，绝不阻塞主流程）
+  timeout_ms: 200
+  # 分级熔断（评审 二.2）：连续失败 N 次（不可达/超时/报错/契约坏）→ 临时熔断
+  fuse_threshold: 5
+  # 首次熔断时长（秒）；熔断到期自动放行一次试探，试探失败则时长翻倍延长
+  fuse_duration_s: 30
+  # 熔断延长的上限（秒），防止故障期被无限拉长
+  fuse_max_s: 600
+  # 置信度门槛（评审 一.1）：Laya 返回 confidence 低于此值的决策不采纳，自动降级原生
+  confidence_threshold: 0.7
+  # task_exception 事件是否自动接入现有异常处理流程（L4 run-error-fix）；
+  # 仅在总闸开启时生效。false = 异常事件只落统一问题库留痕，不自动触发修复。
+  auto_fix_on_exception: true

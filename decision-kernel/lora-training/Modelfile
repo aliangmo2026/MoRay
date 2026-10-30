@@ -1,0 +1,4 @@
+FROM ./merged_moray_decision
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER num_ctx 2048

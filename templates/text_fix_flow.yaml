@@ -1,0 +1,112 @@
+# ============================================================
+# text_fix_flow —— 报错**文本**修复任务模板（L4 最小验证新增，2026-09-28）。
+# 与 error_fix_flow 同构（分析→修复→验证→报告→经验），仅第一步不同：
+#   error_fix_flow.analyze_error  用 iris_analyze_image（硬依赖截图路径）
+#   text_fix_flow.analyze_text    用 iris_analyze_text（log-intent 已在用同一工具，
+#                                 adapters/routes.py:90 先例）
+# 不改 task_runner、不改 error_fix_flow.yaml（两者 run() 均不支持跳过步骤）。
+# 入参 params：project_dir / project_id / error_text / verify_cmd
+# 降级声明（沿用偏差 D5）：zcode_call 不可用→llm_patch；docker 不可用→local_exec。
+# ============================================================
+name: text_fix_flow
+version: 1
+description: 报错文本 → 分析 → 修复 → 沙箱验证 → 报告 → 经验沉淀 全自动闭环
+
+defaults:
+  retries: 1
+  timeout: 180
+
+steps:
+  - id: read_experience
+    type: knowledge_read
+    timeout: 20
+    args:
+      project_id: "{{params.project_id}}"
+      top_n: 3
+
+  - id: analyze_text
+    type: mcp_call
+    timeout: 180
+    args:
+      tool: iris_analyze_text
+      arguments:
+        text: "{{params.error_text}}\n历史优先假设（经验库）：\n{{steps.read_experience.output.hint}}"
+
+  - id: fix_code
+    type: zcode_call
+    timeout: 240
+    args:
+      project_dir: "{{params.project_dir}}"
+      target_file: "{{steps.analyze_text.output.data.file_path}}"
+      error_content: "{{params.error_text}}"
+      hint: "{{steps.read_experience.output.hint}}"
+      fallback: llm_patch
+      prompt: |
+        项目 {{params.project_dir}} 运行报错。错误类型：{{steps.analyze_text.output.data.error_type}}，
+        严重度：{{steps.analyze_text.output.data.severity}}，
+        涉事文件：{{steps.analyze_text.output.data.file_path}}，行号：{{steps.analyze_text.output.data.line_number}}。
+        历史优先假设（经验库）：
+        {{steps.read_experience.output.hint}}
+        报错原文：
+        {{params.error_text}}
+        请在项目内定位涉事文件，直接修改文件修复该错误；只改与该报错相关的代码，保持其他行为不变。
+
+  - id: verify_in_sandbox
+    type: docker_sandbox
+    timeout: 120
+    continue_on_fail: true
+    args:
+      image: python:3.12-slim
+      command: "{{params.verify_cmd}}"
+      workdir: "{{params.project_dir}}"
+      exec_timeout: 60
+      fallback: local_exec
+
+  - id: generate_report
+    type: report
+    timeout: 30
+    args:
+      path: "{{work_dir}}/fix_report.md"
+      content: |
+        # MoRay 排错修复报告 · {{params.project_id}}（文本通道）
+        任务：text_fix_flow（工作目录 {{work_dir}}，全流程 {{elapsed_sec}}s）
+
+        ## 1. 报错识别（Iris analyze_text）
+        - 错误类型：{{steps.analyze_text.output.data.error_type}}
+        - 严重度：{{steps.analyze_text.output.data.severity}}
+        - 涉事文件：{{steps.analyze_text.output.data.file_path}}（行 {{steps.analyze_text.output.data.line_number}}）
+
+        ## 2. 根因候选（按优先级）
+        {{steps.analyze_text.output.data.root_cause_candidates}}
+
+        ## 3. 经验库优先假设（分析前注入）
+        {{steps.read_experience.output.hint}}
+
+        ## 4. 修复
+        - 执行引擎：{{steps.fix_code.engine}}
+        {{steps.fix_code.output.diff}}
+        {{steps.fix_code.output.result}}
+
+        ## 5. 沙箱验证
+        - 状态：{{steps.verify_in_sandbox.status}}（引擎 {{steps.verify_in_sandbox.engine}}）
+        - exit：{{steps.verify_in_sandbox.output.exit_code}}
+        - stdout 尾部：{{steps.verify_in_sandbox.output.stdout}}
+        - stderr 尾部：{{steps.verify_in_sandbox.output.stderr}}
+
+        ## 6. 经验沉淀
+        - 写入：{{steps.record_experience.status}} → {{steps.record_experience.output.path}}
+
+        —— 由 MoRay 任务模板引擎（engine/task_runner.py）自动生成
+
+  - id: record_experience
+    type: knowledge_write
+    timeout: 20
+    args:
+      entry:
+        project_id: "{{params.project_id}}"
+        error_type: "{{steps.analyze_text.output.data.error_type}}"
+        root_cause_category: "{{steps.analyze_text.output.data.root_cause_candidates[0].cause}}"
+        error_snippet: "{{params.error_text}}"
+        solution: "{{steps.fix_code.output.diff}}{{steps.fix_code.output.result}}"
+        duration_sec: "{{elapsed_sec}}"
+        success: "{{steps.verify_in_sandbox.status}}"

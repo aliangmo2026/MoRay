@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html data-page-node-id="YQP48aeAEH7EKIiw4wubsW" lang="zh-CN">
+<head data-page-node-id="lYOtlbreyVFsgJxOEbigLh">
+<script data-page-node-id="BDXz3YVQjdgcaxSY9WFFxY" src="/page/page_comm/inject.js"></script>
+<meta data-page-node-id="fvpAFvNDx6NxuP41XC7yCC" charset="UTF-8">
+<meta data-page-node-id="OVE4nYkGdlJ3qbEPvO3AMb" content="width=device-width, initial-scale=1.0" name="viewport">
+<title data-page-node-id="WKPQ365cKsQGhPTCoTTqow" data-pnid-children="ASRKXb4YxFY2AEImf0e177">AI 助手工作台 · Tailwind 毛玻璃 UI</title>
+
+<!--pnid:TnomNKbim2moDTf3WC6NVL--><!-- Tailwind Play CDN（纯样式，非 JS 逻辑） -->
+<script data-page-node-id="mSKsVYmatrdT5DuoBpxLbZ" src="https://cdn.tailwindcss.com"></script>
+
+<!--pnid:0aZw7wNahkv4oJJNZV6vmb--><!-- 仅做配置：把设计 token 暴露成 Tailwind 类（accent / peach / ink 等） -->
+<script data-page-node-id="rkDT0f25d0z1NxP45xgLFh" data-pnid-children="Fwymzoj7gK38KP8J9cmH7s">
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          accent:   '#f6813c',
+          'accent-2': '#f2691e',
+          'accent-3': '#ff9a56',
+          'accent-soft': '#fdeee1',
+          ink:      '#1d2433',
+          'ink-2':  '#5b6472',
+          'ink-3':  '#9aa3b0',
+        },
+        borderRadius: { '4xl': '32px' },
+        backgroundImage: {
+          aurora: 'linear-gradient(135deg,#e8ecf7 0%,#f4e9f0 30%,#fbeadd 60%,#e5f0f2 100%)',
+          'accent-grad': 'linear-gradient(135deg,#ff9a56,#f2691e)',
+        },
+        boxShadow: {
+          soft:  '0 2px 8px rgba(31,41,61,.05)',
+          card:  '0 8px 28px rgba(31,41,61,.10)',
+          float: '0 18px 50px rgba(31,41,61,.14)',
+          glow:  '0 8px 22px rgba(242,105,30,.45)',
+        },
+      },
+    },
+  };
+</script>
+
+<style data-page-node-id="V8uXXi92gfLnmzvDLkzY1t" data-pnid-children="83EhaTvOkjcziCrxwZBKZI" type="text/tailwindcss">
+  @layer base {
+    body { @apply font-sans antialiased text-ink bg-aurora; }
+  }
+  @layer components {
+    /* 毛玻璃：外壳 */
+    .glass-shell  { @apply bg-white/55 border border-white/65 backdrop-blur-2xl backdrop-saturate-150; }
+    /* 毛玻璃：输入台 */
+    .glass-panel  { @apply bg-white/70 border border-white/70 backdrop-blur-xl backdrop-saturate-150; }
+    /* 历史卡片 */
+    .chat-card    { @apply px-4 py-3.5 rounded-3xl bg-white/[.42] border border-transparent cursor-pointer transition duration-200 hover:bg-white/65 hover:-translate-y-0.5 hover:shadow-card; }
+    .chat-card-on { @apply bg-white/[.85] border-accent/35 shadow-card; }
+    /* 图标按钮 */
+    .icon-btn     { @apply grid place-items-center w-[34px] h-[34px] rounded-[11px] text-ink-2 cursor-pointer transition hover:bg-white/70; }
+  }
+</style>
+</head>
+
+<body data-page-node-id="qsjCyJYJDvkz0e7MR8E7JY" class="min-h-screen flex items-center justify-center p-10">
+
+  <!--pnid:foGAv53EtjYDV3rOIQ0SZT--><!-- 背景光斑（氛围层） -->
+  <div data-page-node-id="YAaaNtgl5njJr7N6hCpKHF" aria-hidden="true" class="fixed inset-0 -z-10 overflow-hidden pointer-events-none">
+    <div data-page-node-id="zrJ81UD5EuXSljIKrfNmLg" class="absolute w-[480px] h-[480px] rounded-full blur-[90px] bg-[rgba(255,158,106,.45)] -left-[120px] top-[8%]"></div>
+    <div data-page-node-id="XKakQf7Dess16WkToYtYrK" class="absolute w-[520px] h-[520px] rounded-full blur-[90px] bg-[rgba(120,160,255,.35)] -right-[140px] -bottom-[6%]"></div>
+  </div>
+
+  <!--pnid:SQjXCa25FT0Z6Kxn7quUIq--><!-- ===== 窗口外壳 ===== -->
+  <div data-page-node-id="X7vVfRJQz2xNXMG5sm7gAA" class="glass-shell relative w-[1240px] h-[800px] flex rounded-4xl overflow-hidden shadow-float">
+
+    <!--pnid:SOqVyWlMllRWwfzG2gDsSh--><!-- ===== 1. 极窄侧边栏（仅图标） ===== -->
+    <aside data-page-node-id="k5qTEB46BotfI4jK1qdz8o" class="w-16 shrink-0 flex flex-col items-center pt-[18px] pb-4 bg-white/[.35] border-r border-ink/[.06]">
+      <div data-page-node-id="3UQsiB0TQEkpS2tl3OyRkL" class="w-9 h-9 rounded-xl bg-accent-grad shadow-[0_6px_16px_rgba(242,105,30,.35)] mb-[26px] p-[10px]">
+        <div data-page-node-id="rIotOsgoGw380FTfOp9ERS" class="w-full h-full rounded-[6px] bg-white/90"></div>
+      </div>
+
+      <ul data-page-node-id="bm3iEvrvkG2XJeQnr24dXk" class="flex flex-col gap-2">
+        <!--pnid:vmpCh2JtFd3qxtwZsOKCBZ--><!-- 对话（选中态） -->
+        <li data-page-node-id="imD2Y0sHiKCYlFnOP7JEc3" class="grid place-items-center w-10 h-10 rounded-[13px] bg-white/[.85] text-accent shadow-soft cursor-pointer" title="对话">
+          <svg data-page-node-id="RY20Mnw9hTYHzqoLHsyC01" fill="none" height="19" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="19"><path data-page-node-id="71hvaEoPGrluzHIV4uJpPa" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/></svg>
+        </li>
+        <li data-page-node-id="sMzzEJiOqFuzqL07lRbOQI" class="icon-btn hover:!rounded-[13px]" title="任务">
+          <svg data-page-node-id="PpTLZresWDxPnOGoQTHtvb" fill="none" height="19" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="19"><path data-page-node-id="t38ALtM9rAlnYAFIm1c0tk" d="M9 11l3 3 8-8"/><path data-page-node-id="tONVV1ihFfpnK9LnvMjOai" d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
+        </li>
+        <li data-page-node-id="NQhq4IuqpVqtAXT0n2NZqJ" class="icon-btn hover:!rounded-[13px]" title="知识库">
+          <svg data-page-node-id="TfecudUoVCHi8Cbj5vVvq2" fill="none" height="19" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="19"><path data-page-node-id="iM2z1CR4XyJSco0nuhNhM9" d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path data-page-node-id="F10XO487p6vKhVf9MKUbuB" d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        </li>
+        <li data-page-node-id="QgcLBJy6P2c5PHCd68vQWv" class="icon-btn hover:!rounded-[13px]" title="插件">
+          <svg data-page-node-id="ZqQ7rKJwXLrmS3GaQ7KQ9m" fill="none" height="19" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="19"><rect data-page-node-id="Uu9gdDJmXy5mkN81tkBmJ0" height="7" rx="1.5" width="7" x="3" y="3"/><rect data-page-node-id="kAY03IOVjBPF3PWr8vgQgC" height="7" rx="1.5" width="7" x="14" y="3"/><rect data-page-node-id="qqzlyWoFUYhlBln5ISlF4W" height="7" rx="1.5" width="7" x="3" y="14"/><rect data-page-node-id="TEQYFzl1DkBipAhw7pKuXN" height="7" rx="1.5" width="7" x="14" y="14"/></svg>
+        </li>
+        <li data-page-node-id="shtUJNwYFeoedfFLw4HJjE" class="icon-btn hover:!rounded-[13px]" title="设置">
+          <svg data-page-node-id="nI9X62qSRtUsMh4hAS9lvN" fill="none" height="19" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="19"><circle data-page-node-id="s1KdaX9mwBz22mbDbk9Fa4" cx="12" cy="12" r="3"/><path data-page-node-id="xh4dWETFa5wVttzpXz9QlA" d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34 1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87 1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>
+        </li>
+      </ul>
+
+      <div data-page-node-id="Hu4gzzEJQDRKtlcrzXThyk" class="flex-1"></div>
+      <div data-page-node-id="bn2rPXjme2yWkbyVAHNu4x" class="w-[34px] h-[34px] rounded-full bg-gradient-to-br from-[#a5b4fc] to-[#818cf8] border-2 border-white/80"></div>
+    </aside>
+
+    <!--pnid:UhS32gOjhrYoeUZT1AAP7Y--><!-- ===== 2. 对话历史列 ===== -->
+    <section data-page-node-id="A75FrV9JVyTNaykKlXbx18" class="w-[280px] shrink-0 flex flex-col gap-2.5 px-3.5 py-[22px] bg-white/[.22] border-r border-ink/[.06]">
+      <!--pnid:iORUAFqNyJ6e6KsVqF2wrE--><!-- 搜索 -->
+      <div data-page-node-id="NiDuyJN3Eq9Sn7uXzepFmF" class="h-10 mb-2 flex items-center gap-2 px-3 rounded-2xl bg-white/50 border border-ink/[.06] text-ink-3 text-[13px]">
+        <svg data-page-node-id="9ivqnIFl3vk7TKIHEkcnIS" fill="none" height="14" stroke="currentColor" stroke-linecap="round" stroke-width="2" viewBox="0 0 24 24" width="14"><circle data-page-node-id="gBtVJSVmbXKXeHAy6ZwwZM" cx="11" cy="11" r="7"/><path data-page-node-id="76JsH3o5Jt39FcmAk8nMDm" d="M21 21l-4.3-4.3"/></svg><!--pnid:WRQ4nZj2tlQcfTnOjm7jh1-->
+        搜索对话…
+      </div>
+
+      <p data-page-node-id="7EkU9cT3ZpqAqomBcrzzaj" class="text-[11px] font-semibold tracking-[.08em] text-ink-3 px-1.5 mt-1.5"><!--pnid:8SGwxhxz90igV7tSPCN38q-->今天</p>
+
+      <article data-page-node-id="xYXXJpG94jXYclfkoDW43N" class="chat-card chat-card-on">
+        <h3 data-page-node-id="XjYGcWr5NhmyQKWGGaYSVM" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:tMArMS2BKmPeABQjDfWo3Z-->设计桌面端 AI 工作台</h3>
+        <div data-page-node-id="a4d0S5NEBsYPO6l8SIA5QT" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="vdgNXkR0Ru2tc2byQLn2YH"><!--pnid:j9XJoZy0P9a1xOmvlNVVqE-->毛玻璃 · 极简风探索</span><span data-page-node-id="k5mVZh9LnmDAuEonz5otLB"><!--pnid:4pFZrpWbhKe81E1z7RPYMT-->14:20</span></div>
+      </article>
+      <article data-page-node-id="rVMZgLBzcCWKoJIX4TYyC7" class="chat-card">
+        <h3 data-page-node-id="P1VozaIOwmkUrtdGr5q4rS" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:bC0uuAqOjyk3HFKtejy8CH-->季度数据复盘摘要</h3>
+        <div data-page-node-id="YlcsN4k05LwhZPBOGZ08dq" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="2FUTUnHHFghzx2KfCJjrDi"><!--pnid:GfMuFmcXBKXylOL7IozuPV-->生成了 3 页报告</span><span data-page-node-id="eSdcVIznzRnnh5MfvJCF8e"><!--pnid:DaZnIjIRXWY90W4fRIs7CS-->10:05</span></div>
+      </article>
+
+      <p data-page-node-id="JthbgkinfnOnIffyC0i5Yt" class="text-[11px] font-semibold tracking-[.08em] text-ink-3 px-1.5 mt-1.5"><!--pnid:odszyZrOKpijLuJDs28l5g-->昨天</p>
+
+      <article data-page-node-id="IiUffPPX8iHzhTplBC1m9j" class="chat-card">
+        <h3 data-page-node-id="k3uNZkdUkeIsCEBHo6TOAH" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:SfJBbDSbqTCWctzCeSjc6s-->Transformer 机制入门</h3>
+        <div data-page-node-id="JGGApte5Ce8czqkToMLxPH" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="uR0aBYy26nRrHFdcLEQ48G"><!--pnid:kW5Aksn4NNLqwWEsxpf1r2-->注意力与位置编码</span><span data-page-node-id="UjxWbecd2m2HktufXoBvY0"><!--pnid:2MmD58qET6wpCKL7Js2TBE-->21:36</span></div>
+      </article>
+      <article data-page-node-id="qsqOvJmFr7uYiB4Upx43Ju" class="chat-card">
+        <h3 data-page-node-id="jl6s94OqG8tkKxjBhFt3ot" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:INQSIuGDAWh4RCx3eheBJw-->旅行计划：京都五日</h3>
+        <div data-page-node-id="VWE78uaiwCG4QNU9NOPYto" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="rzgxaVhe66aiHnTWP12NrJ"><!--pnid:iRWBUMfgKve26HbbH5nKQw-->行程与预算清单</span><span data-page-node-id="iom23UHdTzmUD5shYGNVB6"><!--pnid:VwsXFKlNgH06SB8UfNjCLc-->09:12</span></div>
+      </article>
+
+      <p data-page-node-id="vxgYTfzLFKXNv1THVQ2Bw6" class="text-[11px] font-semibold tracking-[.08em] text-ink-3 px-1.5 mt-1.5"><!--pnid:L93sNMkAu2YYA59ZArVZ9H-->本周更早</p>
+
+      <article data-page-node-id="TKIsyZE15BzekvRD9LGuWM" class="chat-card">
+        <h3 data-page-node-id="ap64Z3aQzO8Kb32ivz1GCN" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:g6cvlkBLZj8LtUeONV0ibi-->周报自动生成模板</h3>
+        <div data-page-node-id="w8oQojz6CjTMxgSVbG6mt5" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="Wq3tilUk7H8rb5jzgNHMSH"><!--pnid:lG57AuJGdMCQNF4RZCoIxd-->已固定到工作台</span><span data-page-node-id="pgfPK6NJvAtvWf7SEjGwGH"><!--pnid:sFhaYtXvYadcf59YpoA13B-->周一</span></div>
+      </article>
+      <article data-page-node-id="tLrihePx5ln4XFkJ4p0A9m" class="chat-card">
+        <h3 data-page-node-id="o5gpyfOF1uDtoOUOdGhZLp" class="text-[13.5px] font-semibold mb-1.5 truncate"><!--pnid:P5JOojAMHuQsFYhZnHjyAC-->产品命名头脑风暴</h3>
+        <div data-page-node-id="x6VO1XBycLpBWfM9uI46Jc" class="flex justify-between text-xs text-ink-3"><span data-page-node-id="Y59ck6tl4tQKghfqq1onPs"><!--pnid:SrMnRBEJ1Gl6cA5KoQU8t8-->48 个候选名</span><span data-page-node-id="AN8jFmKIHrPsJoIUUASepK"><!--pnid:Z7VIPNNANJC1seCyCvqi7z-->周一</span></div>
+      </article>
+    </section>
+
+    <!--pnid:5b6umaz5vGf3g8jnbm1YzK--><!-- ===== 3. 主聊天区 ===== -->
+    <main data-page-node-id="sSAsKcjKQ0MH6ByNTDlzHG" class="flex-1 flex flex-col min-w-0">
+
+      <!--pnid:gBXX0YqRx7snvTGQ7zEDlC--><!-- 顶部极简控制栏 -->
+      <header data-page-node-id="fJlmJnr9iTXCCpzt9qWJdg" class="h-16 shrink-0 flex items-center gap-2.5 px-6">
+        <h1 data-page-node-id="LBNLrxxQvtd09yeC8TiFEJ" class="text-[15px] font-semibold mr-auto"><!--pnid:7D6z3cWVBlE8R9kJUCSHjB-->新对话</h1>
+        <div data-page-node-id="A3NWh5HlalfCsIk03dXa17" class="icon-btn" title="分享">
+          <svg data-page-node-id="nuoCSNTeITiiYk1W4JEycl" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="17"><circle data-page-node-id="TyILTQoYszsj6bB5DAacTz" cx="18" cy="5" r="3"/><circle data-page-node-id="KyeiqjjF4K93ao2e2HP8cv" cx="6" cy="12" r="3"/><circle data-page-node-id="9PSbHxEHgBPPImgKdlXHP3" cx="18" cy="19" r="3"/><path data-page-node-id="dQBsmXMupItb2RgjMoMeXu" d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>
+        </div>
+        <span data-page-node-id="VSZIUI77Fra5rp0wyB0gKk" class="w-px h-5 bg-ink/[.06] mx-1"></span>
+        <div data-page-node-id="D4UtZKT6rp2JgzxanaCHEk" class="icon-btn" title="历史">
+          <svg data-page-node-id="zXidOaziVb9yr1p0LI7Oun" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="17"><circle data-page-node-id="rkx4OqJfd2qy0ETCqL4QAy" cx="12" cy="12" r="9"/><path data-page-node-id="V1LLZtQEgymkVR2clFNSBU" d="M12 7v5l3 3"/></svg>
+        </div>
+        <div data-page-node-id="NG6VbYGsN4eBIl9BhPoGzo" class="icon-btn" title="更多">
+          <svg data-page-node-id="mA8ROah3flQxfilMH8Wynu" fill="currentColor" height="17" viewBox="0 0 24 24" width="17"><circle data-page-node-id="mjGHXKNuUGi4XGlRpWMzl2" cx="5" cy="12" r="1.6"/><circle data-page-node-id="vO7JCKl7GkYBA0qmKXpeNW" cx="12" cy="12" r="1.6"/><circle data-page-node-id="QKUgUV7dLVXXf1PcSZ0Zzq" cx="19" cy="12" r="1.6"/></svg>
+        </div>
+      </header>
+
+      <!--pnid:5slMIdZYnTq8lv80qgfmqf--><!-- 欢迎区 -->
+      <div data-page-node-id="4ZsSnQJZp6souL6mh63FAk" class="flex-1 flex flex-col items-center justify-center gap-[18px] pb-[30px] text-center">
+        <div data-page-node-id="7qn7bzLl2fbW6aCRXmorDa" class="w-[72px] h-[72px] rounded-full bg-accent-grad shadow-[0_14px_40px_rgba(242,105,30,.4)] p-[22px]">
+          <div data-page-node-id="MvDAkrgCOsEQIcmoJZPFjn" class="w-full h-full rounded-full bg-[rgba(255,255,255,.85)]"></div>
+        </div>
+        <h2 data-page-node-id="zjD6H2iFyA4S5xsGyTu3sG" class="text-[28px] font-bold tracking-tight"><!--pnid:mn8ylm88nPT9BgRQbekWI6-->下午好，今天想聊点什么？</h2>
+        <p data-page-node-id="JeqSA5dSOx4hslh6VWc1Ka" class="text-[15px] text-ink-2"><!--pnid:vaXieEFfYGALVi4auudBLp-->我可以帮你写作、分析数据、编写代码，或者只是随便聊聊。</p>
+        <div data-page-node-id="zKlOOAHlKb9I4VFEHJ2Ixi" class="flex gap-2.5 mt-2">
+          <span data-page-node-id="zL3zJXIGZY3yfMZpGjzjjw" class="px-4 py-2.5 rounded-full text-[13px] text-ink-2 bg-white/50 border border-white/65 shadow-soft cursor-pointer transition hover:bg-white/80 hover:-translate-y-px"><!--pnid:W2I8CdgovZWlT2Ra9hI6KX-->✍️ 帮我润色一段文案</span>
+          <span data-page-node-id="T5MNfYztSYBV9v7dqwlLfN" class="px-4 py-2.5 rounded-full text-[13px] text-ink-2 bg-white/50 border border-white/65 shadow-soft cursor-pointer transition hover:bg-white/80 hover:-translate-y-px"><!--pnid:GQp6UIVkvpvIZJQp29jJdI-->📊 分析一份表格</span>
+          <span data-page-node-id="IxfcM5MBnS6qQ95vxqid9d" class="px-4 py-2.5 rounded-full text-[13px] text-ink-2 bg-white/50 border border-white/65 shadow-soft cursor-pointer transition hover:bg-white/80 hover:-translate-y-px"><!--pnid:YsH3RO0oeKmPwtTjHqrJJG-->🧠 头脑风暴点子</span>
+          <span data-page-node-id="TjWGd7NAUzh0RPQvWHzNNF" class="px-4 py-2.5 rounded-full text-[13px] text-ink-2 bg-white/50 border border-white/65 shadow-soft cursor-pointer transition hover:bg-white/80 hover:-translate-y-px"><!--pnid:jxkVtg1psepnk2KrBKEUqV-->💻 写一个小工具</span>
+        </div>
+      </div>
+
+      <!--pnid:D2dGVxvLKmU8Y48iK7QUTc--><!-- ===== 核心输入台 ===== -->
+      <div data-page-node-id="RWHBDESYAUgHsCgnfLqmIw" class="px-7 pb-[26px]">
+        <div data-page-node-id="YilHZYPs3lD0JIktsmZs3L" class="glass-panel rounded-4xl shadow-float px-[22px] pt-5 pb-3.5 transition hover:shadow-[0_22px_60px_rgba(31,41,61,.18)]">
+
+          <!--pnid:yEGJ2gJ9gExk5zOtnADZ3G--><!-- 无边框多行输入 -->
+          <textarea data-page-node-id="o66Vrp3Vx8bR479HKCEit6" class="w-full min-h-[72px] resize-none bg-transparent border-0 outline-none ring-0 text-[15px] leading-relaxed text-ink placeholder:text-ink-3 caret-accent" placeholder="输入消息，「/」唤起快捷指令…" rows="3"></textarea>
+
+          <!--pnid:YRy1UZj7DkRRaQcde0a05y--><!-- 底部工具行 -->
+          <div data-page-node-id="8sXtWvx5NWw8MvRihCdQfE" class="flex items-center gap-1 mt-2">
+
+            <!--pnid:sYTpaMJcTIl7LHPk6fxKuE--><!-- 左：模型切换 + 附件 / 图片 / 语音 -->
+            <div data-page-node-id="CxvOb5kZqm4GxvtDPWOJWn" class="flex items-center gap-1">
+              <div data-page-node-id="cwoFf3P3ank193DHTYHpec" class="flex items-center gap-[7px] pl-[13px] pr-[11px] py-[7px] rounded-full bg-white/70 border border-ink/[.06] text-[13px] font-medium text-ink-2 cursor-pointer transition hover:bg-white">
+                <span data-page-node-id="VYtigsnTsj2BUVFmFk8A2u" class="w-[7px] h-[7px] rounded-full bg-accent"></span><!--pnid:xhKXIJ7dHupNiTAZUaX8Y9-->
+                GLM-4.6
+                <span data-page-node-id="pSO7OzOpv4ZWNOH5G1R6h0" class="w-0 h-0 border-l-4 border-r-4 border-t-[5px] border-l-transparent border-r-transparent border-t-ink-3"></span>
+              </div>
+
+              <span data-page-node-id="az5Y1x1rmPNXYYSQ0r6Pr0" class="w-px h-[18px] bg-ink/[.06] mx-2"></span>
+
+              <div data-page-node-id="o358t6o2kgYQtX6xpXJFwH" class="icon-btn" title="附件">
+                <svg data-page-node-id="zWAYlxLiai8Z4yHDXaSD5k" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="17"><path data-page-node-id="NmAqk5WC9ij46rNqlUSEm3" d="M21.4 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              </div>
+              <div data-page-node-id="SymD4WOPetb1jad7VfB3F4" class="icon-btn" title="图片">
+                <svg data-page-node-id="q3w6eqBKDKP1c0wDXNLDgX" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="17"><rect data-page-node-id="ZUt8qzA6eGq6Ztq0fiK5fQ" height="18" rx="3" width="18" x="3" y="3"/><circle data-page-node-id="o5ZAWfMQ57CLXHUqxCkYKL" cx="8.5" cy="8.5" r="1.5"/><path data-page-node-id="1EMyqIDP4a0OQqqb45Xudx" d="M21 15l-5-5L5 21"/></svg>
+              </div>
+              <div data-page-node-id="sTGbRLqQtyprLUdsSCyZrz" class="icon-btn" title="语音">
+                <svg data-page-node-id="Enqd1NvcyKPVCb6oyVZUgg" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="17"><rect data-page-node-id="wfY5SM9L3ZRBu6WmJBy2H1" height="12" rx="3" width="6" x="9" y="2"/><path data-page-node-id="nClskHUhyO4RmivzbQVq5c" d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg>
+              </div>
+            </div>
+
+            <!--pnid:R9iEUxOWlCKSiT9wlvL3HG--><!-- 右：字数统计 + 发送 -->
+            <div data-page-node-id="RiCGrr6U5EBeCgRNf26JSH" class="ml-auto flex items-center gap-3.5">
+              <span data-page-node-id="SMG8YNN3bxpoHZ6p2rjN2I" class="text-xs text-ink-3 tabular-nums"><!--pnid:hkAPGvG3tXAxCU824RB0cx-->0 / 4000</span>
+              <button data-page-node-id="W0a35dyZ6cgoHkbijRcHkx" class="grid place-items-center w-[42px] h-[42px] rounded-full bg-accent-grad text-white shadow-glow transition cursor-pointer hover:-translate-y-0.5 hover:scale-105 hover:shadow-[0_12px_28px_rgba(242,105,30,.55)]" title="发送" type="button">
+                <svg data-page-node-id="UL1Ucc7OOVIUZ7EDN2hZG2" fill="none" height="17" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="17"><path data-page-node-id="4TOOo3PGKEPkoeFlgT1rfc" d="M12 19V5M5 12l7-7 7 7"/></svg>
+              </button>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</body>
+</html>

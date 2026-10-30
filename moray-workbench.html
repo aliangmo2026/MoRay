@@ -6428,8 +6428,12 @@ const MoraySettings = {
     defaultSysPromptEnabled: true, // 启用默认系统提示（false 时请求不携带默认 system）
     defaultSysPrompt: '',           // 默认系统提示自定义文本（空 = 内置简洁直答文案）
     thinkingDisplay: 'folded',      // 思考过程展示：folded 折叠一行 | auto 流式展开 | hidden 完全隐藏
-    // [深度思考] 三态开关：auto 复杂任务自动开 | on 强制思考 | off 强制不思考（默认 auto）
-    thinkMode: 'auto',
+    // [深度思考] 三态开关：auto 复杂任务自动开 | on 强制思考 | off 强制不思考
+    // [P0可用性修复 2026-10-28] 默认由 'auto' 改为 'off'：实测 auto→'low' 时本地
+    // qwen3.5 系模型的推理链会吃光 max_tokens 预算（问"1+1"烧 5469 推理 token/40.7s
+    // 只挤出 7 字符，第二问烧 8136 token 后正文 0 字符 = 12 轮全空正文的根因）。
+    // 思考改为显式开启，开启时下方 _ensureThinkBudget 会把 max_tokens 抬到 ≥4096。
+    thinkMode: 'off',
     // [M2] 云端通道：true=经本地后端代理（key 存 server/.env，不进浏览器）；false=前端直连（现有方式）
     useBackendProxy: false,
     // [M3] 后端同步：true=在线时双写后端 SQLite（可关，关后纯前端与改造前一致）
@@ -6752,7 +6756,9 @@ class MorayAI {
     const promise = (async () => {
       const temperature = opts.temperature != null ? opts.temperature : MoraySettings.get('temperature');
       const top_p = opts.top_p != null ? opts.top_p : MoraySettings.get('topP');
-      const max_tokens = opts.max_tokens != null ? opts.max_tokens : MoraySettings.get('maxTokens');
+      // [P0可用性修复 2026-10-28] 思考开时抬到 ≥4096，防推理链吃光正文额度
+      const max_tokens = this._ensureThinkBudget(
+        opts.max_tokens != null ? opts.max_tokens : MoraySettings.get('maxTokens'));
 
       if (opts.model === 'bonsai2-27b') {
         // [Bonsai2] 走 MoRay 后端代理到本地 llama-server
@@ -6766,6 +6772,8 @@ class MorayAI {
           // + 真实模型名，走 llm_proxy 的 27B 分支（8080，流式/非流式均原生支持）。
           // [2026-10-03 27B挂死修复] reasoning_effort 同非流式分支（服务端模板缺省 xhigh）。
           body: JSON.stringify({ provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: true, temperature, reasoning_effort: this._bonsai2ReasoningEffort() })
+          // [P0可用性修复 2026-10-28] 27B 属自托管 llama.cpp，模板支持思考链，保留原档位；
+          // 但预算仍需抬到 ≥4096（下方 _ensureThinkBudget 已在 chatStream 统一处理）。
         });
         if (!res.ok || !res.body) throw self._normalizeError(res.status, await res.text().catch(() => ''));
         // [2026-10-01 U-7-1] 此前 return res.body 裸流：onChunk 永不触发（无流式渲染）、
@@ -6832,7 +6840,8 @@ class MorayAI {
             temperature, top_p, max_tokens,
             think: opts.think,
             // [2026-10-21 思考强度三档] 强制下发：llm_proxy 仅对 ollama/custom_27b 透传，云端分支自动忽略
-            reasoning_effort: self._bonsai2ReasoningEffort()
+            // [P0可用性修复 2026-10-28] 不支持思考的模型（qwen2.5 系/laya 系）强制 'none'
+            reasoning_effort: self._isNonThinkingModel(model) ? 'none' : self._bonsai2ReasoningEffort()
           };
           // [2026-10-21 收尾] ollama 显式钉 provider：防全局 LLM_PROVIDER=cloud 时本地模型被路由到云端
           if (self.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
@@ -6996,10 +7005,34 @@ class MorayAI {
    * 原 bonsai2ReasoningEffort 设置键随之停用（设置页下拉不再影响请求）。
    * @returns {'none'|'low'|'xhigh'} */
   _bonsai2ReasoningEffort() {
-    const mode = String(MoraySettings.get('thinkMode') || 'auto');
+    const mode = String(MoraySettings.get('thinkMode') || 'off');
     if (mode === 'off') return 'none';
     if (mode === 'on') return 'xhigh';
     return 'low';
+  }
+
+  /** [P0可用性修复 2026-10-28] 思考开启时抬高生成预算，防推理链吃光正文额度。
+   * 实测：思考开 + max_tokens=2048 时推理烧 5469~8136 token，正文被挤到 0~7 字符。
+   * 思考关（reasoning_effort='none'）原样返回，零改动。
+   * @param {number} max_tokens 原始预算
+   * @returns {number} 思考开时至少 THINK_BUDGET_MIN，否则原值 */
+  _ensureThinkBudget(max_tokens) {
+    const THINK_BUDGET_MIN = 4096;
+    const eff = this._bonsai2ReasoningEffort();
+    if (eff === 'none') return max_tokens;
+    const n = Number(max_tokens) || 0;
+    return n >= THINK_BUDGET_MIN ? n : THINK_BUDGET_MIN;
+  }
+
+  /** [P0可用性修复 2026-10-28] 不支持深度思考的模型强制不发 reasoning_effort。
+   * qwen2.5 系 / qwen2.5:1.5b（含 laya 系派生）无思考链，发该字段徒增 400 风险与
+   * 无谓 token；命中即返回 'none' 让后端把它当作"关思考"处理（llm_proxy 侧对
+   * reasoning_effort='none' 是显式透传，实测是唯一能真关思考的值）。
+   * @param {string} model 模型名
+   * @returns {boolean} true=不支持深度思考 */
+  _isNonThinkingModel(model) {
+    const m = String(model || '').toLowerCase();
+    return /^qwen2\.5/.test(m) || m.includes('laya');
   }
 
   /** 非流式聊天（流式失败时回退）
@@ -7016,7 +7049,9 @@ class MorayAI {
       // [2026-10-01 U-7-3] 修正历史遗留的模型名错误（同流式分支）：显式 provider=custom_27b
       // + 真实模型名，走 llm_proxy 的 27B 分支；_non_stream 返回 {ok,content,reasoning,tool_calls}
       // 与下方读取形状一致。
-      const body = { provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: false, temperature, reasoning_effort: reasoningEffort };
+      const body = { provider: 'custom_27b', model: 'bonsai2-27b', messages: opts.messages, stream: false, temperature, reasoning_effort: reasoningEffort,
+        // [P0可用性修复 2026-10-28] 非流式 27B 同样抬预算（与流式分支同口径）
+        max_tokens: this._ensureThinkBudget(MoraySettings.get('maxTokens')) };
       // [修复 2026-10-20] tools 对任何模型分支都必须透传：此前 27B 分支漏带，路由切到 27B
       // 时上游拿不到工具清单 → 模型发不出 tool_calls，只能纯聊天反问路径/代码
       if (opts.tools && opts.tools.length > 0) {
@@ -7042,14 +7077,17 @@ class MorayAI {
         ? ((window.MorayBackend && MorayBackend.connected && MorayBackend.origin ? MorayBackend.origin : (location.origin.startsWith('http') ? location.origin : '')) + '/api/llm/chat')
         : this._useProxy();
       if (proxyUrl) {
+        const __nm = opts.model || MoraySettings.get('openaiModel');
         const pbody = {
-          model: opts.model || MoraySettings.get('openaiModel'),
+          model: __nm,
           messages: opts.messages, stream: false,
           temperature, top_p: MoraySettings.get('topP'),
-          max_tokens: MoraySettings.get('maxTokens'),
+          // [P0可用性修复 2026-10-28] 思考开时抬到 ≥4096（与流式分支同口径）
+          max_tokens: this._ensureThinkBudget(MoraySettings.get('maxTokens')),
           think: opts.think,
           // [2026-10-21 思考强度三档] 强制下发：llm_proxy 仅对 ollama/custom_27b 透传，云端分支自动忽略
-          reasoning_effort: this._bonsai2ReasoningEffort()
+          // [P0可用性修复 2026-10-28] 不支持思考的模型（qwen2.5 系/laya 系）强制 'none'
+          reasoning_effort: this._isNonThinkingModel(__nm) ? 'none' : this._bonsai2ReasoningEffort()
         };
         // [2026-10-21 收尾] ollama 显式钉 provider + keep_alive 30m 驻留（后端 llm_proxy 同批透传）
         if (this.backend === 'ollama') { pbody.provider = 'ollama'; pbody.keep_alive = '30m'; }
@@ -9893,6 +9931,15 @@ function installThinkModeBtn() {
     if (!commit) { renderThinkPopover(snapOf()); return; } // pointercancel：回到已存档位
     const zone = THINK_ZONES.find(z => ratioFrom(e) < z.max) || THINK_ZONES[THINK_ZONES.length - 1];
     MoraySettings.set('thinkMode', zone.key);
+    // [P0可用性修复 2026-10-28] 思考开时显式警告：实测推理链会吃光 max_tokens 预算
+    // （问"1+1"烧 5469~8136 推理 token / 40~50s，正文被挤到 0~7 字符）。
+    // 同时 20_ai._ensureThinkBudget 会把预算抬到 ≥4096，此处只负责让用户知情。
+    if (zone.key !== 'off' && typeof showNotification === 'function') {
+      showNotification('思考模式已开启',
+        '思考模式会消耗大量 Token：回复更慢（实测 40 秒以上），且推理过程本身会占用输出额度。'
+        + '系统已自动把生成上限提到 4096。若只需快速问答，建议切回「极速」。',
+        'warning', 7000);
+    }
     refreshThinkModeBtn();
     closeThinkPopover();
   };
@@ -11050,7 +11097,15 @@ async function appendDeterministicMetaReply(conv, question) {
  * @returns {Promise<void>} */
 async function sendUserMessage() {
   if (AppState.generating) {
-    showNotification('请稍候', 'AI 正在回复中，可点击停止按钮终止', 'warning', 1800);
+    // [P0可用性修复 2026-10-28] 静默丢弃修复：此前只弹 1.8s 提示就 return，用户快速
+    // 连发时体感是"消息被吞掉"（真机实测连发 10 条只有第 1 条进了系统）。现在：
+    // 1) 输入框内容原样保留（本 return 在清空输入之前，天然保留——保持不动）；
+    // 2) 提示文案改为明确的等待指令，并延长到 4s，让用户知道消息没丢、稍后可重发。
+    if (typeof showNotification === 'function') {
+      showNotification('请等待当前回答完成',
+        '当前回复仍在进行中，这条消息没有发送、内容已保留在输入框。'
+        + '等回答完成后再次点击发送即可；或点击「停止」终止当前回复。', 'warning', 4000);
+    }
     return;
   }
   // [夜间优化1.3] 快速连点保护（400ms 内的重复触发直接忽略）

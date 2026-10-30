@@ -1,0 +1,19 @@
+{
+  "queue": [
+    {
+      "task_id": "parent-card",
+      "goal": "验证失败重试闭环",
+      "target_engine": "zcode",
+      "engine_task_id": "etid-1",
+      "status": "abandoned",
+      "created_at": "2026-10-24T01:00:00",
+      "retry_count": 2,
+      "result_note": "失败：退出码 1",
+      "abandoned_reason": "再次失败"
+    }
+  ],
+  "daily": {
+    "date": "2026-10-24",
+    "count": 0
+  }
+}

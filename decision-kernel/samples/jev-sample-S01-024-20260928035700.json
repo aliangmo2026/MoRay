@@ -1,0 +1,306 @@
+{
+  "sample_id": "jev-11b4c177a0b02b5d-20260928035700",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T03:57:00.703Z",
+  "scenario": {
+    "id": "S01",
+    "category": "普通文件修改",
+    "name": "低风险本地修改 → 快速路径直出（TC-01 同类）"
+  },
+  "request": {
+    "query": "优化本地配置文件 settings.ini 的格式",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790567816828-fdf335",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "medium",
+    "encode_time_ms": 0.018
+  },
+  "standard_decision": {
+    "decision_id": "dec-1735689600000-a1b2c3",
+    "input_snapshot": {
+      "query": "优化本地配置文件 settings.ini 的格式",
+      "world_state_id": "ws-l0-20250101-0001",
+      "context_id": "ctx-local-config-opt",
+      "timestamp": "2025-01-01T00:00:00Z"
+    },
+    "output": {
+      "target_path": "/local/config/settings.ini",
+      "agent_chain": [
+        "code_agent",
+        "confirm_agent"
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "settings.ini",
+        "environment": "default",
+        "risk_tag": "medium",
+        "user_permission": "write",
+        "file_path": "/local/config/settings.ini",
+        "operation": "format_optimize",
+        "permission_level": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "s1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "优化本地配置文件 settings.ini 的格式",
+              "file_path": "/local/config/settings.ini"
+            },
+            "order": 1,
+            "timeout_ms": 5000
+          },
+          "description": "解析用户对本地配置文件格式优化的意图，确认目标文件与优化范围",
+          "verification": "意图解析结果需包含目标路径与操作类型且与输入快照一致"
+        },
+        {
+          "step_id": "s2",
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "action": "confirm_format_optimize",
+              "file_path": "/local/config/settings.ini",
+              "risk_tag": "medium"
+            },
+            "order": 2,
+            "timeout_ms": 8000
+          },
+          "description": "配置修改属中风险操作，向用户确认优化方案与写入权限",
+          "verification": "确认结果需为 approved 且权限等级为 write"
+        },
+        {
+          "step_id": "s3",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "file_path": "/local/config/settings.ini",
+              "mode": "format_optimize",
+              "backup": true
+            },
+            "order": 3,
+            "timeout_ms": 15000
+          },
+          "description": "按确认后的方案对本地配置文件执行格式优化，并生成备份",
+          "verification": "优化后文件可正常解析且备份文件存在"
+        }
+      ],
+      "expected_outcome": "settings.ini 格式完成优化，结构规范化且内容语义不变，原文件已备份",
+      "verification_points": [
+        "文件语法/键值结构可正常解析",
+        "原有配置项与值无丢失",
+        "备份文件生成且可回滚"
+      ],
+      "fallback_plan": {
+        "condition": "优化后文件解析失败或配置项缺失",
+        "action": "使用备份文件回滚至原始内容并报告失败原因",
+        "max_retry": 2
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 3,
+      "risk_level": "medium",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "complexity"
+      ],
+      "trigger_reasons": [
+        "步骤数为 3，达到复杂度升级阈值"
+      ],
+      "upgrade_priority": "P2"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "risk_escalation_by_keyword",
+        "high_risk_requires_confirm",
+        "production_requires_audit"
+      ],
+      "matched_domain_experience": [
+        "local_config_format_optimize_safe_backup"
+      ],
+      "reasoning_summary": "请求涉及本地配置文件修改，未命中生产/线上关键词，风险基准为中；未命中删除/权限/配置关键词，风险不升级；步骤数为 3 触发复杂度升级维度；非代码文件修改×高风险组合，置信度保持 0.9。",
+      "counterfactual_note": "若请求命中生产/线上或删除/权限关键词，将升为 high/critical 并追加 audit 步与 risk 升级维度。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": "aligned",
+      "deviation_note": null,
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 42,
+    "timestamp": "2025-01-01T00:00:00Z",
+    "version": {
+      "meta_core": "1.0",
+      "domain_adapter": "1.0",
+      "world_encoder": "1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "11b4c177a0b02b5d",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790567816828-1d7e1c",
+    "input_snapshot": {
+      "query": "优化本地配置文件 settings.ini 的格式",
+      "world_state_id": "ws-1790567816828-fdf335",
+      "context_id": "ctx-1790567816828",
+      "timestamp": "2026-09-28T03:56:56.828Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::代码修改域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "优化本地配置文件 settings.ini 的格式",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "优化本地配置文件 settings.ini 的格式",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "code_modification"
+        ],
+        "target_object": "settings.ini",
+        "environment": "default",
+        "risk_tag": "medium",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "优化本地配置文件 settings.ini 的格式",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "优化本地配置文件 settings.ini 的格式",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        }
+      ],
+      "expected_outcome": "目标配置文件按请求完成修改，经用户确认与生产审计后安全落地",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.3,
+      "risk_level": "medium",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": false,
+      "trigger_types": [],
+      "trigger_reasons": [],
+      "upgrade_priority": "none"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-CODE-01 代码/配置文件修改场景 → 匹配 code_agent"
+      ],
+      "reasoning_summary": "风险校验：medium（常规风险） → 复杂度评估：识别意图 [code_modification]，生成 2 个步骤 → 能力匹配：代码修改场景匹配 code_agent，按风险叠加 confirm_agent/audit_agent → 路径生成：L0→L1 快速规则路径::代码修改域；组合场景不成立，置信度 0.9；共命中 0 个升级触发维度，维持快速路径执行",
+      "counterfactual_note": "反事实检验：若风险标签为 low/medium 且非组合场景，则仅保留 2 步快速路径，不触发任何升级"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.041,
+    "timestamp": "2026-09-28T03:56:56.828Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 3874.5
+  }
+}

@@ -1,0 +1,57 @@
+ZCode Built-in missing
+ProviderBusinessError: The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek‑v4‑pro. (request_id: f5c2ecfa-3161-4727-86aa-eda4fea99004)
+    at detectProviderBusinessError (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:168819:10)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async Object.fetch (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:168757:34)
+    at async D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:167951:22
+    at async postToApi (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:151160:26)
+    at async AnthropicMessagesLanguageModel.doStream (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:155717:54)
+    at async fn (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:179477:31)
+    at async D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:173922:24
+    at async _retryWithExponentialBackoff (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:174192:12)
+    at async streamStep (D:\ZCode_Test\zcode-repo\apps\zcode-cli\packages\cli\dist\zcode.cjs:179434:21) {
+  code: 'PROVIDER_BUSINESS_ERROR',
+  isProviderBusinessError: true,
+  providerCode: 'invalid_request_error',
+  providerId: '6606faa5-23e3-4472-bc13-e9f53e2fc40c',
+  providerKind: 'anthropic',
+  providerMessage: 'The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek‑v4‑pro. (request_id: f5c2ecfa-3161-4727-86aa-eda4fea99004)',
+  providerRequestId: undefined,
+  responseBodySummary: {
+    keys: [ 'error' ],
+    success: undefined,
+    code: undefined,
+    error_code: undefined,
+    msg: undefined,
+    message: undefined,
+    request_id: undefined,
+    requestId: undefined,
+    error: {
+      keys: [Array],
+      code: 'invalid_request_error',
+      error_code: undefined,
+      msg: undefined,
+      message: 'The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek‑v4‑pro. (request_id: f5c2ecfa-3161-4727-86aa-eda4fea99004)',
+      request_id: undefined,
+      requestId: undefined,
+      type: 'invalid_request_error'
+    }
+  },
+  responseHeaders: {
+    'access-control-allow-credentials': 'true',
+    connection: 'keep-alive',
+    'content-length': '252',
+    'content-type': 'application/json',
+    date: 'Mon, 28 Sep 2026 12:13:48 GMT',
+    'eo-cache-status': 'MISS',
+    'eo-log-uuid': '8714644935304972001',
+    server: 'openresty',
+    'strict-transport-security': 'max-age=31536000; includeSubDomains; preload',
+    vary: 'origin, access-control-request-method, access-control-request-headers',
+    'x-content-type-options': 'nosniff',
+    'x-ds-trace-id': 'f095c8f6e636502bbb77c7c74fc977e9'
+  },
+  responseStatus: 400,
+  statusCode: undefined
+}
+Error: Turn execution failed (traceId: 29fac900-7732-4d28-b1cc-09232b118c22)

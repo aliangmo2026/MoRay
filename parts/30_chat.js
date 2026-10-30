@@ -457,6 +457,15 @@ function installThinkModeBtn() {
     if (!commit) { renderThinkPopover(snapOf()); return; } // pointercancel：回到已存档位
     const zone = THINK_ZONES.find(z => ratioFrom(e) < z.max) || THINK_ZONES[THINK_ZONES.length - 1];
     MoraySettings.set('thinkMode', zone.key);
+    // [P0可用性修复 2026-10-28] 思考开时显式警告：实测推理链会吃光 max_tokens 预算
+    // （问"1+1"烧 5469~8136 推理 token / 40~50s，正文被挤到 0~7 字符）。
+    // 同时 20_ai._ensureThinkBudget 会把预算抬到 ≥4096，此处只负责让用户知情。
+    if (zone.key !== 'off' && typeof showNotification === 'function') {
+      showNotification('思考模式已开启',
+        '思考模式会消耗大量 Token：回复更慢（实测 40 秒以上），且推理过程本身会占用输出额度。'
+        + '系统已自动把生成上限提到 4096。若只需快速问答，建议切回「极速」。',
+        'warning', 7000);
+    }
     refreshThinkModeBtn();
     closeThinkPopover();
   };
@@ -1614,7 +1623,15 @@ async function appendDeterministicMetaReply(conv, question) {
  * @returns {Promise<void>} */
 async function sendUserMessage() {
   if (AppState.generating) {
-    showNotification('请稍候', 'AI 正在回复中，可点击停止按钮终止', 'warning', 1800);
+    // [P0可用性修复 2026-10-28] 静默丢弃修复：此前只弹 1.8s 提示就 return，用户快速
+    // 连发时体感是"消息被吞掉"（真机实测连发 10 条只有第 1 条进了系统）。现在：
+    // 1) 输入框内容原样保留（本 return 在清空输入之前，天然保留——保持不动）；
+    // 2) 提示文案改为明确的等待指令，并延长到 4s，让用户知道消息没丢、稍后可重发。
+    if (typeof showNotification === 'function') {
+      showNotification('请等待当前回答完成',
+        '当前回复仍在进行中，这条消息没有发送、内容已保留在输入框。'
+        + '等回答完成后再次点击发送即可；或点击「停止」终止当前回复。', 'warning', 4000);
+    }
     return;
   }
   // [夜间优化1.3] 快速连点保护（400ms 内的重复触发直接忽略）

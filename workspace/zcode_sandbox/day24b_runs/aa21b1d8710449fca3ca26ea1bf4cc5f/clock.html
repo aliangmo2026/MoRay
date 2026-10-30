@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>数字时钟</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --accent: #6fe3ff;
+    --muted: #8aa3bf;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 1.75rem;
+    padding: 2rem;
+    background: radial-gradient(120% 80% at 50% 0%, #16202e 0%, #0a0e15 55%, #04060a 100%);
+    color: #eaf3ff;
+    font-family: "SFMono-Regular", "Cascadia Mono", Consolas, Menlo, monospace;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  .clock {
+    display: flex;
+    align-items: baseline;
+    font-size: clamp(3.2rem, 17vw, 11rem);
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.03em;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    text-shadow:
+      0 0 10px rgba(111, 227, 255, 0.55),
+      0 0 42px rgba(111, 227, 255, 0.28);
+  }
+
+  .colon { animation: blink 1s steps(1, end) infinite; }
+
+  @keyframes blink { 50% { opacity: 0.12; } }
+
+  .seconds {
+    margin-left: 0.12em;
+    font-size: 0.42em;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+    text-shadow: none;
+  }
+
+  .suffix {
+    margin-left: 0.5em;
+    font-size: 0.26em;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    text-shadow: none;
+  }
+
+  .date {
+    font-size: clamp(0.9rem, 2.2vw, 1.15rem);
+    letter-spacing: 0.18em;
+    color: var(--muted);
+  }
+
+  .toggle {
+    padding: 0.5rem 1rem;
+    font: inherit;
+    font-size: 0.8rem;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+  }
+
+  .toggle:hover,
+  .toggle:focus-visible {
+    color: var(--accent);
+    background: rgba(111, 227, 255, 0.08);
+    border-color: rgba(111, 227, 255, 0.5);
+    outline: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .colon { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="clock">
+    <span id="hours">00</span>
+    <span class="colon">:</span>
+    <span id="minutes">00</span>
+    <span class="colon">:</span>
+    <span id="seconds" class="seconds">00</span>
+    <span id="suffix" class="suffix" hidden>AM</span>
+  </div>
+
+  <p class="date" id="date"></p>
+
+  <button class="toggle" id="toggle" type="button">12 小时制</button>
+
+<script>
+  const hoursEl = document.getElementById('hours');
+  const minutesEl = document.getElementById('minutes');
+  const secondsEl = document.getElementById('seconds');
+  const suffixEl = document.getElementById('suffix');
+  const dateEl = document.getElementById('date');
+  const toggleEl = document.getElementById('toggle');
+
+  const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
+  const pad = (n) => String(n).padStart(2, '0');
+
+  let use24Hour = true;
+  let timer = null;
+
+  function render() {
+    clearTimeout(timer);
+
+    const now = new Date();
+    let hours = now.getHours();
+
+    if (use24Hour) {
+      suffixEl.hidden = true;
+    } else {
+      suffixEl.hidden = false;
+      suffixEl.textContent = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12;
+    }
+
+    hoursEl.textContent = pad(hours);
+    minutesEl.textContent = pad(now.getMinutes());
+    secondsEl.textContent = pad(now.getSeconds());
+    dateEl.textContent =
+      `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 星期${WEEKDAYS[now.getDay()]}`;
+
+    timer = setTimeout(render, 1000 - (Date.now() % 1000) + 10);
+  }
+
+  toggleEl.addEventListener('click', () => {
+    use24Hour = !use24Hour;
+    toggleEl.textContent = use24Hour ? '12 小时制' : '24 小时制';
+    render();
+  });
+
+  render();
+</script>
+</body>
+</html>

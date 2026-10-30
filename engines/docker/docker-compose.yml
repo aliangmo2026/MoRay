@@ -1,0 +1,121 @@
+############################################################
+# MoRay × ZCode 一次性运行容器（设计文档：docs/zcode_docker_isolation.md）
+#
+# 这不是常驻服务。用法是每任务一次性拉起、任务终态即销毁：
+#   docker compose run --rm zcode-runner zcode -p - --mode edit ^
+#       --cwd /workspace/tasks/<task_id>/work --disallowed-tools Bash,WebFetch,Write --json
+#   （stdin 喂提示词；参数词表以 Day 9 实测报告为准，strict 解析器写错即 exit 1）
+# 直接 `docker compose up` 只会执行缺省冒烟命令（zcode --help）后退出。
+#
+# 构建前提：zcode-src/ 源码快照就位（见 Dockerfile 头注与 README）。
+# 运行前提：verify_isolation 全绿（f 节硬闸门）+ MoRay 后端在宿主 8000 运行。
+############################################################
+name: moray-zcode
+
+services:
+  zcode-runner:
+    image: moray/zcode-agent:0.16.9
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ZCODE_VERSION: "0.16.9"
+        # 有 git 来源后必须填真实 commit 哈希（当前本地快照无 .git 元数据，
+        # 身份以镜像内 /opt/zcode/BUILD_INFO 的 bundle sha256 为准）
+        ZCODE_COMMIT: ${ZCODE_COMMIT:-unknown-no-git-metadata}
+
+    # ---- 3.2 挂载：唯一持久可写面 + 只读 provider 配置 ----
+    volumes:
+      # 沙箱（rw）：tasks/<id>/{inbox,work,outbox} 全在这里，其余宿主路径一律不挂
+      - D:/MoRay/workspace/zcode_sandbox:/workspace
+      # provider 配置（ro）：baseUrl+apiKey+model，宿主侧生成（Day 11b）。
+      # 里面只允许放 MoRay 网关本地凭据；上游厂商 Key 绝不出宿主 .env
+      - ${MORAY_ZCODE_PROVIDER_CONFIG_HOST:-./provider/zcode-provider.json}:/run/moray/zcode-provider.json:ro
+
+    # ---- 3.3 网络：internal bridge = 默认拒绝一切出站 ----
+    networks:
+      - moray-zcode-net
+    extra_hosts:
+      # Day 12 实证：internal 网络下该条目无路由、不可达（保留仅为兼容，非通路）。
+      # 唯一放行通路 = 边车代理 moray-gw-proxy（Day 12-13 架构师决策，见设计文档 d 节）
+      - "host.docker.internal:host-gateway"
+    # 不发布任何端口：控制面是宿主 spawn 的 docker CLI stdin/stdout
+
+    # ---- 3.4 资源限制 ----
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g          # = mem_limit：禁止 swap 超出
+    pids_limit: 256            # fork 炸弹
+    read_only: true            # rootfs 只读
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: node                 # UID 1000，非 root
+    stop_grace_period: 10s     # SIGTERM→10s→SIGKILL；任务超时(10-3600s,默认600s)
+                               # 由宿主 watchdog 执行，容器侧无法自改时限
+    working_dir: /workspace
+
+    # ---- 3.5 环境变量注入 ----
+    environment:
+      # 认证（Day 9 实测确认的唯一途径：无任何 CLI flag，只能配置文件+此 env）
+      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: /run/moray/zcode-provider.json
+      # 网关地址固定值，不接受任务参数覆盖（防指到攻击者服务器）。
+      # Day 12-13 决策：经边车代理 moray-gw-proxy 访问宿主网关（代理转发宿主 127.0.0.1:8000）
+      ZCODE_GATEWAY_BASE_URL: http://moray-gw-proxy:8000
+      ZCODE_MODEL_TELEMETRY_ENABLED: "0"
+      # 关联键：容器内只认 task_id，不透传 MoRay session_id（Day 8 决策 D5）
+      ZCODE_TASK_ID: ${ZCODE_TASK_ID:-smoke}
+      # 声明性超时（真实执行者是宿主 watchdog，这里仅供联调可见）
+      MORAY_TASK_TIMEOUT_SEC: ${MORAY_TASK_TIMEOUT_SEC:-600}
+
+    # stdin 喂提示词（-p -）需要 -i；不要 tty（会污染 JSON 输出）
+    stdin_open: true
+    tty: false
+
+    # 缺省冒烟命令；真实任务用 docker compose run 覆盖
+    command: ["zcode", "--help"]
+
+  # ---- 网关边车代理（Day 12-13 架构师决策，B 项修复方案④，替代 netsh portproxy）----
+  # 职责单一：监听 moray-zcode-net 内 8000，把 TCP 流量裸转发到宿主网关 127.0.0.1:8000。
+  # 通路依据（Day 12 实测）：internal 网到宿主无路由；非 internal 桥上 host.docker.internal
+  # 经 vpnkit 落宿主回环，可直达只监听 127.0.0.1 的后端。--network host 在 Docker Desktop
+  # WSL2 下不可用（VM 无 localhostForwarding），故采用双网卡而非 host 模式。
+  # 残余面披露：default 桥侧理论上有公网出站能力，但本容器仅一行 TCP 转发（单一目的地 8000、
+  # 无 DNS 用途、无 HTTP 代理语义——CONNECT 已实测被拒）、cap-drop ALL + 非 root + 只读 rootfs，
+  # 且不被 agent 容器信任为出站代理。MoRay 后端本身保持 127.0.0.1 绑定，不开放局域网。
+  moray-gw-proxy:
+    image: moray/zcode-agent:0.16.9
+    # 固定容器名：验收脚本与文档按此名引用（避免 compose 默认的 项目名-服务名-序号 漂移）
+    container_name: moray-gw-proxy
+    entrypoint:
+      - node
+      - -e
+      - 'const net=require("net");net.createServer(function(c){const u=net.connect({host:"host.docker.internal",port:8000});c.on("error",function(){u.destroy()});u.on("error",function(){c.destroy()});c.pipe(u);u.pipe(c)}).listen(8000,"0.0.0.0")'
+    networks:
+      - moray-zcode-net   # 面向 agent 容器：internal 网内以容器名 DNS 访问
+      - default           # 面向宿主：非 internal 桥（host.docker.internal 可达宿主回环）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: node
+    cpus: "0.5"
+    mem_limit: 128m
+    memswap_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+
+networks:
+  moray-zcode-net:
+    name: moray-zcode-net
+    driver: bridge
+    # internal=true：Docker 直接切断该网络的 NAT 出站——默认拒绝一切外网，
+    # 仅 host-gateway（宿主方向）可达。是否真正生效以 verify_isolation 实测为准
+    #（D4 硬闸门：配置了不算数），平台不兼容时按设计文档 d 节退级预案处理。
+    internal: true

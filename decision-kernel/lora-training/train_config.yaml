@@ -1,0 +1,67 @@
+# ============================================================
+# MoRay 决策内核 · Qwen2.5-1.5B-Instruct LoRA 微调配置（LLaMA-Factory）
+# 生成：2026-09-28 ｜ 本文件是 lora-training 工作区新增件，不改任何核心决策文件。
+# 用法：双击 start-training.bat（等价 llamafactory-cli train train_config.yaml，
+#       需在执行本文件所在目录运行——bat 已自动 cd）。
+# 数据集映射：本目录 dataset_info.json 把 output/train.jsonl、output/val.jsonl
+#       （split_dataset.py 产物，字段 system/user/assistant）注册为
+#       moray_lora_train / moray_lora_val。
+# ============================================================
+
+### 模型
+model_name_or_path: D:/MoRay/decision-kernel/lora-training/base_model
+trust_remote_code: true
+
+# ↑ 优先本地：start-training.bat 探 %USERPROFILE%\.cache\huggingface\hub 及常见本地权重目录，
+#   命中则设 HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1 离线加载；探不到只提示、不自作下载。
+#   若本地另有 HF 权重目录，脚本会自动追加 --model_name_or_path 覆盖。
+
+### 方法：LoRA（rank=8，仅注意力层）
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,k_proj,v_proj,o_proj
+
+### 数据
+dataset_dir: .
+dataset: moray_lora_train
+eval_dataset: moray_lora_val
+template: qwen
+cutoff_len: 1024
+max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 1
+gradient_checkpointing: true
+
+### 输出
+output_dir: lora-adapter
+overwrite_output_dir: true
+logging_dir: logs
+logging_steps: 5
+report_to: none
+plot_loss: false
+
+### 训练超参
+learning_rate: 2.0e-4
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+num_train_epochs: 5.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+weight_decay: 0.01
+bf16: true
+
+### 早停：验证集损失不再下降即自动停止（eval_loss 连续 5 次评估无改善）
+eval_strategy: steps
+eval_steps: 10
+early_stopping_steps: 5
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+save_strategy: steps
+save_steps: 10
+save_total_limit: 3

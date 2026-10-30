@@ -893,23 +893,28 @@ function installModelSelector() {
     pop.className = 'model-popover active';
     pop.style.left = '12px';
     pop.style.bottom = 'calc(100% - 4px)';
-    const models = (AI.models || []).map(m => m.name);
+    // [2026-10-25 统一数据源] 与设置页智能路由同源 getAllSelectableModels()：
+    // 本地过滤 isNonChatModel（nomic-embed-text 等 embedding 系）+ isJudgeOnlyModel
+    // （moray-laya-*，原"判定专用"标注改为直接不入列）；已配置云端模型入列并分组显示。
+    // 数据（value/conv.model/defaultModel）恒为裸模型名，显示层才加 [云端] 标记。
+    const sel = getAllSelectableModels();
+    const models = sel.map(m => m.name);
     // [模型同步] 弹层勾选与输入台标签同一数据源（currentConvModel）
     const current = (typeof currentConvModel === 'function') ? currentConvModel() : ((AppState.activeConv && AppState.activeConv.model) || MoraySettings.get('defaultModel') || models[0] || '');
     if (!models.length) {
-      pop.innerHTML = '<div class="text-xs text-text-tertiary text-center py-4">未检测到模型。<br>请启动 Ollama 或在设置中配置云端 API。</div>';
+      pop.innerHTML = '<div class="text-xs text-text-tertiary text-center py-4">未检测到可选模型。<br>请启动 Ollama，或在「设置 → OpenAI 兼容 API」配置云端服务商。</div>';
     } else {
-      // [2026-10-01 U-6-3] moray-laya-* 是 Laya 判定/蒸馏专用模型（输出恒为结构化 JSON，
-      // 非聊天模型）：选项尾部加"判定专用"标注提醒，避免误选后拿它当聊天模型收到裸 JSON。
-      // 只加标注不移除：用户调试判定链路时仍可在选择器里找到它。
-      const judgeTag = (m) => /^moray-laya-/.test(String(m))
-        ? '<span class="text-[10px] text-text-tertiary flex-shrink-0" style="margin-left:8px">判定专用</span>' : '';
-      pop.innerHTML = models.map(m => `
-        <div class="model-pop-item ${m === current ? 'selected' : ''}" data-pick-model="${escapeHtml(m)}">
-          <span class="truncate" title="${escapeHtml(m)}">${escapeHtml(uniqueModelName(m))}</span>
-          ${judgeTag(m)}
-          ${m === current ? '<i data-lucide="check" class="w-3.5 h-3.5 text-brand-cobalt"></i>' : ''}
-        </div>`).join('');
+      const row = (m) => `
+        <div class="model-pop-item ${m.name === current ? 'selected' : ''}" data-pick-model="${escapeHtml(m.name)}">
+          <span class="truncate" title="${escapeHtml(m.name)}">${escapeHtml(m.cloud ? '[云端] ' + uniqueModelName(m.name) : uniqueModelName(m.name))}</span>
+          ${m.name === current ? '<i data-lucide="check" class="w-3.5 h-3.5 text-brand-cobalt"></i>' : ''}
+        </div>`;
+      const localList = sel.filter(m => !m.cloud);
+      const cloudList = sel.filter(m => m.cloud);
+      const groupHead = (t) => `<div class="text-[10px] text-text-tertiary px-3 pt-2 pb-1 select-none">${t}</div>`;
+      pop.innerHTML =
+        (localList.length ? groupHead('本地模型') + localList.map(row).join('') : '') +
+        (cloudList.length ? groupHead('云端模型') + cloudList.map(row).join('') : '');
       pop.querySelectorAll('[data-pick-model]').forEach(item => {
         item.addEventListener('click', () => {
           const name = item.dataset.pickModel;
@@ -926,7 +931,8 @@ function installModelSelector() {
           if (typeof setActiveModel === 'function') setActiveModel(name, 'user', '用户在输入台手动选择');
           else { if (typeof syncInputModelLabel === 'function') syncInputModelLabel(); updateStatusBar(); }
           pop.remove();
-          showNotification('模型已切换', name, 'success', 1600);
+          // [2026-10-25 统一数据源] 云端模型切换通知带 [云端] 标记，与弹层/设置页一致
+          showNotification('模型已切换', (typeof isCloudModelName === 'function' && isCloudModelName(name) ? '[云端] ' : '') + name, 'success', 1600);
         });
       });
     }

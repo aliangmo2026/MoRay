@@ -174,3 +174,6 @@ decision-kernel/lora-training/OllamaSetup.exe
 
 # ---- Windows 快捷方式（根级 MoRay.lnk 等，1KB 级，防 git add -A 顺手带入）----
 *.lnk
+
+# ==== 2026-10-25 追加：Mimosa 扫描插件落盘（ZCode 插件的 hook 状态/扫描历史，约 472MB 本地缓存，绝不进仓库）====
+.mimosa/

@@ -1,0 +1,434 @@
+{
+  "sample_id": "jev-9681cf7249102838-20260928043713",
+  "task": "MoRay 决策内核 v1.0 JEV 离线决策样本",
+  "contract_version": "DecisionResult v1.0.0",
+  "generated_at": "2026-09-28T04:37:13.419Z",
+  "scenario": {
+    "id": "S04",
+    "category": "只读操作",
+    "name": "read 权限读取生产日志 → 生产风险升级（TC-04 同类）"
+  },
+  "request": {
+    "query": "读取生产环境 error.log 排查异常",
+    "permission": "write",
+    "options": {},
+    "agent_pool": [
+      {
+        "agent_id": "code_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "confirm_agent",
+        "status": "healthy"
+      },
+      {
+        "agent_id": "audit_agent",
+        "status": "healthy"
+      }
+    ]
+  },
+  "world_state": {
+    "state_id": "ws-1790570228810-d30c51",
+    "agent_availability": {
+      "total": 3,
+      "healthy_count": 3,
+      "healthy_agent_ids": [
+        "code_agent",
+        "confirm_agent",
+        "audit_agent"
+      ],
+      "ratio": 1
+    },
+    "user_permission_level": "write",
+    "operation_risk_tag": "high",
+    "encode_time_ms": 0.019
+  },
+  "standard_decision": {
+    "decision_id": "dec-1735689600000-a1b2c3",
+    "input_snapshot": {
+      "query": "读取生产环境 error.log 排查异常",
+      "world_state_id": "ws-l0-20240101-0001",
+      "context_id": "ctx-log-troubleshoot-001",
+      "timestamp": "2025-01-01T00:00:00.000Z"
+    },
+    "output": {
+      "target_path": "/production/logs/error.log",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "intent_analysis",
+            "query": "读取生产环境 error.log 排查异常",
+            "extract": [
+              "目标文件路径",
+              "读取目的",
+              "风险标签"
+            ]
+          },
+          "order": 1,
+          "timeout_ms": 5000
+        },
+        {
+          "agent_id": "confirm_agent",
+          "params": {
+            "action": "user_confirm",
+            "prompt": "即将读取生产环境文件 /production/logs/error.log，请确认操作",
+            "risk_level": "high"
+          },
+          "order": 2,
+          "timeout_ms": 10000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "action": "execution",
+            "target_path": "/production/logs/error.log",
+            "mode": "read_only",
+            "permission": "write"
+          },
+          "order": 3,
+          "timeout_ms": 15000
+        },
+        {
+          "agent_id": "audit_agent",
+          "params": {
+            "action": "audit",
+            "environment": "production",
+            "operation": "read_log",
+            "target_path": "/production/logs/error.log"
+          },
+          "order": 4,
+          "timeout_ms": 8000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "production_env"
+        ],
+        "target_object": null,
+        "environment": "production",
+        "risk_tag": "high",
+        "user_permission": "write",
+        "target_path": "/production/logs/error.log",
+        "operation": "read",
+        "user_permission_level": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": "step-1",
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "intent_analysis",
+              "query": "读取生产环境 error.log 排查异常",
+              "extract": [
+                "目标文件路径",
+                "读取目的",
+                "风险标签"
+              ]
+            },
+            "order": 1,
+            "timeout_ms": 5000
+          },
+          "description": "解析用户意图，识别目标文件为生产环境 error.log，操作类型为只读读取，用于异常排查",
+          "verification": "确认目标路径与操作类型解析正确"
+        },
+        {
+          "step_id": "step-2",
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "action": "user_confirm",
+              "prompt": "即将读取生产环境文件 /production/logs/error.log，请确认操作",
+              "risk_level": "high"
+            },
+            "order": 2,
+            "timeout_ms": 10000
+          },
+          "description": "因涉及生产环境，高风险操作需用户二次确认",
+          "verification": "确认用户已授权本次生产环境读取操作"
+        },
+        {
+          "step_id": "step-3",
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "action": "execution",
+              "target_path": "/production/logs/error.log",
+              "mode": "read_only",
+              "permission": "write"
+            },
+            "order": 3,
+            "timeout_ms": 15000
+          },
+          "description": "以只读模式读取生产环境 error.log 文件内容",
+          "verification": "校验文件读取成功且内容完整，未发生写入或修改"
+        },
+        {
+          "step_id": "step-4",
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "action": "audit",
+              "environment": "production",
+              "operation": "read_log",
+              "target_path": "/production/logs/error.log"
+            },
+            "order": 4,
+            "timeout_ms": 8000
+          },
+          "description": "对生产环境读取操作进行审计记录，留存操作日志",
+          "verification": "确认审计记录已生成并包含操作人、时间、目标路径"
+        }
+      ],
+      "expected_outcome": "成功读取生产环境 error.log 内容并返回异常信息，操作全程有确认与审计记录",
+      "verification_points": [
+        "用户确认已获取",
+        "文件以只读方式成功读取",
+        "内容完整无截断",
+        "审计日志已生成"
+      ],
+      "fallback_plan": {
+        "condition": "读取失败或用户拒绝确认",
+        "action": "终止操作并返回错误原因，提示用户检查权限或路径",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 4,
+      "risk_level": "high",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "complexity"
+      ],
+      "trigger_reasons": [
+        "请求涉及生产环境，风险等级为 high",
+        "决策步骤数为 4，达到复杂度升级阈值"
+      ],
+      "upgrade_priority": "P1"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "rule-risk-production-high",
+        "rule-step-user-confirm",
+        "rule-step-audit-production",
+        "rule-complexity-step-count"
+      ],
+      "matched_domain_experience": [
+        "生产环境只读操作需二次确认与审计",
+        "日志排查场景优先只读模式"
+      ],
+      "reasoning_summary": "请求为读取生产环境日志，命中生产环境高风险规则，风险等级 high；路径生成采用意图解析、用户确认、执行、审计四步；步骤数≥3 触发复杂度升级；非代码/文件修改类高风险组合，故组合场景为 false，置信度 0.9。",
+      "counterfactual_note": "若为非生产环境请求，则无需用户确认与审计步骤，风险等级降为 low，升级维度不触发。"
+    },
+    "meta_consistency": {
+      "constitution_alignment": true,
+      "deviation_note": "",
+      "from_meta_core": true
+    },
+    "source": "JEV-LLM-Sample-v1.0",
+    "latency_ms": 42,
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "version": {
+      "meta_core": "1.0",
+      "domain_adapter": "1.0",
+      "world_encoder": "1.0"
+    }
+  },
+  "decision_origin": "llm",
+  "dedup_fingerprint": "9681cf7249102838",
+  "rule_baseline_decision": {
+    "decision_id": "dec-1790570228810-e84ecc",
+    "input_snapshot": {
+      "query": "读取生产环境 error.log 排查异常",
+      "world_state_id": "ws-1790570228810-d30c51",
+      "context_id": "ctx-1790570228810",
+      "timestamp": "2026-09-28T04:37:08.810Z"
+    },
+    "output": {
+      "target_path": "L0→L1 快速规则路径::通用域",
+      "agent_chain": [
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "读取生产环境 error.log 排查异常",
+            "mode": "analyze_target"
+          },
+          "order": 1,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "code_agent",
+          "params": {
+            "query": "读取生产环境 error.log 排查异常",
+            "mode": "apply_change"
+          },
+          "order": 2,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "confirm_agent",
+          "params": {
+            "confirm_type": "risk_gate",
+            "risk_source": "operation_risk_tag"
+          },
+          "order": 3,
+          "timeout_ms": 30000
+        },
+        {
+          "agent_id": "audit_agent",
+          "params": {
+            "audit_scope": "production_change",
+            "log_level": "full"
+          },
+          "order": 4,
+          "timeout_ms": 30000
+        }
+      ],
+      "param_mapping": {
+        "intent": [
+          "production_env"
+        ],
+        "target_object": null,
+        "environment": "production",
+        "risk_tag": "high",
+        "user_permission": "write"
+      },
+      "step_sequence": [
+        {
+          "step_id": 1,
+          "step_type": "intent_analysis",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "读取生产环境 error.log 排查异常",
+              "mode": "analyze_target"
+            },
+            "order": 1,
+            "timeout_ms": 30000
+          },
+          "description": "解析请求意图，定位目标代码/配置文件",
+          "verification": "输出的目标文件与请求所指对象一致"
+        },
+        {
+          "step_id": 2,
+          "step_type": "execution",
+          "agent_call": {
+            "agent_id": "code_agent",
+            "params": {
+              "query": "读取生产环境 error.log 排查异常",
+              "mode": "apply_change"
+            },
+            "order": 2,
+            "timeout_ms": 30000
+          },
+          "description": "按定位结果执行代码/配置文件修改",
+          "verification": "修改结果通过语法/一致性校验，与预期结果一致"
+        },
+        {
+          "step_id": 3,
+          "step_type": "user_confirm",
+          "agent_call": {
+            "agent_id": "confirm_agent",
+            "params": {
+              "confirm_type": "risk_gate",
+              "risk_source": "operation_risk_tag"
+            },
+            "order": 3,
+            "timeout_ms": 30000
+          },
+          "description": "高风险操作：执行前向用户发起确认",
+          "verification": "用户显式确认后方可继续，拒绝则终止并回滚"
+        },
+        {
+          "step_id": 4,
+          "step_type": "audit",
+          "agent_call": {
+            "agent_id": "audit_agent",
+            "params": {
+              "audit_scope": "production_change",
+              "log_level": "full"
+            },
+            "order": 4,
+            "timeout_ms": 30000
+          },
+          "description": "生产环境变更：记录完整审计日志并复核",
+          "verification": "审计日志落盘且变更单可追溯"
+        }
+      ],
+      "expected_outcome": "请求由快速路径完成处理并通过验证点校验",
+      "verification_points": [
+        "输出的目标文件与请求所指对象一致",
+        "修改结果通过语法/一致性校验，与预期结果一致",
+        "用户显式确认后方可继续，拒绝则终止并回滚",
+        "审计日志落盘且变更单可追溯"
+      ],
+      "fallback_plan": {
+        "condition": "升级至 Layer 2（Lomi 深思层）后仍无法产出可执行方案",
+        "action": "挂起本决策，保留 input_snapshot 上下文快照，转人工澄清后重新进入 L0 编码",
+        "max_retry": 1
+      }
+    },
+    "quality": {
+      "confidence": 0.9,
+      "complexity_score": 0.7,
+      "risk_level": "high",
+      "is_composite_scenario": false,
+      "composite_type": null
+    },
+    "upgrade": {
+      "should_upgrade": true,
+      "trigger_types": [
+        "risk",
+        "complexity"
+      ],
+      "trigger_reasons": [
+        "操作风险标签为 high，命中硬规则 META-RISK-01，强制升级至 Lomi 深思层",
+        "执行步骤数为 4（≥3），超过 Laya 快速路径复杂度阈值，触发升级"
+      ],
+      "upgrade_priority": "P1"
+    },
+    "explainability": {
+      "matched_meta_rules": [
+        "META-RISK-01 风险校验：high/critical 强制升级（硬规则兜底，不可绕过）",
+        "META-COMP-01 复杂度评估：执行步骤数 ≥ 3 触发升级",
+        "META-CAP-01 能力匹配：请求意图 → Agent 域映射",
+        "META-PATH-01 路径生成：基础 2 步，高风险追加确认步，生产环境追加审计步",
+        "META-CONF-01 置信度门槛：低于 0.8 触发升级（组合场景 0.72 / 普通场景 0.9）"
+      ],
+      "matched_domain_experience": [
+        "D-OPS-01 生产环境变更 → 必须追加 audit_agent 审计步骤"
+      ],
+      "reasoning_summary": "风险校验：high（高风险，命中硬规则） → 复杂度评估：识别意图 [production_env]，生成 4 个步骤 → 能力匹配：通用域处理 → 路径生成：L0→L1 快速规则路径::通用域；组合场景不成立，置信度 0.9；共命中 2 个升级触发维度，判定升级（P1）",
+      "counterfactual_note": "反事实检验：若请求不涉及「生产环境」，风险标签将由 critical 降为 high/medium，审计步骤不再追加（步骤数 4 → 3），复杂度升级触发解除"
+    },
+    "meta_consistency": {
+      "constitution_alignment": 1,
+      "deviation_note": "本决策全部判定均由元规则表与领域经验库推导，未引入规则外启发式，无宪法规则偏离",
+      "from_meta_core": true
+    },
+    "source": "Layer1-Laya-RuleEngine-v1.0",
+    "latency_ms": 0.041,
+    "timestamp": "2026-09-28T04:37:08.810Z",
+    "version": {
+      "meta_core": "v1.0.0",
+      "domain_adapter": "v1.0.0",
+      "world_encoder": "v1.0.0"
+    }
+  },
+  "llm_meta": {
+    "model": "deepseek-chat",
+    "attempts": 1,
+    "latency_ms": 4608
+  }
+}

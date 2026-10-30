@@ -67,10 +67,11 @@ function renderNav() {
     navEl.appendChild(item);
   });
 
-  // 在 Iris 下面追加「日志中心」导航项（内部页面，不是 webview）
-  appendLogNavItem();
-  // [L7.7 加性] 「日志中心」下方追加「Laya调试」导航项（内部页面，图标 ⚡）
-  appendLayaDebugNavItem();
+  // [2026-10-23 摘除] 「日志中心」/「Laya调试」侧栏入口已隐：中枢工作台(8000)是
+  // 唯一入口，独立切页按钮冗余（同批：PAGES 的 Laya 引擎标签已注释）。
+  // 两个追加函数体保留原样（零入口=零触发），只断调用——要恢复时放开下行即可。
+  // appendLogNavItem();
+  // appendLayaDebugNavItem();
 }
 
 /** 追加「日志中心」侧边栏项 */

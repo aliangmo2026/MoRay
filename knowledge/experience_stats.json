@@ -1,0 +1,429 @@
+{
+ "version": "l52-1",
+ "updated_at": "2026-10-08T12:59:40+08:00",
+ "offset": 15303,
+ "records": 13,
+ "projects": {
+  "l4_e2e_proj": {
+   "project_id": "l4_e2e_proj",
+   "records": 1,
+   "successes": 1,
+   "duration_sum": 72.7,
+   "duration_n": 1,
+   "success_duration_sum": 72.7,
+   "success_duration_n": 1,
+   "error_types": {
+    "ZeroDivisionError": 1
+   },
+   "languages": {
+    "python": 1
+   },
+   "causes": {
+    "除零错误（分母为0/空集合均值）": {
+     "times": 1,
+     "successes": 1,
+     "error_types": {
+      "ZeroDivisionError": 1
+     },
+     "languages": {
+      "python": 1
+     },
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,10 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱，用完即删）\n def calc_total(items, discount):\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    avg = total / len(items) if items els",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:22:29+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "除零错误（分母为0/空集合均值）",
+     "cause_key": "除零错误（分母为0/空集合均值）",
+     "times": 1,
+     "successes": 1,
+     "success_rate": 1.0,
+     "score": 1.0,
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,10 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱，用完即删）\n def calc_total(items, discount):\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    avg = total / len(items) if items els",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:22:29+08:00",
+     "error_types": [
+      "ZeroDivisionError"
+     ]
+    }
+   ]
+  },
+  "l4_e2e_proj2": {
+   "project_id": "l4_e2e_proj2",
+   "records": 1,
+   "successes": 1,
+   "duration_sum": 85.8,
+   "duration_n": 1,
+   "success_duration_sum": 85.8,
+   "success_duration_n": 1,
+   "error_types": {
+    "ZeroDivisionError": 1
+   },
+   "languages": {
+    "python": 1
+   },
+   "causes": {
+    "除零错误（分母为0/空集合均值）": {
+     "times": 1,
+     "successes": 1,
+     "error_types": {
+      "ZeroDivisionError": 1
+     },
+     "languages": {
+      "python": 1
+     },
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,12 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱，用完即删）\n def calc_total(items, discount):\n+    if not items:\n+        return 0\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    ",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:30:08+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "除零错误（分母为0/空集合均值）",
+     "cause_key": "除零错误（分母为0/空集合均值）",
+     "times": 1,
+     "successes": 1,
+     "success_rate": 1.0,
+     "score": 1.0,
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,12 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱，用完即删）\n def calc_total(items, discount):\n+    if not items:\n+        return 0\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    ",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:30:08+08:00",
+     "error_types": [
+      "ZeroDivisionError"
+     ]
+    }
+   ]
+  },
+  "l4_e2e_proj3": {
+   "project_id": "l4_e2e_proj3",
+   "records": 1,
+   "successes": 1,
+   "duration_sum": 82.2,
+   "duration_n": 1,
+   "success_duration_sum": 82.2,
+   "success_duration_n": 1,
+   "error_types": {
+    "ZeroDivisionError": 1
+   },
+   "languages": {
+    "python": 1
+   },
+   "causes": {
+    "除零错误（分母为0/空集合均值）": {
+     "times": 1,
+     "successes": 1,
+     "error_types": {
+      "ZeroDivisionError": 1
+     },
+     "languages": {
+      "python": 1
+     },
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,10 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱3，用完即删）\n def calc_total(items, discount):\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    avg = total / len(items) if items el",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:34:17+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "除零错误（分母为0/空集合均值）",
+     "cause_key": "除零错误（分母为0/空集合均值）",
+     "times": 1,
+     "successes": 1,
+     "success_rate": 1.0,
+     "score": 1.0,
+     "sample_solution": "--- a/main.py\n+++ b/main.py\n@@ -1,10 +1,10 @@\n # 演示项目：购物车结算小工具（L4 最小验证 E2E 沙箱3，用完即删）\n def calc_total(items, discount):\n     total = sum(price * qty for price, qty in items)\n-    avg = total / len(items)          # BUG: 空购物车时 len(items)==0 → ZeroDivisionError\n+    avg = total / len(items) if items el",
+     "error_snippet": "Traceback (most recent call last):\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 10, in <module>\n    print(calc_total(cart, 0))\n  File \"D:\\MoRay\\work\\14_e2e_proj\\main.py\", line 4, in calc_total\n    avg = total / len(items)\n          ^^^^^^^^^^^^^^^^^^^\n\nZeroDivisionError: division by zero",
+     "last_ts": "2026-09-28T09:34:17+08:00",
+     "error_types": [
+      "ZeroDivisionError"
+     ]
+    }
+   ]
+  },
+  "l45_fixture_fail": {
+   "project_id": "l45_fixture_fail",
+   "records": 3,
+   "successes": 0,
+   "duration_sum": 56.5,
+   "duration_n": 3,
+   "success_duration_sum": 0.0,
+   "success_duration_n": 0,
+   "error_types": {
+    "ZeroDivisionError": 1,
+    "pytest-run": 2
+   },
+   "languages": {
+    "python": 3
+   },
+   "causes": {
+    "除零错误（分母为0/空集合均值）": {
+     "times": 3,
+     "successes": 0,
+     "error_types": {
+      "ZeroDivisionError": 1,
+      "pytest-run": 2
+     },
+     "languages": {
+      "python": 3
+     },
+     "sample_solution": "",
+     "error_snippet": "",
+     "last_ts": "2026-09-28T10:35:39+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "除零错误（分母为0/空集合均值）",
+     "cause_key": "除零错误（分母为0/空集合均值）",
+     "times": 3,
+     "successes": 0,
+     "success_rate": 0.0,
+     "score": 0.0,
+     "sample_solution": "",
+     "error_snippet": "",
+     "last_ts": "2026-09-28T10:35:39+08:00",
+     "error_types": [
+      "ZeroDivisionError",
+      "pytest-run"
+     ]
+    }
+   ]
+  },
+  "l45_fixture_pass": {
+   "project_id": "l45_fixture_pass",
+   "records": 2,
+   "successes": 2,
+   "duration_sum": 25.4,
+   "duration_n": 2,
+   "success_duration_sum": 25.4,
+   "success_duration_n": 2,
+   "error_types": {
+    "pytest-run": 2
+   },
+   "languages": {
+    "python": 2
+   },
+   "causes": {
+    "文件或路径不存在": {
+     "times": 2,
+     "successes": 2,
+     "error_types": {
+      "pytest-run": 2
+     },
+     "languages": {
+      "python": 2
+     },
+     "sample_solution": "无需修复。保持现有实现与测试配置不变；如需复核，在项目根目录重新运行原 pytest 命令并确认退出码为 0。",
+     "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.00s\r\n ",
+     "last_ts": "2026-09-28T10:28:35+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "文件或路径不存在",
+     "cause_key": "文件或路径不存在",
+     "times": 2,
+     "successes": 2,
+     "success_rate": 1.0,
+     "score": 2.0,
+     "sample_solution": "无需修复。保持现有实现与测试配置不变；如需复核，在项目根目录重新运行原 pytest 命令并确认退出码为 0。",
+     "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.00s\r\n ",
+     "last_ts": "2026-09-28T10:28:35+08:00",
+     "error_types": [
+      "pytest-run"
+     ]
+    }
+   ]
+  },
+  "l50_chain_proj": {
+   "project_id": "l50_chain_proj",
+   "records": 2,
+   "successes": 2,
+   "duration_sum": 96.6,
+   "duration_n": 2,
+   "success_duration_sum": 96.6,
+   "success_duration_n": 2,
+   "error_types": {
+    "ZeroDivisionError": 1,
+    "pytest-run": 1
+   },
+   "languages": {
+    "python": 2
+   },
+   "causes": {
+    "除零错误（分母为0/空集合均值）": {
+     "times": 2,
+     "successes": 2,
+     "error_types": {
+      "ZeroDivisionError": 1,
+      "pytest-run": 1
+     },
+     "languages": {
+      "python": 2
+     },
+     "sample_solution": "无需修复。保持当前 `l50_chain_proj` 代码不变，不要应用历史 `calc_total` 空列表补丁；该补丁针对的是本次未出现的异常。",
+     "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.01s\r\n ",
+     "last_ts": "2026-09-28T11:59:20+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "除零错误（分母为0/空集合均值）",
+     "cause_key": "除零错误（分母为0/空集合均值）",
+     "times": 2,
+     "successes": 2,
+     "success_rate": 1.0,
+     "score": 2.0,
+     "sample_solution": "无需修复。保持当前 `l50_chain_proj` 代码不变，不要应用历史 `calc_total` 空列表补丁；该补丁针对的是本次未出现的异常。",
+     "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.01s\r\n ",
+     "last_ts": "2026-09-28T11:59:20+08:00",
+     "error_types": [
+      "ZeroDivisionError",
+      "pytest-run"
+     ]
+    }
+   ]
+  },
+  "iris_fixture": {
+   "project_id": "iris_fixture",
+   "records": 2,
+   "successes": 1,
+   "duration_sum": 196.0,
+   "duration_n": 2,
+   "success_duration_sum": 93.1,
+   "success_duration_n": 1,
+   "error_types": {
+    "AssertionError": 2
+   },
+   "languages": {
+    "python": 2
+   },
+   "causes": {
+    "断言失败": {
+     "times": 2,
+     "successes": 1,
+     "error_types": {
+      "AssertionError": 2
+     },
+     "languages": {
+      "python": 2
+     },
+     "sample_solution": "{\"exit_code\": 0, \"duration_sec\": 18.9, \"cwd\": \"D:\\\\MoRay\\\\workspace\\\\zcode_sandbox\\\\iris_fixture\", \"log_path\": \"C:\\\\Users\\\\莫\\\\AppData\\\\Local\\\\Temp\\\\moray_zcode_1a5d578be17b.log\", \"total_lines\": 31, \"usage\": null, \"metadata\": {\"zcode_session\": null}}",
+     "error_snippet": "python main.py 运行报错：AssertionError: 期望 5，得到 -1。add(2, 3) 返回 -1，应返回 5，请修复 add 函数。",
+     "last_ts": "2026-10-05T23:33:44+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "断言失败",
+     "cause_key": "断言失败",
+     "times": 2,
+     "successes": 1,
+     "success_rate": 0.5,
+     "score": 1.0,
+     "sample_solution": "{\"exit_code\": 0, \"duration_sec\": 18.9, \"cwd\": \"D:\\\\MoRay\\\\workspace\\\\zcode_sandbox\\\\iris_fixture\", \"log_path\": \"C:\\\\Users\\\\莫\\\\AppData\\\\Local\\\\Temp\\\\moray_zcode_1a5d578be17b.log\", \"total_lines\": 31, \"usage\": null, \"metadata\": {\"zcode_session\": null}}",
+     "error_snippet": "python main.py 运行报错：AssertionError: 期望 5，得到 -1。add(2, 3) 返回 -1，应返回 5，请修复 add 函数。",
+     "last_ts": "2026-10-05T23:33:44+08:00",
+     "error_types": [
+      "AssertionError"
+     ]
+    }
+   ]
+  },
+  "v4accept_fixture": {
+   "project_id": "v4accept_fixture",
+   "records": 1,
+   "successes": 1,
+   "duration_sum": 91.7,
+   "duration_n": 1,
+   "success_duration_sum": 91.7,
+   "success_duration_n": 1,
+   "error_types": {
+    "AssertionError": 1
+   },
+   "languages": {
+    "python": 1
+   },
+   "causes": {
+    "断言失败": {
+     "times": 1,
+     "successes": 1,
+     "error_types": {
+      "AssertionError": 1
+     },
+     "languages": {
+      "python": 1
+     },
+     "sample_solution": "{\"exit_code\": 0, \"duration_sec\": 23.9, \"cwd\": \"D:\\\\MoRay\\\\workspace\\\\zcode_sandbox\\\\v4accept_fixture\", \"log_path\": \"C:\\\\Users\\\\莫\\\\AppData\\\\Local\\\\Temp\\\\moray_zcode_2e29d454a269.log\", \"total_lines\": 31, \"usage\": null, \"metadata\": {\"zcode_session\": null}}",
+     "error_snippet": "python main.py 运行报错：AssertionError: 期望 5，得到 -1。add(2, 3) 返回 -1，应返回 5，请修复 add 函数。",
+     "last_ts": "2026-10-08T12:59:40+08:00"
+    }
+   },
+   "top_root_causes": [
+    {
+     "root_cause_category": "断言失败",
+     "cause_key": "断言失败",
+     "times": 1,
+     "successes": 1,
+     "success_rate": 1.0,
+     "score": 1.0,
+     "sample_solution": "{\"exit_code\": 0, \"duration_sec\": 23.9, \"cwd\": \"D:\\\\MoRay\\\\workspace\\\\zcode_sandbox\\\\v4accept_fixture\", \"log_path\": \"C:\\\\Users\\\\莫\\\\AppData\\\\Local\\\\Temp\\\\moray_zcode_2e29d454a269.log\", \"total_lines\": 31, \"usage\": null, \"metadata\": {\"zcode_session\": null}}",
+     "error_snippet": "python main.py 运行报错：AssertionError: 期望 5，得到 -1。add(2, 3) 返回 -1，应返回 5，请修复 add 函数。",
+     "last_ts": "2026-10-08T12:59:40+08:00",
+     "error_types": [
+      "AssertionError"
+     ]
+    }
+   ]
+  }
+ },
+ "global": {
+  "causes": {
+   "除零错误（分母为0/空集合均值）": {
+    "times": 8,
+    "successes": 5,
+    "error_types": {
+     "ZeroDivisionError": 5,
+     "pytest-run": 3
+    },
+    "languages": {
+     "python": 8
+    },
+    "sample_solution": "无需修复。保持当前 `l50_chain_proj` 代码不变，不要应用历史 `calc_total` 空列表补丁；该补丁针对的是本次未出现的异常。",
+    "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.01s\r\n ",
+    "last_ts": "2026-09-28T11:59:20+08:00"
+   },
+   "文件或路径不存在": {
+    "times": 2,
+    "successes": 2,
+    "error_types": {
+     "pytest-run": 2
+    },
+    "languages": {
+     "python": 2
+    },
+    "sample_solution": "无需修复。保持现有实现与测试配置不变；如需复核，在项目根目录重新运行原 pytest 命令并确认退出码为 0。",
+    "error_snippet": "..                                                                       [100%]\r\n2 passed in 0.00s\r\n ",
+    "last_ts": "2026-09-28T10:28:35+08:00"
+   },
+   "断言失败": {
+    "times": 3,
+    "successes": 2,
+    "error_types": {
+     "AssertionError": 3
+    },
+    "languages": {
+     "python": 3
+    },
+    "sample_solution": "{\"exit_code\": 0, \"duration_sec\": 23.9, \"cwd\": \"D:\\\\MoRay\\\\workspace\\\\zcode_sandbox\\\\v4accept_fixture\", \"log_path\": \"C:\\\\Users\\\\莫\\\\AppData\\\\Local\\\\Temp\\\\moray_zcode_2e29d454a269.log\", \"total_lines\": 31, \"usage\": null, \"metadata\": {\"zcode_session\": null}}",
+    "error_snippet": "python main.py 运行报错：AssertionError: 期望 5，得到 -1。add(2, 3) 返回 -1，应返回 5，请修复 add 函数。",
+    "last_ts": "2026-10-08T12:59:40+08:00"
+   }
+  },
+  "languages": {
+   "python": 13
+  }
+ }
+}

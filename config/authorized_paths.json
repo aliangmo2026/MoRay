@@ -1,0 +1,11 @@
+{
+  "authorized_dirs": [
+    "D:\\MoRay",
+    "D:\\Argus",
+    "D:\\Iris",
+    "C:\\Users\\莫\\Documents",
+    "C:\\Users\\莫\\Desktop",
+    "C:\\Users\\莫\\Downloads"
+  ],
+  "sandbox_root": "D:\\MoRay\\workspace\\mapped"
+}

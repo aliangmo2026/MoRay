@@ -1,0 +1,25 @@
+# 构建上下文 = engines/docker/ 本目录（见 docker-compose.yml build.context）。
+# 源码快照 zcode-src/ 需要进上下文，但其重目录与密钥面必须排除。
+
+# 快照里的依赖/构建残留（宿主侧装过的，不带进构建上下文）
+zcode-src/node_modules
+zcode-src/**/node_modules
+zcode-src/.git
+zcode-src/**/dist
+zcode-src/.turbo
+zcode-src/**/*.log
+
+# provider 配置含网关凭据，绝不进镜像层（运行期只读挂载注入）
+provider/
+
+# 本目录自身的非构建文件
+README.md
+verify_isolation.sh
+verify_isolation.bat
+docker-compose.yml
+
+# .env 及其一切变体绝不进构建上下文（Day 11b-b 补洞）
+.env
+.env.*
+*.env
+*.env.*

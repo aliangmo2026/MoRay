@@ -64,6 +64,9 @@ LLM_MODELS = tuple(x.strip() for x in _env_llm_models.split(",") if x.strip()) o
 # ---- 单 session LLM 调用次数熔断 ----
 # 由 llm_proxy 在内存里按 session_id 计数（不落库、不跨重启，重启即清零）；
 # 超过本上限后 /api/llm/chat 直接 429。可用环境变量 / server/.env 覆盖默认 30。
+# [2026-10-30 解除死限制] 设 0（或负数）= 不限次数：多智能体（Argus/Iris 预设）单轮
+# 常超 30 次工具调用，硬熔断会锁死整会话且切模型也无法恢复。llm_proxy 侧以
+# `limit > 0 and count > limit` 判定，故 0 安全地表示"不限"。
 MAX_LLM_CALLS_PER_SESSION: int = 30
 try:
     MAX_LLM_CALLS_PER_SESSION = int(os.environ.get("MAX_LLM_CALLS_PER_SESSION", "30"))

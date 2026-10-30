@@ -53,8 +53,16 @@ def _safe_match_expr(query: str, mode: str) -> str:
     return expr
 
 
-def _fetch_rows(conn, expr: str, lim: int):
-    """参数化执行 corpus 检索：SQL 为内联字面量（零拼接），expr/lim 只经 ? 绑定。"""
+def _fetch_rows(conn, expr: str, lim: int, source: str = ""):
+    """参数化执行 corpus 检索：SQL 为内联字面量（零拼接），expr/lim/source 只经 ? 绑定。
+
+    [P0可用性修复 2026-10-28] 新增 source 过滤（按文档隔离）：非空时用 source = ? 精确
+    匹配命名空间化文档名（'digital_twin:<文档名>'）；为空保持原行为（全 corpus）。
+    """
+    if source:
+        return conn.execute(
+            "SELECT m.id, m.kind, m.content, m.tags, m.source, m.entity_id, m.session_id, m.created_at, bm25(memory_fts) AS bm25_rank FROM memory_fts JOIN memory_bank m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.kind = 'corpus' AND m.source = ? ORDER BY bm25_rank ASC LIMIT ?",
+            (expr, source, lim)).fetchall()
     return conn.execute(
         "SELECT m.id, m.kind, m.content, m.tags, m.source, m.entity_id, m.session_id, m.created_at, bm25(memory_fts) AS bm25_rank FROM memory_fts JOIN memory_bank m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.kind = 'corpus' ORDER BY bm25_rank ASC LIMIT ?",
         (expr, lim)).fetchall()
@@ -65,7 +73,7 @@ def _fetch_rows(conn, expr: str, lim: int):
 _RRF_K = 60.0
 
 
-def _hybrid_recall(query: str, limit: int = 3) -> list:
+def _hybrid_recall(query: str, limit: int = 3, source: str = "") -> list:
     """FTS + 向量双通道召回 kind='corpus' 块，RRF(k=60) 融合（[twin RAG 2026-10-24]）。
 
     - FTS 通道：trigram ≥3 字、AND 查空 → recall_or 兜底（同 v1 两段式），bm25 序；
@@ -73,21 +81,26 @@ def _hybrid_recall(query: str, limit: int = 3) -> list:
       余弦兜底）→ 回表过滤 kind='corpus'；文档不贬值，两通道均无时间衰减；
     - 融合：RRF 逆排名融合（memory_routes.recall hybrid 同款 k=60），score=融合分；
     - fail-open：向量通道任何异常/无嵌入环境只降级纯 FTS（绝不抛、绝不拖垮 FTS 面）。
+    [P0可用性修复 2026-10-28] 新增 source 过滤（按文档隔离）：非空时两通道都只取
+    该命名空间化文档名的块；为空保持原行为（全 corpus，调用方零适配）。
+    [P0可用性修复 2026-10-28] 向量通道熔断：memory_embed 冷却期内 get_embedding 直接
+    返 None，此处自动跳过向量通道走纯 FTS（不再每条消息硬等一个注定超时的嵌入调用）。
     返回 items 形状与 v1 对齐（score=RRF 融合分），fts_score/vec_score/matches
     为纯增量观测字段（matches ⊆ ["fts", "vec"]）。本函数只 SELECT，调用方
     （recall 端点 / llm_proxy 注入段）各自兜底连接级异常。
     """
+    src = str(source or "").strip()
     conn = memory_db.connect()
     try:
         # ---- FTS 通道（bm25 相关度序）----
         expr = _safe_match_expr(query, "recall")
         fts_rows = []
         if expr:
-            fts_rows = _fetch_rows(conn, expr, limit)
+            fts_rows = _fetch_rows(conn, expr, limit, src)
             if not fts_rows:
                 fb_expr = _safe_match_expr(query, "recall_or")
                 if fb_expr and fb_expr != expr:
-                    fts_rows = _fetch_rows(conn, fb_expr, limit)
+                    fts_rows = _fetch_rows(conn, fb_expr, limit, src)
         fts_hits = [(r["id"], abs(float(r["bm25_rank"]))) for r in fts_rows]
 
         # ---- 向量通道（相关度降序；任何失败降级为空，不影响 FTS 面）----
@@ -103,8 +116,14 @@ def _hybrid_recall(query: str, limit: int = 3) -> list:
                 if cand:
                     # 回表过滤 corpus：字面量 SQL 全扫 + Python 过滤（参数绑定纪律，
                     # 不做 IN 拼接；扫描规模 = 分身语料块数）
-                    vrows = conn.execute(
-                        "SELECT id FROM memory_bank WHERE kind = 'corpus'").fetchall()
+                    # [P0可用性修复 2026-10-28] 按文档隔离：非空 source 时只留该文档的块
+                    if src:
+                        vrows = conn.execute(
+                            "SELECT id FROM memory_bank WHERE kind = 'corpus' AND source = ?",
+                            (src,)).fetchall()
+                    else:
+                        vrows = conn.execute(
+                            "SELECT id FROM memory_bank WHERE kind = 'corpus'").fetchall()
                     corpus_ids = {r["id"] for r in vrows}
                     vec_hits = [(mid, sc) for mid, sc in cand.items() if mid in corpus_ids]
                     vec_hits.sort(key=lambda t: t[1], reverse=True)
@@ -192,21 +211,40 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) 
     return chunks
 
 
+def _doc_source(name: str) -> str:
+    """[P0可用性修复 2026-10-28] 文档名 → 命名空间化 source。
+
+    此前 source 硬编码 'digital_twin'，所有文档混进同一语料池、无法按文档隔离检索
+    （真机实测：投喂 150 块后按文档名查 0 行，且新文档被旧语料的无关结果淹没）。
+    改为 'digital_twin:<文档名>'：矩阵按命名空间根键校验（memory_routes 同批放行），
+    检索可按 source 前缀过滤；无名/非法名回退裸 'digital_twin'（兼容存量行）。
+    """
+    clean = str(name or "").strip()
+    if not clean:
+        return "digital_twin"
+    # source 列宽 32（memory_routes 截断口径）：根键 12 + 冒号 1 → 子标识最多 19
+    return ("digital_twin:" + clean)[:32]
+
+
 def chunk_and_insert(text: str, source_name: str) -> dict:
-    """切块 → 逐块 insert_memory(kind='corpus', source='digital_twin', tags=[source_name])。
+    """切块 → 逐块 insert_memory(kind='corpus', source='digital_twin:<文档名>', tags=[source_name])。
+
+    [P0可用性修复 2026-10-28] source 由硬编码 'digital_twin' 改为命名空间化文档名，
+    实现按文档隔离入库；检索侧 _fetch_rows / _hybrid_recall 同批支持 source 过滤。
 
     返回 {"name", "chunks", "inserted", "failed", "ids", "errors"}：
     - chunks  = 切出的块数；inserted = 成功入库块数（含判重幂等命中的已有 id）；
     - failed/errors = 单块落库失败计数与原因（不中断后续块，批内隔离）。
     """
     name = str(source_name or "").strip() or "unnamed"
+    src = _doc_source(name)
     chunks = chunk_text(text)
     ids = []
     errors = []
     failed = 0
     for c in chunks:
         mem_id, err = insert_memory(
-            c, kind="corpus", source="digital_twin", tags=[name])
+            c, kind="corpus", source=src, tags=[name])
         if err:
             failed += 1
             errors.append(str(err)[:200])
@@ -237,12 +275,14 @@ async def twin_ingest(request: Request):
 async def twin_recall(request: Request):
     """corpus 专属检索（[twin RAG 2026-10-24] 默认 hybrid）。
 
-    body {"query": "...", "limit": 3, "mode": "hybrid" | "fts"}：
+    body {"query": "...", "limit": 3, "mode": "hybrid" | "fts", "source": ""}：
     - hybrid（默认）：FTS 通道 + 向量通道 RRF(k=60) 融合，top-N 返回。文档语料
       不贬值，两通道均无时间衰减。向量通道任何异常/无嵌入环境自动降级纯 FTS
       （fail-open，items 契约不变，只是 matches 里没有 "vec"）。
     - mode="fts"：v1 纯 FTS 路径原样保留（bm25 排序、无时间衰减、无增量字段），
       v1 调用方零适配兼容。
+    - [P0可用性修复 2026-10-28] source：按文档隔离检索（命名空间化文档名
+      'digital_twin:<文档名>'，传裸文档名亦可自动补前缀）；为空 = 全 corpus（原行为）。
     默认 limit=3（聊天注入 3 块足够；body 可调 1..50）。检索白名单恒
     kind='corpus'，与主聊天召回（白名单不含 corpus）结构互斥零污染。
     """
@@ -262,13 +302,17 @@ async def twin_recall(request: Request):
     mode = str(body.get("mode") or "hybrid").strip().lower()
     if mode not in ("hybrid", "fts"):
         mode = "hybrid"
+    # [P0可用性修复 2026-10-28] source 归一：裸文档名自动补命名空间前缀
+    src = str(body.get("source") or "").strip()
+    if src and not src.startswith("digital_twin"):
+        src = _doc_source(src)
 
     if mode == "hybrid":
         try:
-            items = _hybrid_recall(query, limit)
+            items = _hybrid_recall(query, limit, src)
         except Exception as e:  # noqa: BLE001
             return _bad("db_error", str(e)[:200], 500)
-        return _ok({"items": items, "mode": "hybrid", "query": query})
+        return _ok({"items": items, "mode": "hybrid", "query": query, "source": src})
 
     # ---- mode="fts"：v1 纯 FTS 路径（原样保留） ----
     match_expr = _safe_match_expr(query, "recall")
@@ -276,12 +320,12 @@ async def twin_recall(request: Request):
         return _bad("bad_request", "query 无有效检索词（每个词需 ≥3 字符，trigram 下限）", 400)
     conn = memory_db.connect()
     try:
-        rows = _fetch_rows(conn, match_expr, limit)
+        rows = _fetch_rows(conn, match_expr, limit, src)
         if not rows:
             # 两段式兜底同 memory_recall（P4 切词修复）：AND 零命中 → 词间 OR 重查一次
             fallback_expr = _safe_match_expr(query, "recall_or")
             if fallback_expr and fallback_expr != match_expr:
-                rows = _fetch_rows(conn, fallback_expr, limit)
+                rows = _fetch_rows(conn, fallback_expr, limit, src)
     except Exception as e:  # noqa: BLE001
         return _bad("db_error", str(e)[:200], 500)
     finally:
@@ -300,4 +344,4 @@ async def twin_recall(request: Request):
             "score": round(abs(float(row["bm25_rank"])), 6),
             "created_at": row["created_at"],
         })
-    return _ok({"items": items, "mode": "fts", "query": query})
+    return _ok({"items": items, "mode": "fts", "query": query, "source": src})

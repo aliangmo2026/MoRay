@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "config": {
+    "providerOrder": ["moray-gateway"],
+    "providerConfigRules": {
+      "providerRules": [
+        {
+          "providerId": "moray-gateway",
+          "providerName": "MoRay Gateway",
+          "config": {
+            "group": "standard-personal",
+            "access": {
+              "type": "api-key",
+              "apiKey": "moray-gw-local-placeholder"
+            },
+            "api": {
+              "type": "openai-chat-completions",
+              "baseUrl": "http://moray-gw-proxy:8000"
+            },
+            "personalModelIds": ["deepseek-flash"],
+            "modelOrder": ["deepseek-flash"]
+          }
+        }
+      ]
+    },
+    "modelConfigRules": {
+      "providerModelRules": [
+        {
+          "modelId": "deepseek-flash",
+          "config": {
+            "properties": {
+              "contextWindow": 64000
+            }
+          },
+          "providerId": "moray-gateway"
+        }
+      ],
+      "manualProviderModelRules": []
+    }
+  }
+}

@@ -841,3 +841,15 @@ html[data-shell-theme] {
 html[data-shell-theme="dark"] .sidebar .restart-btn {
   background: rgba(255, 255, 255, 0.08) !important;
 }
+
+/* ===================== [UI 2.0 沉浸式 2026-10-23] 隐藏顶部 Tab 栏 =====================
+   实况结构：.main(flex column) = #tabs(38px) + #views(flex:1)。
+   display:none 后 .views 以 flex:1 自动吃满 38px——高度计算零改动
+   （100vh/calc 会破坏 flex column，反而砸布局）。
+   切换链路不受影响：侧栏 nav-item 点击 → openTab() → tab 元素仍创建于 DOM
+   承载状态（active/关闭），.webview.active 显隐逻辑独立于 #tabs 可见性；
+   openTab 的 getBoundingClientRect 量的是 .views 内 webview，Tab 栏消失后
+   视口只会更高。Tab 栏自带的 border-bottom 随容器一起隐藏，无需额外去边框。 */
+#tabs.tabs {
+  display: none !important;
+}

@@ -1,0 +1,41 @@
+﻿{
+  "schemaVersion": 1,
+  "config": {
+    "providerOrder": ["ollama-local"],
+    "providerConfigRules": {
+      "providerRules": [
+        {
+          "providerId": "ollama-local",
+          "providerName": "Ollama Local",
+          "config": {
+            "group": "standard-personal",
+            "access": {
+              "type": "api-key",
+              "apiKey": "ollama-local-key"
+            },
+            "api": {
+              "type": "openai-chat-completions",
+              "baseUrl": "http://127.0.0.1:11434/v1"
+            },
+            "personalModelIds": ["ollama-local/qwen2.5:7b"],
+            "modelOrder": ["ollama-local/qwen2.5:7b"]
+          }
+        }
+      ]
+    },
+    "modelConfigRules": {
+      "providerModelRules": [
+        {
+          "modelId": "ollama-local/qwen2.5:7b",
+          "config": {
+            "properties": {
+              "contextWindow": 32768, "reasoning": {"enabled": false}
+            }
+          },
+          "providerId": "ollama-local"
+        }
+      ],
+      "manualProviderModelRules": []
+    }
+  }
+}

@@ -93,6 +93,11 @@ MIN_TIMEOUT = 10
 MAX_TIMEOUT = 3600
 LOG_KEEP = 4000                          # 内存保留日志行数
 
+# [P0可用性修复 2026-10-28] 流式路径看门狗：非流式 start() 有 DEFAULT_TIMEOUT 约束，
+# 而流式 start_stream() 此前零超时（任务可无限跑，只能靠客户端 kill 或进程自退）。
+# 180s 无终态帧即强杀进程树并投一条 failed 帧，让 SSE 侧自然收尾、执行卡不再永久"执行中"。
+STREAM_WATCHDOG_SEC = 180
+
 CREATION_FLAGS = 0
 if sys.platform == "win32":
     # CREATE_NEW_PROCESS_GROUP（配合 taskkill /T 干净收树）| CREATE_NO_WINDOW（不弹黑框）
@@ -120,6 +125,83 @@ _ZCODE_STREAM_TASKS: dict = {}
 # （主表弹出语义保持原样：重连 = 404）。页面关闭后孤儿 CLI 仍在跑、主表已被流 finally 弹掉，
 # 执行卡「快照态停止」靠本表找回 proc。生命周期：reader 补 done_at 后由受理端惰性清扫（1h）回收。
 _ZCODE_STREAM_PROCS: dict = {}
+
+
+# ---------------- [2026-10-27 破壁] 流式任务 cwd 双轨（真实工作区直通） ----------------
+
+def _unsafe_workspace_reason(root: Path) -> str:
+    """工作区根安全闸（agent_tools._safe_path 同源防御的"根"形态）。
+
+    realpath 先行（junction/符号链接指向系统目录同样拒绝）；盘符根（C:\\）、
+    Windows 系统目录（%WINDIR%）、Program Files（含 x86）一律拒绝并返回原因文案，
+    安全返回空串。防御目标：ZCode --mode yolo 拿到 cwd 后可在目录内任意写，
+    绝不能把系统目录交给它。
+    """
+    try:
+        real = Path(os.path.realpath(str(root)))
+    except (OSError, ValueError):
+        return "路径无法解析"
+    if real.drive and real.parent == real:
+        return "不允许把工作区设为盘符根目录"
+    bases = [
+        os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows",
+        os.environ.get("ProgramFiles") or "",
+        os.environ.get("ProgramFiles(x86)") or "",
+    ]
+    for base in bases:
+        if not base:
+            continue
+        try:
+            if real.is_relative_to(Path(os.path.realpath(base))):
+                return "不允许把工作区设在系统目录内（%s）" % base
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def _resolve_stream_run_dir(task_id: str) -> Path:
+    """流式任务执行目录：配置了真实工作区 → 工作区根直通；未配置 → day24b 沙箱（原行为）。
+
+    "已配置"只认显式两源（与 agent_tools._workspace_root 同优先级、但**不含默认值**）：
+    MORAY_WORKSPACE 环境变量 > SQLite kv(agent_workspace)（设置页可改）。都没有 →
+    按改造前逐字回退 Path(SANDBOX_ROOT)/day24b_runs/<task_id>（含 mkdir 失败映射）。
+    已配置则 解析/建目录/安全闸 任一失败 raise StreamTaskError——绝不静默改道沙箱
+    （把用户以为在真实工作区的写入悄悄挪走，比报错更危险）。
+    kv 读取异常视同未配置（回退沙箱 + warning，DB 短暂锁死不阻断任务受理）。
+    """
+    raw = os.environ.get("MORAY_WORKSPACE", "").strip()
+    if not raw:
+        try:
+            from .. import crud
+            raw = str(crud.kv_get("agent_workspace") or "").strip()
+        except Exception as e:  # noqa: BLE001 - kv 不可用视同未配置
+            _logger.warning("[zcode-stream] kv(agent_workspace) 读取失败，回退沙箱：%s", e)
+            raw = ""
+    if not raw:
+        sandbox_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
+        try:
+            sandbox_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise StreamTaskError("sandbox_mkdir_failed", f"创建沙箱目录失败：{e}", 500) from e
+        return sandbox_dir
+    try:
+        root = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        raise StreamTaskError("bad_workspace", f"工作区路径无法解析（{raw}）：{e}", 500) from e
+    unsafe = _unsafe_workspace_reason(root)
+    if unsafe:
+        raise StreamTaskError(
+            "unsafe_workspace",
+            f"工作区 {root} 不被允许：{unsafe}（请在 设置→本机 Agent 修正工作区根）", 400)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise StreamTaskError("workspace_mkdir_failed",
+                              f"创建工作区目录失败：{root}：{e}", 500) from e
+    if not root.is_dir():
+        raise StreamTaskError("bad_workspace", f"工作区不是目录：{root}", 500)
+    _logger.info("[zcode-stream] cwd 直通真实工作区：%s（task=%s）", root, task_id[:8])
+    return root
 
 
 def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
@@ -298,6 +380,58 @@ def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
             logging.getLogger("moray.zcode").warning(
                 "[zcode-memory] 写入钩子异常：task=%s err=%s: %s",
                 task_id, type(e).__name__, str(e)[:200])
+
+
+def _zcode_stream_watchdog(task_id: str, proc, queue, loop, budget_sec: int) -> None:
+    """[P0可用性修复 2026-10-28] 流式任务看门狗线程：预算耗尽仍未终态 → 强杀进程树。
+
+    背景：非流式 start() 有 DEFAULT_TIMEOUT=600 约束，而流式 start_stream() 此前零超时
+    ——任务可无限跑，只能靠客户端 kill 或进程自退；真机实测普通聊天问题被派给 ZCode
+    后卡在"执行中"115s+ 无终态。此处补一道服务端硬闸。
+
+    实现：每 5s 探一次 proc.poll()（提前退出则自然放行），预算耗尽且仍在跑 →
+    taskkill 收树 → 投一条 zcode.task.failed 帧 + [DONE] 哨兵，让直播中的 SSE 自然
+    收尾、执行卡落到终态而非永久"执行中"。绝不抛（daemon 线程，异常只留痕）。
+    """
+    deadline = time.time() + max(10, int(budget_sec))
+    try:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return                      # 进程已自退：reader 线程会补 [DONE]，无需干预
+            time.sleep(5)
+        if proc.poll() is not None:
+            return
+        pid = getattr(proc, "pid", None)
+        detail = "watchdog_timeout_%ss" % budget_sec
+        if pid is not None:
+            try:
+                _zcode_kill_proc_tree(pid)
+            except Exception as e:  # noqa: BLE001 - 收树失败降级直杀
+                detail += "_kill_err:%s" % type(e).__name__
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        # 投终态帧：让 SSE 侧拿到明确失败原因，而非静默断流
+        frame = json.dumps({
+            "type": "zcode.task.failed",
+            "payload": {"task_id": task_id, "reason": detail,
+                        "message": "任务超时（%ss）已被服务端看门狗终止" % budget_sec},
+        }, ensure_ascii=False)
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, frame)
+            loop.call_soon_threadsafe(queue.put_nowait, "[DONE]")
+        except RuntimeError:  # noqa: BLE001 - loop 已关：丢弃即可
+            pass
+        import logging
+        logging.getLogger("moray.zcode").warning(
+            "[zcode-watchdog] 任务超时被终止：task=%s budget=%ss pid=%s",
+            task_id[:8], budget_sec, pid)
+    except Exception as e:  # noqa: BLE001 - 看门狗绝不抛
+        import logging
+        logging.getLogger("moray.zcode").warning(
+            "[zcode-watchdog] 异常（不影响任务）：task=%s err=%s: %s",
+            task_id[:8], type(e).__name__, str(e)[:160])
 
 
 def _zcode_kill_proc_tree(pid: int) -> tuple:
@@ -1248,11 +1382,11 @@ class ZCodeAdapter(ExecutionEngine):
             _ZCODE_STREAM_PROCS.pop(stale, None)
 
         task_id = uuid.uuid4().hex
-        sandbox_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
-        try:
-            sandbox_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            raise StreamTaskError("sandbox_mkdir_failed", f"创建沙箱目录失败：{e}", 500) from e
+        # [2026-10-27 破壁] 执行目录双轨：显式配置真实工作区 → 工作区根直通（ZCode
+        # --cwd/popen cwd 都落在真实项目根，改代码直接作用于用户真实工作区）；未配置
+        # → day24b 沙箱（原行为）。目录创建与安全闸（拒盘符根/系统目录/Program Files）
+        # 都在 _resolve_stream_run_dir 内完成，失败即 raise 绝不静默改道。
+        run_dir = _resolve_stream_run_dir(task_id)
 
         # CLI 解析与 __init__ 同口径：env MORAY_ZCODE_CLI 优先，缺省绝对路径 node + zcode.cjs
         env_cmd = os.environ.get("MORAY_ZCODE_CLI", "").strip()
@@ -1260,7 +1394,12 @@ class ZCodeAdapter(ExecutionEngine):
         # spawn 参数与 Day24a 实证命令逐字一致（stream-json 只在该形态下被真机验证过）；
         # --mode yolo 强制显式传（-p 缺省 mode 时 CLI 默认 yolo，Day9 实测）。
         cmd = [*cli_cmd, "-p", prompt, "--output-format", "stream-json",
-               "--mode", "yolo", "--cwd", str(sandbox_dir)]
+               # [P0可用性修复 2026-10-28] yolo→edit：此前流式路径强制 --mode yolo 且无
+               # 黑名单，真机实测可经绝对路径写沙箱外真实源码（非流式 start() 早已是
+               # edit + 黑名单，两套安全级别并存）。改与非流式同口径：edit 模式 +
+               # Bash/WebFetch/Write 拉黑，配合 --cwd 落在授权工作区内。
+               "--mode", FORCED_MODE, "--disallowed-tools", DISALLOWED_TOOLS,
+               "--cwd", str(run_dir)]
         # [批次二·5 任务4] 数据目录隔离：与 _build_env 同口径——**硬覆盖**。
         # 后端进程常继承桌面 ZCode 会话的 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE（指向 C 盘
         # 真实配置、含云端 Key），setdefault 因变量已存在而失效（E2E 实证会偷跑云端），
@@ -1274,7 +1413,7 @@ class ZCodeAdapter(ExecutionEngine):
         try:
             proc = subprocess.Popen(
                 cmd,
-                cwd=str(sandbox_dir),
+                cwd=str(run_dir),
                 env=zcode_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,  # Day24a 实测 stderr 0 字节，不解析（任务书 gotcha 4）
@@ -1291,7 +1430,7 @@ class ZCodeAdapter(ExecutionEngine):
             "prompt": prompt,
             "language": language,
             "caller": caller,
-            "cwd": str(sandbox_dir),
+            "cwd": str(run_dir),
             "cmd": cmd,
             "proc": proc,
             "queue": queue,
@@ -1304,6 +1443,14 @@ class ZCodeAdapter(ExecutionEngine):
         threading.Thread(
             target=_zcode_stream_reader, args=(task_id, proc, queue, rec["loop"]),
             name="moray-zcode-stream-" + task_id[:8], daemon=True,
+        ).start()
+        # [P0可用性修复 2026-10-28] 流式看门狗：补上此前流式路径缺失的超时闸。
+        # 预算取 STREAM_WATCHDOG_SEC（180s），与非流式 DEFAULT_TIMEOUT 解耦——流式
+        # 面向交互式执行卡，容忍度更低。进程提前自退时看门狗自行放行（每 5s 探 poll）。
+        threading.Thread(
+            target=_zcode_stream_watchdog,
+            args=(task_id, proc, queue, rec["loop"], STREAM_WATCHDOG_SEC),
+            name="moray-zcode-watchdog-" + task_id[:8], daemon=True,
         ).start()
         # [v5 step1] 受理成功（子进程起 + reader 线程起）→ started 上总线。trace_id 分键
         # task_id+":started"——succeeded 保持裸 task_id（send 幂等判重按 trace_id 全表唯一，
@@ -1400,6 +1547,9 @@ class ZCodeAdapter(ExecutionEngine):
         存在性判定的实现偏差（报告已标）：SSE 流结束即从 _ZCODE_STREAM_TASKS 剔出（既有行为、
         红线禁改），而预览恰发生在任务结束后——故「登记表命中 或 沙箱目录存在」任一即可，
         两者皆无 → 404。安全属性不变：只有本后端真实受理过的 task_id 才会有沙箱目录。
+        [2026-10-27 破壁] 任务目录双轨：登记表 rec["cwd"]（工作区直通模式 = 真实工作区根）
+        优先、进程常登表 _PROCS 兜底（流结束后主表已弹，工作区模式必须靠它找回 cwd）；
+        无 rec 才回退 day24b 沙箱原路径。realpath 包含性闸对两种根一视同仁。
         """
         text_exts = {".py", ".js", ".ts", ".json", ".sh", ".bat", ".txt", ".md"}
         image_mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1417,8 +1567,15 @@ class ZCodeAdapter(ExecutionEngine):
         # ---- 2. task_id 必须是本后端签发的 uuid4.hex；登记表或沙箱目录任一命中，否则 404 ----
         if not re.fullmatch(r"[0-9a-f]{32}", task_id):
             raise StreamTaskError("not_found", f"任务不存在：{task_id}", 404)
-        task_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
-        if task_id not in _ZCODE_STREAM_TASKS and not task_dir.is_dir():
+        # [2026-10-27 破壁] 目录双源：主表/常登表 rec["cwd"] 优先（工作区直通模式落真实
+        # 工作区根），无 rec 回退 day24b 沙箱（原路径逐字保留，存在性判定口径不变）
+        rec = _ZCODE_STREAM_TASKS.get(task_id) or _ZCODE_STREAM_PROCS.get(task_id)
+        run_cwd = str(rec.get("cwd") or "") if isinstance(rec, dict) else ""
+        if run_cwd:
+            task_dir = Path(run_cwd)
+        else:
+            task_dir = Path(SANDBOX_ROOT) / "day24b_runs" / task_id
+        if not run_cwd and task_id not in _ZCODE_STREAM_TASKS and not task_dir.is_dir():
             raise StreamTaskError("not_found", f"任务不存在：{task_id}", 404)
         # Windows 保留设备名（open 可能阻塞事件循环）→ 按不存在处理
         if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^/\\]*)?", filename):

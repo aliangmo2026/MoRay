@@ -1,0 +1,105 @@
+# ============================================================
+# test_run_flow —— "跑测试并自动分析"任务模板（L4.5 阶段3.1，2026-09-28）。
+# 与 error_fix_flow / text_fix_flow 同构的声明式模板，engine/task_runner.py 零改动。
+# 流程（任务书 3.1 五步映射到现有步骤类型）：
+#   run_tests        docker_sandbox（fallback local_exec）跑测试命令；
+#                    continue_on_fail: 测试失败不中断流程（要出报告，等价 success=false）
+#   read_experience  knowledge_read（历史优先假设注入分析提示）
+#   analyze_failures mcp_call iris_analyze_text（把测试输出交给 Iris 诊断；
+#                    全过 = "无失败"，有挂 = 根因候选 + 修复建议，两种都出报告）
+#   generate_report  通过率 + 失败用例 + 报错分析 + 修复建议
+#   record_experience knowledge_write（复用同款 entry schema）
+# 入参 params：project_dir / project_id / test_cmd
+# 降级声明（沿用偏差 D5）：docker 不可用→local_exec。
+# 诚实降级说明：task_runner 无条件跳步能力，"失败提取"由 Iris 读输出文本完成，
+#   报告对"全部通过"同样给出结论（多一次分析调用，不谎报为"失败时才有分析"）。
+# ============================================================
+name: test_run_flow
+version: 1
+description: 项目测试 → 自动分析失败 → 通过率/失败用例/根因/修复建议 报告 → 经验沉淀
+
+defaults:
+  retries: 1
+  timeout: 180
+
+steps:
+  - id: run_tests
+    type: docker_sandbox
+    timeout: 300
+    continue_on_fail: true   # 测试失败（exit!=0）也要继续分析与出报告
+    args:
+      image: python:3.12-slim
+      command: "{{params.test_cmd}}"
+      workdir: "{{params.project_dir}}"
+      exec_timeout: 120
+      fallback: local_exec
+
+  - id: read_experience
+    type: knowledge_read
+    timeout: 20
+    args:
+      project_id: "{{params.project_id}}"
+      top_n: 3
+
+  - id: analyze_failures
+    type: mcp_call
+    timeout: 240
+    continue_on_fail: true   # Iris 不可用时仍出报告（测试原始结果已有）
+    args:
+      tool: iris_analyze_text
+      arguments:
+        text: "这是项目 {{params.project_id}} 的测试命令输出（命令：{{params.test_cmd}}）。exit={{steps.run_tests.output.exit_code}}，engine={{steps.run_tests.engine}}。若含失败用例请提取失败测试名、根因候选与修复建议；若全部通过请明确说明『全部测试通过，无失败』。历史优先假设（经验库）：\n{{steps.read_experience.output.hint}}\n—— stdout ——\n{{steps.run_tests.output.stdout}}\n—— stderr ——\n{{steps.run_tests.output.stderr}}"
+
+  - id: generate_report
+    type: report
+    timeout: 30
+    args:
+      path: "{{work_dir}}/test_report.md"
+      content: |
+        # MoRay 测试分析报告 · {{params.project_id}}
+        任务：test_run_flow（工作目录 {{work_dir}}，全流程 {{elapsed_sec}}s）
+        命令：{{params.test_cmd}}　（项目目录 {{params.project_dir}}）
+
+        ## 1. 测试执行
+        - 状态：{{steps.run_tests.status}}（引擎 {{steps.run_tests.engine}}）
+        - exit：{{steps.run_tests.output.exit_code}}
+        - stdout（尾部，超长按 4000 字符截断）：
+        {{steps.run_tests.output.stdout}}
+        - stderr（尾部）：
+        {{steps.run_tests.output.stderr}}
+        - 通过率：请结合上方 pytest 汇总行（passed/failed/error）判读；Iris 结论见第 2 节
+
+        ## 2. 失败分析（Iris）
+        - 分析状态：{{steps.analyze_failures.status}}
+        - 错误类型：{{steps.analyze_failures.output.data.error_type}}
+        - 严重度：{{steps.analyze_failures.output.data.severity}}
+        - 涉事文件：{{steps.analyze_failures.output.data.file_path}}（行 {{steps.analyze_failures.output.data.line_number}}）
+        - 根因候选（按优先级）：
+        {{steps.analyze_failures.output.data.root_cause_candidates}}
+        - 诊断：{{steps.analyze_failures.output.data.diagnosis.root_cause}}
+        - 修复建议：{{steps.analyze_failures.output.data.diagnosis.plan}}
+
+        ## 3. 经验库优先假设（分析前注入）
+        {{steps.read_experience.output.hint}}
+
+        ## 4. 经验沉淀
+        - 写入：{{steps.record_experience.status}} → {{steps.record_experience.output.path}}
+
+        —— 由 MoRay 任务模板引擎（engine/task_runner.py）自动生成
+
+  - id: record_experience
+    type: knowledge_write
+    timeout: 20
+    continue_on_fail: true   # [L4.5] Iris 不可用时经验缺失不应推翻已出的报告（终态已定）
+    args:
+      entry:
+        project_id: "{{params.project_id}}"
+        # [L4.5 E2E 修正] error_type 用静态任务型：全过场景 analyze 无错误类型 →
+        # 空串触发 BAD_ENTRY 丢经验；改静态后"通过"也能沉淀（success=true 是回归基线）。
+        # 真实错误类型在 root_cause_category（Iris 诊断，两态恒有值）。
+        error_type: "pytest-run"
+        root_cause_category: "{{steps.analyze_failures.output.data.diagnosis.root_cause}}"
+        error_snippet: "{{steps.run_tests.output.stdout}} {{steps.run_tests.output.stderr}}"
+        solution: "{{steps.analyze_failures.output.data.diagnosis.plan}}"
+        duration_sec: "{{elapsed_sec}}"
+        success: "{{steps.run_tests.status}}"

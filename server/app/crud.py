@@ -6,11 +6,14 @@
 - 统一返回 {ok:true, data} 或 {ok:false, code, message}
 """
 import json
+import logging
 import sqlite3
 import time
 from typing import Any, Optional
 
 from . import config, db as _db
+
+_logger = logging.getLogger("moray.crud")
 
 _TS = lambda: time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())  # noqa: E731
 
@@ -450,6 +453,109 @@ def clear_event_snapshots(event_type: str | None = None) -> int:
             cur = conn.execute("DELETE FROM event_snapshots WHERE event_type = ?", (str(event_type),))
         else:
             cur = conn.execute("DELETE FROM event_snapshots")
+        conn.commit()
+        return int(cur.rowcount or 0)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------- agent_sessions（国庆冲刺 Day3：会话状态机 + 断点恢复） ----------------
+# 词表与流转规则见 db.py 的 agent_sessions 建表注释。状态机是「记录者」不是「拦截器」：
+# 非法流转只 warning 并返回当前行，绝不抛异常打断工具执行（调用方本也应包在 try 里）。
+
+SESSION_STATUSES = ("pending", "running", "completed", "failed", "interrupted")
+
+# 合法流转表（2.2）：pending → running → completed / failed 为主线；
+# 同一会话的多步任务允许 completed / failed / interrupted → running 再入；
+# running → running 幂等放行（连续调用都算在执行中）。
+_SESSION_TRANSITIONS = {
+    "pending": {"running"},
+    "running": {"running", "completed", "failed"},
+    "completed": {"running"},
+    "failed": {"running"},
+    "interrupted": {"running"},
+}
+
+
+def get_agent_session(session_id: str) -> Optional[dict]:
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM agent_sessions WHERE session_id = ?", (str(session_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def latest_event_id_for_session(session_id: str) -> Optional[int]:
+    """该会话在 event_snapshots 里的最新事件 id（last_event_id 列的来源，Day2 保证工具调用必有事件）。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT MAX(id) AS e FROM event_snapshots WHERE session_id = ?",
+            (str(session_id),)).fetchone()
+        return int(row["e"]) if row and row["e"] is not None else None
+    finally:
+        conn.close()
+
+
+def transition_agent_session(session_id: str, new_status: str,
+                             error_msg: Optional[str] = None,
+                             last_event_id: Optional[int] = None) -> Optional[dict]:
+    """状态机 upsert：未知会话先建为 pending（独立提交，即使后续流转非法也留下 pending 记录），
+    再按 _SESSION_TRANSITIONS 推进到 new_status。
+
+    - error_msg=None → 保留原值；传 ""/文本 → 覆盖（completed/running 用 "" 清空）；
+    - last_event_id=None → 保留原值（允许只流转不带事件指针）；
+    - 非法流转：warning，不改动状态，返回当前行。
+    """
+    sid = str(session_id)
+    if new_status not in SESSION_STATUSES:
+        raise ValueError(f"非法会话状态：{new_status!r}（可用：{', '.join(SESSION_STATUSES)}）")
+    conn = _conn()
+    try:
+        # 第一步：确保行存在（INSERT OR IGNORE 幂等；单独提交，新会话的 pending 记录不因非法流转被回滚吞掉）
+        conn.execute("INSERT OR IGNORE INTO agent_sessions (session_id, status) VALUES (?, 'pending')", (sid,))
+        conn.commit()
+        # 第二步：按规则流转
+        conn.execute("BEGIN")
+        cur_status = conn.execute(
+            "SELECT status FROM agent_sessions WHERE session_id = ?", (sid,)).fetchone()["status"]
+        if new_status != cur_status and new_status not in _SESSION_TRANSITIONS.get(cur_status, set()):
+            conn.rollback()
+            _logger.warning("会话状态非法流转被忽略：%s %s → %s", sid, cur_status, new_status)
+            return get_agent_session(sid)
+        conn.execute(
+            """UPDATE agent_sessions
+               SET status = ?, updated_at = datetime('now', 'localtime'),
+                   error_msg = CASE WHEN ? IS NULL THEN error_msg ELSE ? END,
+                   last_event_id = COALESCE(?, last_event_id)
+               WHERE session_id = ?""",
+            (new_status, error_msg, str(error_msg or "")[:500], last_event_id, sid),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_agent_session(sid)
+
+
+def mark_stale_sessions_interrupted() -> int:
+    """断点恢复（3.1）：新进程启动时把上个进程留下的 pending/running 一律标 interrupted。
+    在 main.py lifespan（init_db 之后）调用。返回被标记的会话数。"""
+    conn = _conn()
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            """UPDATE agent_sessions
+               SET status = 'interrupted', updated_at = datetime('now', 'localtime'),
+                   error_msg = '进程重启：上一进程退出时该会话仍处于 ' || status
+               WHERE status IN ('pending', 'running')""")
         conn.commit()
         return int(cur.rowcount or 0)
     except Exception:

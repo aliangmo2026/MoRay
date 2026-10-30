@@ -31,7 +31,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from . import config, crud
+from . import config, crud, db
 
 router = APIRouter()
 _logger = logging.getLogger("moray.agent")
@@ -48,7 +48,8 @@ DANGEROUS_EXTS = frozenset(
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 # 副作用工具：approved !== true 绝不执行
-SIDE_EFFECT_TOOLS = frozenset({"write_file", "create_file", "move_file", "run_command", "edit_file"})
+SIDE_EFFECT_TOOLS = frozenset({"write_file", "create_file", "move_file", "run_command", "edit_file",
+                               "zcode_run", "zcode_sub_agent"})
 
 # 参数合法字符（纯 token：字母数字 + 少量安全标点；禁空格/引号/重定向/管道/百分号等元字符）
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._:@/\\+~-]+$")
@@ -217,15 +218,108 @@ def _summarize_args(name: str, args: dict) -> str:
         return str(args)[:200]
 
 
-def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, detail: str = "", source: str = "web"):
-    """写审计日志 + 同步写事件溯源快照（Kernel 第二阶段）。
+# [国庆冲刺 Day2] 事件流统一写入：每次到达 _audit 的调用都落一条 event_snapshots，
+# 不再只写 agent_tool_log、不再以 TOOL_IMPLS 为门槛（配置操作/熔断事件同样有记录）。
+# input_json/output_json 列的截断上限（快照本体 snapshot_json 维持既有不截断语义）。
+_EVENT_JSON_TRUNC = 50_000
+# 哪些 status 视为"带错误信息"（error_msg 列/键填充；ok 恒为空串）
+_ERROR_STATUSES = ("error", "timeout", "rejected", "needs_approval", "denied")
 
-    快照记录完整的工具入参、审批状态、执行结果摘要，供 /api/agent/replay 重放使用。
-    快照写入失败不影响主流程（内部 try/catch，仅 warning 日志）。
 
-    source：调用通道（web = 前端/HTTP 直调，mcp = MCP Server）。非 web 时在 detail 前缀标注
-    "source=xxx"：不改变 agent_tool_log 表结构、不影响 GET /api/agent/log 契约，审计表格与
-    时间轴都能直接看到来源（既有调用方不传该参数 → 行为与之前完全一致）。
+def _resolve_session_id(session_id, args=None) -> str:
+    """会话归属统一解析链：显式 session_id > args.session_id > "default"（[:128]）。
+    事件流（Day2）与会话状态（Day3）共用这一条规则 —— 两处各写一份迟早漂移，
+    漂移后果是「状态查不到事件」这类静默 bug。"""
+    sid = session_id or (args.get("session_id") if isinstance(args, dict) else None) or "default"
+    return str(sid)[:128]
+
+
+def _update_session_state(session_id, args, new_status: str, error_msg=None) -> None:
+    """[Day3] 会话状态钩子（只允许挂在 _execute_tool_internal 头尾，见 R2）。
+
+    - running/completed 时传 error_msg="" 清空旧错误；failed 时传原因；
+    - last_event_id 指向该会话最新一条事件（放在 _audit 之后调用即可覆盖本次）；
+    - 状态更新失败只 warning，绝不影响工具执行与响应。"""
+    sid = _resolve_session_id(session_id, args)
+    try:
+        crud.transition_agent_session(sid, new_status, error_msg=error_msg,
+                                      last_event_id=crud.latest_event_id_for_session(sid))
+    except Exception as e:  # noqa: BLE001 - 状态机是记录者，永远不许挡住执行
+        _logger.warning("session state update failed: %s", e)
+
+
+def _append_tool_event(name: str, args: dict, approved: bool, status: str, ms: int,
+                       detail: str, source: str, output, session_id, log_id: int) -> None:
+    """写一条完整事件到 event_snapshots（2.1 要求的 9 字段全部有载体）。
+
+    - event_id = id 列、timestamp = created_at 列（建表默认值），其余 7 个维度为 Day2 新列；
+    - 工具调用（name ∈ TOOL_IMPLS）：event_type="tool_call" 且 source_log_id 关联审计行 ——
+      这是前端时间线「修改并重放此步骤」的既有契约（list_agent_log 按 source_log_id 取 snapshot_id，
+      /api/agent/replay 只读 snapshot 的 tool/args 键），键形状必须保持；
+    - 非工具事件（config_* / budget_exceeded 等）：event_type="operation"，source_log_id 置空 ——
+      不关联日志行 → 时间线不会对它们长出重放按钮（点了也只会 400，不如不出现）；
+    - crud.append_event_snapshot（不可改的旧接口）只会填 4 列，新列需全量落值 → 这里直接 INSERT。
+    写入失败抛给调用方处理（_audit 内 try/except，仅 warning，绝不影响工具执行与响应）。
+    """
+    sid = _resolve_session_id(session_id, args)  # [Day3] 与会话状态钩子共用同一解析链
+    err = str(detail or "")[:1000] if status in _ERROR_STATUSES else ""
+    input_json = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False, default=str)[:_EVENT_JSON_TRUNC]
+    output_json = json.dumps(output, ensure_ascii=False, default=str)[:_EVENT_JSON_TRUNC] if output is not None else ""
+    snapshot = {
+        # ---- 既有键（回放契约：/api/agent/replay 读取 tool/args；勿改形状）----
+        "tool": name,
+        "args": args,
+        "approved": bool(approved),
+        "status": status,
+        "ms": int(ms or 0),
+        "detail": str(detail or "")[:1000],
+        "timestamp": _TS_snapshot(),
+        "workspace": str(_workspace_root(create=False)),
+        "schema_version": 2,  # v2：Day2 补齐 canonical 字段（新增键，回放读取端不受影响）
+        # ---- [Day2] 2.1 规范字段（canonical 命名超集）----
+        "session_id": sid,
+        "tool_name": name,
+        "duration_ms": int(ms or 0),
+        "input": args if isinstance(args, dict) else {},
+        "output": output,
+        "error_msg": err,
+        "source": source or "web",
+    }
+    is_tool = name in TOOL_IMPLS
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO event_snapshots (event_type, entity_id, source_log_id, snapshot_json,"
+            " session_id, tool_name, status, duration_ms, error_msg, input_json, output_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "tool_call" if is_tool else "operation",
+                f"{name}:{log_id}" if log_id else name,
+                log_id if (log_id and is_tool) else None,
+                json.dumps(snapshot, ensure_ascii=False),
+                sid, name, status, int(ms or 0), err, input_json, output_json,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        raise
+    finally:
+        conn.close()
+
+
+def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, detail: str = "",
+           source: str = "web", output=None, session_id=None):
+    """写审计日志（agent_tool_log）+ 统一写事件流（event_snapshots，Day2 起每次调用必有）。
+
+    事件记录完整的工具入参、执行结果（output）、耗时、错误原因与会话归属，
+    供 GET /api/events/snapshots 查询与 /api/agent/replay 重放使用。
+    事件写入失败不影响主流程（内部 try/catch，仅 warning 日志）。
+
+    source：调用通道（web = 前端/HTTP 直调，mcp = MCP Server，llm_proxy = Day1 熔断）。
+    非 web 时在 detail 前缀标注 "source=xxx"：不改变 agent_tool_log 表结构、不影响
+    GET /api/agent/log 契约，审计表格与时间轴都能直接看到来源（既有调用方不传该参数 → 行为与之前完全一致）。
+    output / session_id：Day2 新增可选参数（默认 None → 未知结果/未知会话，
+    session 兜底解析 args.session_id 再兜底 "default"；既有调用方位置参数序不变）。
     """
     detail_text = str(detail or "")
     if source and source != "web":
@@ -235,23 +329,12 @@ def _audit(name: str, args: dict, approved: bool, status: str, ms: int = 0, deta
         log_id = crud.append_agent_log(name, _summarize_args(name, args), approved, status, ms, detail_text)
     except Exception as e:  # noqa: BLE001 - 审计失败不影响工具结果
         _logger.warning("agent audit write failed: %s", e)
-    # 同步写事件溯源快照（仅对真实工具调用写快照，配置类操作不写）
-    if log_id and name in TOOL_IMPLS:
-        try:
-            snapshot = {
-                "tool": name,
-                "args": args,
-                "approved": bool(approved),
-                "status": status,
-                "ms": int(ms or 0),
-                "detail": detail_text[:1000],
-                "timestamp": _TS_snapshot(),
-                "workspace": str(_workspace_root(create=False)),
-                "schema_version": 1,
-            }
-            crud.append_event_snapshot("tool_call", f"{name}:{log_id}", log_id, snapshot)
-        except Exception as e:  # noqa: BLE001 - 快照失败绝不影响工具执行
-            _logger.warning("event snapshot write failed: %s", e)
+    # [Day2] 统一事件写入：真实工具调用与配置/熔断类操作全部落 event_snapshots，不能漏
+    try:
+        _append_tool_event(name, args, approved, status, ms, detail_text,
+                           source, output, session_id, log_id)
+    except Exception as e:  # noqa: BLE001 - 事件写入失败绝不影响工具执行
+        _logger.warning("event snapshot write failed: %s", e)
 
 
 def _TS_snapshot() -> str:
@@ -940,6 +1023,26 @@ def _tool_run_command(args: dict):
     }
 
 
+def _tool_zcode_run(args: dict):
+    """[Laya v3] ZCode 执行引擎：运行本地脚本（授权路径校验/同步在 zcode_proxy 内）。"""
+    from core import zcode_proxy
+    file_path = str(args.get("file_path") or args.get("path") or "").strip()
+    if not file_path:
+        raise ToolError("zcode_run 需要 file_path（本地脚本文件路径）")
+    return zcode_proxy.ZCodeProxy.run_file(
+        file_path, args=str(args.get("args") or ""), lang=str(args.get("lang") or "auto"))
+
+
+def _tool_zcode_sub_agent(args: dict):
+    """[Laya v3] 派发 ZCode 原生子智能体（按场景注入 config/prompts 专用提示词）。"""
+    from core import zcode_proxy
+    task = str(args.get("task") or "").strip()
+    work_dir = str(args.get("work_dir") or "").strip()
+    if not task or not work_dir:
+        raise ToolError("zcode_sub_agent 需要 task 与 work_dir")
+    return zcode_proxy.zcode_sub_agent(task, work_dir, scene=str(args.get("scene") or "general").strip())
+
+
 TOOL_IMPLS = {
     "list_directory": _tool_list_directory,
     "read_file": _tool_read_file,
@@ -952,6 +1055,8 @@ TOOL_IMPLS = {
     "move_file": _tool_move_file,
     "list_processes": _tool_list_processes,
     "system_info": _tool_system_info,
+    "zcode_run": _tool_zcode_run,
+    "zcode_sub_agent": _tool_zcode_sub_agent,
 }
 
 
@@ -1003,13 +1108,23 @@ def _human_summary(name: str, args: dict) -> dict:
             "detail": f"精确替换 {path} 中的文本（{len(old.encode('utf-8'))} 字节 → {len(new.encode('utf-8'))} 字节，{mode}）",
             "preview": old[:200] + ("…" if len(old) > 200 else ""),
         }
+    if name == "zcode_run":
+        fp = str(args.get("file_path") or args.get("path") or "").strip()
+        return {"tool": name, "title": f"运行脚本 {os.path.basename(fp)}",
+                "detail": f"将由 ZCode 执行引擎运行 {fp}（授权目录校验 + 输出捕获 + 预览识别），附加参数：{str(args.get('args') or '')[:120]}"}
+    if name == "zcode_sub_agent":
+        task = str(args.get("task") or "").strip()
+        wd = str(args.get("work_dir") or "").strip()
+        return {"tool": name, "title": f"派发 ZCode 子智能体（{args.get('scene') or 'general'}）",
+                "detail": f"在 {wd} 内自主执行：{task[:160]}；改动将自动同步回原目录"}
     return {"tool": name, "title": name, "detail": json.dumps(args, ensure_ascii=False)[:300]}
 
 
 # ---------------------------------------------------------------- 统一执行入口
 
 def _execute_tool_internal(name: str, args: dict, approved: bool = False,
-                           decision: str = "", source: str = "web") -> tuple[dict, int]:
+                           decision: str = "", source: str = "web",
+                           session_id=None) -> tuple[dict, int]:
     """执行一个本机工具 —— 唯一执行入口（/api/agent/tool 与 MCP Server 共用）。
 
     安全边界完全沿用既有实现，本函数不做任何放宽：
@@ -1019,41 +1134,56 @@ def _execute_tool_internal(name: str, args: dict, approved: bool = False,
         本函数既不绕过也不复制这些校验；
       - 每一次调用（含客户端拒绝、未审批、安全拒绝、执行失败）都写审计与事件快照；
         source != "web" 时在 detail 前缀标注来源（MCP 调用落 "source=mcp"）。
+      - [国庆冲刺 Day3] 头尾各挂一个会话状态钩子（_update_session_state，见 R2 允许区）：
+        入口 pending→running；执行成功 → completed；执行失败/安全拒绝/未知工具 → failed+error_msg；
+        客户端拒绝 / 待审批不改状态（会话还停在 running，等审批后继续）；多步任务允许再入 running。
     返回 (payload, http_status)：未知工具 → 400；其余一律 200（与既有路由行为一致）。
     """
     if not isinstance(args, dict):
         args = {}
+    # ---- [Day3] 头部钩子：会话进入 running ----
+    _update_session_state(session_id, args, "running", error_msg="")
     impl = TOOL_IMPLS.get(name)
     if impl is None:
+        _update_session_state(session_id, args, "failed", f"未知本机工具：{name}")
         return {"ok": False, "code": "unknown_tool",
                 "message": f"未知本机工具：{name}（可用：{', '.join(sorted(TOOL_IMPLS))}）"}, 400
     is_side_effect = name in SIDE_EFFECT_TOOLS
     # 客户端拒绝上报：只审计，绝不执行任何工具（即使是只读的也按上报处理）
     if str(decision or "") == "denied":
-        _audit(name, args, False, "denied", 0, "客户端明确拒绝", source=source)
+        _audit(name, args, False, "denied", 0, "客户端明确拒绝", source=source, session_id=session_id)
+        # [Day3] 状态保持 running：客户端拒绝不判死整个会话
         return {"ok": True, "data": {"denied": True}}, 200
     # 副作用双保险：未带 approved:true 一律不执行
     if is_side_effect and approved is not True:
-        _audit(name, args, False, "needs_approval", 0, "副作用工具未获审批，未执行", source=source)
+        _audit(name, args, False, "needs_approval", 0, "副作用工具未获审批，未执行",
+               source=source, session_id=session_id)
+        # [Day3] 状态保持 running：审批是会话进行中的等待点，不是失败
         return {"ok": True, "needsApproval": True, "summary": _human_summary(name, args)}, 200
     t0 = time.perf_counter()
     try:
         data = impl(args)
         ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, True, "ok", ms, source=source)
+        # [Day2] ok 分支带 output：事件流从此有完整执行结果可回放（快照键新增，旧读取端不受影响）
+        _audit(name, args, True, "ok", ms, source=source, output=data, session_id=session_id)
+        _update_session_state(session_id, args, "completed", error_msg="")  # [Day3] 尾部钩子
         return {"ok": True, "data": data}, 200
     except SafeError as e:
         ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "rejected", ms, str(e)[:200], source=source)
+        _audit(name, args, approved, "rejected", ms, str(e)[:200], source=source, session_id=session_id)
+        _update_session_state(session_id, args, "failed", str(e)[:200])  # [Day3] 尾部钩子
         return {"ok": False, "code": e.code, "message": str(e)}, 200
     except ToolError as e:
         ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "error", ms, str(e)[:200], source=source)
+        _audit(name, args, approved, "error", ms, str(e)[:200], source=source, session_id=session_id)
+        _update_session_state(session_id, args, "failed", str(e)[:200])  # [Day3] 尾部钩子
         return {"ok": False, "code": e.code, "message": str(e)}, 200
     except Exception as e:  # noqa: BLE001 - 兜底：内部错误不泄漏堆栈
         _logger.exception("agent tool %s crashed", name)
         ms = int((time.perf_counter() - t0) * 1000)
-        _audit(name, args, approved, "error", ms, "internal: " + type(e).__name__, source=source)
+        _audit(name, args, approved, "error", ms, "internal: " + type(e).__name__,
+               source=source, session_id=session_id)
+        _update_session_state(session_id, args, "failed", f"internal: {type(e).__name__}")  # [Day3] 尾部钩子
         return {"ok": False, "code": "internal_error",
                 "message": f"工具执行内部错误：{type(e).__name__}"}, 200
 
@@ -1064,7 +1194,8 @@ def _execute_tool_internal(name: str, args: dict, approved: bool = False,
 async def agent_tool_call(request: Request):
     """执行一个本机工具（HTTP 外观层，行为与抽取前完全一致）。
 
-    body: {name, args, approved?, decision?}
+    body: {name, args, approved?, decision?, session_id?}
+    - session_id（或 X-Session-Id 头）仅用于事件流归属，缺失记为 "default"，不参与执行判定；
     - 只读工具（list_directory/read_file）：approved 无关，直接执行；
     - 副作用工具（write_file/run_command）：approved !== true → {needsApproval:true, summary} 绝不执行；
     - decision='denied'：客户端拒绝上报，仅写审计（status=denied），绝不执行。
@@ -1076,12 +1207,15 @@ async def agent_tool_call(request: Request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         return _err(400, "bad_json", "请求体不是合法 JSON")
+    # [Day2] 会话归属：body.session_id > X-Session-Id 头 > None（内部兜底 "default"，与 llm_proxy 同约定）
+    session_id = str(body.get("session_id") or request.headers.get("X-Session-Id") or "").strip() or None
     payload, status = _execute_tool_internal(
         str(body.get("name") or "").strip(),
         body.get("args"),
         approved=body.get("approved") is True,
         decision=str(body.get("decision") or ""),
         source="web",
+        session_id=session_id,
     )
     if status != 200:
         return _err(status, str(payload.get("code") or "error"), str(payload.get("message") or ""))
@@ -1137,6 +1271,29 @@ async def agent_config_set(request: Request):
     return {"ok": True, "data": {"workspace": str(ws), "workspaceExists": True, "writable": True}}
 
 
+@router.get("/api/agent/path_exists")
+def agent_path_exists(path: str = ""):
+    """宿主绝对路径存在性检查（前端 U-7-4 发送前路径闸的对端，2026-10-03 自 agent_runner preflight 迁入）。
+
+    - 不做工作区/沙箱锁定：这是对宿主路径的只读 exists 查询（8005 沙箱的 mapped 根边界与此无关），
+      检查"路径存不存在"，不授予任何读写能力；
+    - 非法 / 超长 / 含非法字符的路径如实记为不存在（False），绝不抛 500 ——
+      前端契约是 fail-open（非 200 或结构不符一律放行），本端点报错等于无声关掉那道闸；
+    - 返回 data.path_exists 为布尔（92_laya_agent 的判定字段），is_dir/resolved 供扩展展示。
+    """
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return {"ok": True, "data": {"path_exists": False, "is_dir": False, "resolved": ""}}
+    try:
+        p = Path(raw).expanduser()
+        resolved = str(p.resolve())
+        exists = p.exists()
+        is_dir = p.is_dir() if exists else False
+    except (OSError, ValueError):
+        return {"ok": True, "data": {"path_exists": False, "is_dir": False, "resolved": ""}}
+    return {"ok": True, "data": {"path_exists": bool(exists), "is_dir": bool(is_dir), "resolved": resolved}}
+
+
 @router.get("/api/agent/log")
 def agent_log(limit: int = 50, offset: int = 0):
     """审计日志分页（新→旧）"""
@@ -1156,6 +1313,22 @@ def agent_log_clear():
         return {"ok": True, "data": {"cleared": n}}
     except Exception as e:  # noqa: BLE001
         return _err(500, "db_error", f"清空失败：{e}")
+
+
+@router.get("/api/agent/session/{session_id}/status")
+def agent_session_status(session_id: str):
+    """[国庆冲刺 Day3] 查询会话状态（断点恢复：只做状态查询，不自动续跑）。
+
+    返回 data = agent_sessions 行：session_id / status（pending·running·completed·failed·interrupted）
+    / created_at / updated_at / last_event_id（指向 Day2 事件流最新一条，可再查 /api/events/snapshots）
+    / error_msg。会话从未有过任何工具调用 → 404 session_not_found。"""
+    try:
+        row = crud.get_agent_session(session_id)
+    except Exception as e:  # noqa: BLE001
+        return _err(500, "db_error", f"读取会话状态失败：{e}")
+    if row is None:
+        return _err(404, "session_not_found", f"会话 {session_id} 尚无状态记录（还没发生过工具调用）")
+    return {"ok": True, "data": row}
 
 
 # ---------------------------------------------------------------- Kernel 第二阶段：事件溯源重放
@@ -1180,6 +1353,9 @@ async def agent_replay(request: Request):
     snapshot_id = body.get("snapshot_id")
     if snapshot_id is None:
         return _err(400, "bad_request", "缺少 snapshot_id 字段（要重放的事件快照 ID）")
+
+    # [Day2] 重放事件同样记录会话归属（body.session_id > X-Session-Id 头 > 兜底 "default"）
+    session_id = str(body.get("session_id") or request.headers.get("X-Session-Id") or "").strip() or None
 
     # 1. 读取原始快照
     try:
@@ -1211,7 +1387,8 @@ async def agent_replay(request: Request):
 
     if is_side_effect and not approved:
         # 副作用工具未审批：不执行，返回 needsApproval（与 /api/agent/tool 行为一致）
-        _audit(tool_name, replay_args, False, "needs_approval", 0, f"重放未获审批（原始快照 {snapshot_id}）")
+        _audit(tool_name, replay_args, False, "needs_approval", 0, f"重放未获审批（原始快照 {snapshot_id}）",
+               session_id=session_id)
         return {
             "ok": True,
             "needsApproval": True,
@@ -1248,11 +1425,12 @@ async def agent_replay(request: Request):
         error_message = f"重放内部错误：{type(e).__name__}"
         data = None
 
-    # 5. 写审计日志（_audit 会自动写事件快照，source_log_id 指向新日志）
+    # 5. 写审计日志 + 事件（_audit 统一落 event_snapshots；成功时 output 带重放结果）
     detail = f"重放自快照 {snapshot_id}"
     if error_message:
         detail += f"：{error_message[:200]}"
-    _audit(tool_name, replay_args, approved, status, ms, detail)
+    _audit(tool_name, replay_args, approved, status, ms, detail,
+           output=data, session_id=session_id)
 
     # 6. 返回结果
     result = {

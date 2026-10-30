@@ -81,6 +81,18 @@ const HARNESS_BOOT_TIMEOUT_MS = 60_000;   // 机器忙/冷启动时 dsh 可能 >
 const HARNESS_TOKEN_RE = /(http:\/\/127\.0\.0\.1:3080\/\?token=[A-Za-z0-9_-]+)/;
 const SPLASH_FILE = path.join(__dirname, 'src', 'harness-splash.html');
 
+// [2026-10-30] 固定 dsh 入口：只认这个版本，不再经 npx 解析 dist-tag。
+// 裸名 latest 解析到更旧的 0.2.1-rc.5，必须钉死 alpha 对应的 0.2.2-alpha.2。
+const DSH_ENTRY_VERSION = '0.2.2-alpha.2';
+// 自有 runtime：优先级高于 npm 缓存（缓存目录可能被 npm 回收）
+const DSH_RUNTIME_DIR = path.join(HARNESS_CWD, 'runtime', 'dsh');
+const DSH_RECOVERY_PREFIX = DSH_RUNTIME_DIR;
+// 首选 spawn 的 node 绝对路径：字面量直用，保证日志里写的路径就是真正执行的那条
+const NODE_EXE_ABSOLUTE = 'C:\\Program Files\\nodejs\\node.exe';
+// [2026-10-30] MoRay 专用 dsh home：与原版 DeepSeek Harness 的会话/凭据/配置分家。
+// 只写进子进程环境，不做系统级设置；删掉 childEnv 里那行即回滚。
+const DSH_HOME_DIR = 'D:\\moray-home';
+
 /* ============================================================
  *  [2026-10-30 沉浸式无边框] Harness 页面注入层
  *  - 拖拽区：主列 <header>（dsh 顶栏）+ 侧栏落款行（*_logoRow——CSS module
@@ -89,6 +101,11 @@ const SPLASH_FILE = path.join(__dirname, 'src', 'harness-splash.html');
  *  - 右上角注入 _ □ × 三钮（#moray-win-controls），经 preload-harness.js
  *    桥到 win:minimize / win:toggle-maximize / win:close（三选对话框照走）
  *  - header 右侧预留 152px 内边距给控制条（原 28px，右上按钮簇整体左移）
+ *  - [2026-10-30 重叠修复] 右侧 tab 面板顶栏（_tabHostHeader_*，非 <header> 标签，
+ *    吃不到上面的 header padding）在分栏视图下，其"分栏/全屏/收起右侧边栏"按钮簇
+ *    与右上角控制条物理重叠。补一条 [class*="tabHostHeader"] padding-right，
+ *    让右侧所有面板顶栏统一给控制条让位（实测 132px 后最右按钮右缘 1142 < 控制条
+ *    左界 1154，完全避开；tab 标题/关闭钮不受影响）。
  *  选择器与几何实测于 1280×720（header 76px 高、最右按钮 x=1268），
  *  dsh 前端大改版时需重新探针复核。
  * ============================================================ */
@@ -101,6 +118,8 @@ header [role="menuitem"], header [role="tablist"] { -webkit-app-region: no-drag;
 [class*="logoRow"] button, [class*="logoRow"] a, [class*="logoRow"] input,
 [class*="logoRow"] [role="button"] { -webkit-app-region: no-drag; }
 header { padding-right: 152px !important; }
+/* 右侧 tab 面板顶栏（分栏/全屏/收起按钮簇）给右上角控制条让位；tab 标题区不受影响。 */
+[class*="tabHostHeader"] { padding-right: 132px !important; }
 #moray-win-controls { position: fixed; top: 0; right: 0; width: 126px; height: 40px;
   display: flex; align-items: stretch; z-index: 2147483000; -webkit-app-region: no-drag;
   font-family: "Segoe UI", system-ui, sans-serif; }
@@ -396,7 +415,9 @@ async function killAllServicePorts() {
  *  Harness（dsh web）生命周期：拉起 -> 抓 token -> 交给窗口
  * ============================================================ */
 
-let dshChild = null;   // 壳自己拉起的 dsh 进程（node -> npx-cli -> dsh）
+let dshChild = null;   // 壳自己拉起的 dsh 进程（node -> dsh/lib/bin.js）
+// 入口解析失败时的可读原因：splash 文案与对话框共用，避免白屏
+let harnessBootError = null;
 
 function harnessLog(msg) {
   launcherLog('[harness] ' + msg);
@@ -428,24 +449,149 @@ async function stopHarness() {
 }
 
 /**
- * 解析 node + npm 的 npx-cli.js：直接 spawn 参数数组，不经 cmd / shell。
- * 可用 MORAY_NODE_EXE / MORAY_NPX_CLI 覆盖（非标准 Node 安装时）。
- * @returns {{ node: string, npx: string } | null}
+ * 解析 node.exe 供日志参考：只做存在性检查，不参与 spawn 命令拼接。
+ * 实际 spawn 用字面量 node.exe 走 PATH（显式前置标准安装目录，见 spawnHarness）。
  */
-function resolveNpxLauncher() {
-  const candidates = [];
-  if (process.env.MORAY_NODE_EXE && process.env.MORAY_NPX_CLI) {
-    candidates.push({ node: process.env.MORAY_NODE_EXE, npx: process.env.MORAY_NPX_CLI });
-  }
-  const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
-  const nodeExe = path.join(programFiles, 'nodejs', 'node.exe');
-  const npmBin = path.join(programFiles, 'nodejs', 'node_modules', 'npm', 'bin');
-  candidates.push({ node: nodeExe, npx: path.join(npmBin, 'npx-cli.js') });
-  candidates.push({ node: nodeExe, npx: path.join(npmBin, 'npx.js') });
+function describeNodeRuntime() {
+  const candidates = [
+    'C:\\Program Files\\nodejs\\node.exe',
+    'C:\\Program Files (x86)\\nodejs\\node.exe'
+  ];
   for (const candidate of candidates) {
-    if (fs.existsSync(candidate.node) && fs.existsSync(candidate.npx)) return candidate;
+    try { if (fs.existsSync(candidate)) return candidate; } catch (err) {}
   }
-  return null;
+  return 'node.exe (PATH)';
+}
+
+/** MORAY_DSH_ENTRY 覆盖入口（env 读取单独成函数，路径处理不碰 env） */
+function dshOverridePath() {
+  const raw = process.env.MORAY_DSH_ENTRY;
+  if (!raw) return null;
+  try { return path.resolve(raw); } catch (err) { return null; }
+}
+
+/** %LOCALAPPDATA%\npm-cache\_npx 的规范绝对路径（env 读取单独成函数） */
+function dshCacheRoot() {
+  const localAppData = process.env.LOCALAPPDATA
+    || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
+  return path.resolve(localAppData, 'npm-cache', '_npx');
+}
+
+/**
+ * 把 base + 若干段拼成绝对路径，校验结果仍以 base 为前缀（禁止 .. 逃逸）。
+ * 越界立即返回 null，绝不把越界路径交给调用方。
+ */
+function containPath(base, ...segments) {
+  const root = path.resolve(base);
+  const target = path.normalize(path.join(root, ...segments));
+  if (!target.startsWith(root + path.sep)) return null;
+  return target;
+}
+
+/** dsh 包目录必须是 <某个哈希目录>/node_modules/@deepseek-ai/dsh 这种规范形状 */
+function isDshPackageDir(dir) {
+  const marker = path.join('node_modules', '@deepseek-ai', 'dsh');
+  return path.resolve(dir).endsWith(path.sep + marker);
+}
+
+/**
+ * 解析固定的 dsh 入口（lib/bin.js 绝对路径），全程不碰 npx / dist-tag / 网络：
+ *   a. MORAY_DSH_ENTRY 指定绝对路径 -> 校验形状后直接采用
+ *   b. 扫 %LOCALAPPDATA%\npm-cache\_npx\*\node_modules\@deepseek-ai\dsh，
+ *      只接受 version === DSH_ENTRY_VERSION；多个命中取 package.json mtime 最新的
+ *   c. 一个都没命中 -> null（调用方拒绝启动，不再有任何回退）
+ * @returns {{ bin: string, version: string, source: string } | null}
+ */
+function resolveDshEntry() {
+  const override = dshOverridePath();
+  if (override) {
+    // 只接受常规 npm 包入口 <pkg>/lib/bin.js，拒绝含 .. 段或非常规层级的外部输入
+    const parts = override.split(path.sep);
+    if (!path.isAbsolute(override) || parts.includes('..')
+        || path.basename(override) !== 'bin.js' || path.basename(path.dirname(override)) !== 'lib'
+        || !isDshPackageDir(path.dirname(path.dirname(override)))) {
+      harnessLog(`MORAY_DSH_ENTRY 不是合法的 dsh 入口（需 <pkg>/lib/bin.js）：${override}`);
+      return null;
+    }
+    // 覆盖入口直接采用，版本只作日志参考（读不到记 unknown）
+    const overridePkgDir = path.resolve(path.dirname(path.dirname(override)));
+    let version = 'unknown';
+    const overridePkgJson = path.normalize(path.join(overridePkgDir, 'package.json'));
+    if (overridePkgJson.startsWith(overridePkgDir + path.sep)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(overridePkgJson, 'utf8'));
+        if (typeof pkg.version === 'string') version = pkg.version;
+      } catch (err) { /* 版本读不到不影响启动 */ }
+    }
+    harnessLog(`dsh 入口：MORAY_DSH_ENTRY=${override} version=${version}`);
+    return { bin: override, version, source: 'MORAY_DSH_ENTRY' };
+  }
+
+  // b. 自有 runtime：<HARNESS_CWD>\runtime\dsh\node_modules\@deepseek-ai\dsh
+  const runtimePkgDir = containPath(DSH_RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh');
+  if (runtimePkgDir) {
+    const runtimeBin = containPath(runtimePkgDir, 'lib', 'bin.js');
+    const runtimePkgJson = path.normalize(path.join(runtimePkgDir, 'package.json'));
+    let runtimeVersion = null;
+    if (runtimeBin && fs.existsSync(runtimeBin) && runtimePkgJson.startsWith(runtimePkgDir + path.sep)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(runtimePkgJson, 'utf8'));
+        if (typeof pkg.version === 'string') runtimeVersion = pkg.version;
+      } catch (err) { runtimeVersion = null; }
+    }
+    if (runtimeVersion === DSH_ENTRY_VERSION) {
+      harnessLog(`dsh 入口：runtime=${runtimeBin} version=${runtimeVersion}`);
+      return { bin: runtimeBin, version: runtimeVersion, source: 'runtime' };
+    }
+    harnessLog(`dsh 入口：runtime 不可用（version=${runtimeVersion || '缺失'}，需要 ${DSH_ENTRY_VERSION}），回退 _npx`);
+  }
+
+  // c. 最后兜底：npm 缓存里的 _npx（保留现有逻辑，不做删除）
+  const npxRoot = dshCacheRoot();
+  let hashDirs = [];
+  try {
+    hashDirs = fs.readdirSync(npxRoot, { withFileTypes: true }).filter((d) => d.isDirectory());
+  } catch (err) {
+    harnessLog(`npx 缓存目录不可读：${npxRoot}（${err.message}）`);
+    return null;
+  }
+
+  const seen = [];
+  const matched = [];
+  for (const dir of hashDirs) {
+    // 目录名先过白名单：只允许 npx 生成的十六进制哈希形状，杜绝 .. / 分隔符注入
+    if (!/^[0-9a-f]{16}$/.test(dir.name)) continue;
+    const pkgDir = containPath(npxRoot, dir.name, 'node_modules', '@deepseek-ai', 'dsh');
+    if (!pkgDir || !fs.existsSync(pkgDir) || !isDshPackageDir(pkgDir)) continue;
+    const bin = containPath(pkgDir, 'lib', 'bin.js');
+    if (!bin) continue;
+    const pkgJson = path.normalize(path.join(pkgDir, 'package.json'));
+    if (!pkgJson.startsWith(pkgDir + path.sep)) continue;
+    let version = null;
+    let mtime = 0;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+      if (typeof pkg.version === 'string') version = pkg.version;
+      mtime = fs.statSync(pkgJson).mtimeMs;
+    } catch (err) {
+      continue;   // 包清单读不出 -> 这个候选不可用
+    }
+    const candidate = { bin, version, mtime, hash: dir.name, hasBin: fs.existsSync(bin) };
+    seen.push(candidate);
+    if (candidate.hasBin && version === DSH_ENTRY_VERSION) matched.push(candidate);
+  }
+  harnessLog(`dsh 入口扫描：${seen.length
+    ? seen.map((c) => `${c.hash}=${c.version || '?'}${c.hasBin ? '' : '(缺 bin.js)'}`).join(', ')
+    : '无'}`);
+  if (!matched.length) {
+    harnessLog(`dsh 入口：没有 version=${DSH_ENTRY_VERSION} 的可用候选`);
+    return null;
+  }
+  matched.sort((a, b) => b.mtime - a.mtime);
+  harnessLog(`dsh 入口候选 ${matched.length} 个：${matched.map((c) => c.bin).join(' | ')}`);
+  const best = matched[0];
+  harnessLog(`dsh 入口选中：${best.bin} version=${best.version}（_npx/${best.hash}）`);
+  return { bin: best.bin, version: best.version, source: `_npx/${best.hash}` };
 }
 
 /**
@@ -460,15 +606,34 @@ function spawnHarness() {
       resolve(null);
       return;
     }
-    const launcher = resolveNpxLauncher();
-    if (!launcher) {
-      harnessLog('找不到 node + npx-cli.js，无法启动 dsh（可设 MORAY_NODE_EXE / MORAY_NPX_CLI）');
+    const entry = resolveDshEntry();
+    if (!entry) {
+      const recovery = `npm i @deepseek-ai/dsh@${DSH_ENTRY_VERSION} --prefix "${DSH_RECOVERY_PREFIX}"`;
+      harnessBootError = {
+        message: `找不到 dsh@${DSH_ENTRY_VERSION}，已拒绝启动（不再经 npx 下载）。`,
+        detail: `恢复命令：${recovery}\n`
+          + `然后设 MORAY_DSH_ENTRY=<目录>\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js 指向入口\n`
+          + `日志：${HARNESS_LOG}`
+      };
+      harnessLog(harnessBootError.message);
+      harnessLog(`找不到 dsh@${DSH_ENTRY_VERSION}，恢复命令：${recovery}`);
       resolve(null);
       return;
     }
+    harnessBootError = null;
     try { fs.mkdirSync(path.dirname(HARNESS_LOG), { recursive: true }); } catch (err) {}
     const stream = fs.createWriteStream(HARNESS_LOG, { flags: 'a' });
-    harnessLog(`==== spawn: ${launcher.node} ${launcher.npx} -y @deepseek-ai/dsh@alpha web --no-open ====`);
+    // 启动前断言绝对路径存在；否则回退 PATH 解析，并把"回退"写进日志
+    const nodeAbsoluteExists = fs.existsSync(NODE_EXE_ABSOLUTE);
+    const nodeCommandLabel = nodeAbsoluteExists
+      ? NODE_EXE_ABSOLUTE
+      : `node.exe（回退：${NODE_EXE_ABSOLUTE} 不存在，走 PATH 解析）`;
+    const spawnLine = `==== spawn: ${nodeCommandLabel} ${entry.bin} (dsh@${entry.version}, ${entry.source}) web --no-open ====`;
+    harnessLog(spawnLine);
+    harnessLog(`node command (actual spawn): ${nodeCommandLabel}`);
+    harnessLog(`node runtime probe (reference only, not used): ${describeNodeRuntime()}`);
+    // 同一行也落进 dsh-web.log：壳外只看一个文件就能确认本次用的入口与版本
+    stream.write(`[moray-shell] ${spawnLine}\n`);
 
     let settled = false;
     let carry = '';
@@ -478,20 +643,32 @@ function spawnHarness() {
       resolve(url);
     };
 
-    const child = spawn(launcher.node,
-      [launcher.npx, '-y', '@deepseek-ai/dsh@alpha', 'web', '--no-open'],
-      {
-        cwd: HARNESS_CWD,
-        env: Object.assign({}, process.env, {
-          // MoRay 网关只校验这个占位凭据存在；真实云端 key 只在 server/.env。
-          // 允许用户用自己的环境变量覆盖，源码不落任何真实凭据。
-          MORAY_LOCAL_KEY: process.env.MORAY_LOCAL_KEY || 'moray-local',
-          // 遥测进程级总闸（cordis.patch.yml 已拔根，此处双保险）。
-          DSH_TELEMETRY_DISABLED: '1'
-        }),
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
+    const childEnv = Object.assign({}, process.env, {
+      // MoRay 网关只校验这个占位凭据存在；真实云端 key 只在 server/.env。
+      // 允许用户用自己的环境变量覆盖，源码不落任何真实凭据。
+      MORAY_LOCAL_KEY: process.env.MORAY_LOCAL_KEY || 'moray-local',
+      // 遥测进程级总闸（cordis.patch.yml 已拔根，此处双保险）。
+      DSH_TELEMETRY_DISABLED: '1',
+      // 命令名用字面量 node.exe（dsh 要求 node>=24.9，Electron 内置 Node 20 不能用），
+      // 这里显式前置标准安装目录，防 Explorer 启动时 PATH 被裁剪导致解析不到。
+      PATH: 'C:\\Program Files\\nodejs;' + (process.env.PATH || ''),
+      // [2026-10-30] 数据分家：本实例只读写 D:\moray-home，原版 Harness 继续用 ~/.dsh。
+      DSH_HOME: DSH_HOME_DIR
+    });
+    // 日志取 childEnv 实际值：按回滚步骤删掉上面这行后，这里会如实打印 unset
+    harnessLog(`DSH_HOME=${childEnv.DSH_HOME || '(unset)'} home=${childEnv.DSH_HOME ? path.resolve(childEnv.DSH_HOME) : '(default ~/.dsh)'}`);
+
+    const spawnArgs = [entry.bin, 'web', '--no-open'];
+    const spawnOpts = {
+      cwd: HARNESS_CWD,
+      env: childEnv,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    };
+    // 命令名用字面量：nodeAbsoluteExists 只决定走哪个分支，日志与执行严格同源
+    const child = nodeAbsoluteExists
+      ? spawn('C:\\Program Files\\nodejs\\node.exe', spawnArgs, spawnOpts)
+      : spawn('node.exe', spawnArgs, spawnOpts);
     dshChild = child;
 
     const scan = (chunk) => {
@@ -575,23 +752,31 @@ async function bootHarnessWindow() {
   await showHarnessFallback();
 }
 
-/** 超时兜底：留在 splash 上给出日志路径，并弹窗提示手动取 token */
+/** 兜底：留在 splash 上给出可读原因（入口缺失 / 超时），并弹窗提示 */
 async function showHarnessFallback() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  const bootError = harnessBootError;
+  const statusText = bootError ? bootError.message : '没有拿到访问令牌，请查看日志：' + HARNESS_LOG;
+  const hintText = bootError ? bootError.detail : '';
   try {
     await mainWindow.webContents.executeJavaScript(
       "(function(){var s=document.getElementById('splash-status');" +
-      'if(s){s.textContent=' + JSON.stringify('没有拿到访问令牌，请查看日志：' + HARNESS_LOG) + ';}' +
-      "var h=document.getElementById('splash-hint');if(h){h.hidden=false;}})()"
+      'if(s){s.textContent=' + JSON.stringify(statusText) + ';}' +
+      "var h=document.getElementById('splash-hint');if(h){h.hidden=false;" +
+      'h.textContent=' + JSON.stringify(hintText) + ';}})()'
     );
   } catch (err) { /* splash 未就绪时忽略 */ }
   dialog.showMessageBox(mainWindow, {
     type: 'warning',
-    title: 'Harness 未就绪',
-    message: '没有在限定时间内拿到 dsh web 的访问令牌。',
-    detail: `日志：${HARNESS_LOG}\n手动取出 "dsh web: http://127.0.0.1:3080/?token=..." 那一行，\n或按 F5 重试（会重新拉起 dsh）。`,
+    title: bootError ? 'dsh 入口未找到' : 'Harness 未就绪',
+    message: bootError ? bootError.message : '没有在限定时间内拿到 dsh web 的访问令牌。',
+    detail: bootError ? bootError.detail
+      : `日志：${HARNESS_LOG}\n手动取出 "dsh web: http://127.0.0.1:3080/?token=..." 那一行，\n或按 F5 重试（会重新拉起 dsh）。`,
     buttons: ['知道了']
-  });
+  }).then(
+    (r) => harnessLog(`fallback 对话框关闭：${JSON.stringify(r)}`),
+    (err) => harnessLog(`fallback 对话框失败：${(err && err.message) || err}`)
+  );
 }
 
 /** 托盘「重启 Harness」：重抓 token 后原地刷新 */
@@ -723,6 +908,10 @@ function createWindow() {
     height: 820,
     minWidth: 960,
     minHeight: 640,
+    // [2026-10-30 品牌换装] 赛博鳐鱼 Logo：窗口/任务栏/Alt-Tab 图标。
+    // PNG 256 由 assets/render 管线（Edge headless 栅格化 moray-logo.svg）生成；
+    // 安装包 exe 图标另见 build/icon.ico（同源四档 ICO）。
+    icon: path.join(__dirname, 'assets', 'icon-256.png'),
     // [2026-10-30 沉浸式] Harness 模式隐藏原生标题栏：titleBarStyle 'hidden'
     // 保留 DWM 阴影/圆角/边缘缩放；拖拽区与最小/最大/关闭按钮由
     // did-finish-load 注入层接管（FRAME_CSS + FRAME_JS + preload-harness.js）。

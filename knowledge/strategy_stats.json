@@ -1,0 +1,48 @@
+{
+ "version": "l60-1",
+ "updated_at": "2026-10-08T12:59:40+08:00",
+ "projects": {
+  "iris_fixture": {
+   "causes": {
+    "断言失败": {
+     "tries": 2,
+     "wins": 1,
+     "consec_fail": 0,
+     "consec_ok": 1,
+     "last_ts": "2026-10-05T23:33:44+08:00"
+    }
+   }
+  },
+  "v4accept_fixture": {
+   "causes": {
+    "断言失败": {
+     "tries": 1,
+     "wins": 1,
+     "consec_fail": 0,
+     "consec_ok": 1,
+     "last_ts": "2026-10-08T12:59:40+08:00"
+    }
+   }
+  }
+ },
+ "fix_tiers": {
+  "iris_fixture": {
+   "real:zcode": {
+    "tries": 2,
+    "wins": 1,
+    "consec_fail": 0,
+    "consec_ok": 1,
+    "last_ts": "2026-10-05T23:33:44+08:00"
+   }
+  },
+  "v4accept_fixture": {
+   "real:zcode": {
+    "tries": 1,
+    "wins": 1,
+    "consec_fail": 0,
+    "consec_ok": 1,
+    "last_ts": "2026-10-08T12:59:40+08:00"
+   }
+  }
+ }
+}

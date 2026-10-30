@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数字时钟</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --glow: #5eead4;
+    --text: #e6edf3;
+    --muted: #7d8da5;
+    --dim: rgba(94, 234, 212, 0.25);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(circle at 50% 40%, #12203a 0%, var(--bg) 65%);
+    font-family: "SF Mono", "Cascadia Mono", "Consolas", "Menlo", monospace;
+    color: var(--text);
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* 细网格背景，增加数字感 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--dim) 1px, transparent 1px),
+      linear-gradient(90deg, var(--dim) 1px, transparent 1px);
+    background-size: 64px 64px;
+    opacity: 0.12;
+    pointer-events: none;
+  }
+
+  .clock {
+    position: relative;
+    text-align: center;
+    padding: 2rem;
+  }
+
+  .time {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 0.06em;
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(3.2rem, 16vw, 11rem);
+    font-weight: 300;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    color: var(--text);
+    text-shadow:
+      0 0 8px rgba(94, 234, 212, 0.55),
+      0 0 32px rgba(94, 234, 212, 0.22);
+  }
+
+  .time .unit { display: inline-block; }
+
+  .colon {
+    display: inline-block;
+    width: 0.48em;
+    text-align: center;
+    color: var(--glow);
+    animation: blink 1s steps(1, end) infinite;
+  }
+
+  @keyframes blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0.18; }
+  }
+
+  .seconds {
+    font-size: 0.42em;
+    color: var(--glow);
+    margin-left: 0.12em;
+    opacity: 0.9;
+  }
+
+  .period {
+    font-size: 0.22em;
+    letter-spacing: 0.35em;
+    color: var(--muted);
+    margin-left: 0.5em;
+    text-transform: uppercase;
+  }
+
+  .date {
+    margin-top: 1.4rem;
+    font-size: clamp(0.85rem, 2.2vw, 1.15rem);
+    letter-spacing: 0.42em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding-left: 0.42em; /* 抵消字间距造成的视觉偏移 */
+  }
+
+  .date .highlight { color: var(--glow); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .colon { animation: none; opacity: 1; }
+  }
+</style>
+</head>
+<body>
+  <main class="clock" role="timer" aria-live="off">
+    <div class="time">
+      <span class="unit" id="hours">00</span>
+      <span class="colon">:</span>
+      <span class="unit" id="minutes">00</span>
+      <span class="colon">:</span>
+      <span class="unit seconds" id="seconds">00</span>
+      <span class="period" id="period">AM</span>
+    </div>
+    <div class="date" id="date"></div>
+  </main>
+
+<script>
+(function () {
+  'use strict';
+
+  var $hours   = document.getElementById('hours');
+  var $minutes = document.getElementById('minutes');
+  var $seconds = document.getElementById('seconds');
+  var $period  = document.getElementById('period');
+  var $date    = document.getElementById('date');
+
+  var WEEKDAYS = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+
+  function pad(n) {
+    return n < 10 ? '0' + n : String(n);
+  }
+
+  function render() {
+    var now = new Date();
+
+    var h24 = now.getHours();
+    var isPM = h24 >= 12;
+    var h12 = h24 % 12 || 12;
+
+    $hours.textContent   = pad(h12);
+    $minutes.textContent = pad(now.getMinutes());
+    $seconds.textContent = pad(now.getSeconds());
+    $period.textContent  = isPM ? 'PM' : 'AM';
+
+    $date.textContent = '';
+    var y = now.getFullYear();
+    var m = pad(now.getMonth() + 1);
+    var d = pad(now.getDate());
+    var weekday = WEEKDAYS[now.getDay()];
+
+    var strong = document.createElement('span');
+    strong.className = 'highlight';
+    strong.textContent = y + '.' + m + '.' + d;
+
+    $date.appendChild(strong);
+    $date.appendChild(document.createTextNode('  ' + weekday));
+  }
+
+  render();
+
+  // 对齐到整秒，避免 setTimeout 累积漂移
+  (function tick() {
+    render();
+    setTimeout(tick, 1000 - (Date.now() % 1000));
+  })();
+
+  // 从后台标签页恢复时立即刷新，避免显示旧时间
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) render();
+  });
+})();
+</script>
+</body>
+</html>
