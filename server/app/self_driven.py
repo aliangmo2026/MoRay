@@ -18,18 +18,26 @@ json_repair 容错解析（self_narrative._parse_narrative_json 同款），targ
   memory.sqlite3/synapse.sqlite3 同目录惯例），每日配额与目标队列同文件；
 - fail-open：读不到心智状态 / LLM 失败 / 产出为空一律返回 None（"没生成"），
   事实原因只进日志，绝不把异常抛给调用方；唯熔断落盘失败 fail-close（见下）；
-- 零自动**执行**（硬约束不变）：目标只生成到 pending_approval，绝不自动派发
-  到执行引擎；派发仍要人点 approve；生成入口两条：
+- 自动**执行**面（[v5.3 2026-10-31] 由用户授权，只放开"只读类"一格）：
+  默认仍是"生成到 pending_approval 等人批"，唯一例外是**只读核对卡**
+  （classify_card_action 判 readonly_class=True：判据是只读命令 + 目标/断言无
+  写意图）会被 _maybe_auto_dispatch 直接派发并自动验证，卡上打 auto_approved
+  标、台账 auto 标单列，日上限 _AUTO_APPROVE_DAILY_CAP=3。
+  授权原话（2026-10-31 22:25）：「只做只读核对、代码扫描、测试运行的卡，可以
+  预授权批量自己跑；写盘、改代码、碰配置的核心动作必须一卡一批，不准越权」。
+  **写盘类卡依旧零自动执行**（_dispatch_card_impl(auto=True) 对非只读卡直接拒）。
+  生成入口两条：
   ① [v1] POST /api/self_driven/generate 手动触发；
   ② [v3 2026-10-31] self_check_loop 每轮尾调 maybe_generate_goal()（3h 冷却 +
-     日配额双闸）——本条是 v3 唯一放开的自动面：**自动生目标，不自动执行**。
+     日配额双闸）——v3 放开了"自动生目标"；v5.3 在此基础上放开"只读卡自动跑"。
   v3 之前的 docstring 写的是"绝不接入自省循环"，那导致目标队列 8 天零新增
   （最后一条生成日 2026-10-23，状态文件 daily.date 即证据）；放开生成面、
   守住执行面，是本轮修的根因。
-  [v2] 派发仍由前端手动发起：POST /api/self_driven/approve 只做状态流转
-  （pending_approval→dispatched 并登记引擎 task_id），绝不触发执行；执行结果
-  由引擎收尾事件经 synapse handler 回写（close_dispatched_goal 置 done/failed）；
-  POST /api/self_driven/reject = 删卡出队（忽略）；
+  [v2] 人批派发：POST /api/self_driven/dispatch（后端权威一跳）把
+  「校验 → 引擎 start_stream → 登记」收进一个函数；POST /api/self_driven/approve
+  只做状态流转（前端两跳遗留）；执行结果由引擎收尾事件经 synapse handler
+  回写（close_dispatched_goal 置 done/failed）；POST /api/self_driven/reject =
+  删卡出队（忽略）；
 - LLM 调用零新增配置面：复用 reflection 同组 config（REFLECTION_API/BASE_URL/
   MODEL/TIMEOUT/NUM_CTX），与 self_narrative._llm_narrate 完全同款 httpx 双协议。
 
@@ -105,7 +113,8 @@ _SYSTEM_PROMPT = (
     "prediction 必须写清“目标达成时会观测到什么具体数值或文件变化”；"
     "verify_cmd 必须是一行**在本机（Windows）现在就能直接执行**的验证命令，硬约束："
     "① 所有文件读写操作（type / dir / findstr / open() / Path() 等）一律使用 Windows"
-    " 盘符绝对路径（如 D:\\MoRay\\...），**禁止相对路径**——验证进程的工作目录不由你"
+    " 盘符绝对路径（如 D:\\MoRay\\...），**禁止相对路径**——连 data.txt、"
+    "scripts\\run.py 这类裸文件名/相对子路径也不行；验证进程的工作目录不由你"
     "控制，相对路径会指向另一个目录（历史真实失败：文件明明存在却报 not found）；"
     "禁止 /tmp、/var、/home 这类 Linux 路径——本机没有这些目录，写了必定失败；"
     "② 不许用 example.com、your_file、path/to、xxx 这类占位符；"
@@ -116,6 +125,13 @@ _SYSTEM_PROMPT = (
     "禁止 2>/dev/null、| grep、`$(...)` 这类 sh 语法——本机是 cmd，写了必定跑不通；"
     "⑥ 命令里出现 Windows 路径时，一律写成 raw 字符串（r'D:\\...'）或正斜杠"
     "（D:/MoRay/...），绝不能在普通字符串里写单反斜杠，否则 \\u 会被当转义而语法错。"
+    "[v5.3 值得自跑的卡] 判据是**只读命令**（纯读取/扫描/统计/跑测试，不写任何文件）"
+    "且目标本身不含写盘意图时，这张卡会被**自动执行并判定**，不需要等人批准；"
+    "而写盘、改代码、改配置的卡必须等人批准。所以：如果你这一轮要核实的是"
+    "“某个事实/数字/文件内容/测试是否通过”，请把 verify_cmd 写成只读命令，"
+    "这样你今天就能拿到一次真实判决。**但不许为了能自跑而降级目标**——"
+    "把“修好 X”改成“看 X 是否存在”这种自我阉割，产出的卡等于零信息，"
+    "比不可判更糟；宁可选写盘目标等人批。"
     "只输出一个 JSON 对象，不要任何解释文字、不要代码块标记，严格符合这个形状："
     '{"goal": "一句话目标（不超过50字）", '
     '"claim": "可证伪断言", '
@@ -150,7 +166,16 @@ _VERIFY_ROOTS = ("D:\\MoRay", "E:\\MoRay OS", "C:\\Users\\")
 #: verify_cmd 里抽路径的形状：盘符绝对路径 或 POSIX 绝对路径（后者不是放行，
 #: 是抓出来判死——为的是日志能说清"你引用的是哪个 Linux 路径"）。POSIX 分支
 #: 强制 ≥2 段（`/a/b`），否则 findstr /C:def 这类命令行斜杠参数会被误判成路径。
-_VERIFY_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"']+|/(?:[^/\s\"']+/)+[^/\s\"']*")
+#: [v6.1] 盘符分支必须同时认反斜杠和正斜杠：_SYSTEM_PROMPT 明确允许模型写
+#: `D:/MoRay/...`，旧分支只认 `D:\`，于是正斜杠路径落进 POSIX 分支被误判
+#: `posix_path`（硬缺陷 → 好卡被判死）。前导 `(?<![\w])` 防 `http://` 的 `p:/`。
+_VERIFY_PATH_RE = re.compile(
+    r"(?<![\w])[A-Za-z]:[\\/][^\s\"']+"
+    r"|/(?:[^/\s\"']+/)+[^/\s\"']*")
+#: 引号包裹的盘符绝对路径：`"D:\Program Files\Python\python.exe"` 含空格，交给
+#: `_VERIFY_PATH_RE` 会在空格处截断成 `D:\Program`（冤判 ghost_path）。先整段
+#: 摘出来，再把原文里的引号段挖空，避免同一路径被重复抽取。
+_QUOTED_ABS_PATH_RE = re.compile(r"""["']([A-Za-z]:[\\/][^"']*)["']""")
 #: [v6 2026-10-31] 相对文件引用：命令里出现**不带盘符/根**的文件 token
 #: （`type reports\\daily.txt`、`python scripts\\check.py`、`open('data.txt')`……）。
 #: 生成的脚本必须用绝对路径：验证子进程的 cwd 由服务端钉在工程根，模型却以为
@@ -162,6 +187,54 @@ _REL_FILE_REF_RE = re.compile(
     r"(?<![\w:.\\/-])"
     r"(?:\.{1,2}[\\/])?(?:[\w.-]+[\\/])*[\w-]+"
     r"\.(?:py|pyw|txt|json|jsonl|md|log|csv|tsv|js|mjs|cjs|ts|tsx|jsx|html|css|"
+    r"yml|yaml|ini|cfg|conf|toml|xml|sql|db|sqlite3?|bat|cmd|ps1|sh|png|jpg|jpeg|"
+    r"gif|bmp|webp|svg|pdf|xlsx?|docx?)\b",
+    re.IGNORECASE)
+#: [v6.1] 盘符相对引用：`C:file.txt` / `open('D:data.json')`——冒号后没有分隔符，
+#: 路径是"该盘当前目录下"，比纯相对路径更隐蔽（换一台机器/换一次 cwd 就指向别处）。
+#: 只挑带已知扩展名的 token，避免把 `12:30`、类型注解 `x: int` 误判成路径。
+_DRIVE_REL_REF_RE = re.compile(
+    r"(?<![\w])[A-Za-z]:(?![\\/\s])[^\s\"']*?\."
+    r"(?:py|pyw|txt|json|jsonl|md|log|csv|tsv|js|mjs|cjs|ts|tsx|jsx|html|css|"
+    r"yml|yaml|ini|cfg|conf|toml|xml|sql|db|sqlite3?|bat|cmd|ps1|sh|png|jpg|jpeg|"
+    r"gif|bmp|webp|svg|pdf|xlsx?|docx?)\b",
+    re.IGNORECASE)
+#: [v6.1] 根相对引用：`\file.txt`（当前盘的根）——前导单个反斜杠，不是 UNC。
+#: 同样只认带扩展名的文件 token，`\n`、`\t` 这类转义不会被当成路径。
+_ROOT_REL_REF_RE = re.compile(
+    r"(?<![\w\\/])\\(?![\\/])[^\s\"']*?\."
+    r"(?:py|pyw|txt|json|jsonl|md|log|csv|tsv|js|mjs|cjs|ts|tsx|jsx|html|css|"
+    r"yml|yaml|ini|cfg|conf|toml|xml|sql|db|sqlite3?|bat|cmd|ps1|sh|png|jpg|jpeg|"
+    r"gif|bmp|webp|svg|pdf|xlsx?|docx?)\b",
+    re.IGNORECASE)
+#: [v6.1] 父目录/当前目录相对引用：`..\README`、`.\scripts\run`（可无扩展名）。
+#: `..\` / `.\` 本身已是明确的相对语义，不必等到有扩展名才判。
+_PARENT_REF_RE = re.compile(r"(?<![\w\\/])\.{1,2}[\\/][^\s\"']+")
+#: [v6.2] python/py 直接跟无扩展名的相对脚本路径（`python scripts\run`）：
+#: 执行脚本本身是一次文件读取，扩展名规则认不出，但相对路径同样随 cwd 漂移。
+#: 只认 `python/py` 后紧跟的第一个 token，因此 `python -c "print(1/2)"` 的代码体、
+#: `python -m pytest ...` 的模块参数都不会被误判；盘符绝对/UNC/环境变量前缀放行。
+_REL_PY_ARG_RE = re.compile(
+    r"(?:^|[\s&|(])(?:python|py)(?:\.exe)?\s+"
+    r"(?P<path>(?![A-Za-z]:[\\/]|\\\\|%)"
+    r"(?:\.{1,2}[\\/])?[^\s\"'|&<>]*[\\/][^\s\"'|&<>]+)",
+    re.IGNORECASE)
+#: [v6.1] URL：`http://127.0.0.1:8000/api/health` 里的 `/api/health` 会被 POSIX
+#: 分支抓成路径 → 冤判 posix_path（硬缺陷）。做路径体检前先把整个 URL 挖空。
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"']+", re.IGNORECASE)
+#: [v6.1] 环境变量前缀的绝对路径：`%USERPROFILE%\x.txt`。cmd 会先把变量展开成
+#: 盘符绝对路径，它不是相对引用；不先挖掉的话，尾部 `\x.txt` 会被根相对规则
+#: 误判成 relative_path（硬缺陷，冤杀合法卡）。
+_ENV_ABS_REF_RE = re.compile(r"%[A-Za-z_][\w]*%[\\/][^\s\"']*")
+#: [v6] 相对体检前先挖掉的**盘符绝对文件路径**。允许路径内部含空格，因为
+#: `E:\MoRay OS\out\future_report.md` 这种真实路径被空格切断后，后半段
+#: `OS\out\future_report.md` 会被 _REL_FILE_REF_RE 误判成相对引用。
+#: 非贪婪到第一个已知扩展名就停：`D:\x.py --config cfg.json` 只吃掉 `D:\x.py`，
+#: 后面的 cfg.json 仍会被判相对（不能把参数里的相对路径一起遮掉）。
+#: 前导 `(?<![\w])` 避免把 `http://` 里的 `p://...` 当成盘符。
+_ABS_FILE_REF_RE = re.compile(
+    r"(?<![\w])[A-Za-z]:[\\/].*?\."
+    r"(?:py|pyw|txt|json|jsonl|md|log|csv|tsv|js|mjs|cjs|ts|tsx|jsx|html|css|"
     r"yml|yaml|ini|cfg|conf|toml|xml|sql|db|sqlite3?|bat|cmd|ps1|sh|png|jpg|jpeg|"
     r"gif|bmp|webp|svg|pdf|xlsx?|docx?)\b",
     re.IGNORECASE)
@@ -192,8 +265,8 @@ def _load_state() -> dict:
     缺失/损坏/形状不对一律回默认空状态（fail-open，不抛）。
 
     [v5] verdict_log 也在这里归一化：只留 dict 行、只留最后 _VERDICT_LOG_MAX 条。
-    键名白名单是刻意的——但这意味着**新增状态键必须同时改这里**，否则
-    _load_state → _save_state 的回写会把新键静默抹掉（v5 台账第一版就踩了：
+    [v5.3] auto_approve_readonly 键必须在这里显式保留——键名白名单是刻意的，
+    新增状态键不同步改这里，回写会把它静默抹掉（v5 台账第一版就踩了这个坑：
     写进去的 250 条读完只剩 1 条）。"""
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8", errors="replace"))
@@ -205,10 +278,13 @@ def _load_state() -> dict:
                     if isinstance(vlog, list) else [])
             return {"queue": queue if isinstance(queue, list) else [],
                     "daily": daily if isinstance(daily, dict) else {},
-                    "verdict_log": vlog}
+                    "verdict_log": vlog,
+                    "auto_approve_readonly":
+                        data.get("auto_approve_readonly", True)}
     except (OSError, ValueError):
         pass  # 从未写过（FileNotFoundError）/坏 JSON（JSONDecodeError）= 空状态
-    return {"queue": [], "daily": {}, "verdict_log": []}
+    return {"queue": [], "daily": {}, "verdict_log": [],
+            "auto_approve_readonly": True}
 
 
 def _save_state(state: dict) -> bool:
@@ -292,12 +368,15 @@ def _remove_goal(task_id: str) -> int:
         return removed
 
 
-def mark_dispatched(task_id: str, engine_task_id: str) -> dict | None:
+def mark_dispatched(task_id: str, engine_task_id: str,
+                    auto: bool = False) -> dict | None:
     """[v2] approve 状态流转：pending_approval → dispatched，登记引擎 task_id
     （闭环匹配键）。不删卡——执行结果要靠 engine_task_id 回写（close_dispatched_goal）。
 
     终态只进不出：已 done/failed 的卡不回退（事件先到的竞态下终态事实优先），
     原样返回让调用方按成功计；重复 approve 幂等刷新 engine_task_id（后写胜）。
+    [v5.3] auto=True 时同一次落盘里打上 auto_approved/auto_reason 标：
+    台账必须能分开"人批的"和"预授权自跑的"，否则 7/7 指标自己就能糊自己。
     返回更新后的卡片 dict；task_id 未命中/落盘失败返回 None（fail-open 不抛）。"""
     tid = str(task_id or "").strip()
     etid = str(engine_task_id or "").strip()[:64]
@@ -312,6 +391,9 @@ def mark_dispatched(task_id: str, engine_task_id: str) -> dict | None:
                 break
         if card is None:
             return None
+        if auto:
+            card["auto_approved"] = True
+            card["auto_reason"] = "readonly_whitelist"
         if str(card.get("status") or "") not in ("done", "failed"):
             card["status"] = "dispatched"
             card["engine_task_id"] = etid
@@ -372,11 +454,14 @@ _RETRY_SYSTEM_PROMPT = (
     '"claim": "一句话断言，必须能被现实判真假（不要口号）", '
     '"prediction": "执行后应该观测到什么（具体、可核对）", '
     '"verify_cmd": "在 Windows cmd 里能直接跑的**单行**命令，退出码 0=断言成立、'
-    '非 0=断言不成立；用绝对路径或 D:\\\\MoRay 下的相对路径；禁止 /tmp 这类 '
-    'Linux 路径、禁止 example.com / path/to 占位符", '
+    '非 0=断言不成立；所有文件读写一律用 Windows 盘符绝对路径（如 D:\\\\MoRay\\\\...），'
+    '禁止相对路径和裸文件名；禁止 /tmp 这类 Linux 路径、禁止 example.com / path/to 占位符", '
     '"target_engine": "zcode 或 laya"}'
     "。target_engine 只允许取值 zcode 或 laya。"
-    "【硬约束】claim 里出现的每一个可判数字（如 10 bytes / 200 行 / 3 个文件）"
+    "【硬约束】verify_cmd 里所有文件读写必须用完整的 Windows 绝对路径；"
+    "相对路径（含 data.txt 这类裸文件名、scripts\\\\run.py 这类相对子路径）"
+    "会被服务端判为硬缺陷并直接拒发卡。"
+    "claim 里出现的每一个可判数字（如 10 bytes / 200 行 / 3 个文件）"
     "都必须在 verify_cmd 里真的被校验，否则这条断言就有一部分没人验。"
 )
 
@@ -477,6 +562,10 @@ async def retry_handler(engine_task_id: str, failure_reason: str) -> dict | None
         "retry_count": retry_count + 1,
         "retry_reason": reason[:200],
     }
+    # [v5.3] 重试链路同样过只读白名单分类：否则失败重试会变成绕过白名单的后门
+    cls = classify_card_action(goal, parsed["claim"], parsed["verify_cmd"])
+    new_card["readonly_class"] = bool(cls["readonly"])
+    new_card["readonly_reason"] = cls["reason"]
     with _STATE_LOCK:
         state = _load_state()
         state["queue"] = list(state.get("queue") or []) + [new_card]
@@ -485,9 +574,16 @@ async def retry_handler(engine_task_id: str, failure_reason: str) -> dict | None
                            new_card["retry_of"])
             return None
     logger.warning("[self_driven] 失败重试卡已生成 task_id=%s retry_of=%s "
-                   "retry_count=%d goal=%s",
+                   "retry_count=%d readonly=%s goal=%s",
                    new_card["task_id"], new_card["retry_of"],
-                   new_card["retry_count"], goal[:40])
+                   new_card["retry_count"], new_card["readonly_class"], goal[:40])
+    if new_card["readonly_class"]:
+        res = _maybe_auto_dispatch(new_card)
+        if res.get("ok"):
+            new_card["status"] = res.get("status") or "dispatched"
+            new_card["auto_approved"] = True
+            new_card["auto_reason"] = "readonly_whitelist"
+            new_card["engine_task_id"] = res.get("engine_task_id") or ""
     return new_card
 
 
@@ -631,8 +727,59 @@ def _clean_field(raw, limit: int) -> str:
 
 
 def _extract_verify_paths(cmd: str) -> list:
-    """从 verify_cmd 抽出候选路径 token（纯函数零 IO，绝不抛）。"""
-    return _VERIFY_PATH_RE.findall(str(cmd or ""))
+    """从 verify_cmd 抽出候选路径 token（纯函数零 IO，绝不抛）。
+
+    [v6.1] 先整段摘引号内的盘符路径（可含空格），再把引号段从待扫描文本里挖空：
+    否则 `"D:\\Program Files\\..."` 会被空格截断成 `D:\\Program`，冤判 ghost_path。
+    """
+    text = str(cmd or "")
+    out = [m.group(1) for m in _QUOTED_ABS_PATH_RE.finditer(text)]
+    out.extend(_VERIFY_PATH_RE.findall(_QUOTED_ABS_PATH_RE.sub(" ", text)))
+    return out
+
+
+#: [v6.2] `python -c` 代码体里的字符串字面量。代码里的 `print('见 dot.py')`
+#: 只是在打印一句散文，不是在读写文件；只有作为 open()/Path()/os.path.* 等
+#: 文件 API 实参的字面量才是路径。不先挖掉散文，裸文件名规则会把 `dot.py`
+#: 误判成 relative_path（硬缺陷 → 合法验证命令被拒发卡）。
+_PY_CODE_STR_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+#: 字面量前紧邻的文件 API 调用（允许 open(r'...') 的 raw/b/u 前缀）。
+_PY_FILE_API_BEFORE_RE = re.compile(
+    r"(?:open|io\.open|codecs\.open|Path|pathlib\.Path|read_text|write_text|"
+    r"read_bytes|write_bytes|os\.path\.\w+|os\.(?:remove|unlink|rename|replace|"
+    r"stat|makedirs|mkdir)|shutil\.\w+|glob\.(?:glob|iglob))\s*\(\s*[rRbBuU]{0,2}$")
+
+
+def _mask_nonfile_code_literals(src: str) -> str:
+    """把 Python 代码里"非文件 API 实参"的字符串字面量内容挖成空格。
+
+    纯函数零 IO、绝不抛。保留引号与长度，便于定位；只处理单/双引号、不嵌套的
+    字面量（脚本生成场景足够，遇复杂 f-string 宁可漏挖也不误判）。
+    """
+    def repl(m):
+        before = src[max(0, m.start() - 80):m.start()]
+        if _PY_FILE_API_BEFORE_RE.search(before):
+            return m.group(0)  # open('data.txt') / Path('cfg.json')：保留
+        q = m.group(0)[0]
+        return q + " " * (len(m.group(0)) - 2) + q
+    return _PY_CODE_STR_RE.sub(repl, src)
+
+
+def _mask_python_c_literals(cmd: str) -> str:
+    """挖掉 `python -c` 代码体里的非文件字面量，返回分析用文本。
+
+    [v6.2] 先归一 `\\"` 为 `"`，因为落盘后的 verify_cmd 可能带着 JSON 转义
+    （`python -c \\"print(...)\\"`），不归一 _PY_C_RE 根本匹配不到代码体。
+    """
+    text = str(cmd or "").replace('\\"', '"').replace("\\'", "'")
+    out, pos = [], 0
+    for m in _PY_C_RE.finditer(text):
+        start, end = m.span("src")
+        out.append(text[pos:start])
+        out.append(_mask_nonfile_code_literals(m.group("src")))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _extract_relative_refs(cmd: str) -> list:
@@ -642,8 +789,21 @@ def _extract_relative_refs(cmd: str) -> list:
     这种没有文件操作、也没有路径的命令仍走 no_path（软缺陷，照发卡）；
     而 `open('data.txt')` / `type reports\\daily.txt` 会被抓成 relative_path
     （硬缺陷，拒发卡），因为文件读写一旦用相对路径，执行目录一变就指向别处。
+
+    [v6] 先挖掉盘符绝对文件路径再匹配：含空格的绝对路径（`E:\\MoRay OS\\...`）
+    被空格切开后，后半段会被误判成相对引用——v4 既有用例已经踩到这一点。
+    [v6.1] 补三类漏网形态：盘符相对 `C:file.txt`、根相对 `\\file.txt`、
+    父/当前目录相对 `..\\README` / `.\\x`。它们同样是"换个 cwd 就指向别处"。
+    [v6.2] `python -c` 代码体里只保留文件 API 实参，`print('见 dot.py')` 这类
+    散文不再被裸文件名规则误杀。
     """
-    return _REL_FILE_REF_RE.findall(str(cmd or ""))
+    text = _mask_python_c_literals(cmd)
+    text = _ABS_FILE_REF_RE.sub(" ", text)
+    text = _ENV_ABS_REF_RE.sub(" ", text)  # %VAR%\x 是绝对路径，不是相对引用
+    return (_REL_FILE_REF_RE.findall(text)
+            + _DRIVE_REL_REF_RE.findall(text)
+            + _ROOT_REL_REF_RE.findall(text)
+            + _PARENT_REF_RE.findall(text))
 
 
 def _verify_python_syntax_problem(cmd: str) -> str:
@@ -685,6 +845,7 @@ def verify_cmd_problem(cmd: str) -> str:
       posix_tool  [v5] 用了 find/grep/awk/sed 这类 POSIX 命令，或 sh 专有语法
       placeholder 用了 example.com / path/to 这类占位符
       syntax      `python -c` 代码体自身的转义错，命令编译不过（永远为假的预言机）
+      relative_path [v6] 文件读写用了相对路径（data.txt / scripts\\run.py）
       no_path     命令里没有任何路径 token（无法定位验证对象）
       ghost_path  引用了不存在的盘符路径，且不在 _VERIFY_ROOTS 下
     已存在的路径一律合格（哪怕是 C:\\Windows\\System32\\cmd.exe）。"""
@@ -703,14 +864,20 @@ def verify_cmd_problem(cmd: str) -> str:
     syntax_bad = _verify_python_syntax_problem(text)
     if syntax_bad:
         return syntax_bad
-    paths = _extract_verify_paths(text)
+    # [v6] 相对文件引用先于 no_path：`type data.txt` 既有"路径"（只是相对的），
+    # 也会被旧逻辑误报成 no_path。相对路径是硬缺陷，原因码必须更准确。
+    if _extract_relative_refs(text):
+        return "relative_path"
+    paths = _extract_verify_paths(_URL_RE.sub(" ", text))
     if not paths:
         return "no_path"
     ok = False
     for p in paths:
         if p.startswith("/"):
             return "posix_path"  # markers 没覆盖到的其它 Linux 路径
-        low_p = p.lower()
+        # [v6.1] 根前缀比较前把正斜杠归一回反斜杠：prompt 允许写 D:/MoRay/...，
+        # 不归一会让「D:/MoRay 下待产出的文件」冤判 ghost_path（硬缺陷拒卡）。
+        low_p = p.replace("/", "\\").lower()
         # 双向前缀：路径含空格时（E:\MoRay OS\...）抽取会被空格切断成
         # E:\MoRay，此时它只是允许根的前缀——按合格处理，不冤枉真路径。
         if os.path.exists(p) or any(low_p.startswith(r.lower()) or r.lower().startswith(low_p)
@@ -741,7 +908,10 @@ _last_verify_sweep_monotonic = 0.0
 #: 命令静态体检里属于"命令本身坏"的原因码：这些情况下 exit≠0 不能记成"预测被
 #: 证伪"（那会把生成器缺陷伪装成世界的否定），统一记 unverifiable。
 #: placeholder / no_path 不算——它们不防碍命令执行，只说明定位不严谨。
-_VERIFY_HARD_PROBLEMS = ("empty", "posix_path", "posix_tool", "syntax", "ghost_path")
+#: [v6] relative_path 是硬缺陷：验证子进程的 cwd 固定为工程根，模型却按目标目录
+#: 写相对路径，命令会在"别处"读写（历史真实失败：文件明明存在却 not found）。
+_VERIFY_HARD_PROBLEMS = ("empty", "posix_path", "posix_tool", "syntax",
+                         "relative_path", "ghost_path")
 #: 验证子进程的工作目录：固定工程根，相对路径有确定语义，不依赖服务启动目录。
 _VERIFY_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ---- v5.2 判据覆盖检查（治"成立里夹带没人验的假话"）----
@@ -779,6 +949,141 @@ def verify_cmd_coverage(claim: str, verify_cmd: str) -> list:
         return missing[:6]
     except Exception:  # noqa: BLE001 - fail-open：覆盖检查绝不抛
         return []
+
+
+# ── [v5.3 2026-10-31] 只读核对白名单（用户授权面）───────────────────────────
+#: 授权记录（写死在代码里，防日后自己扩大解释）：2026-10-31 22:25 用户明确批准：
+#: 「只做只读核对、代码扫描、测试运行的卡，可以预授权批量自己跑；写盘、改代码、
+#: 碰配置的核心动作必须一卡一批，不准越权」。因此白名单只覆盖**判据本身是只读
+#: 命令**且**目标/断言不含写意图**的卡；其余一律留在 pending_approval 等人点。
+#: 已知边界（不许假装没有）：白名单管的是**卡**（自动派发哪些），不是沙箱。
+#: 引擎侧"不许写盘"只是派发 prompt 里的硬性声明 + 事后工作区指纹信号，不是内核
+#: 级拦截。要真守住，只能靠"越权信号可见 + 一卡一批兜底"，不能靠这份代码。
+_AUTO_APPROVE_ENV = "MORAY_AUTO_APPROVE_READONLY"
+#: 每日预授权自跑上限（独立于 3 张/日的生成配额，防止白名单把配额吃光）
+_AUTO_APPROVE_DAILY_CAP = 3
+#: 只读命令的第一个动词（不在此列的一律不算只读：省得 powershell 一句 Set-Content 蒙混）
+_RO_VERB_RE = re.compile(
+    r"^(dir|type|more|findstr|where|python|py|pytest|git|node|"
+    r"get-childitem|get-content|get-item|get-process|test-path|select-string|"
+    r"measure-object|resolve-path|compare-object)\b", re.IGNORECASE)
+#: shell 级写操作词（命中即拒，宁可错杀到人批）
+_RO_SHELL_WRITE_TOKENS = (
+    "set-content", "add-content", "out-file", "new-item", "remove-item",
+    "move-item", "copy-item", "rename-item", "mkdir", "rmdir", "del ", "erase ",
+    " rd ", "taskkill", "stop-process", "start-process", "reg add", "net start",
+    "net stop", "sc stop", "sc start", "touch", "chmod", "attrib", "git add",
+    "git commit", "git checkout", "git reset", "git restore", "git push",
+    "pip install", "npm install", "ollama pull")
+#: python -c 里的写动作（正则匹配而非子串，避免 open( 读模式被误杀）
+_RO_PY_WRITE_RE = re.compile(
+    r"open\s*\([^)]*?['\"][waxX+]|\.write\s*\(|writelines|shutil|os\.remove|"
+    r"os\.unlink|os\.rename|os\.mkdir|os\.makedirs|os\.rmdir|subprocess|"
+    r"os\.system|\.write_text\s*\(|\.write_bytes\s*\(|\.touch\s*\(|"
+    r"\.unlink\s*\(|\.mkdir\s*\(", re.IGNORECASE)
+#: 目标/断言里的写意图词：出现即不归只读类（哪怕 verify_cmd 是只读的）
+_RO_GOAL_WRITE_WORDS = (
+    "写入", "写盘", "创建", "新建", "删除", "移除", "移动", "重命名", "改名",
+    "覆盖", "修改", "改动", "重构", "迁移", "安装", "卸载", "重启", "提交",
+    "配置", "落盘", "生成文件", "补齐文件",
+    # 同义写动词（历史目标里常见说法，不加会被"改写/修复"钻空子）
+    "修复", "改写", "重写", "改成", "替换", "清空", "补全", "新增", "实现",
+    "改代码", "打补丁")
+
+
+def readonly_action_problem(cmd: str) -> str:
+    """验证命令 → 只读缺陷原因（"" = 只读安全，可进白名单）。纯函数零 IO。
+
+    检查顺序是刻意的：**危险形态先判**（重定向/写词/写调用），再交给
+    verify_cmd_problem 做可执行性静态体检。反过来的话，verify_cmd_problem 的
+    软问题（no_path/placeholder）会抢先返回，把 `dir x > y` 这种带重定向的
+    命令报成"插件占位符缺失"，原因失真、危险形态被掩盖。
+    任何一道不过都返回原因串（调用方据此判"必须人批"），绝不抛。
+    """
+    try:
+        c = str(cmd or "").strip()
+        if not c:
+            return "empty"
+        if not _RO_VERB_RE.match(c):
+            return "not_readonly_verb"
+        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "''", c)
+        if ">" in unquoted:
+            return "redirect"
+        low = c.lower()
+        for tok in _RO_SHELL_WRITE_TOKENS:
+            if tok in low:
+                return "write_token:" + tok.strip()
+        if _RO_PY_WRITE_RE.search(c):
+            # 注意用原文 c 而不是 unquoted：python -c "open(...,'w')" 的载荷整体在
+            # 引号里，剥引号后会连同写调用一起消失——等于把最该拦的形态放过。
+            return "py_write"
+        problem = verify_cmd_problem(c)
+        if problem:  # 跑不起来的命令谈不上"只读自跑"（no_path 也拦：无绝对路径≈判不了）
+            return problem
+        return ""
+    except Exception:  # noqa: BLE001 - 判定函数绝不抛，异常按"不白名单"处理
+        return "check_failed"
+
+
+def classify_card_action(goal: str, claim: str, verify_cmd: str) -> dict:
+    """目标卡 → {"readonly": bool, "reason": str}（纯函数零 IO）。
+
+    只读类 = 判据只读 + 目标/断言无写意图。两个条件都满足才自动派发；
+    任一不满足一律 False（落回人批）。这是"预授权"的全部依据。
+    """
+    try:
+        vp = readonly_action_problem(verify_cmd)
+        if vp:
+            return {"readonly": False, "reason": "verify:" + vp}
+        text = "%s %s" % (str(goal or ""), str(claim or ""))
+        hits = [w for w in _RO_GOAL_WRITE_WORDS if w in text]
+        if hits:
+            return {"readonly": False, "reason": "write_intent:" + ",".join(hits[:3])}
+        return {"readonly": True, "reason": ""}
+    except Exception:  # noqa: BLE001
+        return {"readonly": False, "reason": "classify_failed"}
+
+
+def auto_approve_enabled() -> bool:
+    """只读白名单总开关：env 优先（MORAY_AUTO_APPROVE_READONLY=0 一键关），
+    否则读状态文件 auto_approve_readonly（面板可切），默认 True（用户已授权）。"""
+    env = str(os.environ.get(_AUTO_APPROVE_ENV, "")).strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return bool(_load_state().get("auto_approve_readonly", True))
+    except Exception:  # noqa: BLE001 - 状态读不到时保守关掉自跑
+        return False
+
+
+def _auto_approved_today(state=None) -> int:
+    """今日已被预授权自跑的卡数（纯读，绝不抛）。"""
+    try:
+        st = state if isinstance(state, dict) else _load_state()
+        today = _today()
+        return sum(1 for c in (st.get("queue") or [])
+                   if isinstance(c, dict) and c.get("auto_approved")
+                   and str(c.get("created_at") or "")[:10] == today)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+#: 只读卡派发前的工作区指纹（进程内存，重启即失；缺基线 = 本次不出越权信号）
+_RO_BASELINE = {}
+
+
+def _tree_fingerprint(root: str = r"D:\MoRay\server\app") -> str:
+    """只读卡执行窗口内"工作区被动过吗"的信号。归因有限（可能是引擎写的，
+    也可能是我或人改的），所以它只当提示，**绝不改判决**。失败返回 ""。"""
+    try:
+        import hashlib
+        out = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                             capture_output=True, timeout=10)
+        return hashlib.sha256(out.stdout or b"").hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 _VERDICT_LABELS = {"confirmed": "预测成立", "falsified": "预测被证伪",
@@ -875,12 +1180,15 @@ _VERDICT_LOG_MAX = 200
 _VERDICT_KINDS = ("confirmed", "falsified", "unverifiable")
 
 
-def _verdict_log_append(state: dict, task_id: str, verdict: str, now: str) -> None:
+def _verdict_log_append(state: dict, task_id: str, verdict: str, now: str,
+                        auto: bool = False) -> None:
     """往台账写一条（在写回卡的同一把锁内调用，避免两次落盘中间被打断）。
 
     [v5.1] 同一张卡**同一天**只留最后一条判决：重跑验证（force）是"再测一次
     同一件事"，不是"多了一件新事"。早先按次追加，一次重跑就把
     `命令不可判` 从 1 涨到 3，把台账口径糊成"我判了很多条"。
+    [v5.3] 多记一个 auto 标：判决是"人批的卡判出来的"还是"预授权只读卡判出来的"。
+    分开记不是为了好看，是为了让"连续 N 天有判决"这个指标**不能由系统自己刷**。
     """
     log = state.get("verdict_log")
     if not isinstance(log, list):
@@ -893,10 +1201,12 @@ def _verdict_log_append(state: dict, task_id: str, verdict: str, now: str) -> No
         if str(e.get("task_id")) == tid and str(e.get("ts") or "")[:10] == today:
             e["ts"] = now
             e["verdict"] = str(verdict)
+            e["auto"] = bool(e.get("auto")) or bool(auto)
             e["remeasured"] = int(e.get("remeasured") or 0) + 1
             state["verdict_log"] = log
             return
-    log.append({"ts": now, "task_id": tid, "verdict": str(verdict)})
+    log.append({"ts": now, "task_id": tid, "verdict": str(verdict),
+                "auto": bool(auto)})
     state["verdict_log"] = log[-_VERDICT_LOG_MAX:]
 
 
@@ -930,12 +1240,19 @@ def verdict_stats(days: int = 7) -> dict:
             continue
         if d < horizon or d > today:
             continue
-        b = per_day.setdefault(d, {"confirmed": 0, "falsified": 0, "unverifiable": 0})
+        b = per_day.setdefault(d, {"confirmed": 0, "falsified": 0,
+                                   "unverifiable": 0, "auto": 0, "human": 0})
         b[v] += 1
+        if v in ("confirmed", "falsified"):
+            b["auto" if e.get("auto") else "human"] += 1
     confirmed = sum(b["confirmed"] for b in per_day.values())
     falsified = sum(b["falsified"] for b in per_day.values())
     unverifiable = sum(b["unverifiable"] for b in per_day.values())
     judged = confirmed + falsified
+    # [v5.3] 判决来源拆分：预授权自跑的只读卡 vs 人批的卡。两个数都摆出来，
+    # 让"连续 N 天有判决"能被外部核对，而不是只给一个总数糊过去。
+    judged_auto = sum(b["auto"] for b in per_day.values())
+    judged_human = sum(b["human"] for b in per_day.values())
     active = [d for d, b in per_day.items() if (b["confirmed"] + b["falsified"]) > 0]
     streak = 0
     cursor = today
@@ -951,9 +1268,11 @@ def verdict_stats(days: int = 7) -> dict:
         day_list.append({"date": d.isoformat(), "confirmed": b["confirmed"],
                          "falsified": b["falsified"],
                          "unverifiable": b["unverifiable"],
+                         "auto": b["auto"], "human": b["human"],
                          "judged": b["confirmed"] + b["falsified"]})
     return {"days": span, "judged": judged, "confirmed": confirmed,
             "falsified": falsified, "unverifiable": unverifiable,
+            "judged_auto": judged_auto, "judged_human": judged_human,
             "accuracy": round(confirmed / judged, 3) if judged else None,
             "active_days": len(active), "streak": streak,
             "streak_end_today": today in active,
@@ -1029,6 +1348,17 @@ def verify_goal_card(task_id: str, force: bool = False,
         obs = run_verify_command(cmd, timeout=timeout)
         verdict = _verdict_of(obs)
         summary = _summarize_obs(obs)
+        # [v5.3] 只读卡越权信号：派发前留过基线才比（基线在进程内存，重启即失）。
+        # 变了只**提示**，不改判决——变化可能来自引擎，也可能来自我或人改代码，
+        # 归因不了就不许拿它当证据。
+        ro_changed = False
+        if card.get("readonly_class"):
+            base = _RO_BASELINE.pop(tid, "")
+            if base:
+                ro_changed = _tree_fingerprint() != base
+                if ro_changed:
+                    logger.warning("[self_driven] 只读卡执行窗口内工作区有变化 "
+                                   "task_id=%s（归因不明，仅提示）", tid)
         now = datetime.datetime.now().isoformat(timespec="seconds")
         note = "验证 exit=%s %s" % (obs.get("exit"), _VERDICT_LABELS.get(verdict, verdict))
         with _STATE_LOCK:
@@ -1046,14 +1376,19 @@ def verify_goal_card(task_id: str, force: bool = False,
             target["verify_out"] = summary
             target["verify_problem"] = obs.get("problem") or ""
             target["verdict"] = verdict
+            if card.get("readonly_class"):
+                target["ro_tree_changed"] = bool(ro_changed)
             if obs.get("timed_out"):
                 target["verify_timeout"] = True
             # result_note 是面板上唯一能立刻看见的字段：把判据放前面，引擎自述
             # 压后面（不再让"引擎说自己做得不错"冒充验证结论）。
             engine_note = str(target.get("result_note") or "").strip()
+            if ro_changed:
+                note += " · 只读窗口内工作区有变化（仅提示）"
             target["result_note"] = (note + (" · " + engine_note[:80]
                                              if engine_note else ""))[:200]
-            _verdict_log_append(state, tid, verdict, now)
+            _verdict_log_append(state, tid, verdict, now,
+                                auto=bool(target.get("auto_approved")))
             if not _save_state(state):
                 logger.warning("[self_driven] 验证判据落盘失败 task_id=%s", tid)
                 return {"ok": False, "reason": "state_save_failed", "task_id": tid}
@@ -1208,6 +1543,11 @@ def _build_fix_message(parsed: dict, problem: str, repeat) -> dict:
                        "这些目录不存在，命令必定失败")
     elif problem == "placeholder":
         reasons.append("verify_cmd 用了 example.com / path/to 这类占位符，不是真路径")
+    elif problem == "relative_path":
+        reasons.append("verify_cmd 的文件读写用了相对路径（如 data.txt、"
+                       "scripts\\run.py），验证进程的工作目录不是你想象的那个，"
+                       "会读写到别处；必须写成完整的 Windows 绝对路径（D:\\MoRay\\...），"
+                       "连裸文件名也不允许")
     elif problem == "no_path":
         reasons.append("verify_cmd 里没有任何文件路径，无法定位验证对象")
     elif problem == "ghost_path":
@@ -1387,10 +1727,24 @@ async def generate_goal():
                 "engine_task_id": "",
                 "status": "pending_approval",
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds")}
+        # [v5.3] 只读核对白名单：先分类再落卡——分类结果是要长期留痕的字段
+        # （面板/台账都靠它区分"人批的"与"预授权自跑的"），所以写进卡里。
+        cls = classify_card_action(goal, parsed["claim"], parsed["verify_cmd"])
+        card["readonly_class"] = bool(cls["readonly"])
+        card["readonly_reason"] = cls["reason"]
         if not _record_goal(card):  # 超限/落盘失败：不发卡（见模块 docstring）
             return None
-        logger.warning("[self_driven] 目标已进待审批队列 task_id=%s goal=%s",
-                       card["task_id"], goal[:40])
+        logger.warning("[self_driven] 目标已进待审批队列 task_id=%s goal=%s "
+                       "readonly=%s(%s)", card["task_id"], goal[:40],
+                       card["readonly_class"], cls["reason"] or "ok")
+        # [v5.3] 只读类 + 开关开 + 未超日上限 → 当场自动派发（人批的卡不受影响）
+        if card["readonly_class"]:
+            res = _maybe_auto_dispatch(card)
+            if res.get("ok"):
+                card["status"] = res.get("status") or "dispatched"
+                card["auto_approved"] = True
+                card["auto_reason"] = "readonly_whitelist"
+                card["engine_task_id"] = res.get("engine_task_id") or ""
         return card
     finally:
         _goal_inflight = False
@@ -1488,6 +1842,21 @@ def _card_by_id(task_id: str):
     return None
 
 
+#: [v6] 派发指令里的路径硬约束。verify_cmd 已有落卡前的静态拦截（relative_path
+#: 直接拒发卡），但真正写脚本的是引擎：如果 prompt 不前置这条约束，模型会先生成
+#: 一份用相对路径的脚本，等到验证阶段才发现读错了地方。引擎子进程的 cwd 不由
+#: 脚本作者控制，执行目录一变，`open('data.txt')` 就静默指向别处（历史真实失败：
+#: 文件明明存在却报 not found）。
+_DISPATCH_PATH_RULE = (
+    "【路径硬约束】执行任何文件读写（open()/Path().read_text()/write_text()、"
+    "type/dir/findstr 等）一律使用 Windows 盘符绝对路径（如 D:\\MoRay\\...），"
+    "禁止相对路径、裸文件名（data.txt）和相对子路径（scripts\\run.py）——"
+    "执行进程的工作目录不由脚本控制，相对路径会读写到别处。"
+    "路径里的反斜杠必须写成 raw 字符串 r'D:\\...' 或正斜杠 D:/...；"
+    "禁止 /tmp、/var、/home 这类 Linux 路径。"
+)
+
+
 def _build_dispatch_prompt(card: dict) -> str:
     """目标卡 → 派发指令（纯函数零 IO）。三件套一起交给引擎，否则引擎只知道
     "做什么"，不知道"怎么算做成"。"""
@@ -1498,7 +1867,125 @@ def _build_dispatch_prompt(card: dict) -> str:
         v = str(card.get(key) or "").strip()
         if v:
             parts.append("%s：%s" % (label, v))
+    if not any(parts):
+        return ""  # 空卡保持空指令（路由侧按 empty_prompt 拒发）
+    parts.append(_DISPATCH_PATH_RULE)
+    if card.get("readonly_class"):
+        # [v5.3] 只读卡是**自动派发**的（没人看过就开跑），所以把约束写进指令本身：
+        # 后面的工作区指纹信号只能事后提示，真正拦在"别让它写"这一句上。
+        parts.append("【只读约束】本卡为只读核对：只允许读取、扫描、运行测试；"
+                     "禁止创建/修改/删除任何文件，禁止改配置，禁止 git 提交或安装依赖。"
+                     "如果任务需要写入才能完成，停下并说明原因，不要动手。")
     return "\n".join(p for p in parts if p)
+
+
+def _dispatch_card_impl(task_id: str, auto: bool = False) -> dict:
+    """派发一张待审批卡的**唯一实现**（路由与只读白名单共用，[v5.3] 抽出）。
+
+    收进同一个函数的三件事：校验 pending_approval → 引擎 start_stream → 登记。
+    auto=True 只允许只读类卡（readonly_class=True）走，且打标 auto_approved；
+    写盘类卡永远只能由人经 POST /self_driven/dispatch（auto 恒 False）派发。
+    契约与路由一致，见 self_driven_dispatch 的 docstring。
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        return {"ok": False, "reason": "task_id_required"}
+    card = _card_by_id(tid)
+    if card is None:
+        return {"ok": False, "reason": "not_found", "task_id": tid}
+    status = str(card.get("status") or "")
+    if status != "pending_approval":
+        logger.warning("[self_driven] 拒绝派发：卡状态是 %s 不是 pending_approval "
+                       "task_id=%s", status, tid)
+        return {"ok": False, "reason": "not_pending", "status": status}
+    if auto and not card.get("readonly_class"):
+        # 兜底闸：任何调用路径都不许借 auto 派发非只读卡（白名单只覆盖只读类）
+        logger.warning("[self_driven] 拒绝自动派发：非只读类卡 task_id=%s", tid)
+        return {"ok": False, "reason": "not_readonly"}
+    if tid in _DISPATCH_INFLIGHT:
+        return {"ok": False, "reason": "inflight"}
+    engine_name = _sanitize_engine(card.get("target_engine"))
+    _DISPATCH_INFLIGHT.add(tid)
+    try:
+        try:
+            from .engines.local_adapter import get_engine_by_name
+        except Exception as e:  # noqa: BLE001 - 引擎注册表导入失败当没有引擎
+            logger.warning("[self_driven] import 引擎注册表异常：%s: %s",
+                           type(e).__name__, str(e)[:160])
+            return {"ok": False, "reason": "engine_not_found", "engine": engine_name}
+        engine = get_engine_by_name(engine_name)
+        if engine is None or not callable(getattr(engine, "start_stream", None)):
+            return {"ok": False, "reason": "engine_not_found", "engine": engine_name}
+        prompt = _build_dispatch_prompt(card)
+        if not prompt:
+            return {"ok": False, "reason": "empty_prompt"}
+        if card.get("readonly_class"):
+            # 只读卡：派发前取工作区指纹基线（进程内存；重启后无基线 = 不出越权信号）
+            fp = _tree_fingerprint()
+            if fp:
+                _RO_BASELINE[tid] = fp
+        try:
+            res = engine.start_stream({"prompt": prompt, "caller": "moray-self"})
+        except Exception as e:  # noqa: BLE001 - 派发失败转契约错误，不上抛
+            logger.warning("[self_driven] 派发异常 task_id=%s：%s: %s",
+                           tid, type(e).__name__, str(e)[:200])
+            return {"ok": False, "reason": "dispatch_failed",
+                    "detail": "%s: %s" % (type(e).__name__, str(e)[:200])}
+        if not isinstance(res, dict) or not res.get("ok"):
+            return {"ok": False, "reason": "dispatch_failed",
+                    "detail": str(res)[:200]}
+        engine_task_id = str(res.get("task_id") or res.get("id") or "").strip()
+        if not engine_task_id:
+            return {"ok": False, "reason": "dispatch_failed",
+                    "detail": "引擎未返回 task_id：%s" % str(res)[:160]}
+        updated = mark_dispatched(tid, engine_task_id, auto=auto)
+        if updated is None:
+            # 引擎已经在跑、登记却失败：如实报，绝不假装成功（这正是 v2 的脏状态）
+            logger.warning("[self_driven] 派发成功但登记失败 task_id=%s "
+                           "engine_task_id=%s", tid, engine_task_id)
+            return {"ok": False, "reason": "state_save_failed",
+                    "engine_task_id": engine_task_id,
+                    "detail": "引擎已启动但卡状态未落盘，请核对队列"}
+        logger.warning("[self_driven] %s已派发 task_id=%s → %s:%s",
+                       "预授权自跑" if auto else "人工批准",
+                       tid, engine_name, engine_task_id)
+        return {"ok": True, "task_id": tid, "engine_task_id": engine_task_id,
+                "engine": engine_name, "status": updated.get("status"),
+                "auto": bool(auto)}
+    finally:
+        _DISPATCH_INFLIGHT.discard(tid)
+
+
+def _maybe_auto_dispatch(card: dict) -> dict:
+    """只读白名单自动派发（[v5.3]，用户 2026-10-31 22:25 授权）。
+
+    四条闸串联，任一不过就原样留着等人批：
+      ① 卡是只读类（readonly_class，由 classify_card_action 判定）；
+      ② 总开关开着（env / 状态文件，面板可切，一键关）；
+      ③ 今日预授权自跑数 < _AUTO_APPROVE_DAILY_CAP；
+      ④ 卡仍是 pending_approval（_dispatch_card_impl 内再校验一次）。
+    失败只记日志 + 退回人批，绝不抛（生成循环不能被它拖死）。
+    """
+    try:
+        if not isinstance(card, dict) or not card.get("task_id"):
+            return {"ok": False, "reason": "bad_card"}
+        if not card.get("readonly_class"):
+            return {"ok": False, "reason": "not_readonly"}
+        if not auto_approve_enabled():
+            return {"ok": False, "reason": "disabled"}
+        if _auto_approved_today() >= _AUTO_APPROVE_DAILY_CAP:
+            logger.warning("[self_driven] 今日预授权自跑已达上限 %d，转人批 task_id=%s",
+                           _AUTO_APPROVE_DAILY_CAP, card.get("task_id"))
+            return {"ok": False, "reason": "cap_reached"}
+        res = _dispatch_card_impl(card["task_id"], auto=True)
+        if not res.get("ok"):
+            logger.warning("[self_driven] 自动派发失败（转人批）task_id=%s reason=%s",
+                           card.get("task_id"), res.get("reason"))
+        return res
+    except Exception as e:  # noqa: BLE001 - 自动派发异常绝不外抛
+        logger.warning("[self_driven] 自动派发异常：%s: %s",
+                       type(e).__name__, str(e)[:160])
+        return {"ok": False, "reason": "exception"}
 
 
 @router.post("/self_driven/dispatch")
@@ -1527,59 +2014,8 @@ async def self_driven_dispatch(request: Request) -> dict:
     task_id = str((body or {}).get("task_id") or "").strip()
     if not task_id:
         return {"ok": False, "reason": "task_id_required"}
-    card = _card_by_id(task_id)
-    if card is None:
-        return {"ok": False, "reason": "not_found", "task_id": task_id}
-    status = str(card.get("status") or "")
-    if status != "pending_approval":
-        logger.warning("[self_driven] 拒绝派发：卡状态是 %s 不是 pending_approval "
-                       "task_id=%s", status, task_id)
-        return {"ok": False, "reason": "not_pending", "status": status}
-    if task_id in _DISPATCH_INFLIGHT:
-        return {"ok": False, "reason": "inflight"}
-    engine_name = _sanitize_engine(card.get("target_engine"))
-    _DISPATCH_INFLIGHT.add(task_id)
-    try:
-        try:
-            from .engines.local_adapter import get_engine_by_name
-        except Exception as e:  # noqa: BLE001 - 引擎注册表导入失败当没有引擎
-            logger.warning("[self_driven] import 引擎注册表异常：%s: %s",
-                           type(e).__name__, str(e)[:160])
-            return {"ok": False, "reason": "engine_not_found", "engine": engine_name}
-        engine = get_engine_by_name(engine_name)
-        if engine is None or not callable(getattr(engine, "start_stream", None)):
-            return {"ok": False, "reason": "engine_not_found", "engine": engine_name}
-        prompt = _build_dispatch_prompt(card)
-        if not prompt:
-            return {"ok": False, "reason": "empty_prompt"}
-        try:
-            res = engine.start_stream({"prompt": prompt, "caller": "moray-self"})
-        except Exception as e:  # noqa: BLE001 - 派发失败转契约错误，不上抛
-            logger.warning("[self_driven] 派发异常 task_id=%s：%s: %s",
-                           task_id, type(e).__name__, str(e)[:200])
-            return {"ok": False, "reason": "dispatch_failed",
-                    "detail": "%s: %s" % (type(e).__name__, str(e)[:200])}
-        if not isinstance(res, dict) or not res.get("ok"):
-            return {"ok": False, "reason": "dispatch_failed",
-                    "detail": str(res)[:200]}
-        engine_task_id = str(res.get("task_id") or res.get("id") or "").strip()
-        if not engine_task_id:
-            return {"ok": False, "reason": "dispatch_failed",
-                    "detail": "引擎未返回 task_id：%s" % str(res)[:160]}
-        updated = mark_dispatched(task_id, engine_task_id)
-        if updated is None:
-            # 引擎已经在跑、登记却失败：如实报，绝不假装成功（这正是 v2 的脏状态）
-            logger.warning("[self_driven] 派发成功但登记失败 task_id=%s "
-                           "engine_task_id=%s", task_id, engine_task_id)
-            return {"ok": False, "reason": "state_save_failed",
-                    "engine_task_id": engine_task_id,
-                    "detail": "引擎已启动但卡状态未落盘，请核对队列"}
-        logger.warning("[self_driven] 人工批准已派发 task_id=%s → %s:%s",
-                       task_id, engine_name, engine_task_id)
-        return {"ok": True, "task_id": task_id, "engine_task_id": engine_task_id,
-                "engine": engine_name, "status": updated.get("status")}
-    finally:
-        _DISPATCH_INFLIGHT.discard(task_id)
+    # [v5.3] 逻辑收进 _dispatch_card_impl（与只读白名单自动派发同一条原子路径）
+    return _dispatch_card_impl(task_id, auto=False)
 
 
 @router.post("/self_driven/approve")
@@ -1676,4 +2112,34 @@ def self_driven_queue() -> dict:
     except Exception:  # noqa: BLE001 - 补跑调度失败绝不影响队列读取
         pass
     return {"ok": True, "count": len(items), "items": list(reversed(items)),
-            "verdicts": verdict_stats(7), **_quota_info(state)}
+            "verdicts": verdict_stats(7),
+            # [v5.3] 白名单状态随队列一起返回：面板要能看见"现在是否在自跑"
+            "auto_approve": {"enabled": auto_approve_enabled(),
+                             "cap": _AUTO_APPROVE_DAILY_CAP,
+                             "used_today": _auto_approved_today(state)},
+            **_quota_info(state)}
+
+
+@router.post("/self_driven/auto_approve")
+async def self_driven_auto_approve(request: Request) -> dict:
+    """[v5.3] 只读白名单总开关：POST /api/self_driven/auto_approve
+    body {"enabled": true|false}。落状态文件 auto_approve_readonly（跨重启成立）。
+
+    说明：这是**收窄**用的开关（默认 True = 用户已授权开跑）。关掉后只读卡回到
+    人批队列，不需要重启进程；env MORAY_AUTO_APPROVE_READONLY=0 优先级更高，
+    作为进程级急停。契约：{"ok", "enabled", "cap", "used_today"}。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - 坏 JSON 转契约错误
+        return {"ok": False, "reason": "bad_json"}
+    if not isinstance(body, dict) or "enabled" not in body:
+        return {"ok": False, "reason": "enabled_required"}
+    enabled = bool(body.get("enabled"))
+    with _STATE_LOCK:
+        state = _load_state()
+        state["auto_approve_readonly"] = enabled
+        if not _save_state(state):
+            return {"ok": False, "reason": "state_save_failed"}
+    logger.warning("[self_driven] 只读白名单开关 → %s", enabled)
+    return {"ok": True, "enabled": enabled, "cap": _AUTO_APPROVE_DAILY_CAP,
+            "used_today": _auto_approved_today()}
