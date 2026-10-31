@@ -104,7 +104,9 @@ _SYSTEM_PROMPT = (
     "这类无法证伪的口号（历史上这么写产出的目标全是空话）；"
     "prediction 必须写清“目标达成时会观测到什么具体数值或文件变化”；"
     "verify_cmd 必须是一行**在本机（Windows）现在就能直接执行**的验证命令，硬约束："
-    "① 只许引用 Windows 盘符绝对路径（如 D:\\MoRay\\...）或相对路径，"
+    "① 所有文件读写操作（type / dir / findstr / open() / Path() 等）一律使用 Windows"
+    " 盘符绝对路径（如 D:\\MoRay\\...），**禁止相对路径**——验证进程的工作目录不由你"
+    "控制，相对路径会指向另一个目录（历史真实失败：文件明明存在却报 not found）；"
     "禁止 /tmp、/var、/home 这类 Linux 路径——本机没有这些目录，写了必定失败；"
     "② 不许用 example.com、your_file、path/to、xxx 这类占位符；"
     "③ 引用的文件必须现在已存在，或就是本目标这一轮要产出、且路径已在目标里写明；"
@@ -149,6 +151,20 @@ _VERIFY_ROOTS = ("D:\\MoRay", "E:\\MoRay OS", "C:\\Users\\")
 #: 是抓出来判死——为的是日志能说清"你引用的是哪个 Linux 路径"）。POSIX 分支
 #: 强制 ≥2 段（`/a/b`），否则 findstr /C:def 这类命令行斜杠参数会被误判成路径。
 _VERIFY_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"']+|/(?:[^/\s\"']+/)+[^/\s\"']*")
+#: [v6 2026-10-31] 相对文件引用：命令里出现**不带盘符/根**的文件 token
+#: （`type reports\\daily.txt`、`python scripts\\check.py`、`open('data.txt')`……）。
+#: 生成的脚本必须用绝对路径：验证子进程的 cwd 由服务端钉在工程根，模型却以为
+#: 在目标目录，相对路径会静默指向别处（历史真实失败：文件明明存在却 not found）。
+#: 只挑"带已知扩展名的文件 token"，避免把命令名/开关（findstr /C:def）误判成路径；
+#: 前导字符排除 `\\ / : . 字母数字`，因此 `D:\\MoRay\\x.py`、/tmp/x.py 这类绝对
+#: 路径里的各段都不会被当成相对引用（它们由 _VERIFY_PATH_RE 负责）。
+_REL_FILE_REF_RE = re.compile(
+    r"(?<![\w:.\\/-])"
+    r"(?:\.{1,2}[\\/])?(?:[\w.-]+[\\/])*[\w-]+"
+    r"\.(?:py|pyw|txt|json|jsonl|md|log|csv|tsv|js|mjs|cjs|ts|tsx|jsx|html|css|"
+    r"yml|yaml|ini|cfg|conf|toml|xml|sql|db|sqlite3?|bat|cmd|ps1|sh|png|jpg|jpeg|"
+    r"gif|bmp|webp|svg|pdf|xlsx?|docx?)\b",
+    re.IGNORECASE)
 #: `python -c "..."` 的代码体（非贪婪到引号收尾），用来做转义体检。
 _PY_C_RE = re.compile(r"""python(?:\.exe)?\s+-c\s+(?P<q>["'])(?P<src>.*?)(?P=q)""", re.S)
 #: 与近期目标的字符二元组重合度 ≥ 此值 → 判为同主题重复。
@@ -299,6 +315,10 @@ def mark_dispatched(task_id: str, engine_task_id: str) -> dict | None:
         if str(card.get("status") or "") not in ("done", "failed"):
             card["status"] = "dispatched"
             card["engine_task_id"] = etid
+            # [v5] 派发时刻：verify 的"抢救"判龄必须从这里算。用 created_at 算的
+            # 话，一张两小时前排队的卡刚派发就会被判成"过期"，引擎还在跑就抢跑
+            # 量判据——量到的是行动**之前**的世界，误差环直接失真。
+            card["dispatched_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             if not _save_state(state):
                 logger.warning("[self_driven] 派发登记落盘失败 task_id=%s", tid)
                 return None
@@ -585,6 +605,17 @@ def _extract_verify_paths(cmd: str) -> list:
     return _VERIFY_PATH_RE.findall(str(cmd or ""))
 
 
+def _extract_relative_refs(cmd: str) -> list:
+    """从 verify_cmd 抽出相对文件引用（纯函数零 IO，绝不抛）。
+
+    只把"形似文件"的 token 当引用（带常见扩展名），因此 `python -c "print(1)"`
+    这种没有文件操作、也没有路径的命令仍走 no_path（软缺陷，照发卡）；
+    而 `open('data.txt')` / `type reports\\daily.txt` 会被抓成 relative_path
+    （硬缺陷，拒发卡），因为文件读写一旦用相对路径，执行目录一变就指向别处。
+    """
+    return _REL_FILE_REF_RE.findall(str(cmd or ""))
+
+
 def _verify_python_syntax_problem(cmd: str) -> str:
     """`python -c` 代码体的转义体检（纯函数，绝不抛）。命中的是"命令根本编译不过"。
 
@@ -778,11 +809,27 @@ _VERDICT_KINDS = ("confirmed", "falsified", "unverifiable")
 
 
 def _verdict_log_append(state: dict, task_id: str, verdict: str, now: str) -> None:
-    """往台账追加一条（在写回卡的同一把锁内调用，避免两次落盘中间被打断）。"""
+    """往台账写一条（在写回卡的同一把锁内调用，避免两次落盘中间被打断）。
+
+    [v5.1] 同一张卡**同一天**只留最后一条判决：重跑验证（force）是"再测一次
+    同一件事"，不是"多了一件新事"。早先按次追加，一次重跑就把
+    `命令不可判` 从 1 涨到 3，把台账口径糊成"我判了很多条"。
+    """
     log = state.get("verdict_log")
     if not isinstance(log, list):
         log = []
-    log.append({"ts": now, "task_id": str(task_id), "verdict": str(verdict)})
+    tid = str(task_id)
+    today = str(now)[:10]
+    for e in reversed(log):
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("task_id")) == tid and str(e.get("ts") or "")[:10] == today:
+            e["ts"] = now
+            e["verdict"] = str(verdict)
+            e["remeasured"] = int(e.get("remeasured") or 0) + 1
+            state["verdict_log"] = log
+            return
+    log.append({"ts": now, "task_id": tid, "verdict": str(verdict)})
     state["verdict_log"] = log[-_VERDICT_LOG_MAX:]
 
 
@@ -905,6 +952,13 @@ def verify_goal_card(task_id: str, force: bool = False,
         cmd = str(card.get("verify_cmd") or "").strip()
         if not cmd:
             return {"ok": False, "reason": "no_verify_cmd", "task_id": tid}
+        # [v5] 抢跑闸：引擎还在飞的时候量判据，量到的是行动**之前**的世界。
+        # dispatched 且离派发还没到抢救阈值 ⇒ 拒验（force=True 才是人手动重跑）。
+        if status == "dispatched" and not force:
+            age = _dispatch_age_sec(card)
+            if age is not None and age < _VERIFY_STALE_DISPATCH_SEC:
+                return {"ok": False, "reason": "inflight_not_settled",
+                        "age_sec": round(age, 1), "task_id": tid}
         obs = run_verify_command(cmd, timeout=timeout)
         verdict = _verdict_of(obs)
         summary = _summarize_obs(obs)
@@ -968,16 +1022,30 @@ async def verify_goal_async(card_or_tid, force: bool = False) -> dict:
         return {"ok": False, "reason": "exception"}
 
 
+def _dispatch_age_sec(card: dict) -> float | None:
+    """卡距离"派发"过去了多少秒；没有 dispatched_at 返回 None（绝不拿 created_at 顶替）。
+
+    [v5 修正] 早先用 created_at 算，导致一张两小时前排队的卡刚派发就被判"过期"，
+    引擎还在跑就抢跑去量判据——量到的是行动**之前**的世界，误差环当场失真。
+    """
+    raw = str(card.get("dispatched_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        return time.time() - datetime.datetime.fromisoformat(raw).timestamp()
+    except Exception:  # noqa: BLE001 - 时间戳坏就当不知道，不猜
+        return None
+
+
 def _verify_candidates() -> list:
     """挑出"该被验证但还没验"的卡（纯读状态文件，供后台补跑）：
     - done/failed 且没有 verified_at → 引擎终态事件来过但执行器当时不在/没跑；
-    - dispatched 超过 _VERIFY_STALE_DISPATCH_SEC 还没 verified_at → 抢救（事件丢了）。
+    - dispatched 且距**派发**超过 _VERIFY_STALE_DISPATCH_SEC → 抢救（事件丢了）。
     返回 task_id 列表（新→旧顺序）。绝不抛。"""
     try:
         cards = [g for g in (_load_state().get("queue") or []) if isinstance(g, dict)]
     except Exception:  # noqa: BLE001
         return []
-    now = time.time()
     out = []
     for g in cards:
         if g.get("verified_at"):
@@ -990,12 +1058,10 @@ def _verify_candidates() -> list:
             out.append(tid)
             continue
         if status == "dispatched":
-            created = str(g.get("created_at") or "")
-            try:
-                ts = datetime.datetime.fromisoformat(created).timestamp()
-            except Exception:  # noqa: BLE001 - 时间戳坏就不抢救，不猜
-                continue
-            if now - ts >= _VERIFY_STALE_DISPATCH_SEC:
+            age = _dispatch_age_sec(g)
+            if age is None:
+                continue  # 老卡没有派发时刻：交给 close_loop 事件，不抢跑
+            if age >= _VERIFY_STALE_DISPATCH_SEC:
                 out.append(tid)
     return out
 

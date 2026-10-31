@@ -164,6 +164,11 @@ def test_verify_card_missing_and_empty(state_file):
 # ---------------- 4. 补跑候选 ----------------
 
 def test_verify_candidates(state_file):
+    """[v5] 抢救判龄从 dispatched_at 算，不是 created_at。
+
+    早先用 created_at：一张一小时前排队的卡刚派发就被判"过期"，引擎还在跑
+    就抢跑量判据 → 量到行动之前的世界。老卡没有 dispatched_at 一律不抢救。
+    """
     now = time.time()
     old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 3600))
     fresh = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 10))
@@ -171,9 +176,31 @@ def test_verify_candidates(state_file):
     _seed(state_file, _card(task_id="done-verified", status="done",
                             verified_at="2026-10-31T19:00:00"))
     _seed(state_file, _card(task_id="pend", status="pending_approval"))
-    _seed(state_file, _card(task_id="stale", status="dispatched", created_at=old))
-    _seed(state_file, _card(task_id="running", status="dispatched", created_at=fresh))
+    # 排队很久但**刚派发**的卡：不许抢救
+    _seed(state_file, _card(task_id="just-dispatched", status="dispatched",
+                            created_at=old, dispatched_at=fresh))
+    # 派发后确实卡住超过阈值：抢救
+    _seed(state_file, _card(task_id="stale", status="dispatched",
+                            created_at=old, dispatched_at=old))
+    # 老卡没有 dispatched_at：不猜，交给 close_loop
+    _seed(state_file, _card(task_id="legacy-no-ts", status="dispatched",
+                            created_at=old))
     assert set(sd._verify_candidates()) == {"need", "stale"}
+
+
+def test_verify_goal_card_refuses_inflight(state_file):
+    """dispatched 且离派发很近 → 拒验（抢跑）；force=True 才允许人手动重跑。"""
+    now = time.time()
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 5))
+    _seed(state_file, _card(task_id="t-fly", status="dispatched",
+                            dispatched_at=fresh,
+                            verify_cmd='python -c "print(1)"'))
+    res = sd.verify_goal_card("t-fly")
+    assert res["ok"] is False and res["reason"] == "inflight_not_settled"
+    # 人手动重跑：真去跑命令
+    res = sd.verify_goal_card("t-fly", force=True)
+    assert res["ok"] is True
+    assert res["verdict"] == "confirmed"
 
 
 def test_verify_candidates_survives_broken_state(monkeypatch, tmp_path):
@@ -214,6 +241,23 @@ def test_ledger_written_by_verify(state_file):
     log = data.get("verdict_log") or []
     assert len(log) == 1
     assert log[0]["task_id"] == "t-l1" and log[0]["verdict"] == "confirmed"
+
+
+def test_ledger_same_card_same_day_keeps_last(state_file):
+    """[v5.1] 同一张卡同一天重跑 N 次，台账只留最后一条判决。
+
+    按次追加会把"一次重跑"记成"多判了一件新事"，`命令不可判` 从 1 涨到 3，
+    台账口径当场被自己糊掉。重测痕迹留在卡上的 remeasured 计数里。
+    """
+    _seed(state_file, _card(task_id="t-r1", verify_cmd='python -c "print(1)"'))
+    assert sd.verify_goal_card("t-r1")["verdict"] == "confirmed"
+    assert sd.verify_goal_card("t-r1", force=True)["verdict"] == "confirmed"
+    assert sd.verify_goal_card("t-r1", force=True)["verdict"] == "confirmed"
+    log = json.loads(state_file.read_text(encoding="utf-8")).get("verdict_log") or []
+    assert len(log) == 1, log
+    assert log[0]["task_id"] == "t-r1" and log[0]["remeasured"] == 2
+    st = sd.verdict_stats(7)
+    assert (st["judged"], st["confirmed"]) == (1, 1)
 
 
 def test_stats_empty_is_not_fake_accuracy(state_file):
