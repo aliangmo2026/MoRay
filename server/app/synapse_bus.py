@@ -196,6 +196,31 @@ def _handler_self_driven_close_loop(event: dict):
             logger.warning("[synapse] self_observation 回写异常：%s: %s",
                            type(e).__name__, str(e)[:200])
 
+        # [v5 2026-10-31] 执行完还要**对账**：真的跑一次 verify_cmd 拿 exit code，
+        # 把判据写回卡（verified_at/verify_exit/verdict），并把胜负落成新的
+        # self_observation。少了这一步，"执行成功"只是引擎自述 —— 上一个版本
+        # 里 verify_cmd 从头到尾没被执行过一次，闭环有嘴没耳朵。
+        # 走 verify_goal_async：子进程进线程池，绝不冻住事件循环。
+        try:
+            vres = await self_driven.verify_goal_async(card.get("task_id"))
+            verdict = str(vres.get("verdict") or "")
+            if verdict in ("confirmed", "falsified", "unverifiable"):
+                label = {"confirmed": "预测成立", "falsified": "预测被证伪",
+                         "unverifiable": "验证命令不可判"}[verdict]
+                from .memory_routes import insert_memory  # 同上，懒导入防环
+                insert_memory(
+                    "我验证了自驱目标：%s，%s（exit=%s，命令：%s）" % (
+                        str(card.get("goal") or "")[:160], label,
+                        vres.get("exit"),
+                        str(card.get("verify_cmd") or "")[:120]),
+                    kind="self_observation", tags=["self_driven", "verify"],
+                    source="self_driven", entity_id=str(card.get("task_id") or ""))
+                logger.warning("[synapse] 自驱验证对账：task_id=%s verdict=%s exit=%s",
+                               card.get("task_id"), verdict, vres.get("exit"))
+        except Exception as e:  # noqa: BLE001 - 对账失败不影响已落盘的卡状态
+            logger.warning("[synapse] 自驱验证对账异常：%s: %s",
+                           type(e).__name__, str(e)[:200])
+
     return _run()
 
 

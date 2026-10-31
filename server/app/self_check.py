@@ -382,6 +382,11 @@ async def self_check_loop() -> None:
         await memory_hippocampus.memory_hippocampus_maybe()  # 睡眠压缩：旧 self_observation 浓缩为 memory_digest 并物理删源（函数内自守卫；不 trap 进上块防 CancelledError 口径）
     except Exception:  # noqa: BLE001 - 海马体失败不拖循环
         logger.warning("[self_check] memory_hippocampus_maybe 异常", exc_info=True)
+    try:
+        from . import self_driven  # [自驱 v3 2026-10-31] 起手块：与其余 5 桥同款双挂（循环"先睡后跑"，只挂每轮尾要等满 30 分钟才有第一张卡；起手块让重启后立刻可见）
+        await self_driven.maybe_generate_goal()  # 自驱：3h 冷却+日配额过 → LLM 生成目标卡进待审批队列；只生成不执行，派发仍要人 approve（函数内自守卫）
+    except Exception:  # noqa: BLE001 - 自驱失败不拖循环
+        logger.warning("[self_check] self_driven.maybe_generate_goal 异常(起手)", exc_info=True)
     while True:
         await asyncio.sleep(_SELF_CHECK_INTERVAL)
         try:
@@ -406,6 +411,11 @@ async def self_check_loop() -> None:
             await memory_hippocampus.memory_hippocampus_maybe()  # 睡眠压缩：旧 self_observation 浓缩为 memory_digest 并物理删源（函数内自守卫；不 trap 进上块防 CancelledError 口径）
         except Exception:  # noqa: BLE001 - 海马体失败不拖循环
             logger.warning("[self_check] memory_hippocampus_maybe 异常", exc_info=True)
+        try:
+            from . import self_driven  # [自驱 v3 2026-10-31] 第六挂点：惰性导入（其余桥同款防环惯例）
+            await self_driven.maybe_generate_goal()  # 自驱：3h 冷却+日配额过 → LLM 生成目标卡进待审批队列；只生成不执行，派发仍要人 approve（函数内自守卫）
+        except Exception:  # noqa: BLE001 - 自驱失败不拖循环
+            logger.warning("[self_check] self_driven.maybe_generate_goal 异常", exc_info=True)
 
 
 def write_self_check_log(report: dict) -> None:
