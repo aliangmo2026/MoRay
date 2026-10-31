@@ -207,16 +207,27 @@ def _handler_self_driven_close_loop(event: dict):
             if verdict in ("confirmed", "falsified", "unverifiable"):
                 label = {"confirmed": "预测成立", "falsified": "预测被证伪",
                          "unverifiable": "验证命令不可判"}[verdict]
+                # [v5.1] exit 必须以**实测**为准：重复事件/已验过时
+                # verify_goal_async 走 skipped 分支没有 exit 字段，早先直接
+                # 取 vres["exit"] 会把一条"预测成立"记成 exit=None —— 观察
+                # 里出现"我没量到却下了结论"，正是这套系统最该避免的账。
+                exit_obs = vres.get("exit")
+                if exit_obs is None:
+                    try:
+                        cur = self_driven._card_by_id(str(card.get("task_id") or ""))
+                        exit_obs = (cur or {}).get("verify_exit")
+                    except Exception:  # noqa: BLE001
+                        exit_obs = None
                 from .memory_routes import insert_memory  # 同上，懒导入防环
                 insert_memory(
                     "我验证了自驱目标：%s，%s（exit=%s，命令：%s）" % (
                         str(card.get("goal") or "")[:160], label,
-                        vres.get("exit"),
+                        exit_obs if exit_obs is not None else "未记录",
                         str(card.get("verify_cmd") or "")[:120]),
                     kind="self_observation", tags=["self_driven", "verify"],
                     source="self_driven", entity_id=str(card.get("task_id") or ""))
                 logger.warning("[synapse] 自驱验证对账：task_id=%s verdict=%s exit=%s",
-                               card.get("task_id"), verdict, vres.get("exit"))
+                               card.get("task_id"), verdict, exit_obs)
         except Exception as e:  # noqa: BLE001 - 对账失败不影响已落盘的卡状态
             logger.warning("[synapse] 自驱验证对账异常：%s: %s",
                            type(e).__name__, str(e)[:200])

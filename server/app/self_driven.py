@@ -368,8 +368,16 @@ _RETRY_SYSTEM_PROMPT = (
     "你是 MoRay 自驱引擎的失败复盘器。刚才一次自驱目标执行失败，请基于失败原因"
     "给出一个修复式的下一步目标（换一个可行做法，而不是原样重试）。只输出一个 "
     "JSON 对象，不要任何解释或代码块标记，严格符合这个形状："
-    '{"goal": "新的改进目标（不超过50字）", "target_engine": "zcode 或 laya"}'
+    '{"goal": "新的改进目标（不超过50字）", '
+    '"claim": "一句话断言，必须能被现实判真假（不要口号）", '
+    '"prediction": "执行后应该观测到什么（具体、可核对）", '
+    '"verify_cmd": "在 Windows cmd 里能直接跑的**单行**命令，退出码 0=断言成立、'
+    '非 0=断言不成立；用绝对路径或 D:\\\\MoRay 下的相对路径；禁止 /tmp 这类 '
+    'Linux 路径、禁止 example.com / path/to 占位符", '
+    '"target_engine": "zcode 或 laya"}'
     "。target_engine 只允许取值 zcode 或 laya。"
+    "【硬约束】claim 里出现的每一个可判数字（如 10 bytes / 200 行 / 3 个文件）"
+    "都必须在 verify_cmd 里真的被校验，否则这条断言就有一部分没人验。"
 )
 
 
@@ -431,14 +439,36 @@ async def retry_handler(engine_task_id: str, failure_reason: str) -> dict | None
         logger.warning("[self_driven] 重试规划 LLM 失败（engine_task_id=%s）：%s",
                        tid, err)
         return None
-    goal, engine = _parse_goal_payload(raw)
+    # [v5.2] 重试卡必须和主链同一套可证伪三件套：早先这条链路走 v2 的
+    # _parse_goal_payload（只有 goal+engine），于是"失败重试"产出的卡天生没有
+    # verify_cmd —— 审批一次也判不了真假，纯烧人的注意力。现在改走 v3 解析，
+    # 并对硬缺陷（空/posix/syntax/ghost 路径）直接不发卡：宁可不重试，也不发
+    # 一张注定"命令不可判"的卡。
+    parsed = _parse_goal_payload_v3(raw)
+    goal = parsed["goal"]
+    engine = parsed["target_engine"]
     if not goal:
         logger.warning("[self_driven] 重试规划产出为空（engine_task_id=%s）：%r",
                        tid, str(raw)[:60])
         return None
+    problem = verify_cmd_problem(parsed["verify_cmd"])
+    if problem in _VERIFY_HARD_PROBLEMS:
+        logger.warning("[self_driven] 拒发重试卡：verify_cmd 硬缺陷 %s（%s）"
+                       "→ 不为一张注定不可判的卡消耗审批",
+                       problem, str(parsed["verify_cmd"] or "")[:80])
+        return None
+    uncovered = verify_cmd_coverage(parsed["claim"] or goal, parsed["verify_cmd"])
+    if uncovered:
+        logger.warning("[self_driven] v5.2 重试卡判据覆盖不全：%s 未出现在 "
+                       "verify_cmd 中（仍发卡，留痕待批）", uncovered)
     new_card = {
         "task_id": str(uuid.uuid4()),
         "goal": goal,
+        "claim": parsed["claim"],
+        "prediction": parsed["prediction"],
+        "verify_cmd": parsed["verify_cmd"],
+        "verify_problem": problem,
+        "coverage_uncovered": uncovered,
         "target_engine": engine,
         "engine_task_id": "",
         "status": "pending_approval",
@@ -714,6 +744,43 @@ _last_verify_sweep_monotonic = 0.0
 _VERIFY_HARD_PROBLEMS = ("empty", "posix_path", "posix_tool", "syntax", "ghost_path")
 #: 验证子进程的工作目录：固定工程根，相对路径有确定语义，不依赖服务启动目录。
 _VERIFY_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ---- v5.2 判据覆盖检查（治"成立里夹带没人验的假话"）----
+#: 为什么需要：2026-10-31 实测卡 4004b7bf 的 claim 写着 "contains exactly Hello 世界
+#: with 10 bytes"，而 verify_cmd 只比较内容相等、从未校验字节数 —— 判成"预测成立"
+#: 之后，"10 bytes"这句既没被判据覆盖，本身还是错的（实际 12 字节）。引擎不说谎，
+#: 说谎的是"断言里有一条没人验的附条款"。**只打标不拦卡**：判据覆盖是度量，不是
+#: 闸门；拦卡会让"可证伪但覆盖不全"的好卡也发不出去，反而降低活的天数。
+_COVERAGE_CLAUSE_RE = re.compile(
+    r"(\d+)\s*(bytes?|字节|chars?|字符|lines?|行|words?|单词|files?|文件|"
+    r"items?|entries?|个|条|项)", re.IGNORECASE)
+
+
+def verify_cmd_coverage(claim: str, verify_cmd: str) -> list:
+    """断言里的可判数值条款，哪些在 verify_cmd 里找不到对应数字。
+
+    纯函数零 IO、绝不抛（覆盖检查自己不能变成新故障点）。只做一件保守的事：
+    认出「数字 + 单位」条款（10 bytes / 200 行 / 3 个文件），若该数字没有出现在
+    verify_cmd 里，就记为未覆盖。宁漏不误——它只用来提示"这条断言有条款没验到"，
+    误报会污染台账信号，漏报只是少一条提示。
+    """
+    try:
+        text = str(claim or "")
+        cmd = str(verify_cmd or "")
+        if not text or not cmd:
+            return []
+        missing = []
+        for m in _COVERAGE_CLAUSE_RE.finditer(text):
+            num = m.group(1)
+            if num in cmd:
+                continue
+            token = "%s %s" % (num, m.group(2))
+            if token not in missing:
+                missing.append(token)
+        return missing[:6]
+    except Exception:  # noqa: BLE001 - fail-open：覆盖检查绝不抛
+        return []
+
+
 _VERDICT_LABELS = {"confirmed": "预测成立", "falsified": "预测被证伪",
                    "unverifiable": "命令不可判"}
 
@@ -1299,6 +1366,14 @@ async def generate_goal():
                            "（%s）→ 本轮不产出，不烧配额",
                            problem, parsed["verify_cmd"][:80])
             return None
+        # [v5.2] 判据覆盖打标：断言里有、判据里没验的数值条款。只记录不拦卡
+        # （见 verify_cmd_coverage 注释里的口径），让审批的人一眼看到"这条断言
+        # 哪部分其实没被判据覆盖"。
+        uncovered = verify_cmd_coverage(parsed["claim"] or goal,
+                                       parsed["verify_cmd"])
+        if uncovered:
+            logger.warning("[self_driven] v5.2 判据覆盖不全：断言条款 %s 未出现在 "
+                           "verify_cmd 中（仍发卡，留痕待批）", uncovered)
         card = {"task_id": str(uuid.uuid4()),
                 "goal": goal,
                 "claim": parsed["claim"],
@@ -1306,6 +1381,7 @@ async def generate_goal():
                 "verify_cmd": parsed["verify_cmd"],
                 "target_engine": parsed["target_engine"],
                 "verify_problem": problem,
+                "coverage_uncovered": uncovered,
                 "repeat_of": str(repeat.get("task_id") or "")
                              if isinstance(repeat, dict) else "",
                 "engine_task_id": "",
