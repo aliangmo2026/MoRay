@@ -562,6 +562,12 @@ function harnessLog(msg) {
   launcherLog('[harness] ' + msg);
 }
 
+/** [2026-11-01 P0-2] 访问令牌永不落盘：tee 进 dsh-web.log 前抹掉 ?token= 值。
+ * 只作用于持久化流；token 抓取逻辑读的是原始 text，不受影响。 */
+function redactHarnessToken(s) {
+  return s.replace(/([?&]token=)[A-Za-z0-9_-]+/g, '$1[REDACTED]');
+}
+
 /** 用参数数组结束进程树，完全不经过 shell */
 function taskkillTree(pid) {
   return new Promise((resolve) => {
@@ -815,7 +821,7 @@ function spawnHarness() {
 
     const scan = (chunk) => {
       const text = chunk.toString('utf8');
-      stream.write(text);
+      stream.write(redactHarnessToken(text));
       // [2026-11-01 P1-3] 收集 "skipping profile bundle" 行（boot 静默 skip 的唯一痕迹）
       const skipParts = (skipCarry + text).split(/\r?\n/);
       skipCarry = skipParts.pop() ?? '';
