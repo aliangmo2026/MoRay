@@ -82,8 +82,10 @@ async def _scheduler_loop() -> None:
     while True:
         try:
             await _scheduler_tick()
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             # [降噪 2026-10-11] Argus 冷启动 / 暂不可达——良性，降 warning，避免淹真 ERROR
+            # [P1-6 修复 2026-11-01] 捕获从 ConnectError 扩为 TransportError：超时族
+            # （ConnectTimeout/ReadTimeout/ReadError）不再是漏网的全量 ERROR traceback。
             logger.warning("[subscription] scheduler tick skipped: Argus unreachable (%s)", str(e)[:80])
         except Exception:  # noqa: BLE001
             logger.exception("[subscription] scheduler tick failed")
@@ -152,8 +154,9 @@ async def _deliver_loop() -> None:
     while True:
         try:
             await _deliver_tick()
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             # [降噪 2026-10-11] Argus 冷启动 / 暂不可达——良性，降 warning，避免淹真 ERROR
+            # [P1-6 修复 2026-11-01] 同 _scheduler_loop：超时族一并降噪，不再打全量堆栈。
             logger.warning("[subscription] deliver tick skipped: Argus unreachable (%s)", str(e)[:80])
         except Exception:  # noqa: BLE001
             logger.exception("[subscription] deliver tick failed")

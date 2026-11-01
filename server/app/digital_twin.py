@@ -19,6 +19,7 @@
 - 判重键 = (source, 归一化内容全等)，不含 tags——两份不同文档若含相同块，第二份该块
   命中判重返回第一份的 memory_id（tags 归属第一份），按幂等语义接受。
 """
+import json
 import logging
 import re
 
@@ -114,16 +115,20 @@ def _hybrid_recall(query: str, limit: int = 3, source: str = "") -> list:
                 cand = dict(memory_embed.search_similar(
                     q_vec, k=max(limit * 2, 10), kind="corpus"))
                 if cand:
-                    # 回表过滤 corpus：字面量 SQL 全扫 + Python 过滤（参数绑定纪律，
-                    # 不做 IN 拼接；扫描规模 = 分身语料块数）
+                    # [P1-5 修复 2026-11-01] 回表改按 top-k id 定点取：json_each 绑定，
+                    # SQL 保持字面量零拼接（Mimosa 纪律），行数 ≤ k（=limit*2），
+                    # 不再全表扫 corpus——10 万条量级下这是 O(N)→O(k) 的关键收敛。
                     # [P0可用性修复 2026-10-28] 按文档隔离：非空 source 时只留该文档的块
                     if src:
                         vrows = conn.execute(
-                            "SELECT id FROM memory_bank WHERE kind = 'corpus' AND source = ?",
-                            (src,)).fetchall()
+                            "SELECT id FROM memory_bank WHERE kind = 'corpus' AND source = ?"
+                            " AND id IN (SELECT value FROM json_each(?))",
+                            (src, json.dumps(list(cand.keys())))).fetchall()
                     else:
                         vrows = conn.execute(
-                            "SELECT id FROM memory_bank WHERE kind = 'corpus'").fetchall()
+                            "SELECT id FROM memory_bank WHERE kind = 'corpus'"
+                            " AND id IN (SELECT value FROM json_each(?))",
+                            (json.dumps(list(cand.keys())),)).fetchall()
                     corpus_ids = {r["id"] for r in vrows}
                     vec_hits = [(mid, sc) for mid, sc in cand.items() if mid in corpus_ids]
                     vec_hits.sort(key=lambda t: t[1], reverse=True)

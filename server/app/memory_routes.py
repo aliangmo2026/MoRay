@@ -387,11 +387,16 @@ async def memory_recall(request: Request):
                 # vec0 元数据下推只支持单值等值，多 kind 白名单仍走回表过滤。
                 cand = dict(memory_embed.search_similar(q_vec, k=max(limit * 3, 15), kind=None))
                 if cand:
+                    # [P1-5 修复 2026-11-01] 回表改按 top-k id 定点取：json_each 绑定，
+                    # SQL 字面量零拼接（Mimosa 纪律），行数 ≤ k（=limit*3），
+                    # 不再全表扫全部嵌入行（原实现把整库 BLOB 拉进 Python）。
                     conn2 = _conn()
                     try:
                         vrows = conn2.execute(
                             "SELECT id, kind, content, tags, source, entity_id, session_id, weight, created_at "
                             "FROM memory_bank WHERE embedding IS NOT NULL"
+                            " AND id IN (SELECT value FROM json_each(?))",
+                            (json.dumps(list(cand.keys())),)
                         ).fetchall()
                     finally:
                         conn2.close()

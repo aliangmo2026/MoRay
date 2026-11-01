@@ -50,6 +50,19 @@ const READY_TIMEOUT_MS = 30_000;    // 8000 就绪预算（冷启动 13.6s + 一
 const READY_INTERVAL_MS = 1_000;    // 健康轮询间隔
 const EXTRA_PAGE_TIMEOUT_MS = 12_000; // 8000 就绪后，其余标签页地址的补探预算
 
+// [2026-10-31 看门狗] v36 启动器只在壳启动时幂等拉一次服务；8000 运行中被外部
+// 杀掉（手动 taskkill / 异常退出）后无人兜底，前端一直 Connection error。
+// 看门狗常态探测，失联即用 _start_moray.bat 单独拉 8000。
+const BACKEND_BAT = 'D:\\MoRay\\_start_moray.bat';
+const BACKEND_HEALTH_URL = `http://${LISTEN_HOST}:8000/api/health`;
+// [2026-10-31 秒级自愈] 3s 心跳：8000 被外部杀掉（含 agent 误杀自己的 LLM 网关）
+// 最坏 3s 被发现 + ~1-2s 拉起，用户几乎无感。本地环回 GET 开销可忽略；
+// 失联→spawn→失败冷却各有守卫，常态零日志。
+const BACKEND_WATCHDOG_INTERVAL_MS = 3_000;   // 常态探测周期
+const BACKEND_REVIVE_BUDGET_MS = 10_000;      // 拉起后就绪预算
+const BACKEND_REVIVE_POLL_MS = 500;           // 拉起后轮询间隔
+const BACKEND_REVIVE_COOLDOWN_MS = 60_000;    // 拉起失败后的冷却（防进程风暴）
+
 // 全局快捷键：显示 / 隐藏主窗口
 const HOTKEY_TOGGLE = 'Alt+M';
 
@@ -522,6 +535,28 @@ async function killAllServicePorts() {
 let dshChild = null;   // 壳自己拉起的 dsh 进程（node -> dsh/lib/bin.js）
 // 入口解析失败时的可读原因：splash 文案与对话框共用，避免白屏
 let harnessBootError = null;
+// [2026-11-01 P1-3] 本次启动被 dsh 跳过的 profile bundle（如 moray-panels），
+// 从 stderr 逐行收集，启动完成后弹原生警告——不再让面板"无声消失"。
+let harnessSkippedBundles = [];
+
+/** [P1-3] 启动后汇报被 skip 的插件 bundle：日志 + 原生弹窗（不再静默失败）。 */
+function reportHarnessSkippedBundles() {
+  if (!harnessSkippedBundles.length) return;
+  const names = harnessSkippedBundles.slice();
+  harnessLog(`⚠ 本次启动有 ${names.length} 个插件 bundle 被跳过：${names.join(', ')}`);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '插件加载失败',
+      message: `本次启动有 ${names.length} 个插件被跳过，相关面板/工具不可用。`,
+      detail: `跳过的插件：\n${names.join('\n')}\n\n排查：${HARNESS_LOG} 搜 "skipping profile bundle"。\n常见原因：插件 package.json 损坏/带 BOM/缺 dsh.bundle 声明。`,
+      buttons: ['知道了']
+    }).then(
+      (r) => harnessLog(`插件跳过对话框关闭：${JSON.stringify(r)}`),
+      (err) => harnessLog(`插件跳过对话框失败：${(err && err.message) || err}`)
+    );
+  }
+}
 
 function harnessLog(msg) {
   launcherLog('[harness] ' + msg);
@@ -741,6 +776,9 @@ function spawnHarness() {
 
     let settled = false;
     let carry = '';
+    // [2026-11-01 P1-3] 每次 spawn 重置 skip 收集；按整行匹配防跨 chunk 重复计数。
+    harnessSkippedBundles = [];
+    let skipCarry = '';
     const finish = (url) => {
       if (settled) return;
       settled = true;
@@ -778,6 +816,13 @@ function spawnHarness() {
     const scan = (chunk) => {
       const text = chunk.toString('utf8');
       stream.write(text);
+      // [2026-11-01 P1-3] 收集 "skipping profile bundle" 行（boot 静默 skip 的唯一痕迹）
+      const skipParts = (skipCarry + text).split(/\r?\n/);
+      skipCarry = skipParts.pop() ?? '';
+      for (const line of skipParts) {
+        const sm = line.match(/skipping profile bundle ["']([^"']+)["']/);
+        if (sm && !harnessSkippedBundles.includes(sm[1])) harnessSkippedBundles.push(sm[1]);
+      }
       const matched = (carry + text).match(HARNESS_TOKEN_RE);
       carry = (carry + text).slice(-512);   // token 行可能被 chunk 切断
       if (!matched) return;
@@ -802,7 +847,9 @@ function spawnHarness() {
           && mainWindow.webContents.getURL().startsWith('file:')) {
         // [2026-10-29] 超时后 token 才到：窗口还停在 splash 就自动切过去。
         harnessLog('token URL captured (late)');
-        mainWindow.loadURL(target).catch((err) => harnessLog(`迟到 token 加载失败：${err.message}`));
+        mainWindow.loadURL(target)
+          .then(() => reportHarnessSkippedBundles())
+          .catch((err) => harnessLog(`迟到 token 加载失败：${err.message}`));
       }
     };
     child.stdout.on('data', scan);
@@ -841,6 +888,7 @@ async function bootHarnessWindow() {
     try {
       await mainWindow.loadURL(url);
       harnessLog('Harness 已加载');
+      reportHarnessSkippedBundles();
       // 一行 DPI/视口诊断：高分屏缩放异常时先看这里
       try {
         const diag = await mainWindow.webContents.executeJavaScript(
@@ -889,6 +937,7 @@ async function restartHarness() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (url) {
     try { await mainWindow.loadURL(url); } catch (err) { harnessLog(`重启后加载失败：${err.message}`); }
+    reportHarnessSkippedBundles();
   } else {
     await showHarnessFallback();
   }
@@ -896,17 +945,21 @@ async function restartHarness() {
 
 /** 托盘「重启全部服务」：停 6 服务 + Harness -> 并行拉起 -> 加载新 token 页 */
 async function restartEverything() {
+  stopBackendWatchdog();   // 杀/拉服务期间别让看门狗抢跑，与启动器竞争 8000 端口
   await killAllServicePorts();
   if (LEGACY_SHELL) {
     await launchAll();
+    startBackendWatchdog();
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reloadIgnoringCache();
     return;
   }
   const launch = launchAll();          // 8000 与 dsh 并行：dsh 的模型目录来自配置声明，不依赖 8000 先就绪
   const url = await ensureHarnessReady();
   await launch;
+  startBackendWatchdog();
   if (mainWindow && !mainWindow.isDestroyed() && url) {
     try { await mainWindow.loadURL(url); } catch (err) { harnessLog(`重载失败：${err.message}`); }
+    reportHarnessSkippedBundles();
   }
 }
 
@@ -938,12 +991,83 @@ async function launchAll() {
 }
 
 /* ============================================================
+ *  8000 看门狗 [2026-10-31]：壳运行期间失联 → 自动拉起
+ *  - 单飞守卫：拉起期间不叠加探测，绝不并发 spawn 多个 bat
+ *  - 失败冷却：拉起失败后下一个心跳顺延 60s，bat 持续崩溃也不进程风暴
+ *  - timer/spawn 均 unref：不阻止壳退出，服务存活不依赖壳（后台自转）
+ * ============================================================ */
+
+let backendWatchdogTimer = null;
+let backendReviving = false;
+
+/** 用官方 bat 单独拉 8000，500ms 轮询直到 health 200 或预算耗尽 */
+async function reviveBackend() {
+  launcherLog('[watchdog] 8000 失联 -> spawn _start_moray.bat');
+  try {
+    // [2026-10-31 黑框修复] 不得加 detached:true——DETACHED_PROCESS 让 cmd 无控制台，
+    // cmd 再拉控制台程序 python.exe 时系统会新建一个【可见】控制台黑框（uvicorn
+    // 日志满屏滚）。只用 windowsHide:true：cmd 得到隐藏控制台，python 继承之，
+    // 全树无窗口（与 ps1 启动器 CreateNoWindow 同机制）。壳退出不杀无主子进程，
+    // 服务照旧后台自转，无需 detached。
+    spawn('cmd.exe', ['/c', BACKEND_BAT], {
+      stdio: 'ignore',
+      windowsHide: true
+    });
+  } catch (err) {
+    launcherLog(`[watchdog] spawn 失败：${err.message}`);
+    return false;
+  }
+  const deadline = Date.now() + BACKEND_REVIVE_BUDGET_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, BACKEND_REVIVE_POLL_MS));
+    if (await httpGetOnce(BACKEND_HEALTH_URL, 1500)) return true;
+  }
+  return false;
+}
+
+/** 心跳链：探测失败 -> 拉起；结果决定下一次心跳的间隔（成功常态 / 失败冷却） */
+function scheduleBackendWatchdog(delayMs) {
+  clearTimeout(backendWatchdogTimer);
+  backendWatchdogTimer = setTimeout(async () => {
+    let nextDelay = BACKEND_WATCHDOG_INTERVAL_MS;
+    try {
+      if (!backendReviving && !(await httpGetOnce(BACKEND_HEALTH_URL, 2000))) {
+        backendReviving = true;
+        try {
+          const ok = await reviveBackend();
+          launcherLog(`[watchdog] 8000 拉起${ok ? '成功' : '未在预算内就绪（冷却后重试）'}`);
+          if (!ok) nextDelay = BACKEND_REVIVE_COOLDOWN_MS;
+        } finally {
+          backendReviving = false;
+        }
+      }
+    } catch (err) {
+      launcherLog(`[watchdog] 心跳异常：${err.message}`);
+    }
+    scheduleBackendWatchdog(nextDelay);
+  }, delayMs);
+  if (backendWatchdogTimer.unref) backendWatchdogTimer.unref();
+}
+
+function startBackendWatchdog() {
+  if (backendWatchdogTimer) return;   // 已在跑（重启全部服务等场景防叠加）
+  scheduleBackendWatchdog(BACKEND_WATCHDOG_INTERVAL_MS);
+  launcherLog(`[watchdog] 已启动：每 ${BACKEND_WATCHDOG_INTERVAL_MS / 1000}s 探测 ${BACKEND_HEALTH_URL}`);
+}
+
+function stopBackendWatchdog() {
+  clearTimeout(backendWatchdogTimer);
+  backendWatchdogTimer = null;
+}
+
+/* ============================================================
  *  关闭决策：对话框三选 + 记忆
  * ============================================================ */
 
 /** 完全退出：杀 6 服务（不含 Ollama）+ dsh，然后退出壳 */
 async function doQuitAll() {
   isQuitting = true;
+  stopBackendWatchdog();   // 先停看门狗，否则杀完 8000 它会立刻再拉起来
   await stopHarness();
   await killAllServicePorts();
   app.quit();
@@ -1407,8 +1531,10 @@ if (!gotLock) {
       console.log(`全局快捷键 ${HOTKEY_TOGGLE} 注册失败（可能被其它程序占用）。`);
     }
 
-    // 无条件调一次 v36 启动器（幂等）并等待就绪
-    launchAll().catch((e) => console.error('[launchAll] 异常：', e));
+    // 无条件调一次 v36 启动器（幂等）并等待就绪，随后交给看门狗常态巡检
+    launchAll()
+      .catch((e) => console.error('[launchAll] 异常：', e))
+      .finally(() => startBackendWatchdog());
   });
 
   // 关闭窗口不退出（托盘常驻）；真正退出口是标题栏 ✕ / 托盘「退出程序」
