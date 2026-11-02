@@ -1,3 +1,0 @@
-hello world
-zcode cloud test
-end

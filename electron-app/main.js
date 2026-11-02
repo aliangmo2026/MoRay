@@ -28,6 +28,7 @@
 const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell } = require('electron');
 const { spawn, exec, execFile } = require('child_process');
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 
@@ -62,6 +63,10 @@ const BACKEND_WATCHDOG_INTERVAL_MS = 3_000;   // 常态探测周期
 const BACKEND_REVIVE_BUDGET_MS = 10_000;      // 拉起后就绪预算
 const BACKEND_REVIVE_POLL_MS = 500;           // 拉起后轮询间隔
 const BACKEND_REVIVE_COOLDOWN_MS = 60_000;    // 拉起失败后的冷却（防进程风暴）
+// [2026-11-01 双击即用] 窗口创建前静默预拉 8000 的等待预算/轮询间隔。
+// 只等端口 LISTENING，不 GET /api/health（端口先于应用就绪，省一次 HTTP）。
+const BACKEND_PRELAUNCH_WAIT_MS = 10_000;
+const BACKEND_PRELAUNCH_POLL_MS = 400;
 
 // 全局快捷键：显示 / 隐藏主窗口
 const HOTKEY_TOGGLE = 'Alt+M';
@@ -980,8 +985,81 @@ function setStatus(page, status) {
   }
 }
 
-async function launchAll() {
+/* ============================================================
+ *  [2026-11-01 双击即用] 窗口创建前静默预拉 8000
+ *  - 先 net 探活：已在监听 -> 跳过 spawn（防双开/端口冲突）
+ *  - 未监听 -> cmd /c _start_moray.bat，windowsHide + stdio ignore，全树无黑框
+ *  - 刻意不用 detached：本项目实测 DETACHED_PROCESS 会让 cmd 再拉起的 python
+ *    新建【可见】控制台（见 reviveBackend 的 2026-10-31 黑框修复注释）；
+ *    child.unref() 已足够——服务进程独立于壳存活，关前端不影响后端。
+ *  - 返回 Promise<{listening:boolean, spawned:boolean}>，由 launchAll 等待，
+ *    避免"预拉 bat"与"v36 启动器"同时抢 8000。
+ * ============================================================ */
+
+let backendPrelaunchPromise = null;
+
+/** TCP 探活 127.0.0.1:port（不依赖 HTTP 实现；超时/拒绝一律 false） */
+function isLocalPortListening(port, timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: LISTEN_HOST, port });
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+/** 窗口创建前静默拉起 8000：已监听跳过；否则 bat 拉起并等端口就绪 */
+async function ensureBackendBeforeWindow() {
+  if (await isLocalPortListening(8000)) {
+    launcherLog('[prelaunch] 8000 已在监听，跳过 spawn（防双开）');
+    return { listening: true, spawned: false };
+  }
+  launcherLog('[prelaunch] 8000 未监听 -> 静默 spawn _start_moray.bat');
+  let spawned = false;
+  try {
+    const child = spawn('cmd.exe', ['/c', BACKEND_BAT], {
+      windowsHide: true,   // 硬约束：绝不弹黑框
+      detached: false,     // 见上方注释：detached 在 Windows 会产生可见控制台
+      stdio: 'ignore'
+    });
+    child.on('error', (err) => launcherLog(`[prelaunch] spawn 失败：${err.message}`));
+    child.unref();         // 服务不依赖壳存活（关壳不带走后端）
+    spawned = true;
+  } catch (err) {
+    launcherLog(`[prelaunch] spawn 异常：${err.message}`);
+  }
+  const deadline = Date.now() + BACKEND_PRELAUNCH_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, BACKEND_PRELAUNCH_POLL_MS));
+    if (await isLocalPortListening(8000)) {
+      launcherLog('[prelaunch] 8000 已就绪（端口 LISTENING）');
+      return { listening: true, spawned };
+    }
+  }
+  launcherLog('[prelaunch] 等待超时，交由启动器/看门狗接管');
+  return { listening: false, spawned };
+}
+
+async function launchAll(prelaunch) {
   PAGES.forEach((p) => setStatus(p, 'starting'));
+  // 先等预拉结果再动启动器：成功则启动器按端口幂等跳过 8000，
+  // 失败/超时则由启动器兜底，避免两个拉起路径同时抢 8000。
+  if (prelaunch) {
+    try {
+      const pre = await prelaunch;
+      launcherLog(`[prelaunch] 结果 listening=${!!(pre && pre.listening)} spawned=${!!(pre && pre.spawned)}`);
+    } catch (err) {
+      launcherLog(`[prelaunch] 等待异常：${err.message}`);
+    }
+  }
   spawnLauncher();
 
   const moray = PAGES.find((p) => p.id === 'moray');
@@ -1525,6 +1603,13 @@ if (!gotLock) {
       console.warn('[MoRay Shell] clearCache failed:', e);
     }
 
+    // [2026-11-01 双击即用] 建窗前先静默探活/拉起 8000；不 await——splash 秒开，
+    // launchAll 内再等这个 Promise 的结果（防与 v36 启动器双拉起 8000）。
+    backendPrelaunchPromise = ensureBackendBeforeWindow().catch((err) => {
+      launcherLog(`[prelaunch] 异常：${err.message}`);
+      return { listening: false, spawned: false };
+    });
+
     loadPrefs();
     createWindow();
     createTray();
@@ -1538,7 +1623,7 @@ if (!gotLock) {
     }
 
     // 无条件调一次 v36 启动器（幂等）并等待就绪，随后交给看门狗常态巡检
-    launchAll()
+    launchAll(backendPrelaunchPromise)
       .catch((e) => console.error('[launchAll] 异常：', e))
       .finally(() => startBackendWatchdog());
   });

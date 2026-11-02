@@ -300,3 +300,20 @@ ORGAN_MEMORY_ENABLED = os.environ.get("MORAY_ORGAN_MEMORY", "1").strip().lower()
 # 关闸时 send() 完全 no-op（synapse_bus.send 首行检查），bus consumer 也不起（main.py 门控）。
 SYNAPSE_DB = os.environ.get("MORAY_SYNAPSE_DB", str(DATA_DIR / "synapse.sqlite3"))
 SYNAPSE_ENABLED = os.environ.get("MORAY_SYNAPSE", "0").strip().lower() not in ("0", "false", "no", "off")
+
+# ---- [外部触达 v1 2026-11-01] OneBot 同机对接配置（本块为文件尾纯追加，上方任何一项未动）----
+# 总闸默认关：BOT_ENABLED=false 时 POST /api/bot/webhook 一律 503、后台 bot_worker 不起。
+# 属性名用 BOT_*，env 前缀沿用仓库惯例 MORAY_*（映射见 server/.env.example）：
+#   BOT_ENABLED   <- MORAY_BOT_ENABLED
+#   BOT_TOKEN     <- MORAY_BOT_TOKEN
+#   BOT_API_BASE  <- MORAY_BOT_API_BASE
+#   BOT_API_TOKEN <- MORAY_BOT_API_TOKEN
+BOT_ENABLED = os.environ.get("MORAY_BOT_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+# Webhook 入站鉴权（OneBot access-token 同款，Authorization: Bearer <token>）。
+# 留空 = 拒绝一切入站（fail-close）：没配 token 的 webhook 等于把本机 LLM 白送。
+BOT_TOKEN = os.environ.get("MORAY_BOT_TOKEN", "").strip()
+# OneBot 实现（NapCat / Lagrange）的 HTTP API 根地址。bot_client.startup 只放行回环主机，
+# 即使 .env 被改成公网地址也会在启动期拒绝（本地 Bot 网关不得被当成任意主机代理）。
+BOT_API_BASE = os.environ.get("MORAY_BOT_API_BASE", "http://127.0.0.1:3000").strip().rstrip("/")
+# OneBot HTTP API 出站鉴权（可选；与入站 BOT_TOKEN 是两个独立凭据，可相同也可不同）。
+BOT_API_TOKEN = os.environ.get("MORAY_BOT_API_TOKEN", "").strip()

@@ -185,6 +185,21 @@ async def lifespan(_app: FastAPI):
     deliver_task = asyncio.create_task(_deliver_loop())
     _app.state.scheduler_task = scheduler_task
     _app.state.deliver_task = deliver_task
+    # [外部触达 v1 2026-11-01] OneBot 同机对接：总闸开 + 出站基址合法才起 worker。
+    # 关闸时 webhook 返回 503；基址非法时只留 warning、worker 不起（不炸启动）。
+    bot_task = None
+    if config.BOT_ENABLED:
+        from . import bot_client as _bot_client  # 惰性导入（新模块防环惯例）
+        from .bot_routes import bot_worker as _bot_worker
+        if await _bot_client.startup():
+            bot_task = asyncio.create_task(_bot_worker())
+            _app.state.bot_task = bot_task
+            logger.warning("[bot] enabled: webhook=/api/bot/webhook api_base=%s",
+                           config.BOT_API_BASE)
+        else:
+            logger.warning("[bot] BOT_ENABLED=true 但出站客户端未就绪，worker 不启动")
+    else:
+        logger.warning("[bot] disabled (MORAY_BOT_ENABLED=false)")
     # [自省循环 2026-10-09 桥一] ERROR 环形缓冲挂到 moray logger（ERROR+ 才进环）；
     # [桥一 v1.6] 统一走 install_error_handlers()：环形缓冲 + moray_errors.log
     # FileHandler（append 落盘，补重启盲区）一并挂上，幂等。自检 loop 起手跑一轮
@@ -213,6 +228,15 @@ async def lifespan(_app: FastAPI):
     # [L5.2] 监控循环收尾：未启用时 disable 是安全 no-op（不养僵尸任务、不让 teardown 挂起）
     from .log_monitor import manager as _monitor_manager  # noqa: E402
     await _monitor_manager.disable()
+    # [外部触达 v1] 先停 worker 再关出站客户端：cancelled 的 handler 不再摸已关闭的 client。
+    if bot_task is not None:
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
+    from . import bot_client as _bot_client  # noqa: E402
+    await _bot_client.shutdown()
     for t in (scheduler_task, deliver_task):
         t.cancel()
     for t in (scheduler_task, deliver_task):
@@ -250,6 +274,14 @@ from .digital_twin import router as digital_twin_router  # noqa: E402 [数字分
 app.include_router(digital_twin_router)  # [数字分身 v1 2026-10-23] POST /api/twin/ingest + /api/twin/recall；独立路径，既有匹配顺序不变
 from .self_driven import router as self_driven_router  # noqa: E402 [自驱引擎 v1 2026-10-23]
 app.include_router(self_driven_router, prefix="/api")  # [自驱引擎 v1 2026-10-23] POST /api/self_driven/generate + GET /api/self_driven/queue；独立路径，既有匹配顺序不变
+# [真实感知 2026-11-01] GET /api/system/organs（实时 7 端口探活）+ GET /api/system/events
+# （llm_proxy 拦截事件环形缓冲）；独立路径前缀 /api/system/*，与既有 /api/* 不冲突。
+from .system_routes import router as system_router  # noqa: E402
+app.include_router(system_router)
+# [外部触达 v1 2026-11-01] POST /api/bot/webhook（OneBot 入站；Bearer 鉴权）。
+# 关闸时路由仍在但一律 503（诚实报"未启用"，比 404 更好排障）。
+from .bot_routes import router as bot_router  # noqa: E402
+app.include_router(bot_router)
 
 # 关键坑：前端可能以 file:// 打开（Origin 为字符串 "null"），也可能来自
 # http://127.0.0.1 或 http://localhost 的任意端口 —— 正则统一放行

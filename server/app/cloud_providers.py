@@ -196,6 +196,18 @@ def _render_block(entries: list[tuple[str, str, str]]) -> str:
         "          maxTokensField: max_tokens",
         "          supportsUsageInStreaming: true",
         "        streamIdleTimeoutMs: 180000",
+        # [2026-10-31 预算熔断不重试] 显式 retryPolicy（与 moray-cloud 同款）：
+        # 不含 RATE_LIMIT —— 429（云端预算熔断/上游限流）不进重试链。缺省时
+        # dsh-llm 的默认 policy = maxRetries:5 且 retryableCodes 含 RATE_LIMIT，
+        # 熔断后会长程任务空转 5 次重试（2026-10-31 事故实证）。
+        "        retryPolicy:",
+        "          mode: normal",
+        "          maxRetries: 3",
+        "          retryableCodes:",
+        "            - EMPTY_RESPONSE",
+        "            - SERVER",
+        "            - TIMEOUT",
+        "            - TRANSPORT",
         "        models:",
     ]
     for model, owner, display in entries:
@@ -203,6 +215,13 @@ def _render_block(entries: list[tuple[str, str, str]]) -> str:
         lines.append("            name: %s · %s" % (model, display or owner))
         lines.append("            contextWindow: 131072")
         lines.append("            maxTokens: 8192")
+        # 手写模型条目缺 input 时 pi-ai 物化成纯文本（DEFAULT_INPUT=["text"]），
+        # dsh 会话层会以 MODEL_DOES_NOT_SUPPORT_IMAGES 拒收图片。注册表条目是用户
+        # 自行录入的厂商模型，这里统一声明视觉能力：官方 API 对带图请求要么解析、
+        # 要么返回明确的上游错误，不会像纯文本声明那样在 UI 静默屏蔽图片入口。
+        # 代价：确属纯文本的模型也能挂图，上游会答"看不到图"（数据模型只有模型名
+        # 列表无法按模型区分；如需精确声明，后续可在面板加 per-model 视觉开关）。
+        lines.append("            input: [text, image]")
     lines.append(_MARK_END)
     return "\n".join(lines)
 

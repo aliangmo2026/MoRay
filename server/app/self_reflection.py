@@ -14,6 +14,11 @@
   正是素材缺口的根；窗口内容必带 [窗口 时间戳] → 逐行唯一，双查重天然通过，
   静默期窗口也如实落行。
 
+[真实感知 2026-11-01] 窗口事实之外再拼两段**外部真实状态**：self_check 最近一次
+报告（level / 下线端口 / 窗口内 ERROR 数）与 self_state 实时流水（mental_score /
+连续失败次数）。此前自我观察只数"我说了多少话"，看不到"我做砸了什么"；接上这
+两路之后，痛觉才进得了自省原料池。取不到就写"读取失败"并带原因码，绝不补 0/100。
+
 与 B1 的分工：本模块写出的行是"给自己的日记"，不是"给用户捞的记忆"——
 召回白名单已治本（memory_routes.py [白名单治本 2026-10-10]）：
 kind IN ('fact','task_result','insight','preference')，
@@ -112,29 +117,126 @@ def _read_memory_counts() -> dict:
             "total_count": sum(counts.values())}
 
 
-def _build_content(current: dict, snapshot: dict) -> str:
+def _read_self_check_facts() -> dict:
+    """[真实感知 2026-11-01] 读 self_check 最近一次报告，只提取三件事实：
+    level / 下线端口 / 窗口内 ERROR 数。
+
+    只读——不触发新一轮探活、不写任何模块状态（报告本身是 30 分钟粒度的
+    缓存快照，口径与自检循环一致，这里不另立探活）。任何环节缺失都
+    status=unavailable + 具体原因，让调用方如实写"读取失败"，不编全绿。"""
+    try:
+        from . import self_check
+        report = self_check.get_last_report()
+    except Exception as e:  # noqa: BLE001 - fail-open：取不到是事实，绝不抛
+        logger.warning("[self_reflection] 读 self_check 报告异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return {"status": "unavailable",
+                "reason": "%s: %s" % (type(e).__name__, str(e)[:80])}
+    if not isinstance(report, dict):
+        return {"status": "unavailable", "reason": "首轮自检尚未完成"}
+    ports = report.get("ports")
+    errors = report.get("errors")
+    if not isinstance(ports, dict) or not isinstance(errors, dict):
+        return {"status": "unavailable", "reason": "报告缺 ports/errors 字段"}
+    err_count = errors.get("recent_30min")
+    if isinstance(err_count, bool) or not isinstance(err_count, int):
+        return {"status": "unavailable", "reason": "errors.recent_30min 非整数"}
+    down = [str(p) for p, v in ports.items()
+            if isinstance(v, dict) and v.get("up") is False]
+    return {"status": "ok",
+            "level": str(report.get("level") or "unknown"),
+            "ts": str(report.get("ts") or ""),
+            "ports_total": len(ports),
+            "down_ports": down,
+            "errors_30min": err_count}
+
+
+def _read_state_facts() -> dict:
+    """[真实感知 2026-11-01] 读实时状态机最新一行（memory.sqlite3 的 self_state_log）。
+
+    id 为 None = 该表还没有任何行（进程内尚无成败事件）→ 如实 unavailable。
+    刻意不把 get_current_state() 的基线默认值 100/0 当成"我很健康"：那正是
+    "自欺"的另一种写法。字段非整数同样如实报失败。"""
+    try:
+        from . import self_state
+        cur = self_state.get_current_state()
+    except Exception as e:  # noqa: BLE001 - fail-open
+        logger.warning("[self_reflection] 读 self_state 异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return {"status": "unavailable",
+                "reason": "%s: %s" % (type(e).__name__, str(e)[:80])}
+    if not isinstance(cur, dict):
+        return {"status": "unavailable", "reason": "get_current_state 返回非 dict"}
+    if cur.get("id") is None:
+        return {"status": "unavailable", "reason": "状态流水为空"}
+    ms = cur.get("mental_score")
+    cf = cur.get("consecutive_failures")
+    if (isinstance(ms, bool) or not isinstance(ms, int)
+            or isinstance(cf, bool) or not isinstance(cf, int)):
+        return {"status": "unavailable", "reason": "mental_score 非整数"}
+    return {"status": "ok",
+            "mental_score": ms,
+            "consecutive_failures": cf,
+            "engine": str(cur.get("engine") or ""),
+            "event": str(cur.get("event") or "")}
+
+
+def _render_perception(self_check_facts: dict | None, state_facts: dict | None) -> str:
+    """真实感知两段（自检快照 + 实时状态流水），只放事实，不出现建议/归因。
+
+    任一段读不到 → 明写"读取失败"并附原因；绝不用 0 / 100 冒充健康。两段都
+    拿不到时仍输出两行失败告知——"镜子照不到自己"本身就是要被记录的事实。"""
+    parts = []
+    sc = self_check_facts if isinstance(self_check_facts, dict) else {}
+    if sc.get("status") == "ok":
+        down = sc.get("down_ports") or []
+        down_txt = "无" if not down else "、".join(str(p) for p in down)
+        parts.append(
+            "近 30 分钟自检 level=%s（报告时刻 %s）：%d 个端口下线（%s）；窗口内 ERROR %d 条"
+            % (sc.get("level") or "unknown", sc.get("ts") or "未知",
+               len(down), down_txt, sc.get("errors_30min")))
+    else:
+        parts.append("自检快照读取失败（%s）" % (sc.get("reason") or "未取到报告"))
+
+    st = state_facts if isinstance(state_facts, dict) else {}
+    if st.get("status") == "ok":
+        parts.append(
+            "实时状态：mental_score=%d，连续失败 %d 次（最近事件 %s/%s）"
+            % (st.get("mental_score"), st.get("consecutive_failures"),
+               st.get("engine") or "未知", st.get("event") or "未知"))
+    else:
+        parts.append("实时状态读取失败（%s）" % (st.get("reason") or "未取到状态流水"))
+    return "；" + "；".join(parts) + "。"
+
+
+def _build_content(current: dict, snapshot: dict,
+                   self_check_facts: dict | None = None,
+                   state_facts: dict | None = None) -> str:
     """[丙改法 2026-10-14] 窗口增量模板——内容必带 [窗口 时间戳] 保证逐行唯一
     （dup / insert P1 双查重天然通过），因此不再需要 no_change 拦闸。
     - 空快照（进程重启后首次）→ 基线行：只写绝对值，不编 delta、不写时长；
     - 反思日计数日切/重启会使 delta 为负 → 取重置后的当日值（重置前尾数
       不可考，如实取可考部分）；计数为负（forget 删行）是真实净变化，如实写。
-    纯数字事实、无建议无归因；时长 = now - 上次观察时刻（epoch 秒，挂钟）。"""
+    纯数字事实、无建议无归因；时长 = now - 上次观察时刻（epoch 秒，挂钟）。
+    [真实感知 2026-11-01] 尾部追加 self_check / self_state 两段真实状态。"""
     ts = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
     if not snapshot.get("last_observed_at"):
-        return ("[窗口 %s] 基线（本进程首次观察）：当前 task_result %d 条、"
+        base = ("[窗口 %s] 基线（本进程首次观察）：当前 task_result %d 条、"
                 "insight %d 条、库内总计 %d 条") % (
             ts, current["task_result_count"], current["insight_count"],
             current["total_count"])
-    dur = max(0, int(time.time() - snapshot["last_observed_at"]))
-    n1 = current["task_result_count"] - snapshot["task_result_count"]
-    n2 = current["insight_count"] - snapshot["insight_count"]
-    n3 = current["reflection_triggers"] - snapshot["reflection_triggers"]
-    if n3 < 0:
-        n3 = current["reflection_triggers"]  # 日计数归零/重置：取当日已触发数
-    return ("[窗口 %s] 自上次观察 %dh%dm：净增 task_result %d 条、insight %d 条、"
-            "反思触发 %d 次；当前库内总计 %d 条") % (
-        ts, dur // 3600, (dur % 3600) // 60, n1, n2, n3,
-        current["total_count"])
+    else:
+        dur = max(0, int(time.time() - snapshot["last_observed_at"]))
+        n1 = current["task_result_count"] - snapshot["task_result_count"]
+        n2 = current["insight_count"] - snapshot["insight_count"]
+        n3 = current["reflection_triggers"] - snapshot["reflection_triggers"]
+        if n3 < 0:
+            n3 = current["reflection_triggers"]  # 日计数归零/重置：取当日已触发数
+        base = ("[窗口 %s] 自上次观察 %dh%dm：净增 task_result %d 条、insight %d 条、"
+                "反思触发 %d 次；当前库内总计 %d 条") % (
+            ts, dur // 3600, (dur % 3600) // 60, n1, n2, n3,
+            current["total_count"])
+    return base + _render_perception(self_check_facts, state_facts)
 
 
 def self_reflection_maybe() -> dict:
@@ -166,7 +268,8 @@ def self_reflection_maybe() -> dict:
             "total_count": mem["total_count"],
             "reflection_triggers": counters["daily_count"],
         }
-        content = _build_content(current, _last_snapshot)
+        content = _build_content(current, _last_snapshot,
+                                 _read_self_check_facts(), _read_state_facts())
         conn = memory_db.connect()
         try:
             hit = conn.execute(

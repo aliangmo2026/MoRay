@@ -1,6 +1,0 @@
-Placeholder file created in response to the bare instruction "Write".
-
-No topic, filename, or format was specified, and the working directory
-contained no instructions, so no substantive content could be produced.
-Replace the contents of this file (or ask for a different one) once the
-intended content is known.

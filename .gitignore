@@ -146,6 +146,24 @@ tmp/
 # 会话临时脚本/目录：如 _tmp_probe.py、.tmp_pw/
 _tmp_*
 .tmp_*
+# ---- 2026-11-02 开源前清洗：审计/备份/测试残留一律不进仓库 ----
+# 验收与调试产物（bot 验签样本、基线哈希等）
+_audit/
+# 每小时/每轮补丁前的手工备份目录（_patchbak_<时间戳>/）
+_patchbak_*/
+# 根级一次性探针脚本（_probe_abspath*.py 等）
+_probe_*.py
+# 任何 *.bak / *.bak_<时间戳> / *.bak_dir，含历史上误追踪的三处
+*.bak
+*.bak_*
+*.bak_dir/
+# test_*_workspace：测试运行时工作区（沙箱 inbox、状态快照），不是测试代码
+test_*_workspace/
+# 根级沙箱运行时目录（zcode_sandbox / iris_fixture 等执行产物）
+/workspace/
+# P1 修复期间的临时文件副本与一次性测试文件
+/tmp_p1fix_current/
+/utf_test.txt
 # 注：*.log 已由上方既有规则屏蔽，此处不重复添加
 # ---- 2026-10-10 补记（侦察验证时发现 l* 前缀漏掉 p_mcp_audit.md）----
 # 兜底 docs/ 下全部审计记录（p_mcp_audit.md 等；涵盖此前的 docs/l*_audit.md）

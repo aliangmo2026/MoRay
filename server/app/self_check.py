@@ -90,6 +90,19 @@ def read_recent_error_lines(marker: str, max_bytes: int = 512 * 1024, limit: int
 
 #: 最近一次报告（只读端点数据源；首跑前为 None）
 _LAST_REPORT: dict | None = None
+
+
+def get_last_report():
+    """[真实感知 2026-11-01] 只读访问器：返回最近一次自检报告对象（首跑前为 None）。
+
+    给 self_reflection 用——它要把"端口下线/ERROR 计数"当真实痛觉喂给自我观察。
+    直接摸 `_LAST_REPORT` 这个私有名等于把"报告只写一次"的纪律打穿；本函数是
+    稳定契约：返回原对象，不拷贝、不修改、不做任何补全（拿不到就是 None，
+    调用方必须如实写"读取失败"，不得把 None 当成全绿）。
+    """
+    return _LAST_REPORT
+
+
 #: ERROR 环形缓冲单例（main.py 挂 handler 与本模块读取必须是同一对象）
 _ERROR_HANDLER: "ErrorRingBuffer | None" = None
 #: v1.6 ERROR FileHandler 单例（install 与重取必须同一对象，防双开文件句柄）

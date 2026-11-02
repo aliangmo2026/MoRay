@@ -340,8 +340,9 @@ def _upstream_code(status: int) -> str:
     }.get(status, "upstream_error")
 
 
-def _err(status: int, code: str, message: str):
-    return JSONResponse(status_code=status, content={"ok": False, "code": code, "message": message})
+def _err(status: int, code: str, message: str, headers: dict | None = None):
+    return JSONResponse(status_code=status, content={"ok": False, "code": code, "message": message},
+                        headers=headers or None)
 
 
 #: [2026-09-30d 任务二点五] 云端每百万 token 美元单价（成本价目表）。
@@ -832,7 +833,12 @@ async def llm_chat(request: Request):
                     _vec_open = True
                 if not _vec_open:
                     _logger.info("[twin-rag] 向量通道熔断冷却中，本次仅走 FTS 检索")
-                _twin_items = _hybrid_recall(_twin_query, limit=3)
+                # [外部触达 v1 2026-11-01] 这行是**同步**调用：内部 get_embedding 走
+                # httpx.Client（阻塞），冷加载实测 60s 超时、热态 ~7s。放在 async handler
+                # 里会卡死整个事件循环——worker 处理 IM 消息期间 webhook/UI 全部排队
+                # （实测 duplicate 请求被拖 7.5s，冷加载时 53.8s）。丢线程池执行：
+                # _hybrid_recall 每次自建 sqlite 连接，无 loop 绑定对象，线程安全。
+                _twin_items = await asyncio.to_thread(_hybrid_recall, _twin_query, 3)
                 if _twin_items:
                     # [P1-1 2026-10-26 QA 修复] 召回非空即强命中：置位物理剥夺标志。此前
                     # 10-24b 取消阈值重构只删了旧阈值块里的置位、未在此分支补回，导致下方
@@ -931,9 +937,19 @@ async def llm_chat(request: Request):
         # detective_research（Argus 外部搜索）从本次请求的 tools 里摘除，模型无此工具可调，
         # 只能依据注入的内部知识作答；zcode 等其余工具不受影响。全部摘除时不下发 tools 键。
         if _twin_strong_hit:
+            _tools_before = len(tools)
             tools = [t for t in tools
                      if not (isinstance(t, dict) and isinstance(t.get("function"), dict)
                              and (t["function"].get("name") or "") == "detective_research")]
+            if len(tools) < _tools_before:
+                # [真实感知 2026-11-01] 拦截必须留痕：此前这段是纯内存分支，事后
+                # 无从证明"这一刻剥夺发生过"。_emit_intercept 自带 try/except，
+                # 观测旁路的任何异常都不会影响本次请求。
+                try:
+                    from .system_routes import _emit_intercept
+                    _emit_intercept("物理剥夺", "命中Twin RAG，已剥夺外部搜索")
+                except Exception:  # noqa: BLE001 - 观测旁路绝不反噬主链路
+                    pass
         if tools:
             payload["tools"] = tools
     if body.get("tool_choice") is not None:
@@ -1016,8 +1032,26 @@ async def llm_chat(request: Request):
                 est_cost_usd=min(_est_requested, float(config.PER_CALL_BUDGET_USD)))
         except cloud_budget_guard.CloudBudgetError as e:
             _logger.warning("[router] 云端预算闸门拒绝：%s", e)
+            # [真实感知 2026-11-01] 预算阻断进拦截事件流（旁路，fail-open）。
+            # 只有 BudgetExceeded 才是"预算不足"；其余子类（CloudDisabled /
+            # CloudNotForFallback / StateUnavailable）如实换个说法，不栽赃预算。
+            try:
+                from .system_routes import _emit_intercept
+                _reason = ("云端预算不足，已阻断请求"
+                           if isinstance(e, cloud_budget_guard.BudgetExceeded)
+                           else "云端预算闸门拒绝，已阻断请求")
+                _emit_intercept("预算拦截", "%s（%s）" % (_reason, type(e).__name__))
+            except Exception:  # noqa: BLE001 - 观测旁路绝不反噬主链路
+                pass
             if isinstance(e, cloud_budget_guard.BudgetExceeded):
-                return _err(429, "cloud_budget_exceeded", str(e))
+                # [2026-10-31 预算超限不重试] X-Should-Retry:false 是 OpenAI SDK 重试
+                # 惯例的一票否决头，pi-ai 的 isRetryableProviderError 见之直接放弃，
+                # 兜住 dsh 侧任何 retryPolicy 漏配的 provider——熔断是确定性拒绝，
+                # 重试只会白烧配额外加长程任务的中断时间。Retry-After 给 1h 防瞎等。
+                return _err(429, "cloud_budget_exceeded",
+                            "云端每日预算/次数已超限（%s）。请重置熔断：网关面板「重置云端预算」"
+                            "按钮或 POST /api/budget/reset；或等跨日自动清零。" % e,
+                            headers={"X-Should-Retry": "false", "Retry-After": "3600"})
             if isinstance(e, cloud_budget_guard.CloudDisabled):
                 return _err(503, "cloud_api_disabled", str(e))
             if isinstance(e, cloud_budget_guard.CloudNotForFallback):
@@ -1649,7 +1683,10 @@ async def openai_chat_completions(request: Request):
             return JSONResponse(status_code=inner_result.status_code,
                                 content=_oai_error_body("upstream_error", "内部错误。"))
         return JSONResponse(status_code=inner_result.status_code,
-                            content=_map_legacy_error_body(data))
+                            content=_map_legacy_error_body(data),
+                            # [2026-10-31 预算超限不重试] 透传 _err 携带的响应头
+                            # （X-Should-Retry:false / Retry-After——pi-ai 一票否决重试靠它）
+                            headers=dict(inner_result.headers))
 
     # ---- 4c. 非流式成功（dict）→ 标准 OpenAI chat.completion ----
     return _to_openai_completion(inner_result)

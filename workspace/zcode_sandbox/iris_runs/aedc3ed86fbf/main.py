@@ -1,1 +1,0 @@
-raise FileNotFoundError("[Errno 2] No such file or directory: config.yaml")

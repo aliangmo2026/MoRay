@@ -1,7 +1,0 @@
-﻿zcode.cmd : ZCode Built-in skipped (not-due)
-所在位置 行:1 字符: 600
-+ ... ; $prompt | & "D:\MoRay\engines\bin\zcode.cmd" -p - --mode edit --cwd ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (ZCode Built-in skipped (not-due):String) [], RemoteException
-    + FullyQualifiedErrorId : NativeCommandError
- 

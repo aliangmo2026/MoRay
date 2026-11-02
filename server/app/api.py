@@ -289,6 +289,116 @@ def cost_stats(days: int = 14):
     })
 
 
+# ---------------- [使用统计面板 2026-10-31] 总览与按日聚合 ----------------
+def _stats_cutoff(days: int, default: int) -> int:
+    """days 夹紧后返回 epoch 毫秒 cutoff（参数化下推，无 SQL 拼接）。"""
+    try:
+        n = int(days)
+    except (TypeError, ValueError):
+        n = default
+    return int((time.time() - max(1, min(n, 3650)) * 86400) * 1000)
+
+
+def _stats_streak(dates: set[str]) -> int:
+    """最长连续活跃天数（YYYY-MM-DD 集合 → 天数；从最近一天往回数最长段）。"""
+    import datetime as _dt
+    if not dates:
+        return 0
+    parsed = sorted(_dt.date.fromisoformat(d) for d in dates)
+    best = run = 1
+    for a, b in zip(parsed, parsed[1:]):
+        run = run + 1 if (b - a).days == 1 else 1
+        best = max(best, run)
+    return best
+
+
+@router.get("/api/stats/overview")
+def stats_overview(days: int = 30):
+    """使用统计面板顶部指标卡：累计/输入/输出 Token、请求数、活跃天数、
+    单日峰值、最长连续天数、按模型汇总。
+
+    - 数据源 usage_log（llm_proxy 流式/非流式收尾落库的上游真值），只读聚合；
+    - days 夹紧 1..3650，cutoff epoch 毫秒参数绑定（同 cost_stats 惯例）；
+    - 任何异常 → 500 带 code，前端按失败态渲染（不编造数据）。"""
+    cutoff_ms = _stats_cutoff(days, 30)
+    try:
+        conn = _db.connect()
+        try:
+            totals = conn.execute(
+                "SELECT COALESCE(SUM(prompt_tokens),0) AS pt, "
+                "COALESCE(SUM(completion_tokens),0) AS ct, "
+                "COUNT(*) AS requests, MIN(date) AS first_date, MAX(date) AS last_date "
+                "FROM usage_log WHERE ts >= ?", (cutoff_ms,)).fetchone()
+            daily = conn.execute(
+                "SELECT date, SUM(prompt_tokens + completion_tokens) AS tokens "
+                "FROM usage_log WHERE ts >= ? GROUP BY date ORDER BY tokens DESC",
+                (cutoff_ms,)).fetchall()
+            by_model = conn.execute(
+                "SELECT model, SUM(prompt_tokens) AS prompt, "
+                "SUM(completion_tokens) AS completion, COUNT(*) AS requests "
+                "FROM usage_log WHERE ts >= ? GROUP BY model "
+                "ORDER BY (prompt + completion) DESC", (cutoff_ms,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"usage_log 聚合失败：{e}", 500)
+    pt = int(totals["pt"] or 0)
+    ct = int(totals["ct"] or 0)
+    peak = daily[0] if daily else None
+    return _ok({
+        "total_tokens": pt + ct,
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "requests": int(totals["requests"] or 0),
+        "active_days": len(daily),
+        "first_date": totals["first_date"] or "",
+        "last_date": totals["last_date"] or "",
+        "peak": {"date": peak["date"], "tokens": int(peak["tokens"] or 0)} if peak else None,
+        "streak": _stats_streak({r["date"] for r in daily}),
+        "by_model": [
+            {"model": r["model"] or "", "prompt": int(r["prompt"] or 0),
+             "completion": int(r["completion"] or 0), "requests": int(r["requests"] or 0)}
+            for r in by_model
+        ],
+    })
+
+
+@router.get("/api/stats/daily")
+def stats_daily(days: int = 90):
+    """使用统计面板图表数据：按 (date, model) 粒度返回 Token 消耗数组，
+    前端据此渲染热力图（按日折叠）与按模型分色的每日趋势折线。
+
+    - days 夹紧 1..3650，cutoff epoch 毫秒参数绑定；
+    - 同时返回 models（按累计 token 降序，前端配色/图例直接用）；
+    - 任何异常 → 500 带 code。"""
+    cutoff_ms = _stats_cutoff(days, 90)
+    try:
+        conn = _db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT date, model, SUM(prompt_tokens) AS prompt, "
+                "SUM(completion_tokens) AS completion, COUNT(*) AS requests "
+                "FROM usage_log WHERE ts >= ? GROUP BY date, model ORDER BY date ASC",
+                (cutoff_ms,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        return _bad("db_error", f"usage_log 聚合失败：{e}", 500)
+    model_rank: dict[str, int] = {}
+    for r in rows:
+        m = str(r["model"] or "")
+        model_rank[m] = model_rank.get(m, 0) + (r["prompt"] or 0) + (r["completion"] or 0)
+    return _ok({
+        "rows": [
+            {"date": r["date"], "model": r["model"] or "",
+             "prompt": int(r["prompt"] or 0), "completion": int(r["completion"] or 0),
+             "requests": int(r["requests"] or 0)}
+            for r in rows
+        ],
+        "models": sorted(model_rank, key=model_rank.get, reverse=True),
+    })
+
+
 # ---------------- [Iris P0] ZCode 沙箱真实执行接口（2026-09-27） ----------------
 # 授权与依据：D:\Iris\docs\p0_audit.md（红线4"仅在现有 api.py 路由框架内新增 1 个路由"；
 # 红线3"仅在现有适配器层封装接口"；既有行零修改，本节为文件尾纯追加）。
@@ -335,12 +445,16 @@ async def zcode_run(request: Request):
             if callable(roll):
                 roll()
             bucket["iris:zcode"] = bucket.get("iris:zcode", 0) + 1
-            if bucket["iris:zcode"] > config.MAX_LLM_CALLS_PER_SESSION:
+            # [2026-11-01 额度守卫] 与 llm_proxy.py:755 同口径：上限 <= 0 视为"不限"。
+            # 此前直接 count > cap，cap=0 时首个请求必拒（429 文案还把 0 当上限展示）。
+            _zlim = config.MAX_LLM_CALLS_PER_SESSION
+            if _zlim > 0 and bucket["iris:zcode"] > _zlim:
+                _zcount = bucket["iris:zcode"]
                 return JSONResponse(status_code=429, content={
                     "ok": False,
                     "error": "session_budget_exceeded",
-                    "msg": "ZCode 执行桶（iris:zcode）已达今日上限（%d次）" % config.MAX_LLM_CALLS_PER_SESSION,
-                    "message": "ZCode 执行次数已达今日上限（%d 次），明日自动清零后可继续" % config.MAX_LLM_CALLS_PER_SESSION,
+                    "msg": "ZCode 执行桶（iris:zcode）已达今日上限（上限 %d 次，已用 %d 次）" % (_zlim, _zcount),
+                    "message": "ZCode 执行次数已达今日上限（上限 %d 次，已用 %d 次），明日自动清零后可继续" % (_zlim, _zcount),
                 })
     except Exception as e:  # noqa: BLE001 - 熔断读取失败不阻断执行（如实留痕）
         logging.getLogger("moray.zcode").warning("zcode budget gate read failed: %s", e)
@@ -537,3 +651,28 @@ router.include_router(_reflection_router)
 # 关闸时表为空端点如实返回零值），上方任何一行未动。
 from .synapse_routes import router as _synapse_router  # noqa: E402
 router.include_router(_synapse_router)
+
+
+# ---------------- [2026-10-31] 云端预算闸门：状态查看 + 手动重置熔断 ----------------
+# cloud_budget_guard 的 budget_daily.tripped=1 闩死后即便额度恢复也不自动放行
+# （跨日才清零）。这两个端点给网关面板的「重置云端预算」按钮用：
+#   GET  /api/budget/state → 当日 {date,total_usd,call_count,tripped}
+#   POST /api/budget/reset → reset_circuit() 置 tripped=0，返回重置后状态
+from . import cloud_budget_guard as _budget_guard  # noqa: E402
+
+
+@router.get("/api/budget/state")
+def budget_state():
+    try:
+        return _ok(_budget_guard.get_daily_state())
+    except _budget_guard.BudgetStateUnavailable as e:
+        return _bad("budget_state_unavailable", str(e), status=503)
+
+
+@router.post("/api/budget/reset")
+def budget_reset():
+    try:
+        _budget_guard.reset_circuit()
+        return _ok(_budget_guard.get_daily_state())
+    except _budget_guard.BudgetStateUnavailable as e:
+        return _bad("budget_reset_failed", str(e), status=503)

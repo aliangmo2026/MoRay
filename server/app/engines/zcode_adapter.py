@@ -114,6 +114,9 @@ if sys.platform == "win32":
 # api.py 原实现逐字一致；api.py 保留同名兼容别名（tests/organ_memory_selftest.py 直引）。
 _ZCODE_EVENT_WHITELIST = frozenset({
     "turn.started", "turn.completed", "tool.updated", "checkpoint.created", "result",
+    # [2026-11-01 exit_code 真信号] 服务端合成终态帧：真实 proc.returncode + 可观测
+    # 原始字段。旧消费方按未知类型忽略即可，不改既有事件语义。
+    "zcode.exit_code",
     "model.streaming",   # [2026-10-01 U-5] 放行模型文字流（占真机流 88%），
                           # 让前端能显示"模型在说什么"的过程
 })
@@ -284,6 +287,41 @@ def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
         rec = _ZCODE_STREAM_TASKS.get(task_id) or _ZCODE_STREAM_PROCS.get(task_id)
         if rec is not None:
             rec["done_at"] = time.time()
+        # [2026-11-01 exit_code 真信号] 合成终态帧：rc 是本线程唯一拿到的真实
+        # proc.returncode，此前只进 synapse/记忆、不进 SSE，导致 Laya 侧只能写死 0。
+        # 帧在全部原始 CLI 行之后、[DONE] 之前入队；未知类型对旧消费方安全忽略。
+        # idle_reason 置 None：结构化空转判定只在非流式 _finalize 产出，流式 rec 无
+        # lines 字段，不在此重造判据（绝不编造）；同时透传读流原始计数字段。
+        try:
+            _rc = proc.returncode
+        except Exception:  # noqa: BLE001 - 取不到就按未知（None）上报
+            _rc = None
+        _rec = rec or {}
+        _rcv = _rc if isinstance(_rc, int) and not isinstance(_rc, bool) else None
+        # 终态 status 由 rc + 是否有 result 帧确定性派生（与上方记忆钩子同口径，不编造）；
+        # 流式 rec["status"] 恒为 "running"，原样塞给消费方会降级原有 projection 语义，
+        # 故原始值改放 rec_status 字段。
+        if _rcv is None:
+            _term_status = "unknown"
+        elif _rcv == 0 and last_result is not None:
+            _term_status = "completed"
+        else:
+            _term_status = "failed"
+        _put(json.dumps({
+            "type": "zcode.exit_code",
+            "payload": {
+                "task_id": task_id,
+                "exit_code": _rcv,
+                "status": _term_status,
+                "rec_status": _rec.get("status"),
+                "idle_reason": None,
+                "got_result": last_result is not None,
+                "parse_errors": _parse_errors,
+                "empty_lines": _empty_lines,
+                "dropped_types": _dropped_types,
+                "loop_exit_reason": _loop_exit_reason,
+            },
+        }, ensure_ascii=False))
         _put("[DONE]")
         # ---- [器官→记忆 线B] ZCode 流式任务成功 → 旁路写一条 task_result 记忆 ----
         # 判据（对齐 Laya "成功才钩"）：returncode==0 且截到 result 终态帧；

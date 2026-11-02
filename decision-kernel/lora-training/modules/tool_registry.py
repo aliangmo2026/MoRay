@@ -251,6 +251,8 @@ async def _call_zcode_cli(prompt: str, t0: Optional[float] = None) -> Dict[str, 
                     return _env("zcode", code=-1, msg="moray zcode stream HTTP %d" % resp.status_code, t0=t0)
                 last_turn = None
                 ev_types = []
+                result_ev = None      # result 帧先暂存：终态帧在其后、[DONE] 之前
+                term = None           # 服务端合成终态帧 payload（真实 exit_code/status/idle_reason）
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -260,19 +262,34 @@ async def _call_zcode_cli(prompt: str, t0: Optional[float] = None) -> Dict[str, 
                         continue
                     ev_types.append(str(ev.get("type")))
                     if ev.get("type") == "result":
-                        data = {
-                            "output": ev.get("response") or "",
-                            "exit_code": 0,
-                            "stdout": ev.get("response") or "",
-                            "stderr": "",
-                            "status": (ev.get("projection") or {}).get("status", "ok"),
-                            "sessionId": ev.get("sessionId", ""),
-                        }
-                        return _env("zcode", data=data, t0=t0)
+                        result_ev = ev
+                        continue
+                    if ev.get("type") == "zcode.exit_code":
+                        _p = ev.get("payload")
+                        if isinstance(_p, dict):
+                            term = _p
+                        continue
                     if ev.get("type") == "turn.completed":
                         last_turn = ev.get("payload") or {}
                     if ev.get("type") == "[DONE]":
                         break
+                # [2026-11-01] exit_code 只认终态帧的真实值；缺失/类型不对一律 None（未知），
+                # 绝不回退 0——self_check 对 None 会跳过而非误判通过。
+                _term_ec = term.get("exit_code") if isinstance(term, dict) else None
+                if not (isinstance(_term_ec, int) and not isinstance(_term_ec, bool)):
+                    _term_ec = None
+                if result_ev is not None:
+                    data = {
+                        "output": result_ev.get("response") or "",
+                        "exit_code": _term_ec,
+                        "stdout": result_ev.get("response") or "",
+                        "stderr": "",
+                        "status": (term.get("status") if isinstance(term, dict) and term.get("status")
+                                   else (result_ev.get("projection") or {}).get("status", "ok")),
+                        "idle_reason": term.get("idle_reason") if isinstance(term, dict) else None,
+                        "sessionId": result_ev.get("sessionId", ""),
+                    }
+                    return _env("zcode", data=data, t0=t0)
         # 无 result 帧兜底：turn.completed 里带响应文本/失败原因
         if isinstance(last_turn, dict):
             if last_turn.get("resultType") == "failed" or last_turn.get("error"):
@@ -281,8 +298,11 @@ async def _call_zcode_cli(prompt: str, t0: Optional[float] = None) -> Dict[str, 
             resp_text = last_turn.get("response") or ""
             if resp_text:
                 return _env("zcode", data={
-                    "output": resp_text, "exit_code": 0, "stdout": resp_text,
-                    "stderr": "", "status": "ok", "sessionId": task_id,
+                    "output": resp_text, "exit_code": _term_ec, "stdout": resp_text,
+                    "stderr": "",
+                    "status": (term.get("status") if isinstance(term, dict) and term.get("status") else "ok"),
+                    "idle_reason": term.get("idle_reason") if isinstance(term, dict) else None,
+                    "sessionId": task_id,
                 }, t0=t0)
         return _env("zcode", code=-1,
                     msg="moray zcode 任务结束但无有效结果（task_id=%s，事件:%s）"
@@ -342,12 +362,19 @@ async def _call_zcode_cli_direct(prompt: str, t0: Optional[float] = None,
                 in_block = False
     if not isinstance(block, dict):
         return _env("zcode", code=-1, msg="zcode CLI 无有效输出: %s" % text[-300:], t0=t0)
+    # [2026-11-01] 直调分支同样不写死 0：优先返回体 exit_code，其次真实 proc.returncode，
+    # 两者都取不到则 None（未知，不回退 0）。
+    _block_ec = block.get("exit_code")
+    if not (isinstance(_block_ec, int) and not isinstance(_block_ec, bool)):
+        _block_ec = proc.returncode if isinstance(proc.returncode, int) \
+            and not isinstance(proc.returncode, bool) else None
     data = {
         "output": block.get("response") or "",
-        "exit_code": 0,
+        "exit_code": _block_ec,
         "stdout": block.get("response") or "",
         "stderr": "",
         "status": block.get("projection", {}).get("status", "ok"),
+        "idle_reason": None,
         "sessionId": block.get("sessionId", ""),
     }
     return _env("zcode", data=data, t0=t0)

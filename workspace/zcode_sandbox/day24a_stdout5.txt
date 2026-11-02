@@ -1,1 +1,0 @@
-Created `fib.py` (10 lines). The `fib` function is an iterative 0-indexed implementation (fib(0)=0, fib(1)=1), and the `__main__` block prints `fib(10)`, which is 55. No commands were run.
