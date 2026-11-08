@@ -2,15 +2,16 @@
 """L7.6 工具注册表：统一封装 iris / argus / zcode / file 四类工具。
 
 设计约束（与本机真实服务对齐，非任务书的理想路径）：
-  * iris  真实入口 = POST http://localhost:8004/  （JSON-RPC tools/call，需 X-API-Key）
-          任务书写的 /analyze 在本机不存在，已改为 JSON-RPC 直连 iris_analyze_image/text。
+  * iris  统一入口 = MoRay 8000 通用 MCP 网关 POST /api/mcp/gateway/call
+          （第2晚 2026-11-06 改造：此前直连 Iris 8004 JSON-RPC；现由 8000 的
+          mcp_gateway 负责 SSE/鉴权/信封，Laya 不再持有 IRIS_MCP_API_KEY）。
   * argus 真实入口 = POST http://127.0.0.1:8010/mcp/ （JSON-RPC tools/call，工具 search_web）
           任务书写的 /search 在本机不存在，search_web 工具语义等价（关键词→结果列表）。
   * zcode 本机当前 8005 无监听；保持可配置端点，调用失败返回标准错误信封、不抛异常。
   * file  本地 stdlib 读写/遍历，带根目录约束防路径穿越。
 
 所有地址与超时可用环境变量覆盖：
-  LAYA_IRIS_BASE / LAYA_ARGUS_BASE / LAYA_ZCODE_BASE / LAYA_FILE_ROOT
+  LAYA_MCP_GATEWAY_BASE（默认复用 LAYA_MORAY_BASE）/ LAYA_ARGUS_BASE / LAYA_ZCODE_BASE / LAYA_FILE_ROOT
   LAYA_TOOL_TIMEOUT_IRIS / _ARGUS / _ZCODE （秒）
 
 统一返回信封（成功/失败都是这一个形状，executor/self_check 只认它，绝不抛异常打断流程）：
@@ -44,7 +45,6 @@ except Exception:  # noqa: BLE001
     _HAS_FILE_PROXY = False
 
 # ---------------- 端点配置（环境变量优先，回落到本机实测默认） ----------------
-IRIS_BASE = os.environ.get("LAYA_IRIS_BASE", "http://localhost:8004").rstrip("/")
 # [2026-10-01 U-6-4] 默认端口从 8003 改为 8010：
 # 整个生态（Electron 启动器 / start_moray_full.ps1 / D:\Argus\start_argus.bat）
 # 已统一 Argus 到 8010；8003 是 2026-09-30 之前的旧端口，已废弃。
@@ -63,10 +63,16 @@ ZCODE_RUN_BASE = os.environ.get("LAYA_ZCODE_RUN_BASE", "http://127.0.0.1:8000/ap
 # （POST /api/engines/zcode/tasks + GET /api/engines/zcode/stream/{id}），
 # 统一 zcode 执行引擎入口 = moray 8000，Laya 不再绕过引擎直调 CLI。
 MORAY_BASE = os.environ.get("LAYA_MORAY_BASE", "http://127.0.0.1:8000").rstrip("/")
-# Iris MCP 的 X-API-Key：本机 iris 用 loopback-only 闸门，密钥来自 D:\Iris\server\start_server.ps1
-IRIS_API_KEY = os.environ.get("IRIS_MCP_API_KEY", "morayIrisKey2026")
+# [MCP 网关第2晚 2026-11-06] Iris 不再直连：统一经 MoRay 8000 的通用网关
+# （POST /api/mcp/gateway/call，鉴权 Key 只在 8000 的 server/.env 里，Laya 不再持有）。
+MCP_GATEWAY_BASE = os.environ.get("LAYA_MCP_GATEWAY_BASE", MORAY_BASE).rstrip("/")
+MCP_GATEWAY_CALL = MCP_GATEWAY_BASE + "/api/mcp/gateway/call"
+# 兼容旧引用（只读展示，不参与调用）：实际传输已迁到网关。
+IRIS_BASE = os.environ.get("LAYA_IRIS_BASE", MCP_GATEWAY_BASE).rstrip("/")
 
-_T_IRIS = float(os.environ.get("LAYA_TOOL_TIMEOUT_IRIS", "120"))
+# [第2晚 2026-11-06 实测] Iris analyze_text 云端诊断实测 150s；网关侧超时 240s，
+# Laya 客户端 300s = 让网关先返回自己的信封（否则 Laya 先断，看不到器官错误码）。
+_T_IRIS = float(os.environ.get("LAYA_TOOL_TIMEOUT_IRIS", "300"))
 _T_ARGUS = float(os.environ.get("LAYA_TOOL_TIMEOUT_ARGUS", "90"))
 _T_ZCODE = float(os.environ.get("LAYA_TOOL_TIMEOUT_ZCODE", "60"))
 
@@ -94,6 +100,76 @@ _ZCODE_CODE_HINT = re.compile(
 FILE_ROOT = Path(os.environ.get("LAYA_FILE_ROOT", str(Path(__file__).resolve().parent.parent))).resolve()
 
 VALID_TOOLS = ("iris", "argus", "zcode", "file")
+
+# ---------------- [2026-11-03 夜班模式] 工具层烧钱/越权闸门 ----------------
+# Laya 跑在独立进程（8001），不能 import server.app.night_shift；这里用 1.5s 超时的
+# 本机 HTTP 调 MoRay 8000 的 /api/night_shift/*。三条纪律：
+#   1) 闸门可达且说 allow=false → 必须拦截（fail-closed，这是安全阀本身）；
+#   2) 闸门不可达（8000 没起/夜间模式未部署）→ 放行（fail-open）——否则一次 8000
+#      抖动会把 Laya 的所有工具调用打死，而 zcode 本来就依赖 8000；
+#   3) 记账失败只忽略，绝不影响工具返回值。
+_NIGHT_TIMEOUT = float(os.environ.get("LAYA_NIGHT_TIMEOUT", "1.5"))
+
+
+async def _night_guard(tool: str, path: str = "") -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=_NIGHT_TIMEOUT) as c:
+            r = await c.post(MORAY_BASE + "/api/night_shift/guard",
+                             json={"tool": str(tool or ""), "path": str(path or "")},
+                             headers={"Content-Type": "application/json"})
+            if r.status_code != 200:
+                return {"allow": True, "note": "night_guard_http_%d" % r.status_code}
+            data = r.json()
+            return data if isinstance(data, dict) else {"allow": True}
+    except Exception as e:  # noqa: BLE001 - 闸门不可达按放行（见上方纪律 2）
+        return {"allow": True, "note": "night_guard_unreachable: %s" % type(e).__name__}
+
+
+def _night_exit_code(env: Dict[str, Any]) -> Optional[int]:
+    data = env.get("data") if isinstance(env, dict) else None
+    if isinstance(data, dict):
+        code = data.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+    err = env.get("error") if isinstance(env, dict) else None
+    if isinstance(err, dict):
+        code = err.get("code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+    return None
+
+
+async def _night_record(tool: str, env: Dict[str, Any], task_key: str = "",
+                        files: Optional[list] = None) -> None:
+    try:
+        data = env.get("data") if isinstance(env, dict) else None
+        status = str(data.get("status") or "") if isinstance(data, dict) else ""
+        output = ""
+        if isinstance(data, dict):
+            output = str(data.get("output") or data.get("stdout") or "")[:1200]
+        if not output and isinstance(env, dict):
+            output = str(env.get("error") or "")[:1200]
+        exit_code = _night_exit_code(env)
+        # file 工具的写盘成功信封没有 exit_code（data={path,written}）。若原样上报
+        # None，night_shift 会按"未知退出码"记成失败——三次成功写盘就误触发熔断。
+        # 统一口径：只要有 data 且无 error，就是成功（exit_code=0）。
+        if exit_code is None and isinstance(data, dict) and not env.get("error"):
+            exit_code = 0
+            status = status or "completed"
+        payload = {
+            "tool": tool,
+            "task_key": str(task_key or "")[:300],
+            "exit_code": exit_code,
+            "status": status,
+            "output": output,
+        }
+        if files:
+            payload["files"] = [str(p) for p in files if str(p).strip()]
+        async with httpx.AsyncClient(timeout=_NIGHT_TIMEOUT) as c:
+            await c.post(MORAY_BASE + "/api/night_shift/record", json=payload,
+                         headers={"Content-Type": "application/json"})
+    except Exception:  # noqa: BLE001 - 记账旁路失败绝不影响工具结果
+        pass
 
 
 def _env(tool: str, data: Any = None, code: int = 0, msg: str = "", t0: float = 0.0) -> Dict[str, Any]:
@@ -125,7 +201,13 @@ def _rpc_envelope(tool: str, raw: Dict[str, Any], t0: float) -> Dict[str, Any]:
 
 # ---------------- iris ----------------
 async def _call_iris(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """看图/读截图/识别报错。payload 支持 image_path | image_base64 | text（三选一）。"""
+    """看图/读截图/识别报错。payload 支持 image_path | image_base64 | text（三选一）。
+
+    第2晚 2026-11-06：不再直连 Iris 8004，统一 POST MoRay 8000 的
+    /api/mcp/gateway/call（网关负责 SSE 握手 / X-API-Key / 信封归一化）。
+    网关应答 {"ok","server","tool","code","data"}；本函数把它翻译回 Laya 的
+    统一信封（ok/tool/data/error/elapsed_ms），失败绝不抛异常。
+    """
     t0 = time.perf_counter()
     if "text" in payload and "image_path" not in payload and "image_base64" not in payload:
         name, args = "iris_analyze_text", {"text": payload["text"], "lang_hint": payload.get("lang_hint", ""),
@@ -139,15 +221,25 @@ async def _call_iris(payload: Dict[str, Any]) -> Dict[str, Any]:
         if "lang_hint" in payload:
             args["lang_hint"] = payload["lang_hint"]
         name = "iris_analyze_image"
-    body = {"jsonrpc": "2.0", "id": int(t0 * 1000) % 100000, "method": "tools/call",
-            "params": {"name": name, "arguments": args}}
+    body = {"server": "iris", "tool": name, "arguments": args}
     try:
         async with httpx.AsyncClient(timeout=_T_IRIS) as c:
-            r = await c.post(IRIS_BASE + "/", json=body,
-                             headers={"X-API-Key": IRIS_API_KEY, "Content-Type": "application/json"})
+            r = await c.post(MCP_GATEWAY_CALL, json=body,
+                             headers={"Content-Type": "application/json"})
             if r.status_code != 200:
-                return _env("iris", code=r.status_code, msg="iris HTTP %d: %s" % (r.status_code, r.text[:200]), t0=t0)
-            return _rpc_envelope("iris", r.json(), t0)
+                return _env("iris", code=r.status_code,
+                            msg="mcp gateway HTTP %d: %s" % (r.status_code, r.text[:200]), t0=t0)
+            data = r.json()
+        if not isinstance(data, dict):
+            return _env("iris", code=-1, msg="mcp gateway 返回非 JSON object", t0=t0)
+        if not data.get("ok"):
+            code = data.get("code") or "gateway_error"
+            detail = (data.get("data") or {}).get("message") \
+                if isinstance(data.get("data"), dict) else None
+            return _env("iris", code=502,
+                        msg="%s: %s" % (code, str(detail or data.get("message") or "")[:300]),
+                        t0=t0)
+        return _env("iris", data=data.get("data"), t0=t0)
     except Exception as e:  # noqa: BLE001
         return _env("iris", code=-1, msg="%s: %s" % (type(e).__name__, str(e)[:200]), t0=t0)
 
@@ -174,6 +266,18 @@ async def _call_argus(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------------- zcode ----------------
 async def _call_zcode(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """[2026-11-03 夜班模式] 前置闸门 + 结果记账包装；真实执行保持原逻辑零改动。"""
+    t0 = time.perf_counter()
+    guard = await _night_guard("zcode")
+    if not guard.get("allow", True):
+        reason = str(guard.get("reason") or "夜班已暂停")
+        return _env("zcode", code=429, msg="夜班熔断：" + reason, t0=t0)
+    result = await _call_zcode_impl(payload)
+    await _night_record("zcode", result, task_key=str(payload.get("code") or "")[:300])
+    return result
+
+
+async def _call_zcode_impl(payload: Dict[str, Any]) -> Dict[str, Any]:
     """写代码/跑脚本/代码执行。payload 支持 code。返回执行结果+退出码。"""
     t0 = time.perf_counter()
     code = payload.get("code") or payload.get("script") or ""
@@ -410,6 +514,37 @@ def _proxy_err_code(msg: str) -> int:
 
 
 async def _call_file(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """[2026-11-03 夜班模式] 写盘前允许清单闸门 + 写后登记。
+
+    读/列目录不触发闸门（夜班只限制"改什么"，不限制"看什么"）；写盘命中清单外
+    路径时由 8000 的 /api/night_shift/guard 直接返回 allow=false，本层原样转 403，
+    不进入 proxy_file_write，因此不会发生"先写坏再报告"。
+    """
+    t0 = time.perf_counter()
+    op = str(payload.get("op") or payload.get("operation") or "").lower()
+    path = str(payload.get("path") or "")
+    if op == "write" and path:
+        guard = await _night_guard("file", path=path)
+        if not guard.get("allow", True):
+            reason = str(guard.get("reason") or "越权修改拦截")
+            return _env("file", code=403, msg=reason, t0=t0)
+    result = await _call_file_impl(payload)
+    if op == "write" and path:
+        data = result.get("data") if isinstance(result, dict) else None
+        ok = isinstance(data, dict) and not result.get("error")
+        if ok:
+            try:
+                async with httpx.AsyncClient(timeout=_NIGHT_TIMEOUT) as c:
+                    await c.post(MORAY_BASE + "/api/night_shift/note_file",
+                                 json={"path": path, "op": "write"},
+                                 headers={"Content-Type": "application/json"})
+            except Exception:  # noqa: BLE001 - 登记失败不影响已完成的写入
+                pass
+        await _night_record("file", result, task_key=path)
+    return result
+
+
+async def _call_file_impl(payload: Dict[str, Any]) -> Dict[str, Any]:
     """本地文件 read / write / list_dir。op 必填。"""
     t0 = time.perf_counter()
     op = str(payload.get("op") or payload.get("operation") or "").lower()
@@ -469,7 +604,8 @@ async def call_tool(tool: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def registry_status() -> Dict[str, Any]:
     """供 /execute 首行进度/调试：当前各工具端点配置快照。"""
-    return {"iris": IRIS_BASE + "/ (X-API-Key)", "argus": ARGUS_BASE + "/mcp/ (search_web)",
+    return {"iris": MCP_GATEWAY_CALL + " (via 8000 gateway)",
+            "argus": ARGUS_BASE + "/mcp/ (search_web)",
             "zcode": ZCODE_BASE + "/execute", "file_root": str(FILE_ROOT)}
 
 

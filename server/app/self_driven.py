@@ -105,6 +105,13 @@ _DEFAULT_ENGINE = "zcode"
 _SYSTEM_PROMPT = (
     "你是 MoRay。这是你当前的心智状态：{mental_state}。"
     "可用执行引擎：zcode（擅长写代码、执行命令）；laya（擅长任务拆解与编排）。"
+    "你的能力雷达（近7天真实工具调用统计，成功率/失败归因/耗时）：{capability_radar}。"
+    "若雷达点名了成功率低于 60% 的弱器官，本轮目标**优先**设计为对该器官的"
+    "可证伪练习（例：『用 Scribe 扫描 server/app 下一个模块并输出总结文件』、"
+    "『用 Argus 检索一个话题并核对结果时效』、『用 Iris 识别一张本地图片并核对文字』）；"
+    "练习目标同样必须满足 claim/prediction/verify_cmd 的全部硬约束，"
+    "verify_cmd 只验该器官产出本身；雷达为空或写明读取失败时忽略本段，"
+    "按常规方向出目标。"
     "你近期已生成过的目标在下面，**禁止重复这些主题**，必须换一个新方向："
     "{recent_goals}。"
     "请根据你最近的失败或不足，提出一个**可被证伪**的改进目标。硬要求："
@@ -267,7 +274,11 @@ def _load_state() -> dict:
     [v5] verdict_log 也在这里归一化：只留 dict 行、只留最后 _VERDICT_LOG_MAX 条。
     [v5.3] auto_approve_readonly 键必须在这里显式保留——键名白名单是刻意的，
     新增状态键不同步改这里，回写会把它静默抹掉（v5 台账第一版就踩了这个坑：
-    写进去的 250 条读完只剩 1 条）。"""
+    写进去的 250 条读完只剩 1 条）。
+    [第二战 2026-11-07] self_fix_log 同款归一化（只留 dict 行、最后 30 条）——
+    漏加这行的话，任何一次 _record_goal/_save_state 回写都会把自愈留痕静默
+    抹掉，晨报"自愈尝试"段就永远空白（本次实测踩中：07:33 写入的留痕被
+    07:34 起手挂点的常规回写冲掉）。"""
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8", errors="replace"))
         if isinstance(data, dict):
@@ -276,14 +287,18 @@ def _load_state() -> dict:
             vlog = data.get("verdict_log")
             vlog = ([e for e in vlog if isinstance(e, dict)][-_VERDICT_LOG_MAX:]
                     if isinstance(vlog, list) else [])
+            flog = data.get("self_fix_log")
+            flog = ([e for e in flog if isinstance(e, dict)][-30:]
+                    if isinstance(flog, list) else [])
             return {"queue": queue if isinstance(queue, list) else [],
                     "daily": daily if isinstance(daily, dict) else {},
                     "verdict_log": vlog,
+                    "self_fix_log": flog,
                     "auto_approve_readonly":
                         data.get("auto_approve_readonly", True)}
     except (OSError, ValueError):
         pass  # 从未写过（FileNotFoundError）/坏 JSON（JSONDecodeError）= 空状态
-    return {"queue": [], "daily": {}, "verdict_log": [],
+    return {"queue": [], "daily": {}, "verdict_log": [], "self_fix_log": [],
             "auto_approve_readonly": True}
 
 
@@ -323,20 +338,30 @@ def _quota_info(state: dict) -> dict:
     return {"date": date, "generated_today": count, "limit": _DAILY_GOAL_LIMIT}
 
 
-def _record_goal(card: dict) -> bool:
+def _record_goal(card: dict, quota_free: bool = False) -> bool:
     """配额 +1 并把目标卡追加进队列，原子写回状态文件。成功 True / 失败 False。
     熔断双重保险：写盘前再查一次今日限额（generate_goal 的 LLM 前检查拦
     浪费推理开销，这里守最终一致性——配额没记上就发卡 = 限额可被绕穿）。
+    [第二战 2026-11-07] quota_free=True：自愈卡专用通道——不占普通日配额、
+    不 +1。为何要开这条通道：实测常规目标一早把 3/3 配额吃满后，自愈卡被
+    daily_limit_reached 永久挤死；自愈是弱器官连败的兜底动作，限流由自身
+    双闸（self_fix 日限 2 + 6h 冷却）负责，不该跟常规目标抢同一口锅。
     纯同步段：_STATE_LOCK 绝不跨 await。"""
     with _STATE_LOCK:
         state = _load_state()
         quota = _quota_info(state)
-        if quota["generated_today"] >= quota["limit"]:
-            logger.warning("[self_driven] 拒记：今日配额已满 %d/%d",
-                           quota["generated_today"], quota["limit"])
-            return False
-        state["daily"] = {"date": quota["date"],
-                          "count": quota["generated_today"] + 1}
+        if quota_free:
+            if quota["generated_today"] < quota["limit"]:
+                # 普通配额还有余量时照常计数（口径统一：一张卡就是一次生成）
+                state["daily"] = {"date": quota["date"],
+                                  "count": quota["generated_today"] + 1}
+        else:
+            if quota["generated_today"] >= quota["limit"]:
+                logger.warning("[self_driven] 拒记：今日配额已满 %d/%d",
+                               quota["generated_today"], quota["limit"])
+                return False
+            state["daily"] = {"date": quota["date"],
+                              "count": quota["generated_today"] + 1}
         state["queue"] = list(state.get("queue") or []) + [card]
         if not _save_state(state):
             logger.warning("[self_driven] 拒发卡：配额/队列落盘失败（熔断 fail-close）")
@@ -624,14 +649,17 @@ def _fetch_mental_state():
 
 # ---- LLM 目标生成（self_narrative._llm_narrate 同款 httpx 双协议） ----
 
-def build_goal_messages(mental_state: dict, recent: list = None):
+def build_goal_messages(mental_state: dict, recent: list = None, radar: str = ""):
     """心智状态 dict → messages。纯函数零 IO（build_narrative_messages 同款
     可单测惯例）：mental_state 序列化紧凑 JSON 后替换进 system 模板，
     整体钳 _MENTAL_STATE_CHARS 防跑飞。
 
     [v4] recent = 近期待办卡（新→旧），拼成"禁止重复"清单注入模板。为什么必须
     喂：v3 实测两张自动卡都咬住"绝对路径 / stderr"同一主题——因为心智状态里
-    只记着那一条历史失败，模型没有"我上次已经做过这个"的记忆，就会一直复读。"""
+    只记着那一条历史失败，模型没有"我上次已经做过这个"的记忆，就会一直复读。
+    [能力图谱 2026-11-06] radar = 能力雷达文本（self_capability.radar_text 产出，
+    调用方在 generate_goal 里取、这里只做注入——保持本函数零 IO）。为空时注入
+    "无数据"占位，system prompt 已指示模型忽略该段。"""
     ms_text = json.dumps(mental_state, ensure_ascii=False,
                          separators=(",", ":"))[:_MENTAL_STATE_CHARS]
     lines = []
@@ -642,8 +670,11 @@ def build_goal_messages(mental_state: dict, recent: list = None):
         if g:
             lines.append("%d. %s" % (i, g))
     recent_text = "；".join(lines) if lines else "（无）"
+    radar_text = (str(radar or "").strip()
+                  or "（无数据——忽略能力雷达，按常规方向出目标）")[:900]
     system = (_SYSTEM_PROMPT.replace("{mental_state}", ms_text)
-              .replace("{recent_goals}", recent_text))
+              .replace("{recent_goals}", recent_text)
+              .replace("{capability_radar}", radar_text))
     return [{"role": "system", "content": system},
             {"role": "user", "content": _USER_PROMPT}]
 
@@ -1655,7 +1686,17 @@ async def generate_goal():
                        quota["generated_today"], quota["limit"])
         return None
     recent = _fetch_recent_goals()
-    messages = build_goal_messages(mental_state, recent)
+    # [能力图谱 2026-11-06] 能力雷达注入（弱点补全权重）：弱器官（成功率<60%）
+    # 会被 system prompt 引导为本轮练习方向。读不到 = 空串 → prompt 段自动降级。
+    # radar_text 内部 fail-open，这里再兜一层——自驱主链路绝不被旁路拖死。
+    try:
+        from . import self_capability
+        radar_text = self_capability.radar_text(max_chars=900)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[self_driven] 能力雷达读取失败（忽略，常规方向出卡）：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        radar_text = ""
+    messages = build_goal_messages(mental_state, recent, radar_text)
     _goal_inflight = True
     try:
         raw, err = await _llm_goal(messages)
@@ -1781,9 +1822,269 @@ async def maybe_generate_goal() -> dict:
     return {"ran": True, "reason": "generated", "card": card}
 
 
+# ================================================================
+# [第二战 2026-11-07] self_fix_mode：弱器官连败 → 沙箱自愈卡
+#
+# 动机：能力图谱（self_capability）已经让 MoRay 知道"哪个器官连败"，但
+# 之前的应对只是"换个方向出卡"。自愈模式把短板本身变成目标：对连败器官
+# 产出"诊断报告 + 修复草案"，人审后派发——**修复动作永远停在沙箱里**。
+#
+# 安全底线三层（缺一不发卡，fail-close）：
+#   1. 模板层：卡完全由模板生成（不调 LLM，零幻觉零注入面），goal/claim/
+#      verify_cmd 文本写死产物路径在 workspace/self_fix/ 下，并明文声明
+#      "绝不修改 server 源码"；
+#   2. 结构层：self_fix_path_problem 三道硬闸——verify_cmd 碰核心源码树/
+#      数据库即拒（forbidden_target）；verify_cmd 没锚定 self_fix 沙箱即拒
+#      （unanchored）；基础体检 verify_cmd_problem 全套（POSIX/占位符/相对
+#      路径/幽灵路径/语法错）照过不误；
+#   3. 执行层：自愈卡含"产出诊断文件"的写盘意图 → classify_card_action
+#      判非只读 → **必须等人批准**才派发（不进 v5.3 只读自跑白名单）；
+#      夜班执行时另有写盘允许清单与越权拦截双保险。
+# 留痕：生成即写 state.self_fix_log（date/organ/goal/task_id），晨报
+# （night_shift.report_markdown）读取并在"自愈尝试"段展示——卡即使被
+# approve 出队，留痕仍在。
+# 配额：复用普通日配额 _DAILY_GOAL_LIMIT（防自愈卡挤掉常规目标时反而互相
+# 牵制刷屏），另加自身日限 _SELF_FIX_DAILY_LIMIT=2 + 6h 冷却 + 在飞闸。
+
+#: 自愈产物沙箱：工程根下 workspace/self_fix（与 zcode_sandbox 平级，
+#: 不在核心源码树 server/ 内；verify_cmd 用绝对路径，判据 cwd 无关）。
+_SELF_FIX_DIR = os.path.join(_VERIFY_CWD, "workspace", "self_fix")
+#: 触发阈值：某器官最近执行序列尾部连续失败 ≥3 次才触发自愈
+_SELF_FIX_STREAK_MIN = 3
+#: 自愈卡自身日限（state.self_fix_log 按日计数）
+_SELF_FIX_DAILY_LIMIT = 2
+#: 自愈生成冷却（秒）：6h——日限 2 + 冷却双闸，防同一弱项反复刷卡
+_SELF_FIX_COOLDOWN_SEC = 6 * 3600
+_self_fix_inflight = False
+_self_fix_last_monotonic = 0.0
+
+#: [硬闸①] 判据命令禁区 token：核心源码树与数据库（不区分大小写匹配）。
+#: 自愈的 verify_cmd 只许读 workspace/self_fix/ 下的产物，绝不允许把
+#  server/app、server/data、adapters、engine 等核心区写进要执行的命令。
+_SELF_FIX_FORBIDDEN_TOKENS = (
+    "server\\app", "server/app", "server\\data", "server/data",
+    "adapters\\", "adapters/", "engine\\", "engine/",
+    "moray.sqlite3", "memory.sqlite3",
+)
+#: [硬闸②] 判据锚点：verify_cmd 必须引用 self_fix 沙箱（判据只验沙箱产物）
+_SELF_FIX_ANCHOR = "self_fix"
+#: 诊断报告必含标记（verify_cmd 据此判定"真的写了修复草案"）
+_SELF_FIX_PLAN_MARK = "FIX-PLAN"
+
+
+def self_fix_path_problem(goal: str, claim: str, verify_cmd: str) -> str:
+    """自愈卡路径硬闸（verify_cmd_problem 之外的第二道专属闸）。
+    合格返回 ""，不合格返回原因码。纯函数零 IO，绝不抛。
+
+    ⓪ verify_cmd 为空 → "empty"（最基础的问题最先报）
+    ① verify_cmd 含核心树/数据库 token → "forbidden_target"
+    ② verify_cmd 没锚定 self_fix 沙箱 → "unanchored"
+    ③ 基础体检（verify_cmd_problem：posix/占位符/语法/相对路径/ghost）
+       照常全跑 → 透传原因码
+    goal/claim 不做 token 扫描：自愈卡文本全部来自模板白名单（含"读取
+    server 报错做诊断"属任务书允许的读取语义），经 LLM 的卡不走本函数。"""
+    v = str(verify_cmd or "")
+    if not v.strip():
+        return "empty"
+    low = v.lower()
+    for tok in _SELF_FIX_FORBIDDEN_TOKENS:
+        if tok.lower() in low:
+            return "forbidden_target"
+    if _SELF_FIX_ANCHOR not in low:
+        return "unanchored"
+    return verify_cmd_problem(v)
+
+
+def _build_self_fix_card(organ: str, label: str, streak: int, cause: str) -> dict:
+    """连败器官 → 模板自愈卡（不调 LLM）。产物/判据全部锚定 _SELF_FIX_DIR。
+
+    目标语义（任务书示例）：读最近报错 → 在 workspace/self_fix/ 产诊断
+    报告 → 附修复草案（FIX-PLAN 标记段）。修复是"草案"不是"执行"：
+    真正动核心代码永远要人把草案审完自己来，或另开写盘卡走审批。"""
+    date = datetime.datetime.now().strftime("%Y%m%d")
+    fname = "self_fix_%s_%s.md" % (date, organ)
+    target = os.path.join(_SELF_FIX_DIR, fname)
+    goal = ("自愈练习：%s 近 %d 次执行连败（主因 %s），诊断并在沙箱产出修复草案"
+            % (label, streak, cause))[:_GOAL_TEXT_MAX]
+    claim = ("%s 存在且非空，内容包含「%s」「%s」和「%s」三处标记"
+             % (target, organ, cause, _SELF_FIX_PLAN_MARK))[:_CLAIM_TEXT_MAX]
+    prediction = ("诊断报告生成于 workspace/self_fix/（含失败归因与 FIX-PLAN "
+                  "修复草案），server 源码零修改")[:_PRED_TEXT_MAX]
+    # 判据：python -c 只读检查产物存在/含标记；raw 字符串装绝对路径，
+    # organ/标记均为 ASCII（cause 是中文，只进 claim 不进命令，防 GBK 编码炸）。
+    # 刻意不写 len(t)>N 这类比较符：verify_cmd_problem 的占位符闸把裸 `<`/`>`
+    # 当占位符尖括号（v4 老闸，不为自愈卡改语义），标记检查本身已隐含非空。
+    verify_cmd = (
+        "python -c \"import os,sys;p=r'%s';"
+        "t=open(p,encoding='utf-8',errors='ignore').read() if os.path.isfile(p) else '';"
+        "sys.exit(0) if (os.path.isfile(p) and t and '%s' in t and '%s' in t) else sys.exit(1)\""
+        % (target, organ, _SELF_FIX_PLAN_MARK))
+    card = {
+        "task_id": str(uuid.uuid4()),
+        "goal": goal,
+        "claim": claim,
+        "prediction": prediction,
+        "verify_cmd": verify_cmd,
+        "target_engine": "zcode",
+        "card_type": "self_fix",
+        "organ": organ,
+        "streak": int(streak),
+        "fix_target": target,
+        "verify_problem": "",
+        "coverage_uncovered": [],
+        "repeat_of": "",
+        "engine_task_id": "",
+        "status": "pending_approval",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    cls = classify_card_action(goal, claim, verify_cmd)
+    card["readonly_class"] = bool(cls["readonly"])
+    card["readonly_reason"] = cls["reason"]
+    return card
+
+
+def _self_fix_today_count(state: dict) -> int:
+    """今日已生成自愈卡数（state.self_fix_log 按日数）。纯函数零 IO。"""
+    today = _today()
+    n = 0
+    for e in (state.get("self_fix_log") or []):
+        if isinstance(e, dict) and str(e.get("date") or "") == today:
+            n += 1
+    return n
+
+
+def self_fix_today_summary() -> list:
+    """今日自愈尝试留痕行（night_shift.report_markdown 晨报"自愈尝试"段）。
+    数据源 state.self_fix_log（approve 删卡不影响留痕）。失败/无记录返回 []。"""
+    try:
+        today = _today()
+        out = []
+        for e in (_load_state().get("self_fix_log") or []):
+            if not isinstance(e, dict) or str(e.get("date") or "") != today:
+                continue
+            out.append("- 尝试自愈 %s 器官（连败 %s 次，主因 %s）：诊断与补丁草案在 "
+                       "`%s`（卡片状态 %s，修复需人工审批）"
+                       % (e.get("organ") or "?", e.get("streak") or "?",
+                          e.get("cause") or "未知", e.get("fix_target") or "—",
+                          e.get("card_status") or "pending_approval"))
+        return out
+    except Exception as e:  # noqa: BLE001 - 留痕失败绝不炸晨报
+        logger.warning("[self_driven] self_fix_today_summary 异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return []
+
+
+def generate_self_fix_goal() -> dict:
+    """[第二战] 自愈模式主入口：连败器官 → 模板自愈卡（人审批流）。
+
+    闸（全在写盘之前判完）：在飞 → 冷却 → 连败检测 → 自身日限 →
+    普通日配额 → 路径硬闸 → _record_goal（落盘 fail-close）。
+    返回 {"ran": bool, "reason": str, "card": dict|None}；吞异常绝不抛。"""
+    global _self_fix_inflight, _self_fix_last_monotonic
+    if _self_fix_inflight:
+        return {"ran": False, "reason": "inflight", "card": None}
+    now = time.monotonic()
+    if now - _self_fix_last_monotonic < _SELF_FIX_COOLDOWN_SEC:
+        return {"ran": False, "reason": "cooldown", "card": None}
+    _self_fix_inflight = True
+    try:
+        streaks = None
+        try:
+            from . import self_capability
+            streaks = self_capability.organ_recent_outcomes()
+        except Exception as e:  # noqa: BLE001 - 雷达盲了就没有自愈依据
+            logger.warning("[self_driven] 连败检测失败（不自愈）：%s: %s",
+                           type(e).__name__, str(e)[:120])
+        if not streaks:
+            return {"ran": False, "reason": "no_failure_streak", "card": None}
+        # 候选：连败 ≥3 且非闸门事件器官；连败最狠者优先
+        cands = [(o, info) for o, info in streaks.items()
+                 if o not in ("meta", "other")
+                 and int(info.get("streak") or 0) >= _SELF_FIX_STREAK_MIN]
+        if not cands:
+            return {"ran": False, "reason": "no_failure_streak", "card": None}
+        cands.sort(key=lambda kv: -int(kv[1].get("streak") or 0))
+        organ, info = cands[0]
+        state = _load_state()
+        if _self_fix_today_count(state) >= _SELF_FIX_DAILY_LIMIT:
+            return {"ran": False, "reason": "self_fix_daily_limit", "card": None}
+        # [第二战 2026-11-07] 自愈卡走 quota_free 通道（不占普通日配额）：
+        # 实测常规 3 张/天吃满后自愈卡被永久挤死——兜底动作必须有独立口粮，
+        # 限流由 _SELF_FIX_DAILY_LIMIT=2 + 6h 冷却 + 连败检测三闸负责。
+        # 失败主因 + 器官中文名（雷达快照里读；读不到如实写"未知"/原名）
+        cause = "未知"
+        label = organ
+        try:
+            from . import self_capability as _cap
+            snap = _cap.capability_snapshot()
+            for o in (snap.get("agent_tools", {}).get("organs") or []):
+                if o.get("organ") == organ:
+                    label = o.get("label") or label
+                    if o.get("top_failure"):
+                        cause = o["top_failure"].get("label") or cause
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        card = _build_self_fix_card(organ, label,
+                                    int(info.get("streak") or 0), cause)
+        problem = self_fix_path_problem(card["goal"], card["claim"],
+                                        card["verify_cmd"])
+        if problem:
+            logger.warning("[self_driven] 拒发自愈卡：路径硬闸 %s（verify=%s）",
+                           problem, card["verify_cmd"][:100])
+            return {"ran": False, "reason": "verify_%s" % problem, "card": None}
+        if not _record_goal(card, quota_free=True):
+            return {"ran": False, "reason": "record_failed", "card": None}
+        # 留痕（approve 删卡不影响）：self_fix_log 追加 + 原子落盘
+        with _STATE_LOCK:
+            st2 = _load_state()
+            st2["self_fix_log"] = list(st2.get("self_fix_log") or []) + [{
+                "date": _today(), "organ": organ, "streak": int(info.get("streak") or 0),
+                "cause": cause, "task_id": card["task_id"],
+                "fix_target": card["fix_target"],
+                "card_status": "pending_approval",
+                "created_at": card["created_at"],
+            }][-30:]  # 留最近 30 条，防无限膨胀
+            _save_state(st2)
+        _self_fix_last_monotonic = now
+        logger.warning("[self_driven] 自愈卡已进待审批队列 task_id=%s organ=%s "
+                       "streak=%d target=%s", card["task_id"], organ,
+                       card["streak"], card["fix_target"])
+        return {"ran": True, "reason": "generated", "card": card}
+    except Exception as e:  # noqa: BLE001 - 自愈失败绝不反噬调用循环
+        logger.warning("[self_driven] generate_self_fix_goal 异常：%s: %s",
+                       type(e).__name__, str(e)[:160])
+        return {"ran": False,
+                "reason": "unhandled: %s: %s" % (type(e).__name__, str(e)[:120]),
+                "card": None}
+    finally:
+        _self_fix_inflight = False
+
+
+def maybe_generate_self_fix() -> dict:
+    """循环挂点（self_check_loop 每轮尾调用）：generate_self_fix_goal 的
+    自守卫包装。冷却/日限/连败检测全在函数内，这里只兜异常。"""
+    try:
+        return generate_self_fix_goal()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[self_driven] maybe_generate_self_fix 异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return {"ran": False,
+                "reason": "unhandled: %s: %s" % (type(e).__name__, str(e)[:120]),
+                "card": None}
+
+
 # ---- API（generate/approve/reject 三 POST + GET queue） ----
 
 router = APIRouter()
+
+@router.post("/self_driven/self_fix/generate")
+async def self_fix_generate() -> dict:
+    """[第二战] 手动触发一次自愈：POST /api/self_driven/self_fix/generate。
+    判据与循环挂点完全同款（连败检测+双日限+路径硬闸）；无连败器官时
+    如实带 reason（no_failure_streak），绝不硬造修复目标。"""
+    res = generate_self_fix_goal()
+    return {"ok": bool(res.get("ran")), **res}
 
 
 @router.post("/self_driven/generate")

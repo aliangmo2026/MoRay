@@ -209,16 +209,50 @@ def _render_perception(self_check_facts: dict | None, state_facts: dict | None) 
     return "；" + "；".join(parts) + "。"
 
 
+def _read_capability_facts() -> dict:
+    """[能力图谱 2026-11-06] 读能力雷达事实短句（self_capability 单一事实源）。
+
+    此前自省看得到"我说了多少话/做砸了什么任务"，看不到"我伸手用的每个工具
+    成功率多少、谁在拖后腿"——能力雷达补上这一路。读取走 capability_snapshot
+    （进程内 60s TTL 缓存，本循环 1h 一轮，无额外库压力）。任何异常如实转
+    unavailable + 原因，绝不编造数字。"""
+    try:
+        from . import self_capability
+        snap = self_capability.capability_snapshot()
+        insights = snap.get("insights") or []
+        if not insights:
+            return {"status": "unavailable", "reason": "雷达无事实短句"}
+        return {"status": "ok", "insights": insights,
+                "weak": snap.get("weakest") or []}
+    except Exception as e:  # noqa: BLE001 - fail-open：雷达盲了不拦观察行
+        logger.warning("[self_reflection] 读能力雷达异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return {"status": "unavailable",
+                "reason": "%s: %s" % (type(e).__name__, str(e)[:80])}
+
+
+def _render_capability(facts: dict | None) -> str:
+    """[能力图谱 2026-11-06] 能力雷达段：只放事实短句（工具成功率/失败归因/
+    耗时/弱器官），无建议无归因。读不到如实写读取失败——与 _render_perception
+    同款"镜子照不到自己也要照"纪律。"""
+    f = facts if isinstance(facts, dict) else {}
+    if f.get("status") == "ok":
+        return "；能力雷达：" + "；".join(str(s) for s in f.get("insights") or []) + "。"
+    return "；能力雷达读取失败（%s）。" % (f.get("reason") or "未取到快照")
+
+
 def _build_content(current: dict, snapshot: dict,
                    self_check_facts: dict | None = None,
-                   state_facts: dict | None = None) -> str:
+                   state_facts: dict | None = None,
+                   capability_facts: dict | None = None) -> str:
     """[丙改法 2026-10-14] 窗口增量模板——内容必带 [窗口 时间戳] 保证逐行唯一
     （dup / insert P1 双查重天然通过），因此不再需要 no_change 拦闸。
     - 空快照（进程重启后首次）→ 基线行：只写绝对值，不编 delta、不写时长；
     - 反思日计数日切/重启会使 delta 为负 → 取重置后的当日值（重置前尾数
       不可考，如实取可考部分）；计数为负（forget 删行）是真实净变化，如实写。
     纯数字事实、无建议无归因；时长 = now - 上次观察时刻（epoch 秒，挂钟）。
-    [真实感知 2026-11-01] 尾部追加 self_check / self_state 两段真实状态。"""
+    [真实感知 2026-11-01] 尾部追加 self_check / self_state 两段真实状态。
+    [能力图谱 2026-11-06] 再追加能力雷达一段（各器官成功率/失败归因/耗时）。"""
     ts = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
     if not snapshot.get("last_observed_at"):
         base = ("[窗口 %s] 基线（本进程首次观察）：当前 task_result %d 条、"
@@ -236,7 +270,8 @@ def _build_content(current: dict, snapshot: dict,
                 "反思触发 %d 次；当前库内总计 %d 条") % (
             ts, dur // 3600, (dur % 3600) // 60, n1, n2, n3,
             current["total_count"])
-    return base + _render_perception(self_check_facts, state_facts)
+    return (base + _render_perception(self_check_facts, state_facts)
+            + _render_capability(capability_facts))
 
 
 def self_reflection_maybe() -> dict:
@@ -269,7 +304,8 @@ def self_reflection_maybe() -> dict:
             "reflection_triggers": counters["daily_count"],
         }
         content = _build_content(current, _last_snapshot,
-                                 _read_self_check_facts(), _read_state_facts())
+                                 _read_self_check_facts(), _read_state_facts(),
+                                 _read_capability_facts())
         conn = memory_db.connect()
         try:
             hit = conn.execute(

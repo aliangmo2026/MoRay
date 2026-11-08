@@ -212,6 +212,19 @@ async def _dispatch_event(evt: Dict[str, Any]) -> str:
     fn = _HANDLERS.get(etype)
     if fn is None:
         return "ignored"
+    # [2026-11-03 夜班模式] Laya 决策进 run.events（观测旁路，不消耗预算）。
+    # 夜间无人值守时这些事件原本只进日志，晨报的"昨夜轨迹"看不到"Laya 在几点
+    # 改了什么计划"；这里同步一份进 night_shift，任何异常都吞掉，绝不影响处理。
+    try:
+        from . import night_shift as _night
+        _detail = str(payload.get("reason") or payload.get("decision")
+                      or payload.get("message") or payload.get("summary")
+                      or payload.get("scenario") or "")
+        if not _detail:
+            _detail = json.dumps(payload, ensure_ascii=False, default=str)[:400]
+        _night.record_decision(etype, _detail)
+    except Exception:  # noqa: BLE001 - 观测旁路失败不能反噬事件分派
+        pass
     try:
         await fn(payload)
         return "processed"

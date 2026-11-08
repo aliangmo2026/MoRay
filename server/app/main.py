@@ -270,6 +270,10 @@ from .engines.local_adapter import LocalAdapter, router as engines_router  # noq
 app.include_router(engines_router)  # [Day7] GET /api/engines/list 只读路由；独立路径，放最后不影响既有匹配顺序
 app.include_router(self_check.router, prefix="/api")  # [自省循环 2026-10-09] GET /api/self_check/report 只读端点；独立路径，既有匹配顺序不变
 app.include_router(self_narrative.router, prefix="/api")  # [桥三 v1-stage1 2026-10-10] GET /api/self_narrative/readiness 只读端点；追加在 self_check.router 之后，独立路径，既有匹配顺序不变
+# [能力图谱 2026-11-06] GET /api/self_model/capabilities（各器官/工具成功率、耗时、失败归因）。
+# 独立路径 /api/self_model/*，与既有 /api/* 不冲突；self_capability 全只读聚合零写库。
+from .self_capability import router as self_capability_router  # noqa: E402
+app.include_router(self_capability_router, prefix="/api")
 from .digital_twin import router as digital_twin_router  # noqa: E402 [数字分身 v1 2026-10-23]
 app.include_router(digital_twin_router)  # [数字分身 v1 2026-10-23] POST /api/twin/ingest + /api/twin/recall；独立路径，既有匹配顺序不变
 from .self_driven import router as self_driven_router  # noqa: E402 [自驱引擎 v1 2026-10-23]
@@ -282,6 +286,20 @@ app.include_router(system_router)
 # 关闸时路由仍在但一律 503（诚实报"未启用"，比 404 更好排障）。
 from .bot_routes import router as bot_router  # noqa: E402
 app.include_router(bot_router)
+# [夜班模式 2026-11-03] GET /api/night_shift/report（晨报）+ status/plan/guard/record/
+# events/stream（SSE）。独立前缀 /api/night_shift/*，既有匹配顺序与行为不变。
+from .night_shift import router as night_shift_router  # noqa: E402
+app.include_router(night_shift_router, prefix="/api")
+# [路线一·审查委员会 2026-11-07] POST /api/review/committee（受理多智能体互审）+
+# GET /api/review/committee/{job_id}（轮询）+ GET /api/review/committee（列表）。
+# 事件逐条上轴 synapse 总线，战术轨迹浮窗零改动可见。独立路径，既有匹配顺序不变。
+from .review_committee import router as review_committee_router  # noqa: E402
+app.include_router(review_committee_router)
+# [路线三·可视化编排画布 2026-11-08] POST /api/workflow/run（受理画布 JSON，拓扑序串行执行）
+# + GET /api/workflow/stream/{run_id}（SSE 实时事件流，前端节点着色）+ status/tools 辅助端点。
+# 节点动作白名单硬编码在 workflow_engine.NODE_TOOLS，画布永远开不出任意 MCP 调用面。
+from .workflow_engine import router as workflow_router  # noqa: E402
+app.include_router(workflow_router)
 
 # 关键坑：前端可能以 file:// 打开（Origin 为字符串 "null"），也可能来自
 # http://127.0.0.1 或 http://localhost 的任意端口 —— 正则统一放行

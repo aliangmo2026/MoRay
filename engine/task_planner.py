@@ -91,7 +91,9 @@ async def _gateway_call(prompt: str) -> str:
                             {"role": "user", "content": prompt}],
                "stream": False, "session_id": PLANNER_SESSION, "temperature": 0.0}
     async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_TIMEOUT_SEC, connect=5)) as c:
-        r = await c.post(GATEWAY_URL + "/api/llm/chat", json=payload)
+        # [第4晚 2026-11-06] 规划器内部回调：打 organ 标记，绝不接收 MCP 工具 schema。
+        r = await c.post(GATEWAY_URL + "/api/llm/chat", json=payload,
+                         headers={"X-Moray-Source": "organ"})
         data = r.json()
     if not data.get("ok"):
         raise RuntimeError(str(data.get("message") or data.get("error") or "gateway rejected"))

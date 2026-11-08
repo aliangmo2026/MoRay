@@ -111,7 +111,24 @@ def _read_narrative_sources() -> dict:
         "last_self": ({"id": last_self_row[0], "created_at": last_self_row[1],
                        "content": last_self_row[2]}
                       if last_self_row is not None else None),
+        "capability_radar": _read_capability_radar(),
     }
+
+
+def _read_capability_radar() -> str:
+    """[能力图谱 2026-11-06] 读能力雷达文本（self_capability 单一事实源，60s 缓存）。
+
+    此前叙事的素材全是"我说了多少话/做砸了什么任务"这类记录，模型反思能力短板
+    时没有数据可依，只能编。雷达给 prompt 供真实口径：各器官成功率、失败归因
+    （超时/鉴权/拦截）、平均耗时、弱器官点名。读不到返回空串（prompt 段整体省略，
+    system prompt 已要求"缺失时如实写明"，fail-open 绝不抛）。"""
+    try:
+        from . import self_capability
+        return self_capability.radar_text(max_chars=900)
+    except Exception as e:  # noqa: BLE001 - 雷达盲了叙事照常生成
+        logger.warning("[self_narrative] 读能力雷达异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return ""
 
 
 def _seconds_since_last_generation():
@@ -198,7 +215,8 @@ _SYSTEM_PROMPT = """你是 MoRay。请基于以下观察，用第一人称写一
 2. narrative 不超过 800 字；mental_state 各字段同样只依据观察里存在的事实。
 3. 绝不编造观察里不存在的依据。
 4. 你的能力自评分数（capability_score）必须基于输入里的现实状态推导——观察记录中出现的 mental_score、连续失败次数、失败事实就是唯一依据；严禁自行编造 85 分这类脱离观察的固定高分。只要出现连续失败或 mental_score 偏低，就必须深刻反思并如实下调评分，同时在 narrative 里写出对这条失败链的反思。
-5. 观察里完全没有 mental_score / 失败事实时，不得给出脱离事实的推断性高分：按观察里最近一条可观测事实保守取值，并在 narrative 中写明"状态依据缺失"。"""
+5. 观察里完全没有 mental_score / 失败事实时，不得给出脱离事实的推断性高分：按观察里最近一条可观测事实保守取值，并在 narrative 中写明"状态依据缺失"。
+6. [能力图谱 2026-11-06] 输入里的"能力雷达"是近 7 天真实工具调用统计（各器官成功率、失败归因、耗时）。narrative 必须点名其中成功率最低或失败最集中的器官，写出你对自己这项能力边界的认识（例如：某器官失败主因是安全拦截还是超时，说明的是哪类短板）；capability_score 还必须参考雷达成功率——多数器官低于 60% 时应明显下调。能力雷达段缺失时，在 narrative 中如实写明"能力雷达读取失败"，不得凭空编造任何能力评价。"""
 
 #: 在飞闸（进程内存活，重启清零）：生成中不重复触发，端点与循环两入口共用
 _narrative_inflight = False
@@ -229,6 +247,12 @@ def build_narrative_messages(sources: dict):
         lines.append("")
         lines.append("[最近自我仪表盘]")
         lines.append(str(last.get("content") or ""))
+    # [能力图谱 2026-11-06] 能力雷达段（真实工具调用统计）：放在仪表盘之后、
+    # 总长截断之前——8192 ctx 下雷达 ≤900 字符，排在尾部最不容易被预算闸切掉。
+    radar = str(sources.get("capability_radar") or "")
+    if radar:
+        lines.append("")
+        lines.append(radar)
     user = "\n".join(lines)[:_NARRATIVE_PROMPT_CHARS]
     messages = [{"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user}]

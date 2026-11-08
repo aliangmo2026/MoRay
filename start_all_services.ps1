@@ -15,9 +15,17 @@
     9301   Iris-SSE   powershell -File D:\Iris\server\start_server.ps1
     8004   Iris-RPC   D:\MoRay\server\.venv\Scripts\python.exe D:\Iris\server\mcp_server.py
                        (cwd D:\Iris\server)
+    9310   Scribe     E:\moray-scribe\.venv\Scripts\python.exe -m moray_scribe.mcp.http_main
+                       (cwd E:\moray-scribe —— out/ 相对项目根，必须指向项目根)
+    9311   Surgeon    D:\python3.12\python.exe -m moray_surgeon.mcp_server
+                       (cwd E:\moray-surgeon; MORAY_MCP_TRANSPORT=streamable-http)
+    9312   AIOps      E:\moray-aio\.venv\Scripts\python.exe -m app.tools.mcp_http
+                       (cwd E:\moray-aio; FastAPI 包手写 JSON-RPC)
 
   注意：9301 与 8004 是同一个 mcp_server.py 的两个实例，唯一区别是
   IRIS_MCP_PORT（不设 = 默认 9301；显式设 8004）。不是两个不同的程序。
+  9310/9311/9312 均为 streamable-HTTP，绑定 127.0.0.1，路径统一 /mcp；
+  FastMCP 两个器官用 stateless_http + json_response（无 initialize/会话头）。
 
   设计说明（为什么这么写）
     * 环境变量按服务隔离。PowerShell 5.1 的 Start-Process 没有 -Environment 参数
@@ -248,6 +256,51 @@ $services = @(
             IRIS_MCP_API_KEY     = 'morayIrisKey2026'
             IRIS_GATEWAY_URL     = 'http://127.0.0.1:8000'
             IRIS_LLM_TIMEOUT_SEC = '90'
+        }
+        EnvDel  = $null
+    }
+    # ---- [MCP 网关第3晚 2026-11-06] Scribe / Surgeon / AIOps HTTP 触手 ----
+    # Scribe 的 WorkDir 必须是 E:\moray-scribe：out/ 是相对 CWD 解析的，指错会写错产物。
+    @{
+        Name    = 'Scribe 9310'
+        Port    = 9310
+        WaitSec = 10
+        Probe   = 'http://127.0.0.1:9310/mcp'
+        File    = 'E:\moray-scribe\.venv\Scripts\python.exe'
+        Args    = '-m moray_scribe.mcp.http_main'
+        WorkDir = 'E:\moray-scribe'
+        Check   = 'E:\moray-scribe\src\moray_scribe\mcp\http_main.py'
+        EnvSet  = @{ MORAY_MCP_HOST = '127.0.0.1'; MORAY_MCP_PORT = '9310' }
+        EnvDel  = $null
+    }
+    @{
+        Name    = 'Surgeon 9311'
+        Port    = 9311
+        WaitSec = 10
+        Probe   = 'http://127.0.0.1:9311/mcp'
+        File    = 'D:\python3.12\python.exe'
+        Args    = '-m moray_surgeon.mcp_server'
+        WorkDir = 'E:\moray-surgeon'
+        Check   = 'E:\moray-surgeon\src\moray_surgeon\mcp_server.py'
+        EnvSet  = @{
+            MORAY_MCP_TRANSPORT = 'streamable-http'
+            MORAY_MCP_HOST      = '127.0.0.1'
+            MORAY_MCP_PORT      = '9311'
+        }
+        EnvDel  = $null
+    }
+    @{
+        Name    = 'AIOps 9312'
+        Port    = 9312
+        WaitSec = 10
+        Probe   = 'http://127.0.0.1:9312/health'
+        File    = 'E:\moray-aio\.venv\Scripts\python.exe'
+        Args    = '-m app.tools.mcp_http'
+        WorkDir = 'E:\moray-aio'
+        Check   = 'E:\moray-aio\app\tools\mcp_http.py'
+        EnvSet  = @{
+            MORAY_AIO_MCP_HOST = '127.0.0.1'
+            MORAY_AIO_MCP_PORT = '9312'
         }
         EnvDel  = $null
     }

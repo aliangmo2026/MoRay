@@ -28,9 +28,14 @@ from . import config
 from . import cloud_budget_guard
 from . import cloud_providers  # [2026-10-30 动态多厂商] UI 注册表：按名字/模型动态选上游
 from . import db as _db  # [真实数据链路 2026-10-26] usage_log 落库
+from . import night_shift  # [2026-11-03 夜班模式] 预算/失败/模型/写盘四条硬熔断
+from . import mcp_gateway  # [MCP 网关试点 2026-11-05] 外部器官工具注入 + 服务端执行环
 
 router = APIRouter()
 _logger = logging.getLogger("moray.llm")
+# [第4晚 2026-11-06] MCP 注入/熔断观测点走 moray.mcp：mcp_gateway 已给该 logger 自挂
+# handler（moray 根 logger 只放行 ERROR），否则顶层拦截/熔断日志会被静默吞掉。
+_mcp_log = logging.getLogger("moray.mcp")
 
 # 连接/读取/写入/池化超时（读取放宽到 300s 支持长思考流式）
 _TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
@@ -245,6 +250,11 @@ def _resolve_body_provider(request: Request, body: dict) -> tuple[str, str]:
 
     /api/llm/chat 的两处消费点（一级预检 + 上游选择）共用本函数，保证两处 provider
     值恒同源（此前是两行重复字面量，本次一并收口）。"""
+    # [2026-11-03 夜班模式] 烧钱熔断强制本地：必须排在所有来源之前，否则
+    # X-Moray-Provider: cloud 会绕过 body.provider。该标记只由 night_shift 在
+    # 判定"高级付费模型"后写入，普通请求永远拿不到。
+    if body.get("_night_shift_force_local") is True:
+        return "ollama", "night_shift"
     header_provider = str(request.headers.get("X-Moray-Provider") or "").strip().lower()
     if header_provider in _HEADER_PROVIDER_ALLOWLIST:
         return header_provider, "header"
@@ -666,6 +676,20 @@ def _synthetic_identity_sse(model: str) -> str:
             + "data: [DONE]\n\n")
 
 
+def _synthetic_text_sse(text: str, model: str, chunk_id: str = "moray-mcp-fuse") -> str:
+    """把任意固定文本包成 OpenAI 兼容 SSE（防死循环熔断的流式兜底）。"""
+    now = int(time.time())
+    chunk = {"id": chunk_id, "object": "chat.completion.chunk", "created": now,
+             "model": model,
+             "choices": [{"index": 0, "delta": {"content": text}}]}
+    stop = {"id": chunk_id, "object": "chat.completion.chunk", "created": now,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    return ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+            + "data: " + json.dumps(stop, ensure_ascii=False) + "\n\n"
+            + "data: [DONE]\n\n")
+
+
 @router.post("/api/llm/chat")
 async def llm_chat(request: Request):
     # ---- 1. 入参解析（[2026-09-30d 任务二点五] 前移到配置检查之前：检查需读 body.provider；
@@ -674,6 +698,29 @@ async def llm_chat(request: Request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         return _err(400, "bad_json", "请求体不是合法 JSON。")
+
+    # ---- [第4晚 2026-11-06] 防死循环顶层硬闸：器官回调标记 ----
+    # 在进入任何注入/工具逻辑之前先识别；即使 MCP_CHAT_INJECT_DEFAULT 已默认开启，
+    # 带 X-Moray-Source: organ 的请求也永远拿不到工具 schema。网关 prepare_chat_tools
+    # 内还有第二道同语义检查（defense in depth），两层任一命中即零注入。
+    _is_organ_callback = str(request.headers.get("X-Moray-Source") or "").strip().lower() == "organ"
+
+    # ---- 1.1 [2026-11-03 夜班模式] 烧钱熔断总闸 ----
+    # 刻意放在 provider 预检之前：只有在这里先改写 body.provider/model，
+    # "X-Moray-Provider: cloud + gpt-4" 才不可能在下面的云端预检里先放行。
+    # 三条硬约束都在 night_shift 内判定（预算 15 / 连续失败 3 / 高级模型改写本地）；
+    # 非夜班请求零副作用（未命中 marker 且无 active run 时立即返回 allow=True）。
+    if isinstance(body.get("messages"), list) and body.get("messages"):
+        _ns_session_id = str(
+            body.get("session_id") or request.headers.get("X-Session-Id") or ""
+        ).strip() or "default"
+        _ns = night_shift.handle_chat_request(body, body["messages"], _ns_session_id, request)
+        if _ns.get("active") and not _ns.get("allow"):
+            # X-Should-Retry:false：夜班熔断是确定性拒绝，任何 SDK 自动重试都只会
+            # 白烧配额并拖长中断时间（与云端预算超限同款约定）。
+            return _err(429, str(_ns.get("code") or "night_shift_blocked"),
+                        str(_ns.get("message") or "夜班模式已暂停。"),
+                        headers={"X-Should-Retry": "false", "Retry-After": "600"})
 
     # ---- 1.5 [2026-10-25 BYOK 透传] 前端显式携带的第三方兼容 API base/key ----
     # 设置页"经本地后端代理"链路：浏览器直连 openrouter.ai 等被 CORS 拦成 Failed to
@@ -879,7 +926,9 @@ async def llm_chat(request: Request):
     # [2026-10-30 动态多厂商] 请求头点名了 UI 注册表里的服务商 → 走云端分支，
     # 闸门/预算/身份底座全部复用，不绕过。
     _target_header = str(request.headers.get("X-Moray-Target-Provider") or "").strip().lower()
-    if _target_header and cloud_providers.lookup_by_name(_target_header):
+    # [2026-11-03 夜班模式] 强制本地时，动态厂商头同样不能把请求拉回云端计费。
+    if (_target_header and not body.get("_night_shift_force_local")
+            and cloud_providers.lookup_by_name(_target_header)):
         provider = "cloud"
     if provider == "ollama":
         model = requested or config.OLLAMA_MODEL
@@ -933,14 +982,17 @@ async def llm_chat(request: Request):
     # [阶段0 本机 Agent] 工具调用协议透传：仅请求体显式携带时才透传（无 tools 的旧请求行为完全不变）
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
-        # [twin×argus 冲突修复 2026-10-24] 物理剥夺：twin 强命中（内部文档足够回答）时把
-        # detective_research（Argus 外部搜索）从本次请求的 tools 里摘除，模型无此工具可调，
-        # 只能依据注入的内部知识作答；zcode 等其余工具不受影响。全部摘除时不下发 tools 键。
+        # [twin×argus 冲突修复 2026-10-24；第2晚配置化] 物理剥夺：twin 强命中（内部文档
+        # 足够回答）时把外部搜索工具（默认 detective_research）从本次请求的 tools 里摘除，
+        # 模型无此工具可调，只能依据注入的内部知识作答；其余工具不受影响。
+        # [第2晚 2026-11-06] 白名单从 config.MCP_TWIN_DEPRIVED_TOOLS 读取（原为硬编码），
+        # 后续新增外部检索工具无需再改代理主链路。
         if _twin_strong_hit:
+            _deprived = set(getattr(config, "MCP_TWIN_DEPRIVED_TOOLS", ()) or ())
             _tools_before = len(tools)
             tools = [t for t in tools
                      if not (isinstance(t, dict) and isinstance(t.get("function"), dict)
-                             and (t["function"].get("name") or "") == "detective_research")]
+                             and (t["function"].get("name") or "") in _deprived)]
             if len(tools) < _tools_before:
                 # [真实感知 2026-11-01] 拦截必须留痕：此前这段是纯内存分支，事后
                 # 无从证明"这一刻剥夺发生过"。_emit_intercept 自带 try/except，
@@ -952,6 +1004,33 @@ async def llm_chat(request: Request):
                     pass
         if tools:
             payload["tools"] = tools
+
+    # [MCP 网关 2026-11-05 试点；第4晚 2026-11-06 默认全量注入] 外部器官只读工具注入：
+    # 普通聊天默认获得白名单内全部只读工具；X-Moray-Tools 可显式收窄/none 关闭；
+    # 器官回调由顶层 _is_organ_callback 硬豁免（网关内还有第二道）。任何失败 fail-open
+    # 返回空列表 = 不注入，聊天零影响。
+    # [2026-11-06 E2E 修正] twin 强命中不再拦截注入：twin 剥夺语义针对自动化前端行为，
+    # 而语料非空时 _hybrid_recall 恒返 top-3 → 强命中恒真（实测把 opt-in 也拦死）。
+    # 上方 MCP_TWIN_DEPRIVED_TOOLS 物理剥夺段原样保留，不受影响。
+    _mcp_chat_tools: list = []
+    if _is_organ_callback:
+        # [第4晚] 顶层斩断：连 prepare_chat_tools 都不进，保证器官内部调用零工具 schema。
+        _mcp_log.info("[mcp] 顶层拦截：器官回调（X-Moray-Source: organ）不注入任何 MCP 工具")
+    elif not _is_title_call:
+        _mcp_chat_tools = await mcp_gateway.prepare_chat_tools(
+            request, tools if isinstance(tools, list) else [])
+        if _mcp_chat_tools:
+            tools = (tools if isinstance(tools, list) else []) + _mcp_chat_tools
+            payload["tools"] = tools
+            # [第4晚 2026-11-06 默认注入修正] twin 包装层把"内部知识"和"严禁调用外部
+            # 搜索工具"写在同一条 system 消息里。默认注入开启后，整条删除会连带丢掉召回
+            # 语料 → 只摘掉禁令从句，保留知识行（messages 与 payload["messages"] 是同一
+            # list 对象，原位改写两侧同步）。自动化路径的 detective_research 剥夺不变。
+            _twin_ban_clause = "，严禁调用外部搜索工具"
+            for _m in messages:
+                if (isinstance(_m, dict) and _m.get("role") == "system"
+                        and str(_m.get("content") or "").startswith("[相关个人文档知识]")):
+                    _m["content"] = str(_m.get("content") or "").replace(_twin_ban_clause, "")
     if body.get("tool_choice") is not None:
         payload["tool_choice"] = body["tool_choice"]
     # [2026-10-21 keep_alive 透传] 前端 ollama 请求统一走本代理后，keep_alive:'30m' 需后端接力
@@ -1521,10 +1600,63 @@ async def llm_chat(request: Request):
         finally:
             await client.aclose()
 
+    # [MCP 网关 2026-11-05 试点；第4晚 2026-11-06 默认注入 + 15 次硬熔断] 服务端工具
+    # 执行环：注入的 mcp__<server>__* 工具由 8000 自己执行并以 role:"tool" 回喂（复用
+    # _do_request），客户端只见最终答案；环内失败/前端工具一律交回下方既有
+    # _stream/_non_stream 链路（身份/套话守卫、usage 记账零旁路）。
+    # 环结束后注入工具必被摘除；若触发 15 次熔断，直接合成固定安全提示，不再调模型。
+    if _mcp_chat_tools:
+        _mcp_rounds = await mcp_gateway.run_server_tool_rounds(
+            payload, upstream_url, upstream_headers, _do_request,
+            model=model, record_usage=_record_usage_log)
+        _mcp_fused = bool(payload.pop("_moray_mcp_fused", False))
+        _mcp_fuse_message = str(
+            payload.pop("_moray_mcp_fuse_message", "")
+            or getattr(config, "MCP_FUSE_MESSAGE",
+                       "系统安全限制：工具调用次数超限，已强制中断。"))
+        if _mcp_fused:
+            _mcp_log.warning("[mcp] 工具调用熔断：%s", _mcp_fuse_message)
+            if stream:
+                async def _fuse_stream():
+                    yield _synthetic_text_sse(_mcp_fuse_message, model)
+                return StreamingResponse(
+                    _fuse_stream(), media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "X-Moray-Mcp-Fused": "1"})
+            return {"ok": True, "content": _mcp_fuse_message, "reasoning": "",
+                    "model": model,
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                              "total_tokens": 0}}
+        if _mcp_rounds:
+            _mcp_log.info("[mcp] 服务端工具环完成：%d 轮已回喂，交回原链路出最终答案", _mcp_rounds)
+
+    # ---- [路线二·长效语义记忆 2026-11-07] 对话收尾触发记忆提炼（fire-and-forget）----
+    # 非流式=生成完成后调度；流式=包装生成器，[DONE] 吐完（收尾/取消/中断）后在
+    # finally 调度——chunk 原样透传，SSE 协议字节零改动。organ 回环（X-Moray-Source:
+    # organ）与标题辅助请求绝不提炼；提炼全链路在 to_thread 工作线程，事件循环零阻塞。
     if stream:
-        return StreamingResponse(_stream(), media_type="text/event-stream",
+        async def _stream_with_memory_extract():
+            try:
+                async for _chunk in _stream():
+                    yield _chunk
+            finally:
+                try:
+                    from . import memory_extractor
+                    memory_extractor.schedule_extract_after_chat(
+                        messages, session_id,
+                        skip=_is_organ_callback or _is_title_call)
+                except Exception:  # noqa: BLE001 - fire-and-forget 纪律
+                    pass
+        return StreamingResponse(_stream_with_memory_extract(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return await _non_stream()
+    _chat_result = await _non_stream()
+    try:
+        from . import memory_extractor
+        memory_extractor.schedule_extract_after_chat(
+            messages, session_id, skip=_is_organ_callback or _is_title_call)
+    except Exception:  # noqa: BLE001
+        pass
+    return _chat_result
 
 
 # ---------------------------------------------------------------------------

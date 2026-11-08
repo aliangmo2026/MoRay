@@ -195,3 +195,8 @@ decision-kernel/lora-training/OllamaSetup.exe
 
 # ==== 2026-10-25 追加：Mimosa 扫描插件落盘（ZCode 插件的 hook 状态/扫描历史，约 472MB 本地缓存，绝不进仓库）====
 .mimosa/
+
+# ==== 2026-11-08 开源收网追加：安全扫描残留 / 雷达过程图 ====
+.moratest_*/
+.probe3_*/
+/_radar_*.png

@@ -5,7 +5,7 @@
 缓存快照对外（GET /api/self_check/report）；监控大屏要的是"现在这一秒谁活着"。
 本模块补两条只读通道：
 
-  GET /api/system/organs          7 端口实时 TCP 探活（复用 self_check._probe_port），
+  GET /api/system/organs          10 端口实时 TCP 探活（复用 self_check._probe_port），
                                   1 秒 TTL 缓存 + 每口真实 latency_ms。**不读**那份
                                   30 分钟旧报告——旧报告是快照，不是探活结果。
   GET /api/system/events?since=   llm_proxy 拦截事件（物理剥夺 / 预算阻断）增量读取。
@@ -35,7 +35,7 @@ router = APIRouter()
 
 #: 1 秒 TTL 缓存时长。大屏按 1-2s 轮询时，同秒内的重复请求共用一轮探活结果。
 _CACHE_TTL_S = 1.0
-#: 单口探活超时（秒）。与 self_check._probe_port 默认值同量级：7 口并发，最坏
+#: 单口探活超时（秒）。与 self_check._probe_port 默认值同量级：10 口并发，最坏
 #: 1s 收敛，不会让前端轮询堆积。
 _PROBE_TIMEOUT_S = 1.0
 
@@ -47,6 +47,10 @@ _ORGAN_META = {
     8010: ("argus", "Argus 情报"),
     8004: ("iris-jsonrpc", "Iris 感官（给 Laya）"),
     9301: ("iris-sse", "Iris 感官（主服务）"),
+    # [第3晚 2026-11-06] 三器官 HTTP 触手
+    9310: ("scribe", "Scribe 文档器官"),
+    9311: ("surgeon", "Surgeon 重构器官"),
+    9312: ("aiops", "AIOps 运维器官"),
     11434: ("ollama", "Ollama 本地模型"),
 }
 

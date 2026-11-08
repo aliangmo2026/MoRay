@@ -556,7 +556,10 @@ class TaskTemplateRunner:
             payload["model"] = GATEWAY_MODEL
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=5)) as c:
-                r = await c.post(GATEWAY_URL + "/api/llm/chat", json=payload)
+                # [第4晚 2026-11-06] 内部任务引擎回调：MCP 注入默认开启后必须打 organ
+                # 标记，否则 21 个只读工具 schema 会污染规划/执行 prompt 并可能成环。
+                r = await c.post(GATEWAY_URL + "/api/llm/chat", json=payload,
+                                 headers={"X-Moray-Source": "organ"})
                 data = r.json()
         except Exception as e:  # noqa: BLE001
             raise StepError("GATEWAY_UNREACHABLE", f"{type(e).__name__}: {e}")

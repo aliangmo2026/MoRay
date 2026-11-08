@@ -676,3 +676,10 @@ def budget_reset():
         return _ok(_budget_guard.get_daily_state())
     except _budget_guard.BudgetStateUnavailable as e:
         return _bad("budget_reset_failed", str(e), status=503)
+
+
+# ---- [MCP 网关第2晚 2026-11-06] 加性挂载统一网关 HTTP 面 /api/mcp/gateway/*（同款两行折叠）----
+# 逻辑全在 server/app/mcp_routes.py（薄路由）；传输/鉴权/信封全复用 server/app/mcp_gateway.py。
+# 消费方 = Laya 8001 的 tool_registry._call_iris（旧直连 Iris 8004 已废弃）。
+from .mcp_routes import router as _mcp_gateway_router  # noqa: E402
+router.include_router(_mcp_gateway_router)

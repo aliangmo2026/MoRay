@@ -62,6 +62,8 @@ _SOURCE_KIND_MATRIX = {
     "memory_hippocampus": {"memory_digest"},  # [海马体 v1 2026-10-22] 睡眠压缩产物专属 source×kind
     "digital_twin": {"corpus"},  # [数字分身 v1 2026-10-23] 语料切块摄入专属 source×kind（recall 白名单不含 corpus，主召回零污染）
     "self_driven": {"self_observation"},  # [自驱 v2 2026-10-23] 执行闭环回写「我执行了自驱目标…」专属 source×kind
+    "night_shift": {"task_result"},  # [夜班模式 2026-11-03] 连续失败熔断的失败原因专属 source×kind
+    "memory_extractor": {"auto_fact", "auto_pref"},  # [路线二 2026-11-07] 对话后自动提炼的客观事实/偏好专属 source×kind（corpus 永不沾）
 }
 
 #: 写入校验拒绝的错误前缀——端点据此判定 HTTP code
@@ -317,7 +319,10 @@ async def memory_recall(request: Request):
             # [白名单治本 2026-10-10] 召回面收白名单：只允许用户可见的 kind 进；
             # 新 kind（self_observation / self / 未来）默认不进，结构上防污染。
             # 注：'fact' 是 schema 默认 kind，当前库中无数据，预留。
-            "AND m.kind IN ('fact', 'task_result', 'insight', 'preference') "
+            # [路线二 2026-11-07] 收编 auto_fact/auto_pref（Memory Extractor 对话后
+            # 自动提炼的用户事实/偏好）——自动记忆被召回是"长记性"的全部意义；
+            # corpus 依旧不在白名单（与数字分身语料的隔离口径不变）。
+            "AND m.kind IN ('fact', 'task_result', 'insight', 'preference', 'auto_fact', 'auto_pref') "
         )
         params = [match_expr]
         if kind:
@@ -377,7 +382,8 @@ async def memory_recall(request: Request):
     # 为纯 FTS（与 AND→OR 兜底同哲学：只降级不加阈值）。回表用"嵌行全扫 +
     # Python 过滤"而非 IN 拼接（参数绑定纪律；嵌行规模=库内带 embedding 的行数）。
     mode = str(body.get("mode") or "fts").strip().lower()
-    _RECALL_KINDS = ("fact", "task_result", "insight", "preference")  # 与上方 SQL 白名单同口径，改一处必改两处
+    # [路线二 2026-11-07] 收编 auto_fact/auto_pref，与上方 SQL 白名单同口径，改一处必改两处
+    _RECALL_KINDS = ("fact", "task_result", "insight", "preference", "auto_fact", "auto_pref")
     vec_items = []
     if mode == "hybrid":
         try:

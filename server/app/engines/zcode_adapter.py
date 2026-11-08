@@ -121,6 +121,57 @@ _ZCODE_EVENT_WHITELIST = frozenset({
                           # 让前端能显示"模型在说什么"的过程
 })
 
+#: [2026-11-03 夜班模式] 从 tool.updated 的 payload 里抽取"被修改的文件"。
+#: 只认带扩展名的文件路径（目录/cwd 不算改动），且只在工具成功（kind=result）
+#: 时上报——scheduled 只代表"准备做"，提前记进 modified_files 会撒谎。
+#: 这是 best-effort：不同 CLI 版本的 payload 键名可能不同，抽不到就不记，
+#: 绝不因为解析失败影响流式任务（调用方 try/except 包住）。
+_NIGHT_FILE_KEYS = frozenset({
+    "file_path", "filepath", "path", "target_file", "filename", "abs_path",
+})
+_NIGHT_FILE_EXT_RE = re.compile(
+    r"\.(?:py|pyi|js|jsx|ts|tsx|json|jsonc|md|txt|yaml|yml|toml|ini|cfg|css|scss|"
+    r"html|htm|sql|bat|ps1|sh|go|rs|java|kt|c|cc|cpp|h|hpp|cs|php|rb|vue|svelte)$",
+    re.IGNORECASE,
+)
+
+
+def _night_tool_paths(obj: dict) -> list:
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if not isinstance(payload, dict):
+        return []
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind and kind not in ("result", "completed", "success", "ok"):
+        return []
+    # 只认"写类"工具：Read/Grep 的 payload 也带 file_path，不过滤会把"读过的文件"
+    # 记成"改过的文件"。toolName 缺失时保留 best-effort（不同 CLI 版本字段不一）。
+    tool_name = str(payload.get("toolName") or payload.get("tool_name") or "").strip().lower()
+    if tool_name and not any(
+            word in tool_name for word in
+            ("write", "edit", "replace", "patch", "create", "delete", "remove",
+             "move", "rename", "apply", "mkdir", "touch", "save")):
+        return []
+    found: list = []
+
+    def _walk(node, depth: int) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (str(key).lower() in _NIGHT_FILE_KEYS
+                        and isinstance(value, str)
+                        and _NIGHT_FILE_EXT_RE.search(value.strip())):
+                    path = value.strip()
+                    if path not in found:
+                        found.append(path)
+                _walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item, depth + 1)
+
+    _walk(payload, 0)
+    return found[:20]
+
 # task_id -> {task_id, status, prompt, language, cwd, cmd, proc, queue, loop, created_at, done_at}
 _ZCODE_STREAM_TASKS: dict = {}
 
@@ -256,6 +307,15 @@ def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
                 last_result = obj
             elif obj.get("type") == "turn.completed":
                 last_turn = obj
+            elif obj.get("type") == "tool.updated":
+                # [2026-11-03 夜班模式] 记录 ZCode 实际改动的文件（best-effort）。
+                # 夜班未激活时 note_file_write 立即 no-op，既有流式任务零副作用。
+                try:
+                    from .. import night_shift as _ns
+                    for _fp in _night_tool_paths(obj):
+                        _ns.note_file_write(_fp, op="zcode_tool")
+                except Exception:  # noqa: BLE001 - 记账失败绝不影响读流
+                    pass
             _put(line)
             # [v5 step1] turn.completed → progress（每轮一条上总线）。tool.updated/
             # model.streaming 禁上总线（真机流 88% 会刷屏台账）。异常绝不影响读流。
@@ -307,6 +367,24 @@ def _zcode_stream_reader(task_id: str, proc, queue, loop) -> None:
             _term_status = "completed"
         else:
             _term_status = "failed"
+        # [2026-11-03 夜班模式] 流式任务同样记账（与 _finalize 同口径，工具侧幂等：
+        # record_execution 只在夜班 active 时生效）。task_key 用 prompt 而非 task_id，
+        # 这样"同一任务重试 3 次"会落在同一个连续失败计数器上。
+        try:
+            from .. import night_shift as _night_shift
+            _ns_out = ""
+            if isinstance(last_result, dict):
+                _ns_out = str(last_result.get("response") or "")[:1200]
+            _night_shift.record_execution(
+                task_key=str(_rec.get("prompt") or task_id),
+                exit_code=_rcv,
+                status=_term_status,
+                output=_ns_out or str(_loop_exit_reason or "")[:1200],
+                tool="zcode_stream",
+            )
+        except Exception as _ns_err:  # noqa: BLE001 - 记账失败不影响终态帧
+            _logger.warning("[night_shift] zcode stream 记账异常（忽略）：%s: %s",
+                           type(_ns_err).__name__, str(_ns_err)[:160])
         _put(json.dumps({
             "type": "zcode.exit_code",
             "payload": {
@@ -1174,6 +1252,25 @@ class ZCodeAdapter(ExecutionEngine):
         rec["exit_code"] = rc
         rec["ended_at"] = time.time()
         rec["duration_sec"] = round(rec["ended_at"] - (rec["started_at"] or rec["created_at"]), 1)
+        # [2026-11-03 夜班模式] 真实执行结果记账：exit_code 非 0 由 night_shift 累计，
+        # 同一任务连续 3 次失败会暂停夜班并写记忆库/发 SSE。非夜班 run 零副作用；
+        # 记账旁路任何异常绝不反噬 ZCode 收尾（fail-open）。
+        try:
+            from .. import night_shift as _night_shift
+            _task_obj = rec.get("task")
+            _task_prompt = ""
+            if isinstance(_task_obj, dict):
+                _task_prompt = str(_task_obj.get("prompt") or _task_obj.get("action") or "")
+            _night_shift.record_execution(
+                task_key=_task_prompt or str(rec.get("task_id") or ""),
+                exit_code=rc,
+                status=rec.get("status"),
+                output=str(rec.get("error") or "")[:1200],
+                tool="zcode",
+            )
+        except Exception as _ns_err:  # noqa: BLE001 - 记账失败不影响执行结果
+            _logger.warning("[night_shift] zcode 记账异常（忽略）：%s: %s",
+                           type(_ns_err).__name__, str(_ns_err)[:160])
         if rec["status"] == STATUS_COMPLETED:
             # 失败时 result=None（契约要求）；usage 拿不到就是 None，绝不编造
             rec["result"] = {

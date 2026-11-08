@@ -330,7 +330,10 @@ async def _ask_llm(job: dict) -> tuple[str, str]:
     }
     try:
         async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_S, trust_env=False) as client:
-            resp = await client.post(_LLM_URL, json=payload)
+            # [第4晚 2026-11-06] IM 是单发文本回复：默认 MCP 注入开启后显式 none，
+            # 防止 21 个工具 schema 把 QQ 回复变成工具轮/多段消息。
+            resp = await client.post(_LLM_URL, json=payload,
+                                     headers={"X-Moray-Tools": "none"})
         data = resp.json()
     except Exception as e:  # noqa: BLE001 - 回环失败按兜底回复处理，worker 不崩
         logger.warning("[bot] LLM 回环调用失败 message_id=%s：%s: %s",

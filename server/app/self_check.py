@@ -53,8 +53,9 @@ logger = logging.getLogger("moray.self_check")
 
 #: 定时间隔：30 分钟，硬编码（任务书裁定不读 config）
 _SELF_CHECK_INTERVAL = 1800
-#: 探活端口：MoRay 8000 / 其余为本机生态（8001/8005/8010/8004/9301/Ollama 11434）
-_PROBE_PORTS = (8000, 8001, 8005, 8010, 8004, 9301, 11434)
+#: 探活端口：MoRay 8000 / 其余为本机生态
+#: （8001/8005/8010/8004/9301/9310 Scribe/9311 Surgeon/9312 AIOps/Ollama 11434）
+_PROBE_PORTS = (8000, 8001, 8005, 8010, 8004, 9301, 9310, 9311, 9312, 11434)
 #: 输出文件：__file__ 解析（server/app/ 的上上级 = 工程根；main.py:8 "路径全部基于
 #: __file__ 解析"同款惯例），实际即 D:\MoRay\logs\self_check.log
 _LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "self_check.log"
@@ -329,6 +330,23 @@ def _collect_backlog() -> dict:
             "chains": chains[:20], "truncated": len(chains) > 20}
 
 
+def _collect_night_shift() -> dict:
+    """[2026-11-03 夜班模式] 只读快照：当前/最近一次夜班的预算消耗与状态。
+
+    刻意不参与下方 anomalous 判定——夜班 waiting_human 是"需要人看"的业务状态，
+    不是自省镜子坏了；把它算进 level 会让自检从"器官探活"变成"任务看板"。
+    任何异常 fail-open 成 no_data（与其余 _collect_* 同纪律）。
+    """
+    try:
+        from . import night_shift
+        snap = night_shift.snapshot()
+        return snap if isinstance(snap, dict) else {"status": "no_data"}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "no_data",
+                "reason": "night_shift.snapshot not accessible: %s: %s"
+                          % (type(e).__name__, str(e)[:120])}
+
+
 async def self_check_once() -> dict:
     """跑一轮，返回报告 dict（顺带更新 _LAST_REPORT 并落 self_check.log）。
 
@@ -355,6 +373,7 @@ async def self_check_once() -> dict:
         "budget_gate": budget_gate,
         "backlog": backlog,
         "errors": {"recent_30min": err_count, "recent_items": err_items},
+        "night_shift": _collect_night_shift(),
         "level": "warn" if anomalous else "info",
     }
     _LAST_REPORT = report
@@ -400,6 +419,11 @@ async def self_check_loop() -> None:
         await self_driven.maybe_generate_goal()  # 自驱：3h 冷却+日配额过 → LLM 生成目标卡进待审批队列；只生成不执行，派发仍要人 approve（函数内自守卫）
     except Exception:  # noqa: BLE001 - 自驱失败不拖循环
         logger.warning("[self_check] self_driven.maybe_generate_goal 异常(起手)", exc_info=True)
+    try:
+        from . import self_driven  # [第二战 2026-11-07] 自愈：连败器官 → 沙箱自愈卡（6h 冷却+自身日限2+路径硬闸，函数内自守卫；模板卡零 LLM）
+        self_driven.maybe_generate_self_fix()
+    except Exception:  # noqa: BLE001 - 自愈失败不拖循环
+        logger.warning("[self_check] self_driven.maybe_generate_self_fix 异常(起手)", exc_info=True)
     while True:
         await asyncio.sleep(_SELF_CHECK_INTERVAL)
         try:
@@ -429,6 +453,11 @@ async def self_check_loop() -> None:
             await self_driven.maybe_generate_goal()  # 自驱：3h 冷却+日配额过 → LLM 生成目标卡进待审批队列；只生成不执行，派发仍要人 approve（函数内自守卫）
         except Exception:  # noqa: BLE001 - 自驱失败不拖循环
             logger.warning("[self_check] self_driven.maybe_generate_goal 异常", exc_info=True)
+        try:
+            from . import self_driven  # [第二战 2026-11-07] 自愈挂点（每轮尾同款）：连败器官才出卡，6h 冷却+日限内部自管
+            self_driven.maybe_generate_self_fix()
+        except Exception:  # noqa: BLE001 - 自愈失败不拖循环
+            logger.warning("[self_check] self_driven.maybe_generate_self_fix 异常", exc_info=True)
 
 
 def write_self_check_log(report: dict) -> None:
