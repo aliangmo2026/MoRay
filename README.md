@@ -72,8 +72,6 @@ MoRay 把三件事做成了**物理事实**：
 
 > 把「多器官协同」从代码里的一段 JSON，变成你拖出来的一条线。
 
-<!-- 📷 画布实拍占位：docs/assets/workflow_canvas.png（运行中=闪烁蓝 / 成功=绿 的着色流转） -->
-
 ### 4. 🧠 自我认知（能力雷达）
 
 能看清自己成功率的**元认知系统**——MoRay 知道自己每个器官好不好使：
@@ -303,11 +301,11 @@ copy server\.env.example server\.env
 
 > Surgeon 100%、Scribe 100%、Argus 80%——每个器官的真实成功率、平均耗时与失败归因，悬停出完整统计卡片。**Agent 第一次能看清自己几斤几两。**
 
-### 图 5 · 可视化工作流画布（占位）
+### 图 5 · 可视化工作流画布
 
-<!-- ![工作流画布](docs/assets/workflow_canvas.png) -->
+![工作流画布](docs/assets/workflow_canvas.png)
 
-> 📷 **截图占位**：拖入 Surgeon → Scribe 连线点运行，节点灰 → 闪烁蓝 → 双绿的着色流转（截图文件 `docs/assets/workflow_canvas.png` 待补）。
+> 拖入 Surgeon → Scribe 连线点运行：节点灰 → 闪烁蓝 → 双绿的着色流转。本图为真机运行实拍，2/2 节点全绿（171ms / 172ms），产物 `out/symbol-graph.json` 落盘。
 
 ---
 
