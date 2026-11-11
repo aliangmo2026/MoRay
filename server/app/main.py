@@ -23,6 +23,7 @@ from . import config, crud, db, memory_db, synapse_bus, synapse_db
 from . import self_check  # [自省循环 2026-10-09 桥一] 30 分钟定时自检：只记录+标记，级别 1-2
 from . import self_narrative  # [桥三 v1-stage1 2026-10-10] 自我叙事骨架：只做准备度检查，不调 LLM、不写库
 from . import self_state  # [自我模型 v4 2026-10-23] 实时状态机：self_state_log 流水读写（bump_state/get_current_state）
+from . import skill_extractor  # [经验泛化引擎 2026-11-10] 失败经验→规则→注入 的轮询提炼 loop
 from .llm_proxy import router as llm_router, startup_budget_note
 from .api import router as api_router
 from .agent_tools import router as agent_tools_router
@@ -208,6 +209,11 @@ async def lifespan(_app: FastAPI):
     self_check.install_error_handlers()
     self_check_task = asyncio.create_task(self_check.self_check_loop())
     _app.state.self_check_task = self_check_task
+    # [经验泛化引擎 2026-11-10] 规则提炼+生命周期轮询 loop（总闸关时 loop 内秒退）。
+    # 独立 task + 强引用（scheduler/deliver 同款 GC 纪律）；起手先扫一轮含冷启动
+    # checkpoint 初始化（只监听本次启动之后的新增失败经验，绝不回灌历史）。
+    skill_task = asyncio.create_task(skill_extractor.skill_extract_loop())
+    _app.state.skill_task = skill_task
     # [2026-10-06 Synapse v1] 总线消费循环：总闸 SYNAPSE_ENABLED（默认关）开着才起
     # （MONITOR_ENABLED 同款门控惯例）。事件先落 synapse.sqlite3 再叫醒（Argus event_hub
     # 哲学：库是事实来源，队列只叫醒）；规则分发见 synapse_bus._RULES。
@@ -244,6 +250,12 @@ async def lifespan(_app: FastAPI):
             await t
         except asyncio.CancelledError:
             pass
+    # [经验泛化引擎] 轮询 loop 收尸（未起/已退出是安全 no-op）
+    try:
+        skill_task.cancel()
+        await skill_task
+    except asyncio.CancelledError:
+        pass
     # [Synapse v1] 总线收尸：cancel consumer + 未决 handler（未启用时是安全 no-op）
     await synapse_bus.stop()
     await _argus_client.aclose()

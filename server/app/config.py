@@ -527,3 +527,28 @@ MEMORY_EXTRACT_TIMEOUT = float(os.environ.get("MORAY_MEMORY_EXTRACT_TIMEOUT", "1
 # 同 session 提炼冷却窗（秒）：防 dsh/ZCode 工具环连发聊天把提炼刷成洪水（KNN 去重
 # 是正确性兜底，冷却只是省算力的第一道闸）；0 = 关闭冷却。
 MEMORY_EXTRACT_COOLDOWN_SEC = float(os.environ.get("MORAY_MEMORY_EXTRACT_COOLDOWN_SEC", "15"))
+
+# ---- [经验泛化引擎 2026-11-10] skill_extractor（文件尾纯追加，上方任何一项未动）----
+# 失败经验 → 通用行为规则 → 相关任务注入【系统经验拦截】→ 连败降信 → 归档。
+# 消费方 = server/app/skill_extractor.py（轮询 loop 挂 lifespan）+ llm_proxy 注入点。
+# 提炼模型复用 MEMORY_EXTRACT_MODEL（同一枚本地小模型旋钮，qwen2.5:1.5b）。
+SKILL_EXTRACT_ENABLED = os.environ.get("MORAY_SKILL_EXTRACT_ENABLED", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# 注入总闸（llm_proxy 消费；提炼照跑，A/B 对照用）
+SKILL_RULE_INJECT_ENABLED = os.environ.get("MORAY_SKILL_RULE_INJECT", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# 轮询间隔（秒）：监听记忆库新增失败经验（60s 与 self_check 快照间隔同量级）
+SKILL_EXTRACT_INTERVAL_SEC = float(os.environ.get("MORAY_SKILL_EXTRACT_INTERVAL_SEC", "60"))
+# 单次经验提炼推理超时（秒）：与 MEMORY_EXTRACT_TIMEOUT 同口径
+SKILL_EXTRACT_TIMEOUT = float(os.environ.get("MORAY_SKILL_EXTRACT_TIMEOUT", "120"))
+# 注入匹配阈值：任务描述与规则的余弦相似度 > 0.75 才注入（任务书钉死）
+SKILL_RULE_SIM_THRESHOLD = float(os.environ.get("MORAY_SKILL_RULE_SIM", "0.75"))
+# 单次注入最多规则条数（任务书钉死 3）
+SKILL_RULE_MAX_INJECT = int(os.environ.get("MORAY_SKILL_RULE_MAX_INJECT", "3"))
+# 新规则初始置信度（任务书钉死 0.8；落 memory_bank.weight）
+SKILL_RULE_INIT_CONFIDENCE = float(os.environ.get("MORAY_SKILL_RULE_INIT_CONF", "0.8"))
+# 注入后连续失败结果次数达限 → 置信度 -SKILL_RULE_CONF_PENALTY（任务书：连败 5 次 -0.2）
+SKILL_RULE_FAIL_STREAK_LIMIT = int(os.environ.get("MORAY_SKILL_RULE_FAIL_STREAK", "5"))
+SKILL_RULE_CONF_PENALTY = float(os.environ.get("MORAY_SKILL_RULE_CONF_PENALTY", "0.2"))
+# 置信度低于 0.5 → 自动归档（不再注入；任务书钉死）
+SKILL_RULE_MIN_CONFIDENCE = float(os.environ.get("MORAY_SKILL_RULE_MIN_CONF", "0.5"))

@@ -30,6 +30,7 @@ from . import cloud_providers  # [2026-10-30 动态多厂商] UI 注册表：按
 from . import db as _db  # [真实数据链路 2026-10-26] usage_log 落库
 from . import night_shift  # [2026-11-03 夜班模式] 预算/失败/模型/写盘四条硬熔断
 from . import mcp_gateway  # [MCP 网关试点 2026-11-05] 外部器官工具注入 + 服务端执行环
+from . import skill_extractor  # [经验泛化引擎 2026-11-10] 工具调用前注入【系统经验拦截】
 
 router = APIRouter()
 _logger = logging.getLogger("moray.llm")
@@ -1031,6 +1032,48 @@ async def llm_chat(request: Request):
                 if (isinstance(_m, dict) and _m.get("role") == "system"
                         and str(_m.get("content") or "").startswith("[相关个人文档知识]")):
                     _m["content"] = str(_m.get("content") or "").replace(_twin_ban_clause, "")
+    # [经验泛化引擎 2026-11-10] 动态规则注入：本轮请求带 tools（ZCode/Surgeon 等工具环
+    # 透传 + MCP 注入都汇到这个非空判定）= 模型即将发起工具调用 → 用最后一条 user 消息
+    # 作任务描述，KNN 匹配 skill_rule（相似度 > 0.75 取 top-3），插【系统经验拦截】system
+    # 消息。纪律：to_thread 防阻塞事件循环（twin RAG 同款）；organ 回环/标题请求豁免；
+    # fail-open 任何失败只记日志不阻断聊天。
+    if (tools and not _is_organ_callback and not _is_title_call
+            and config.SKILL_RULE_INJECT_ENABLED):
+        try:
+            _skill_task_text = ""
+            for _m in reversed(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content")
+                    if isinstance(_c, str):
+                        _skill_task_text = _c.strip()
+                    elif isinstance(_c, list):
+                        _skill_task_text = " ".join(
+                            str(_p.get("text") or "") for _p in _c
+                            if isinstance(_p, dict)).strip()
+                    break
+            if len(_skill_task_text) > 2:
+                _skill_rules = await asyncio.to_thread(
+                    skill_extractor.match_and_record, _skill_task_text)
+                if _skill_rules:
+                    _skill_insert_at = 0
+                    for _m in messages:
+                        if isinstance(_m, dict) and _m.get("role") == "system":
+                            _skill_insert_at += 1
+                        else:
+                            break
+                    messages.insert(_skill_insert_at, {
+                        "role": "system",
+                        "content": skill_extractor.render_injection_text(_skill_rules),
+                    })
+                    _logger.warning("[skill-inject] 注入 %d 条经验规则（cos %.2f~%.2f）：%s",
+                                    len(_skill_rules),
+                                    min(r["cosine"] for r in _skill_rules),
+                                    max(r["cosine"] for r in _skill_rules),
+                                    "；".join(r["rule"][:30] for r in _skill_rules))
+        except Exception as _skill_err:  # noqa: BLE001 - fail-open 不阻断聊天
+            _logger.warning("[skill-inject] 注入跳过（不影响聊天）：%s: %s",
+                            type(_skill_err).__name__, str(_skill_err)[:160])
+
     if body.get("tool_choice") is not None:
         payload["tool_choice"] = body["tool_choice"]
     # [2026-10-21 keep_alive 透传] 前端 ollama 请求统一走本代理后，keep_alive:'30m' 需后端接力

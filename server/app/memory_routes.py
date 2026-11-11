@@ -64,6 +64,7 @@ _SOURCE_KIND_MATRIX = {
     "self_driven": {"self_observation"},  # [自驱 v2 2026-10-23] 执行闭环回写「我执行了自驱目标…」专属 source×kind
     "night_shift": {"task_result"},  # [夜班模式 2026-11-03] 连续失败熔断的失败原因专属 source×kind
     "memory_extractor": {"auto_fact", "auto_pref"},  # [路线二 2026-11-07] 对话后自动提炼的客观事实/偏好专属 source×kind（corpus 永不沾）
+    "skill_extractor": {"skill_rule"},  # [经验泛化引擎 2026-11-10] 失败经验提炼的行为规则专属 source×kind（置信度写 weight；不进 _RECALL_KINDS，专属注入通道）
 }
 
 #: 写入校验拒绝的错误前缀——端点据此判定 HTTP code
@@ -136,9 +137,14 @@ def _fts_expr(query: str, mode: str = "recall") -> str:
 
 
 def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
-                  source: str = "manual", entity_id: str = "", session_id: str = "default"):
+                  source: str = "manual", entity_id: str = "",
+                  session_id: str = "default", weight: float | None = None):
     """落库一条记忆（主表 + FTS 单事务双写）。[反思MVP 2026-10-04] 从 memory_save
     抽出的唯一 INSERT 汇聚点：save 端点与 reflection.py 共用，避免第二处裸 INSERT。
+
+    [经验泛化引擎 2026-11-10] 新增可选 weight（置信度，skill_rule 专用）：None 时
+    INSERT 列面与历史完全一致（既有调用方行为零变化）；非 None 时写入 memory_bank
+    的 weight 预留字段。两类 INSERT 均为字面量 SQL + 全量参数化。
 
     [P1精确判重 2026-10-06] INSERT 前查重：同 source 且 _norm_text(content) 全等
     的记录已存在 → 不 INSERT，幂等返回 (已有 id, "")。只拦逐字重复（标点/空白
@@ -200,11 +206,18 @@ def insert_memory(content: str, kind: str = "fact", tags: list | None = None,
     conn = _conn()
     try:
         conn.execute("BEGIN")
-        conn.execute(
-            "INSERT INTO memory_bank (id, kind, content, tags, source, entity_id, session_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (mem_id, kind, content, tags, source, entity_id, session_id, now, now)
-        )
+        if weight is not None:
+            conn.execute(
+                "INSERT INTO memory_bank (id, kind, content, tags, source, entity_id, session_id, weight, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mem_id, kind, content, tags, source, entity_id, session_id, float(weight), now, now)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO memory_bank (id, kind, content, tags, source, entity_id, session_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mem_id, kind, content, tags, source, entity_id, session_id, now, now)
+            )
         conn.execute(
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
             (mem_id, content, tags)

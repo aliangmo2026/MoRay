@@ -54,6 +54,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import config
+from . import guardian
 
 _logger = logging.getLogger("moray.mcp")
 
@@ -432,6 +433,25 @@ async def execute_chat_tool(server: str, raw_name: str,
     base64 与用户正文，审计只需要"调了什么、成没成、多快"）；审计失败仅 warning，
     绝不影响执行结果返回。"""
     t0 = time.time()
+    # [Guardian 2026-11-11] 语义安全守门员：执行前三级审查（低危直通 → 硬规则 →
+    # 1.5B 语义审查；模型故障 fail-open 绝不阻塞主链路）。物理白名单
+    # （MCP_INJECT_FORBIDDEN_TOOLS）只管"注不注入"，管不住显式 API 点名；
+    # 这里是工具执行的唯一咽喉（工具环 + /api/mcp/gateway/call 都汇入），
+    # 拦截在真正触达器官之前。
+    try:
+        ok, reason = await guardian.check_tool_safety(raw_name, arguments)
+    except Exception as g_err:  # noqa: BLE001 - 守卫本身故障 = fail-open 放行
+        ok, reason = True, "guardian fail-open: %s: %s" % (type(g_err).__name__, str(g_err)[:120])
+    if not ok:
+        _logger.warning("[mcp-gw] Guardian 拦截 %s.%s：%s", server, raw_name, reason)
+        try:
+            from .system_routes import _emit_intercept
+            _emit_intercept("守卫拦截", "%s.%s：%s" % (server, raw_name, reason))
+        except Exception:  # noqa: BLE001 - 观测旁路失败绝不反噬
+            pass
+        return {"code": "GUARDIAN_BLOCKED",
+                "data": {"message": "【系统安全守卫】已拦截本次工具调用 %s.%s：%s"
+                                    % (server, raw_name, reason)}}
     env = await _gateway(server).call_tool(raw_name, arguments, timeout=tool_timeout(raw_name))
     elapsed_ms = int((time.time() - t0) * 1000)
     _logger.info("[mcp-gw] %s.%s code=%s %.0fms", server, raw_name,
