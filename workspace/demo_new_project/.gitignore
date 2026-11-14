@@ -1,0 +1,5 @@
+# notes CLI 运行时产物（不入库）
+__pycache__/
+.pytest_cache/
+_test_data/
+notes/

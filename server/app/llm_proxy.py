@@ -31,6 +31,7 @@ from . import db as _db  # [真实数据链路 2026-10-26] usage_log 落库
 from . import night_shift  # [2026-11-03 夜班模式] 预算/失败/模型/写盘四条硬熔断
 from . import mcp_gateway  # [MCP 网关试点 2026-11-05] 外部器官工具注入 + 服务端执行环
 from . import skill_extractor  # [经验泛化引擎 2026-11-10] 工具调用前注入【系统经验拦截】
+from . import pm_agent  # [PM Agent 2026-11-14] 需求澄清前置闸（产品经理）
 
 router = APIRouter()
 _logger = logging.getLogger("moray.llm")
@@ -870,6 +871,55 @@ async def llm_chat(request: Request):
     # 身份兜底，让它变成一次干净的“系统提示 + 单句输入”调用。
     _is_title_call = _looks_like_title_request(messages)
 
+    # ---- [PM Agent 2026-11-14] 需求澄清前置闸（产品经理）：派发执行链路
+    #      （Agent 工具环 / 上游模型轮）之前先判定需求是否模糊。三段语义：
+    #        · need_clarify=true  → 合成澄清回复**短路返回**：不进工具环、不调
+    #          上游、零真实模型轮（响应带 X-Moray-PM-Clarify: 1 便于观测）；
+    #        · need_clarify=false + 任务书 → 记下 taskbook_text，待 twin RAG 之后
+    #          注入到用户消息尾部（见下方任务书注入段），原链路照常继续；
+    #        · 透传 / 闸关闭 / 模型失败 → 什么都不做（fail-open，聊天零变化）。
+    #      硬豁免（零讨论）：organ 回环（器官链路绝不能被闸）/ dsh 标题请求 /
+    #      BYOK 转发（用户显式指定的第三方上游）/ 工具环中途轮（messages 已有
+    #      role:"tool" = Agent 已开工，此时闸住会把半截任务变成答非所问）。
+    #      事件循环卫生：同步重活在 pm_agent 内部 to_thread；本 await 与主链路
+    #      同协程，客户端断连时随请求协程一起被取消（弃请求不占队）。
+    #      stream 在这里提前解析一份（与下方 :1009 同表达式、body.stream 沿途
+    #      零变异，两处恒同值）——闸必须先于事实卡/twin RAG，否则澄清短路要
+    #      白付一次嵌入调用的延迟。
+    _pm_verdict = None
+    # 工具环中途轮豁免的判别式：只看**最后一个 user 消息之后**有没有 role:"tool"。
+    # （初版用"全历史任一 tool"——真机实测即被打脸：老会话历史里的旧 tool 消息
+    # 会让豁免永久化，整会话从此绕过闸门；现行范围豁免只拦本轮已开工的半途轮。）
+    _pm_last_user = -1
+    for _pm_i, _pm_m in enumerate(messages):
+        if isinstance(_pm_m, dict) and _pm_m.get("role") == "user":
+            _pm_last_user = _pm_i
+    _pm_tool_after = any(isinstance(m, dict) and m.get("role") == "tool"
+                         for m in messages[_pm_last_user + 1:]) if _pm_last_user >= 0 else False
+    if (not _is_organ_callback and not _is_title_call and not custom_base
+            and not _pm_tool_after):
+        _pm_stream = body.get("stream", True) is not False
+        _pm_verdict = await pm_agent.clarify_requirement(
+            pm_agent.last_user_text(messages), messages)
+        if _pm_verdict.get("need_clarify") and _pm_verdict.get("reply_text"):
+            _logger.warning("[pm] 需求澄清短路：不派发执行链路（%d 问，rounds=%d）",
+                            len(_pm_verdict.get("questions") or []),
+                            int(_pm_verdict.get("rounds") or 0))
+            if _pm_stream:
+                async def _pm_clarify_stream():
+                    yield _synthetic_text_sse(_pm_verdict["reply_text"],
+                                              str(pm_agent.PM_MODEL),
+                                              chunk_id="moray-pm-clarify")
+                return StreamingResponse(
+                    _pm_clarify_stream(), media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "X-Moray-PM-Clarify": "1"})
+            return {"ok": True, "content": _pm_verdict["reply_text"],
+                    "reasoning": "", "model": str(pm_agent.PM_MODEL),
+                    "pm_clarify": True,
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                              "total_tokens": 0}}
+
     # [桥三事实卡 2026-10-15] system 层注入（调 LLM 之前；非对话流，user/assistant
     # 轮零改动）：每次请求前置拼接确定性事实卡——被问及自身时只复述库内事实、禁外推。
     # render_self_card 为纯函数（tests/test_self_card.py 钉死）；collect 单源失败自降级。
@@ -967,6 +1017,25 @@ async def llm_chat(request: Request):
         except Exception as _twin_err:  # noqa: BLE001 - fail-open：检索/组装失败不阻断聊天
             _logger.warning("[twin-rag] 注入跳过（不影响聊天）：%s: %s",
                             type(_twin_err).__name__, str(_twin_err)[:160])
+
+    # ---- [PM Agent 2026-11-14] 任务书注入：澄清放行时把结构化任务书追加到
+    #      最后一条用户消息尾部。刻意放在事实卡 / twin RAG **之后**：RAG query
+    #      取"最后一条 user 消息"原文，先注入会把任务书文本混进检索 query；
+    #      注入只追加文本（不换角色、不插消息），与头部的事实卡/身份注入互不影响。
+    if _pm_verdict is not None and _pm_verdict.get("taskbook_text"):
+        _pm_taskbook = str(_pm_verdict["taskbook_text"])
+        for _pm_i in range(len(messages) - 1, -1, -1):
+            _pm_m = messages[_pm_i]
+            if isinstance(_pm_m, dict) and _pm_m.get("role") == "user":
+                if isinstance(_pm_m.get("content"), list):
+                    # 多模态分片形状：追加一个文本片（图片等原有分片不动）
+                    _pm_m["content"] = list(_pm_m["content"]) + [
+                        {"type": "text", "text": _pm_taskbook}]
+                else:
+                    _pm_m["content"] = str(_pm_m.get("content") or "") + _pm_taskbook
+                break
+        _logger.info("[pm] 任务书已注入放行（prd %d 字）",
+                     len(_pm_verdict.get("prd_draft") or ""))
 
     # 模型名解析（[2026-09-30 本地优先强制；2026-09-30b 支持 custom_27b]）：
     # provider=ollama → 直接透传请求模型名（Ollama 接受任意模型名），缺省回落 OLLAMA_MODEL；
