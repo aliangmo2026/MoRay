@@ -433,6 +433,30 @@ try:
 except ValueError:
     PER_CALL_BUDGET_USD = 0.1
 
+# ---- [账单修复 2026-11-14] Token 维度日上限 + 同 Session 工具请求频率限制 ----
+# 背景（11-14 账单取证）：壳 agent 循环 550 轮烧 1938 万 token / 5.85 元——金额闸
+# （DAILY_BUDGET_USD）对"token 量大但单价低"的 flash 模型不敏感，需 token 维度上限。
+# DAILY_MAX_TOKENS：当日云端消耗（prompt+completion，按上游实况记账）达到该值后，
+# 后续云端请求在 llm_proxy 入口自动降级本地 Ollama（0 = 不限）。
+DAILY_MAX_TOKENS: int = 2_000_000
+try:
+    DAILY_MAX_TOKENS = int(os.environ.get("DAILY_MAX_TOKENS", "2000000"))
+except ValueError:
+    DAILY_MAX_TOKENS = 2_000_000
+
+# 同一 session_id 在 TOOLREQ_WINDOW_SEC 秒窗口内发起超过 TOOLREQ_LIMIT 次
+# 带 tools 的请求 → 429 强制中断（疑似 agent 长循环）。0 = 不限。
+TOOLREQ_WINDOW_SEC: int = 300
+try:
+    TOOLREQ_WINDOW_SEC = int(os.environ.get("MORAY_TOOLREQ_WINDOW_SEC", "300"))
+except ValueError:
+    TOOLREQ_WINDOW_SEC = 300
+TOOLREQ_LIMIT: int = 80
+try:
+    TOOLREQ_LIMIT = int(os.environ.get("MORAY_TOOLREQ_LIMIT", "80"))
+except ValueError:
+    TOOLREQ_LIMIT = 80
+
 MORAY_BUDGET_DB = os.environ.get("MORAY_BUDGET_DB", r"D:\MoRay\data\cloud_budget.db").strip()
 
 # ---- [2026-10-01 Z-3] ZCode 云端专用开关（本块为文件尾纯追加，上方任何一项未动）----

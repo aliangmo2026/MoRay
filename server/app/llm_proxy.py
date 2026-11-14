@@ -19,6 +19,7 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 
 import httpx
 from fastapi import APIRouter, Request
@@ -46,6 +47,11 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
 # key = session_id（前端请求体 session_id 字段或 X-Session-Id 头，缺失归入 "default"）。
 _session_calls: dict[str, int] = {}
 
+# [账单修复 2026-11-14] 同 Session 带工具请求滑动窗口（防 agent 长循环烧钱）。
+# key = session_id，value = 窗口内请求时间戳 deque；11-14 账单取证：21 分钟 550 轮
+# 的 agent 循环就是这副形态（波内 0-5s 连发 + 15-18s 间歇）。
+_toolreq_times: dict[str, deque] = {}
+
 # [Day24.11] 按天重置：跨自然日整表清零（惰性检查，无定时器 / 无后台任务 / 无新存储）。
 _budget_day: str = ""
 
@@ -58,13 +64,20 @@ _warmup_hint_logged: bool = False
 
 
 # ---------------- [真实数据链路 2026-10-26] 对话级用量落库（旁路） ----------------
-def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms: int) -> None:
+def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms: int,
+                      cloud: bool = False) -> None:
     """把一次对话的真实用量写入 usage_log（db.py SCHEMA 尾部建表）。
 
     tokens 取上游真值（Ollama eval_count / OpenAI 兼容 usage 块）；cost_cny 后端无
     价目表恒 0.0（金额由前端 CostEngine 按人民币价目表换算，后端只记事实）。
     旁路原则：任何异常只落 DEBUG，绝不影响已成功的对话响应（同 settle/refund 惯例）。
-    SQL 为字面量 + ? 绑定（外部值绝不拼接）。"""
+    SQL 为字面量 + ? 绑定（外部值绝不拼接）。
+
+    [账单修复 2026-11-14] cloud=True 时把真实 token 同步累计进云端预算账本
+    （cloud_budget_guard.record_tokens）——本函数是**唯一上游调用记账汇聚点**
+    （非流式/流式/MCP 工具轮全经此处），修复"金额闸只按 permit 记账、工具环
+    N 次上游调用只记 1 次"的盲区（11-14：实发 550 记账 310）。调用方都在
+    to_thread 工作线程内，同步 sqlite 不碰事件循环。"""
     try:
         conn = _db.connect()
         try:
@@ -79,6 +92,14 @@ def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms
             conn.close()
     except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响响应
         _logger.debug("[usage_log] 写入失败（不影响响应）：%s: %s", type(e).__name__, e)
+    # [账单修复 2026-11-14] 云端调用 token 同步进预算账本（DAILY_MAX_TOKENS 数据源）。
+    # 旁路纪律同上：失败只 DEBUG，绝不影响响应。
+    if cloud:
+        try:
+            cloud_budget_guard.record_tokens(prompt_tokens, completion_tokens)
+        except Exception as e:  # noqa: BLE001
+            _logger.debug("[usage_log] 云端 token 记账失败（不影响响应）：%s: %s",
+                          type(e).__name__, e)
 
 
 # ---------------- [体检修复2 2026-11-14] 弃请求取消传播 ----------------
@@ -771,6 +792,71 @@ async def llm_chat(request: Request):
                         str(_ns.get("message") or "夜班模式已暂停。"),
                         headers={"X-Should-Retry": "false", "Retry-After": "600"})
 
+    # ---- 1.2 [账单修复 2026-11-14] 同 Session 带工具请求频率限制（防 agent 长循环）----
+    # 背景：11-14 账单取证——同一 session 21 分钟 550 轮带工具请求烧 1938 万 token。
+    # 只数"带 tools 的请求"（agent 工具轮形态），纯聊天零影响；organ 回环豁免
+    # （工具环自身有 15 轮硬熔断 + 120s 总时限，不会长跑）。滑窗纯内存，重启即清零。
+    if (isinstance(body.get("tools"), list) and body.get("tools")
+            and not _is_organ_callback and config.TOOLREQ_LIMIT > 0):
+        _rl_session_id = str(body.get("session_id")
+                             or request.headers.get("X-Session-Id") or "").strip() or "default"
+        _rl_now = time.time()
+        _rl_dq = _toolreq_times.setdefault(_rl_session_id, deque())
+        while _rl_dq and _rl_now - _rl_dq[0] > config.TOOLREQ_WINDOW_SEC:
+            _rl_dq.popleft()
+        _rl_dq.append(_rl_now)
+        if len(_toolreq_times) > 256:
+            # 防长跑膨胀：顺手清空桶（空 deque 的 session 不再占内存）
+            for _rl_k in [k for k, v in _toolreq_times.items() if not v]:
+                _toolreq_times.pop(_rl_k, None)
+        if len(_rl_dq) > config.TOOLREQ_LIMIT:
+            _logger.warning("[rate-limit] session=%s %ds 窗口内带工具请求 %d 次（上限 %d），"
+                            "疑似 agent 长循环，强制中断",
+                            _rl_session_id, config.TOOLREQ_WINDOW_SEC, len(_rl_dq),
+                            config.TOOLREQ_LIMIT)
+            try:
+                from .system_routes import _emit_intercept
+                _emit_intercept("频率熔断", "该会话的 Agent 任务疑似陷入长循环，已强制中断保护预算。"
+                                "（session=%s，%ds 窗口内 %d 次带工具请求）"
+                                % (_rl_session_id, config.TOOLREQ_WINDOW_SEC, len(_rl_dq)))
+            except Exception:  # noqa: BLE001 - 观测旁路绝不反噬主链路
+                pass
+            return _err(429, "session_agent_loop_suspected",
+                        "该会话的 Agent 任务疑似陷入长循环，已强制中断保护预算。",
+                        headers={"X-Should-Retry": "false", "Retry-After": "300"})
+
+    # ---- 1.3 [账单修复 2026-11-14] 云端 Token 日上限 → 自动降级本地 Ollama ----
+    # 达到 DAILY_MAX_TOKENS 后，把"将要路由云端"的请求就地改写为本地（provider=
+    # ollama + 主本地模型），此后所有下游逻辑（含 801 行的云端预检闸）看到的都是
+    # 一次普通本地请求——零云端调用、零计费。BYOK 透传豁免（用户自有 Key 自行计费）。
+    # 事件+日志留痕；第二道防线在 acquire_explicit 的 TokenBudgetExceeded（race 兜底）。
+    _bill_byok_pair = (bool(str(body.get("base_url") or "").strip())
+                       and bool(str(body.get("api_key") or "").strip()))
+    # 降级权威旗标：X-Moray-Provider 头会压过 body.provider（Z-3 语义），只改 body
+    # 拦不住头路由——两处 provider 解析点（下方云端预检闸 + 路由选择）见旗标强制本地。
+    _bill_force_local = False
+    if not _bill_byok_pair and int(getattr(config, "DAILY_MAX_TOKENS", 0) or 0) > 0:
+        try:
+            _bill_provider, _bill_src = _resolve_body_provider(request, body)
+            _bill_eff = _bill_provider or config.LLM_PROVIDER
+            _would_cloud = _bill_eff not in ("ollama", "custom_27b")
+        except Exception:  # noqa: BLE001 - 判定失败按不放行降级处理（保守放行原路由）
+            _would_cloud = False
+        if _would_cloud and cloud_budget_guard.token_budget_exceeded():
+            body["provider"] = "ollama"
+            body["model"] = config.OLLAMA_MODEL
+            _bill_force_local = True
+            _logger.warning("[budget] 云端 Token 日上限已达（DAILY_MAX_TOKENS=%d）："
+                            "本次请求自动降级本地 Ollama（model=%s）",
+                            config.DAILY_MAX_TOKENS, config.OLLAMA_MODEL)
+            try:
+                from .system_routes import _emit_intercept
+                _emit_intercept("预算拦截",
+                                "云端 Token 日上限已超（DAILY_MAX_TOKENS=%d），"
+                                "本次云端请求已自动降级本地 Ollama" % config.DAILY_MAX_TOKENS)
+            except Exception:  # noqa: BLE001 - 观测旁路绝不反噬主链路
+                pass
+
     # ---- 1.5 [2026-10-25 BYOK 透传] 前端显式携带的第三方兼容 API base/key ----
     # 设置页"经本地后端代理"链路：浏览器直连 openrouter.ai 等被 CORS 拦成 Failed to
     # fetch，改由本机后端转发。安全：必须成对提供；过 SSRF 校验（仅 http/https + 公网
@@ -800,6 +886,9 @@ async def llm_chat(request: Request):
     # X-Moray-Provider 在白名单内时直接生效，否则回落 body.provider。两处 provider
     # 消费点（此处一级预检 + 下方上游选择）恒同源。
     body_provider, provider_source = _resolve_body_provider(request, body)
+    # [账单修复 2026-11-14] Token 降级权威旗标：压过任何头/体来源，按本地放行
+    if _bill_force_local:
+        body_provider, provider_source = "ollama", "downgraded"
     effective_provider = body_provider or config.LLM_PROVIDER
     if effective_provider == "cloud" and provider_source in ("header", "body"):
         _gate_err_early = _cloud_gate()  # 幂等；下方 cloud 分支的原有调用点原样保留
@@ -925,6 +1014,13 @@ async def llm_chat(request: Request):
     # render_self_card 为纯函数（tests/test_self_card.py 钉死）；collect 单源失败自降级。
     # [2026-10-16 总闸] MORAY_SELF_CARD 默认开；设 0/false/no/off = 完全跳过注入，
     # 供"无卡对照重跑"等 A/B 场景（进程 env 优先于 .env，load_dotenv 不覆盖既有 env）。
+    # [账单修复 2026-11-14 · 前缀缓存抢救] 事实卡**只收集不注入**：原先 prepend 到
+    # messages[0]（System Prompt 最前）——卡内含实时 DB 计数器，每轮内容都变，把
+    # 云端前缀缓存的字节对齐打断在第一个 system 消息上（11-14 账单取证：agent 循环
+    # 550 轮 × 3.5 万 token 的最大放大器）。现改为暂存 _fact_card_text，统一在
+    # 下方"尾部注入收敛点"追加为 messages 末尾的独立 system 消息；头部（身份底座
+    # + 基础 system prompt）字节级稳定，前缀缓存命中可上 95%+。
+    _fact_card_text = ""
     if not _is_title_call and os.environ.get("MORAY_SELF_CARD", "1").strip().lower() not in ("0", "false", "no", "off"):
         from .self_card import collect_db_state, render_self_card
 
@@ -932,14 +1028,7 @@ async def llm_chat(request: Request):
         _card_state = await asyncio.to_thread(collect_db_state)
         _card_text = render_self_card(_card_state)
         _card_marker = "[系统事实卡·岗位①] 仅复述，禁外推。\n\n"
-        _sys_msg = next((m for m in messages if isinstance(m, dict)
-                         and m.get("role") == "system"), None)
-        if _sys_msg is not None and not isinstance(_sys_msg.get("content"), list):
-            # str/缺省路径与 spec 草图逐字等价；list（多模态分片）不拼接防 TypeError，
-            # 落到下方独立插入分支。
-            _sys_msg["content"] = _card_marker + _card_text + "\n\n" + (_sys_msg.get("content") or "")
-        else:
-            messages.insert(0, {"role": "system", "content": _card_marker + _card_text})
+        _fact_card_text = _card_marker + _card_text
 
     # [数字分身 RAG 2026-10-24] twin 语料注入（紧随事实卡之后）：取最后一条 user
     # 消息作 query，进程内直调 digital_twin._hybrid_recall（FTS + 向量 RRF 融合）
@@ -951,6 +1040,8 @@ async def llm_chat(request: Request):
     # [twin×argus 冲突修复 2026-10-24] _twin_strong_hit：twin 强命中标志。闸关/异常/召回为空
     # 时恒 False，tools 剥夺段（下方 payload 组装处）据此判定。
     _twin_strong_hit = False
+    # [账单修复 2026-11-14] twin RAG 注入文本暂存（尾部注入收敛点统一下发，见下）
+    _twin_text = ""
     if not _is_title_call and os.environ.get("MORAY_TWIN_RAG", "1").strip().lower() not in ("0", "false", "no", "off"):
         try:
             from .digital_twin import _hybrid_recall
@@ -1004,16 +1095,10 @@ async def llm_chat(request: Request):
                             _doc = str(_tags[0]) or _doc
                         _twin_lines.append("[%d] %s（来源：%s）"
                                            % (_i, str(_it.get("content") or "").strip(), _doc))
-                    _insert_at = 0
-                    for _m in messages:
-                        if isinstance(_m, dict) and _m.get("role") == "system":
-                            _insert_at += 1
-                        else:
-                            break
-                    messages.insert(_insert_at, {
-                        "role": "system",
-                        "content": "\n".join(_twin_lines),
-                    })
+                    # [账单修复 2026-11-14] 只组装不注入——原 insert 到前导 system 之后
+                    # 会把动态召回内容顶进消息头部打断前缀缓存；现暂存，尾部注入收敛点
+                    # 统一追加为 messages 末尾的独立 system 消息。
+                    _twin_text = "\n".join(_twin_lines)
         except Exception as _twin_err:  # noqa: BLE001 - fail-open：检索/组装失败不阻断聊天
             _logger.warning("[twin-rag] 注入跳过（不影响聊天）：%s: %s",
                             type(_twin_err).__name__, str(_twin_err)[:160])
@@ -1037,12 +1122,27 @@ async def llm_chat(request: Request):
         _logger.info("[pm] 任务书已注入放行（prd %d 字）",
                      len(_pm_verdict.get("prd_draft") or ""))
 
+    # ---- [账单修复 2026-11-14] 尾部注入收敛点：动态内容一律作为 messages **末尾**
+    #      的独立 system 消息下发。字节级稳定的头部 = 身份底座（常量）+ 用户基础
+    #      system prompt + 历史消息 → 云端前缀缓存命中最大化。位置刻意在 PM 任务书
+    #      注入**之后**：任务书只写一次进 user 消息、后续轮次随历史原样重发（天然
+    #      缓存稳定）；而事实卡（实时计数器）/twin RAG（每轮召回不同）每轮重新渲染，
+    #      必须待在队尾，绝不能回头部。MCP 工具环在 ring 内追加 tool 轮次时，这几条
+    #      尾部 system 的位置恒定在 ring 轮次之前 → 环内逐轮的前缀缓存同样受益。
+    if _fact_card_text:
+        messages.append({"role": "system", "content": _fact_card_text})
+    if _twin_text:
+        messages.append({"role": "system", "content": _twin_text})
+
     # 模型名解析（[2026-09-30 本地优先强制；2026-09-30b 支持 custom_27b]）：
     # provider=ollama → 直接透传请求模型名（Ollama 接受任意模型名），缺省回落 OLLAMA_MODEL；
     # provider=custom_27b → 透传，缺省回落 LOCAL_27B_MODEL_NAME；
     # provider=cloud → 维持原白名单兜底（云端网关只认 _UPSTREAM_MODELS）。
     requested = str(body.get("model") or "").strip()
     provider, provider_source = _resolve_body_provider(request, body)
+    # [账单修复 2026-11-14] Token 降级权威旗标：路由选择同被覆盖（头路由拦不住 body 改写）
+    if _bill_force_local:
+        provider, provider_source = "ollama", "downgraded"
     # [2026-10-30 动态多厂商] 请求头点名了 UI 注册表里的服务商 → 走云端分支，
     # 闸门/预算/身份底座全部复用，不绕过。
     _target_header = str(request.headers.get("X-Moray-Target-Provider") or "").strip().lower()
@@ -1174,13 +1274,10 @@ async def llm_chat(request: Request):
                 _skill_rules = await asyncio.to_thread(
                     skill_extractor.match_and_record, _skill_task_text)
                 if _skill_rules:
-                    _skill_insert_at = 0
-                    for _m in messages:
-                        if isinstance(_m, dict) and _m.get("role") == "system":
-                            _skill_insert_at += 1
-                        else:
-                            break
-                    messages.insert(_skill_insert_at, {
+                    # [账单修复 2026-11-14] 原 insert 到前导 system 之后（头部）会把
+                    # KNN 匹配结果（每轮可能不同）顶进消息头部打断前缀缓存——改为
+                    # append 到消息末尾（尾部注入收敛点之后，绝对队尾），头部字节稳定。
+                    messages.append({
                         "role": "system",
                         "content": skill_extractor.render_injection_text(_skill_rules),
                     })
@@ -1286,6 +1383,14 @@ async def llm_chat(request: Request):
                 _emit_intercept("预算拦截", "%s（%s）" % (_reason, type(e).__name__))
             except Exception:  # noqa: BLE001 - 观测旁路绝不反噬主链路
                 pass
+            if isinstance(e, cloud_budget_guard.TokenBudgetExceeded):
+                # [账单修复 2026-11-14] Token 维度超限：预路由降级（1.3 段）通常已把
+                # 请求改写本地走不到这里；race 兜底（记账与判定间窗口）在此硬拒一次，
+                # 下一次请求起 1.3 段即稳定降级。X-Should-Retry:false 同款纪律。
+                return _err(429, "cloud_token_budget_exceeded",
+                            "云端 Token 日上限已超（%s）。本次请求被拒以保护预算；"
+                            "后续请求将自动降级本地 Ollama。" % e,
+                            headers={"X-Should-Retry": "false", "Retry-After": "3600"})
             if isinstance(e, cloud_budget_guard.BudgetExceeded):
                 # [2026-10-31 预算超限不重试] X-Should-Retry:false 是 OpenAI SDK 重试
                 # 惯例的一票否决头，pi-ai 的 isRetryableProviderError 见之直接放弃，
@@ -1515,7 +1620,7 @@ async def llm_chat(request: Request):
         await asyncio.to_thread(
             _record_usage_log, out["model"], out["usage"]["prompt_tokens"] + _extra_pt,
             out["usage"]["completion_tokens"] + _extra_ct,
-            int((time.time() - _t0) * 1000))
+            int((time.time() - _t0) * 1000), cloud=not use_local)
         return out
 
     async def _stream():
@@ -1732,7 +1837,7 @@ async def llm_chat(request: Request):
                         # 被丢弃的那次调用照样入账（钱花了就得记）
                         await asyncio.to_thread(
                             _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
-                            int((time.time() - _t0) * 1000))
+                            int((time.time() - _t0) * 1000), cloud=not use_local)
                     await upstream.aclose()
                     if _substitute:
                         # [2026-10-29 身份叛变] 身份追问 + 沾厂商名 → 固定 MoRay 口径，
@@ -1751,7 +1856,7 @@ async def llm_chat(request: Request):
                 if capt["pt"] or capt["ct"]:
                     await asyncio.to_thread(
                         _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
-                        int((time.time() - _t0) * 1000))
+                        int((time.time() - _t0) * 1000), cloud=not use_local)
                 return
         except asyncio.CancelledError:
             raise
@@ -1779,11 +1884,16 @@ async def llm_chat(request: Request):
     # 环结束后注入工具必被摘除；若触发 15 次熔断，直接合成固定安全提示，不再调模型。
     if _mcp_chat_tools:
         # [体检修复2 2026-11-14] 工具环最长 120s：断连竞速，客户端走了就取消整个环
+        # [账单修复 2026-11-14] 环内每轮上游调用经 _record_usage_cloud 按路由记 token：
+        #   工具环是"一轮 permit 多次上游调用"的记账盲区主源（11-14：实发 550 / 记账 310）
+        def _record_usage_for_ring(m, p, c, ms):
+            _record_usage_log(m, p, c, ms, cloud=not use_local)
+
         _ok_loop, _loop_rounds = await _cancel_on_disconnect(
             request,
             mcp_gateway.run_server_tool_rounds(
                 payload, upstream_url, upstream_headers, _do_request,
-                model=model, record_usage=_record_usage_log))
+                model=model, record_usage=_record_usage_for_ring))
         if not _ok_loop:
             _logger.warning("[llm] 客户端已断开：MCP 工具环已取消（上游生成随之中止）")
             return JSONResponse(

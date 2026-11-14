@@ -39,8 +39,8 @@ from . import config
 logger = logging.getLogger("moray.cloud_budget")
 
 __all__ = ["CloudPermit", "CloudBudgetError", "CloudDisabled", "CloudNotForFallback",
-           "BudgetExceeded", "BudgetStateUnavailable",
-           "acquire_explicit", "acquire_fallback", "settle", "refund",
+           "BudgetExceeded", "TokenBudgetExceeded", "BudgetStateUnavailable",
+           "acquire_explicit", "acquire_fallback", "settle", "refund", "record_tokens",
            "reset_circuit", "get_daily_state"]
 
 
@@ -60,6 +60,13 @@ class BudgetExceeded(CloudBudgetError):
     """预算超限或当日熔断已打开。"""
 
 
+class TokenBudgetExceeded(BudgetExceeded):
+    """[账单修复 2026-11-14] 当日云端 Token 达 DAILY_MAX_TOKENS 上限。
+
+    与 BudgetExceeded 的语义差异：**不置 tripped 闩锁**（下一次 acquire 重查、次日
+    自然恢复），调用方（llm_proxy）据此走"自动降级本地 Ollama"而非硬 429。"""
+
+
 class BudgetStateUnavailable(CloudBudgetError):
     """预算状态不可读/事务失败（fail-closed：acquire 路径绝不放行）。"""
 
@@ -77,11 +84,12 @@ class CloudPermit:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS budget_daily (
-  date       TEXT PRIMARY KEY,
-  total_usd  REAL NOT NULL DEFAULT 0,
-  call_count INTEGER NOT NULL DEFAULT 0,
-  tripped    INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL
+  date         TEXT PRIMARY KEY,
+  total_usd    REAL NOT NULL DEFAULT 0,
+  call_count   INTEGER NOT NULL DEFAULT 0,
+  tripped      INTEGER NOT NULL DEFAULT 0,
+  tokens_total INTEGER NOT NULL DEFAULT 0,
+  updated_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS budget_reservations (
   permit_id    TEXT PRIMARY KEY,
@@ -92,6 +100,18 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
   created_at   TEXT NOT NULL
 );
 """
+
+
+def _ensure_tokens_column(conn: sqlite3.Connection) -> None:
+    """[账单修复 2026-11-14] 老库幂等迁移：budget_daily 补 tokens_total 列。
+
+    CREATE TABLE IF NOT EXISTS 不会给既有表加列，这里显式 ALTER（重复执行时
+    duplicate column 错误按幂等吞掉）。在每次 executescript(_SCHEMA) 之后调用。"""
+    try:
+        conn.execute("ALTER TABLE budget_daily ADD COLUMN tokens_total INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
 def _today() -> str:
@@ -180,6 +200,7 @@ def _acquire_common(trace_id: str, est_cost_usd: float, require_fallback_flag: b
     try:
         try:
             conn.executescript(_SCHEMA)
+            _ensure_tokens_column(conn)
             conn.execute("BEGIN IMMEDIATE")
         except (sqlite3.Error, OSError) as e:
             raise BudgetStateUnavailable("预算库初始化/加锁失败（fail-closed）：%s: %s"
@@ -204,20 +225,31 @@ def _acquire_common(trace_id: str, est_cost_usd: float, require_fallback_flag: b
 
 
 def _acquire_tx(conn: sqlite3.Connection, today: str, trace_id: str, est: float) -> CloudPermit:
-    """BEGIN IMMEDIATE 事务体：读当日行 → 熔断闩检查 → 三重限额检查 → 预扣。"""
-    row = conn.execute("SELECT total_usd, call_count, tripped FROM budget_daily WHERE date = ?",
+    """BEGIN IMMEDIATE 事务体：读当日行 → 熔断闩检查 → Token 上限 → 三重限额检查 → 预扣。"""
+    row = conn.execute("SELECT total_usd, call_count, tripped, tokens_total FROM budget_daily WHERE date = ?",
                        (today,)).fetchone()
     if row is None:
-        conn.execute("INSERT INTO budget_daily (date, total_usd, call_count, tripped, updated_at) "
-                     "VALUES (?, 0, 0, 0, ?)", (today, _now()))
-        total_usd, call_count, tripped = 0.0, 0, 0
+        conn.execute("INSERT INTO budget_daily (date, total_usd, call_count, tripped, tokens_total, updated_at) "
+                     "VALUES (?, 0, 0, 0, 0, ?)", (today, _now()))
+        total_usd, call_count, tripped, tokens_total = 0.0, 0, 0, 0
     else:
         total_usd, call_count, tripped = float(row["total_usd"]), int(row["call_count"]), int(row["tripped"])
+        tokens_total = int(row["tokens_total"] or 0)
 
     if tripped:
         conn.execute("ROLLBACK")
         raise BudgetExceeded("今日云端预算熔断已打开（budget_daily.tripped=1，date=%s）："
                              "需 reset_circuit() 或等跨日" % today)
+
+    # [账单修复 2026-11-14] Token 维度上限：超限即拒（不置 tripped 闩锁——下一次
+    # acquire 重查、次日自然恢复），调用方据此自动降级本地 Ollama。刻意放在
+    # 金额/次数三重检查**之前**且不进 reasons（保持既有 tripped 语义逐字不变）。
+    if int(getattr(config, "DAILY_MAX_TOKENS", 0) or 0) > 0 \
+            and tokens_total >= int(config.DAILY_MAX_TOKENS):
+        conn.execute("ROLLBACK")
+        raise TokenBudgetExceeded(
+            "今日云端 Token 已消耗 %d，达到 DAILY_MAX_TOKENS=%d（云端请求将自动降级本地 Ollama）"
+            % (tokens_total, int(config.DAILY_MAX_TOKENS)))
 
     reasons = []
     if est > float(config.PER_CALL_BUDGET_USD):
@@ -379,6 +411,62 @@ def refund(permit: CloudPermit, reason: str) -> None:
                 permit.permit_id, float(permit.reserved_usd), reason_text)
 
 
+def record_tokens(prompt_tokens: int, completion_tokens: int) -> None:
+    """[账单修复 2026-11-14] 按上游调用实况累计当日云端 token（含工具轮）。
+
+    接线点 = llm_proxy._record_usage_log（**唯一上游调用汇聚点**：非流式/流式/
+    MCP 工具轮都经它记账）——cloud=True 的调用进当日 tokens_total。这是修复
+    "预算记账盲区"的根：此前金额闸只按 permit 记账，一轮 agent 工具环 N 次上游
+    调用只记 1 次，550 次实发只入账 310。
+
+    旁路纪律：任何失败只 warning，绝不影响响应；tokens=0 直接跳过。
+    失败/中止调用（refund 路径）token 未知，不计数（宁可少记不可多扣）。
+    """
+    n = max(0, int(prompt_tokens or 0)) + max(0, int(completion_tokens or 0))
+    if n <= 0:
+        return
+    today = _today()
+    conn = _connect()
+    try:
+        conn.executescript(_SCHEMA)
+        _ensure_tokens_column(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT tokens_total FROM budget_daily WHERE date = ?",
+                               (today,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO budget_daily (date, total_usd, call_count, tripped, "
+                             "tokens_total, updated_at) VALUES (?, 0, 0, 0, ?, ?)",
+                             (today, n, _now()))
+            else:
+                conn.execute("UPDATE budget_daily SET tokens_total = tokens_total + ?, "
+                             "updated_at = ? WHERE date = ?", (n, _now(), today))
+            conn.execute("COMMIT")
+        except (sqlite3.Error, OSError) as e:
+            _safe_rollback(conn)
+            logger.warning("[cloud_budget] token 记账失败（不影响响应）：%s: %s",
+                           type(e).__name__, e)
+    finally:
+        conn.close()
+
+
+def token_budget_exceeded() -> bool:
+    """[账单修复 2026-11-14] 当日云端 token 是否已达 DAILY_MAX_TOKENS。
+
+    消费方 = llm_proxy 预路由降级判定（把"将要路由云端"的请求就地改写为本地）。
+    读失败按 False 处理（fail-open：降级判定失败不阻断聊天；acquire 路径仍有
+    fail-closed 的 TokenBudgetExceeded 兜底——两道闸只松一道）。0 = 不限恒 False。
+    """
+    if int(getattr(config, "DAILY_MAX_TOKENS", 0) or 0) <= 0:
+        return False
+    try:
+        return int(get_daily_state().get("tokens_total") or 0) >= int(config.DAILY_MAX_TOKENS)
+    except Exception as e:  # noqa: BLE001 - fail-open（见上；acquire 侧 fail-closed 兜底）
+        logger.warning("[cloud_budget] token 预算读取失败（fail-open 放行）：%s: %s",
+                       type(e).__name__, e)
+        return False
+
+
 def reset_circuit() -> None:
     """手动重置当日熔断（仅测试与人工介入用；跨日由日期行自然清零，无需调用）。"""
     today = _today()
@@ -402,7 +490,8 @@ def reset_circuit() -> None:
 
 
 def get_daily_state() -> dict:
-    """当日状态快照 {date, total_usd, call_count, tripped}，供 startup_budget_note 只读报告。
+    """当日状态快照 {date, total_usd, call_count, tripped, tokens_total}，供
+    startup_budget_note / 网关面板预算徽标只读报告（tokens_total 为 11-14 新增维度）。
 
     读失败抛 BudgetStateUnavailable（校准 3：由调用方如实报告，不炸启动）。
     """
@@ -411,13 +500,16 @@ def get_daily_state() -> dict:
     try:
         try:
             conn.executescript(_SCHEMA)
-            row = conn.execute("SELECT total_usd, call_count, tripped FROM budget_daily "
+            _ensure_tokens_column(conn)
+            row = conn.execute("SELECT total_usd, call_count, tripped, tokens_total FROM budget_daily "
                                "WHERE date = ?", (today,)).fetchone()
         except (sqlite3.Error, OSError) as e:
             raise BudgetStateUnavailable("预算库不可读：%s: %s" % (type(e).__name__, e)) from e
     finally:
         conn.close()
     if row is None:
-        return {"date": today, "total_usd": 0.0, "call_count": 0, "tripped": False}
+        return {"date": today, "total_usd": 0.0, "call_count": 0, "tripped": False,
+                "tokens_total": 0}
     return {"date": today, "total_usd": float(row["total_usd"]),
-            "call_count": int(row["call_count"]), "tripped": bool(int(row["tripped"]))}
+            "call_count": int(row["call_count"]), "tripped": bool(int(row["tripped"])),
+            "tokens_total": int(row["tokens_total"] or 0)}
