@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import os
@@ -40,20 +41,34 @@ from . import config
 
 logger = logging.getLogger("moray.guardian")
 
+#: [体检修复2 2026-11-14] 单线程后台写盘池：审查热路径（async check_tool_safety）的
+#: 日志落盘离环——emit 只做 submit（µs 级），磁盘 open/write 在后台串行执行。
+_log_writer_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="guardian-log")
+
 
 class _GuardianFileHandler(logging.Handler):
-    """logs/guardian.log（moray 根 logger 只放 ERROR 的教训：模块自挂 handler）。"""
+    """logs/guardian.log（moray 根 logger 只放 ERROR 的教训：模块自挂 handler）。
+    [体检修复2 2026-11-14] emit 改为向 _log_writer_pool 投递，不再在事件循环上做
+    同步 open/append/close（体检静态审查 P2：每次工具调用至少一次同步磁盘 IO）。"""
 
     def __init__(self) -> None:
         super().__init__(level=logging.INFO)
         self.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 
-    def emit(self, record: logging.LogRecord) -> None:
+    @staticmethod
+    def _write_line(line: str) -> None:
         try:
             base = Path(__file__).resolve().parents[2] / "logs"
             base.mkdir(parents=True, exist_ok=True)
             with open(base / "guardian.log", "a", encoding="utf-8") as f:
-                f.write(self.format(record) + "\n")
+                f.write(line + "\n")
+        except Exception:  # noqa: BLE001 - 日志面缺失不扰主链路
+            pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _log_writer_pool.submit(self._write_line, self.format(record))
         except Exception:  # noqa: BLE001 - 日志面缺失不扰主链路
             pass
 

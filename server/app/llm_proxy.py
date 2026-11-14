@@ -80,6 +80,50 @@ def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms
         _logger.debug("[usage_log] 写入失败（不影响响应）：%s: %s", type(e).__name__, e)
 
 
+# ---------------- [体检修复2 2026-11-14] 弃请求取消传播 ----------------
+async def _watch_client_disconnect(request, poll_sec: float = 0.5) -> bool:
+    """断连轮询：Starlette 的 is_disconnected 是非阻塞检查（即时取消的 receive 探测），
+    每 poll_sec 查一次。探测自身异常按"仍连接"处理（绝不因观测面拖垮主链路）。"""
+    while True:
+        try:
+            if await request.is_disconnected():
+                return True
+        except Exception:  # noqa: BLE001 - 探测失败按仍连接
+            return False
+        await asyncio.sleep(poll_sec)
+
+
+async def _cancel_on_disconnect(request, coro):
+    """弃请求不取消的根治。体检压测实锤：7 条被客户端放弃的非流式请求在服务端
+    继续跑完，Ollama 侧 16 条 ESTABLISHED 占队 10 分钟——uvicorn 对非流式响应
+    不取消 handler，取消信号从未到达 httpx。
+
+    做法：重活与断连轮询竞速（FIRST_COMPLETED）：
+      * 重活先完成 → 正常返回 (True, result)；
+      * 客户端先断开 → cancel 重活（CancelledError 直达正在 await 的 httpx 调用，
+        连接即断，Ollama 侧生成随之中止并释放算力），返回 (False, None)。
+    账本旁路（usage_log/settle/refund）已 to_thread 化：线程内不被取消，
+    取消路径上的账照记不丢。"""
+    work = asyncio.ensure_future(coro)
+    watcher = asyncio.ensure_future(_watch_client_disconnect(request))
+    try:
+        done, _pending = await asyncio.wait({work, watcher},
+                                            return_when=asyncio.FIRST_COMPLETED)
+        if work in done:
+            return True, work.result()
+        work.cancel()
+        try:
+            await work
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001 - 取消连锁的次生异常一并吞掉
+            _logger.warning("[llm] 断开取消收尾异常（忽略）：%s: %s", type(e).__name__, e)
+        return False, None
+    finally:
+        # 已取消的 watcher 无需回收：CancelledError 结局不触发"未检异常"告警
+        watcher.cancel()
+
+
 def _scan_stream_usage(raw: bytes, capt: dict) -> None:
     """流式透传途中轻量捕获 usage（只读，不改字节/不改 SSE 结构）。
 
@@ -715,7 +759,10 @@ async def llm_chat(request: Request):
         _ns_session_id = str(
             body.get("session_id") or request.headers.get("X-Session-Id") or ""
         ).strip() or "default"
-        _ns = night_shift.handle_chat_request(body, body["messages"], _ns_session_id, request)
+        # [体检修复2 2026-11-14] 夜班激活期 handle_chat_request 做原子写盘（含 fsync），
+        # 离环执行——非夜班请求零写盘但同样零成本离环。
+        _ns = await asyncio.to_thread(
+            night_shift.handle_chat_request, body, body["messages"], _ns_session_id, request)
         if _ns.get("active") and not _ns.get("allow"):
             # X-Should-Retry:false：夜班熔断是确定性拒绝，任何 SDK 自动重试都只会
             # 白烧配额并拖长中断时间（与云端预算超限同款约定）。
@@ -734,7 +781,9 @@ async def llm_chat(request: Request):
         if not (custom_base_raw and custom_key):
             return _err(400, "bad_upstream_override",
                         "base_url 与 api_key 必须同时提供（只给其一无法安全转发）。")
-        custom_base, _upstream_err = _validate_upstream_base(custom_base_raw)
+        # [体检修复2 2026-11-14] getaddrinfo 是同步 DNS（Windows 可达数秒），离环执行
+        custom_base, _upstream_err = await asyncio.to_thread(
+            _validate_upstream_base, custom_base_raw)
         if not custom_base:
             return _err(400, "upstream_url_rejected", "base_url 被拒绝：" + str(_upstream_err))
 
@@ -829,7 +878,8 @@ async def llm_chat(request: Request):
     if not _is_title_call and os.environ.get("MORAY_SELF_CARD", "1").strip().lower() not in ("0", "false", "no", "off"):
         from .self_card import collect_db_state, render_self_card
 
-        _card_state = collect_db_state()
+        # [体检修复2 2026-11-14] 同步扫两库离环（每条聊天都走，此前阻塞事件循环）
+        _card_state = await asyncio.to_thread(collect_db_state)
         _card_text = render_self_card(_card_state)
         _card_marker = "[系统事实卡·岗位①] 仅复述，禁外推。\n\n"
         _sys_msg = next((m for m in messages if isinstance(m, dict)
@@ -1149,7 +1199,9 @@ async def llm_chat(request: Request):
         if not _est_requested >= 0:
             _est_requested = float(config.PER_CALL_BUDGET_USD)
         try:
-            _cloud_permit = cloud_budget_guard.acquire_explicit(
+            # [体检修复2 2026-11-14] BEGIN IMMEDIATE 同步事务离环
+            _cloud_permit = await asyncio.to_thread(
+                cloud_budget_guard.acquire_explicit,
                 trace_id=uuid.uuid4().hex,
                 est_cost_usd=min(_est_requested, float(config.PER_CALL_BUDGET_USD)))
         except cloud_budget_guard.CloudBudgetError as e:
@@ -1307,8 +1359,9 @@ async def llm_chat(request: Request):
             # refund 异常只记日志，绝不吞掉原始上游错误响应。
             if _cloud_permit is not None:
                 try:
-                    cloud_budget_guard.refund(_cloud_permit,
-                                              reason="upstream_error_status_%d" % status)
+                    await asyncio.to_thread(
+                        cloud_budget_guard.refund,
+                        _cloud_permit, reason="upstream_error_status_%d" % status)
                 except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响错误响应
                     _logger.warning("[llm_proxy] refund 失败（不影响响应）：%s", e)
             if status == 400 and msg and "model" in msg.lower():
@@ -1382,15 +1435,18 @@ async def llm_chat(request: Request):
         # 结算失败保留预扣计提（偏保守方向）并落 WARNING，绝不影响已成功的响应。
         if _cloud_permit is not None:
             try:
-                cloud_budget_guard.settle(_cloud_permit,
-                                          _cloud_actual_cost_usd(data) + _extra_cost)
+                await asyncio.to_thread(
+                    cloud_budget_guard.settle,
+                    _cloud_permit, _cloud_actual_cost_usd(data) + _extra_cost)
             except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响响应（同 _audit_budget_exceeded 惯例）
                 _logger.warning("[router] 云端预算结算失败（保留预扣 %.4f）：%s: %s",
                                 _cloud_permit.reserved_usd, type(e).__name__, e)
         # [真实数据链路 2026-10-26] 非流式收尾：上游 usage 真值落 usage_log（旁路）
-        _record_usage_log(out["model"], out["usage"]["prompt_tokens"] + _extra_pt,
-                          out["usage"]["completion_tokens"] + _extra_ct,
-                          int((time.time() - _t0) * 1000))
+        # [体检修复2 2026-11-14] 同步 sqlite INSERT 离环；断连取消时线程内照记不丢
+        await asyncio.to_thread(
+            _record_usage_log, out["model"], out["usage"]["prompt_tokens"] + _extra_pt,
+            out["usage"]["completion_tokens"] + _extra_ct,
+            int((time.time() - _t0) * 1000))
         return out
 
     async def _stream():
@@ -1505,7 +1561,8 @@ async def llm_chat(request: Request):
                     # 走到这里；本地 provider 在上方"绝不降级云端"分支已提前返回。
                     if _cloud_permit is not None:
                         try:
-                            cloud_budget_guard.refund(
+                            await asyncio.to_thread(
+                                cloud_budget_guard.refund,
                                 _cloud_permit,
                                 reason="upstream_error_status_%d" % upstream.status_code)
                         except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响错误事件
@@ -1521,7 +1578,7 @@ async def llm_chat(request: Request):
                 # 仅插入在成功透传之前，上方"绝不降级云端"各错误分支零改动。
                 if _cloud_permit is not None:
                     try:
-                        cloud_budget_guard.settle(_cloud_permit, 0.0)
+                        await asyncio.to_thread(cloud_budget_guard.settle, _cloud_permit, 0.0)
                     except Exception as e:  # noqa: BLE001 - 账本旁路失败不影响流式透传
                         _logger.warning("[router] 云端预算结算失败（流式，保留预扣 %.4f）：%s: %s",
                                         _cloud_permit.reserved_usd, type(e).__name__, e)
@@ -1604,8 +1661,9 @@ async def llm_chat(request: Request):
                 if _abort:
                     if capt["pt"] or capt["ct"]:
                         # 被丢弃的那次调用照样入账（钱花了就得记）
-                        _record_usage_log(capt["model"] or model, capt["pt"], capt["ct"],
-                                          int((time.time() - _t0) * 1000))
+                        await asyncio.to_thread(
+                            _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
+                            int((time.time() - _t0) * 1000))
                     await upstream.aclose()
                     if _substitute:
                         # [2026-10-29 身份叛变] 身份追问 + 沾厂商名 → 固定 MoRay 口径，
@@ -1622,8 +1680,9 @@ async def llm_chat(request: Request):
                     yield _c
                 _hold = []
                 if capt["pt"] or capt["ct"]:
-                    _record_usage_log(capt["model"] or model, capt["pt"], capt["ct"],
-                                      int((time.time() - _t0) * 1000))
+                    await asyncio.to_thread(
+                        _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
+                        int((time.time() - _t0) * 1000))
                 return
         except asyncio.CancelledError:
             raise
@@ -1634,8 +1693,9 @@ async def llm_chat(request: Request):
             # 保护会拒绝二次回冲并落 WARNING——这正是 refund 幂等语义存在的场景。
             if _cloud_permit is not None:
                 try:
-                    cloud_budget_guard.refund(_cloud_permit,
-                                              reason="stream_error_%s" % type(e).__name__)
+                    await asyncio.to_thread(
+                        cloud_budget_guard.refund,
+                        _cloud_permit, reason="stream_error_%s" % type(e).__name__)
                 except Exception as refund_err:  # noqa: BLE001 - 账本旁路失败不影响错误事件
                     _logger.warning("[llm_proxy] refund 失败（不影响响应）：%s", refund_err)
             yield f"data: {json.dumps({'ok': False, 'code': 'upstream_error', 'message': '流式传输中断：' + type(e).__name__})}\n\n"
@@ -1649,9 +1709,19 @@ async def llm_chat(request: Request):
     # _stream/_non_stream 链路（身份/套话守卫、usage 记账零旁路）。
     # 环结束后注入工具必被摘除；若触发 15 次熔断，直接合成固定安全提示，不再调模型。
     if _mcp_chat_tools:
-        _mcp_rounds = await mcp_gateway.run_server_tool_rounds(
-            payload, upstream_url, upstream_headers, _do_request,
-            model=model, record_usage=_record_usage_log)
+        # [体检修复2 2026-11-14] 工具环最长 120s：断连竞速，客户端走了就取消整个环
+        _ok_loop, _loop_rounds = await _cancel_on_disconnect(
+            request,
+            mcp_gateway.run_server_tool_rounds(
+                payload, upstream_url, upstream_headers, _do_request,
+                model=model, record_usage=_record_usage_log))
+        if not _ok_loop:
+            _logger.warning("[llm] 客户端已断开：MCP 工具环已取消（上游生成随之中止）")
+            return JSONResponse(
+                status_code=499,
+                content={"ok": False, "code": "client_disconnected",
+                         "message": "客户端已断开，上游调用已中止。"})
+        _mcp_rounds = _loop_rounds
         _mcp_fused = bool(payload.pop("_moray_mcp_fused", False))
         _mcp_fuse_message = str(
             payload.pop("_moray_mcp_fuse_message", "")
@@ -1692,7 +1762,15 @@ async def llm_chat(request: Request):
                     pass
         return StreamingResponse(_stream_with_memory_extract(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    _chat_result = await _non_stream()
+    # [体检修复2 2026-11-14] 非流式重活断连竞速：体检压测 7 条弃请求占队 10 分钟的根治。
+    # 断连取消路径不安排记忆提炼（半截答案不进记忆库）。
+    _ok_work, _chat_result = await _cancel_on_disconnect(request, _non_stream())
+    if not _ok_work:
+        _logger.warning("[llm] 客户端已断开：非流式出答已取消（上游生成随之中止）")
+        return JSONResponse(
+            status_code=499,
+            content={"ok": False, "code": "client_disconnected",
+                     "message": "客户端已断开，上游调用已中止。"})
     try:
         from . import memory_extractor
         memory_extractor.schedule_extract_after_chat(
@@ -1982,7 +2060,7 @@ async def llm_test(request: Request):
         return _test_err(400, "未填写 API Key", "在服务商控制台创建 Key 后粘贴到此处")
     if not model:
         return _test_err(400, "未填写模型名", "在「默认模型」填写服务商支持的模型名")
-    safe_base, err = _validate_upstream_base(base_url)
+    safe_base, err = await asyncio.to_thread(_validate_upstream_base, base_url)
     if not safe_base:
         return _test_err(400, "接口地址被拒绝：" + str(err),
                          "代理转发仅允许公网 http/https 地址；本地服务请用直连")

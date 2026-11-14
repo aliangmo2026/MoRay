@@ -148,6 +148,12 @@ def connect() -> sqlite3.Connection:
         conn.execute("PRAGMA busy_timeout = 5000")
     except sqlite3.Error:
         pass
+    # [体检修复2 2026-11-14] WAL：读写并行（与 db.py 同款；journal_mode 是库级持久
+    # 属性，每连接幂等声明；不可用介质退回默认 DELETE，不阻塞启动）。
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     if _sqlite_vec is not None:
         _load_vec(conn)
     return conn

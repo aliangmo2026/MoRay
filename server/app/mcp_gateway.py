@@ -470,7 +470,9 @@ async def execute_chat_tool(server: str, raw_name: str,
             status = "timeout"
         else:
             status = "error"
-        crud.append_agent_log(
+        # [体检修复2 2026-11-14] 同步 sqlite 审计写离环（guardian 拦截后的必经路径）
+        await asyncio.to_thread(
+            crud.append_agent_log,
             "mcp__%s__%s" % (str(server)[:20], str(raw_name)[:36]),
             "", True, status, elapsed_ms,
             ("source=mcp | code=%s | %s" % (code, msg)).rstrip(" |")[:1000])
@@ -580,7 +582,8 @@ async def run_server_tool_rounds(payload: Dict[str, Any], upstream_url: str,
             # 工具轮也是真实消耗：usage 照记 usage_log（旁路，同 _record_usage_log 惯例）
             if record_usage is not None:
                 try:
-                    record_usage(model, _pt, _ct, 0)
+                    # [体检修复2 2026-11-14] usage 落库离环（同步 sqlite 不再阻塞事件循环）
+                    await asyncio.to_thread(record_usage, model, _pt, _ct, 0)
                 except Exception:  # noqa: BLE001
                     pass
             ours, others = [], []
@@ -666,7 +669,9 @@ async def run_server_tool_rounds(payload: Dict[str, Any], upstream_url: str,
                 # [第4晚] 夜班记账：工具次数 + 本轮 token（无 active run 时零副作用）
                 try:
                     from . import night_shift as _night
-                    _night.record_mcp_round(
+                    # [体检修复2 2026-11-14] 夜班记账含原子写盘（fsync），离环执行
+                    await asyncio.to_thread(
+                        _night.record_mcp_round,
                         tool_calls=len(kept_calls), prompt_tokens=_pt,
                         completion_tokens=_ct, failures=_round_failures,
                         detail=",".join(_round_names))
