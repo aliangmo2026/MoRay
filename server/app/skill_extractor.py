@@ -453,9 +453,18 @@ def _rules_needing_outcome(conn, occurred_at: str) -> list:
 
 def scan_once() -> dict:
     """轮询单轮主体（线程内执行）：checkpoint(rowid 游标) → 新 insight/失败 task_result
-    提炼规则；task_result 全量做生命周期对账。每行独立 try/except（毒丸行不阻塞队列），
-    checkpoint 恒前移。首次运行（无 checkpoint）冷启动=只从当前最大 rowid 起监听。"""
-    stats = {"scanned": 0, "extracted": [], "accounted": 0, "error": ""}
+    提炼规则；task_result 全量做生命周期对账。
+
+    [体检修复 2026-11-14] 事务纪律重构（根治批内嵌套连接撞锁 + 毒丸丢规则两个 P1）：
+      * 行级短事务：每行按「对账 DML → 立即 commit → 模型提炼（此刻零连接零写锁）
+        → 规则落库（_store_rule 自带短连接，与外层不再嵌套）→ checkpoint 前移（自带
+        commit）」推进，外层不再跨模型调用持有任何未提交写事务；
+      * 毒丸语义反转：单行异常 → 记入 stats["failed_rows"] 并**停止本批、不前移
+        checkpoint**，该行及之后下轮重试（规则不再丢）。对账 DML 已先行提交，其
+        last_outcome_at 游标幂等防重算；同 rowid 连续失败会在日志 WARNING 暴露，
+        便于人肉排雷，但绝不静默越过。
+    首次运行（无 checkpoint）冷启动=只从当前最大 rowid 起监听。"""
+    stats = {"scanned": 0, "extracted": [], "accounted": 0, "error": "", "failed_rows": []}
     conn = memory_db.connect()
     try:
         _ensure_tables(conn)
@@ -472,34 +481,46 @@ def scan_once() -> dict:
             "WHERE kind IN ('insight', 'task_result') AND rowid > ? ORDER BY rowid ASC LIMIT ?",
             (ck, _SCAN_BATCH_LIMIT)).fetchall()
         stats["scanned"] = len(rows)
-        new_ck = ck
         for row in rows:
+            row_rid = int(row["rowid"])
             try:
                 kind = str(row["kind"] or "")
                 content = str(row["content"] or "")
                 tags = str(row["tags"] or "")
                 created_at = str(row["created_at"] or "")
                 failed = _is_failed_record(tags, content)
+                # ---- 短事务①：对账 DML 立即落盘（游标幂等，失败重试不重算） ----
                 if kind == "task_result":
                     _lifecycle_account(conn, row["id"], failed, created_at)
+                    conn.commit()
                     stats["accounted"] += 1
+                # ---- 模型提炼：此刻外层零未提交写事务，跨 120s 模型调用不持锁 ----
+                rules = []
                 if kind == "insight" or failed:
                     experience = content[:_EXPERIENCE_MAX_CHARS]
                     raw = _call_extract_model(experience)
                     rules = _parse_rules(raw)
-                    for rule in rules:
-                        detail = _store_rule(rule, str(row["session_id"] or "default"))
-                        detail["source_record_id"] = row["id"]
-                        stats["extracted"].append(detail)
+                # ---- 规则落库：_store_rule 自带短连接（无嵌套撞锁面） ----
+                for rule in rules:
+                    detail = _store_rule(rule, str(row["session_id"] or "default"))
+                    detail["source_record_id"] = row["id"]
+                    stats["extracted"].append(detail)
+                # ---- 短事务②：checkpoint 前移（_set_checkpoint 自带 commit） ----
+                _set_checkpoint(conn, row_rid)
+                if rules:
                     logger.info("经验提炼（kind=%s id=%s 失败=%s）：%d 条规则 | %s",
                                 kind, row["id"][:8], failed, len(rules),
                                 "；".join(rules[:2]))
-            except Exception as e:  # noqa: BLE001 - 毒丸行不阻塞队列
-                logger.warning("单条记录处理异常（id=%s）：%s: %s",
-                               str(row["id"])[:8], type(e).__name__, str(e)[:160])
-            new_ck = int(row["rowid"])
-        if rows:
-            _set_checkpoint(conn, new_ck)
+            except Exception as e:  # noqa: BLE001 - 毒丸行：停止本批且不前移 checkpoint
+                logger.warning("单条记录处理失败，checkpoint 停在 rowid=%d 不前移（id=%s）：%s: %s",
+                               ck, str(row["id"])[:8], type(e).__name__, str(e)[:160])
+                stats["failed_rows"].append({
+                    "rowid": row_rid,
+                    "id": str(row["id"])[:8],
+                    "error": "%s: %s" % (type(e).__name__, str(e)[:160]),
+                })
+                stats["error"] = stats["failed_rows"][-1]["error"]
+                break
         return stats
     finally:
         conn.close()

@@ -132,14 +132,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def connect() -> sqlite3.Connection:
-    """建立连接（自动创建数据目录；MORAY_DB 指定时建其父目录），返回 row 工厂连接"""
+    """建立连接（自动创建数据目录；MORAY_DB 指定时建其父目录），返回 row 工厂连接
+
+    [体检修复 2026-11-14] 并发卫生两件套：
+      * timeout=5.0 → 连接级 busy_timeout：写锁竞争时排队等 5s 而不是立即抛
+        "database is locked"（此前 busy_timeout=0，与 mcp_gateway 审计写/
+        usage_log 写并发时是即时炸雷）；
+      * journal_mode=WAL：读写并行（读不阻塞写、写不阻塞读）。journal_mode 是
+        库级持久属性，这里每连接幂等声明一次（首个连接落盘，此后是 no-op 查询）；
+        不支持 WAL 的介质/旧版本 OperationalError 时退回默认 DELETE，不阻塞启动。"""
     try:
         config.SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    conn = sqlite3.connect(config.SQLITE_PATH)
+    conn = sqlite3.connect(config.SQLITE_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:  # noqa: BLE001 - WAL 不可用退回 DELETE 模式
+        pass
     return conn
 
 

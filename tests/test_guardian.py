@@ -5,7 +5,8 @@ r"""Guardian Agent 单元测试（2026-11-11）。
   1. 低危直通：search_web 普通查询 → 放行，且 1.5B 模型零调用；
   2. 硬规则：rm -rf D:\ → 确定性拦截（不依赖模型）；
   3. 高危工具 + 语义 unsafe → 拦截；语义 safe → 放行；
-  4. fail-open：模型抛异常 / 输出不可解析 → 放行（守卫绝不阻塞主链路）。
+  4. [体检修复 2026-11-14] 判定不可得按工具风险分级：高危工具 fail-close（拦截，
+     不留"守卫失明窗口"）；非高危软特征 fail-open（模型故障不反噬正常业务）。
 
 跑法：D:/python3.12/python.exe -m pytest tests/test_guardian.py -v
 （cwd=仓库根；也可 python tests/test_guardian.py 直跑）
@@ -90,27 +91,40 @@ def test_high_risk_tool_llm_safe_passes(monkeypatch):
     assert "semantic pass" in reason
 
 
-# ---------------- 4. fail-open（守卫绝不阻塞主链路） ----------------
+# ---------------- 4. 判定不可得：高危 fail-close / 非高危 fail-open ----------------
+# [体检修复 2026-11-14] 旧口径"模型挂了一律 fail-open"在体检中被证明是绕过面：
+# 守卫失明窗口恰好覆盖 execute/refactor 系高危工具。新口径按工具风险分级。
 
-def test_fail_open_on_model_exception(monkeypatch):
+def test_fail_close_on_model_exception_high_risk(monkeypatch):
     async def _broken(tool_name, args_blob):
         raise RuntimeError("ollama down (simulated)")
 
     monkeypatch.setattr(guardian, "_llm_verdict", _broken)
     ok, reason = asyncio.run(guardian.check_tool_safety(
         "execute_plan", {"plan": "whatever"}))
-    assert ok is True, "模型挂了必须 fail-open 放行"
-    assert "fail-open" in reason
+    assert ok is False, "高危工具在语义审查不可得时必须 fail-close 拦截"
+    assert "fail-close" in reason
 
 
-def test_fail_open_on_garbage_verdict(monkeypatch):
+def test_fail_close_on_garbage_verdict_high_risk(monkeypatch):
     async def _garbage(tool_name, args_blob):
         raise ValueError("guardian verdict unparseable: 之类散文")
 
     monkeypatch.setattr(guardian, "_llm_verdict", _garbage)
     ok, reason = asyncio.run(guardian.check_tool_safety(
         "execute_safe_python", {"code": "print(1)"}))
-    assert ok is True
+    assert ok is False
+    assert "fail-close" in reason
+
+
+def test_fail_open_on_model_exception_low_risk(monkeypatch):
+    async def _broken(tool_name, args_blob):
+        raise RuntimeError("ollama down (simulated)")
+
+    monkeypatch.setattr(guardian, "_llm_verdict", _broken)
+    ok, reason = asyncio.run(guardian.check_tool_safety(
+        "search_web", {"command": "cat a.txt | python"}))
+    assert ok is True, "非高危软特征在模型挂掉时保持 fail-open（不反噬正常业务）"
     assert "fail-open" in reason
 
 

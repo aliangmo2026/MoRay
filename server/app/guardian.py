@@ -11,10 +11,12 @@
           mkfs/dd、reg delete 等）→ 不依赖小模型直接拦（1.5B 判断力有限，毁灭性操作
           必须确定性拦死）；这一层保证"rm -rf D:\\"必拦；
   Tier 2 语义审查 —— 高危工具或中度危险参数 → 调 1.5B 审查；判 unsafe 拦截；
-          模型挂了/超时/输出不可解析 → **fail-open 放行**（守卫绝不阻塞主流程）。
+          [体检修复 2026-11-14] 判定不可得（超时/异常/不可解析）时**按工具风险分级**：
+          高危工具 fail-close（拦截，不留"守卫失明窗口"）；非高危软特征 fail-open
+          （模型故障不反噬正常业务）。
 
 纪律：
-  * 主链路零阻塞：Tier 2 总预算 GUARDIAN_TIMEOUT（默认 15s），超时按 fail-open；
+  * 主链路零阻塞：Tier 2 总预算 GUARDIAN_TIMEOUT（默认 15s），超时按上面分级处理；
   * 算力显存卫生：keep_alive=0（不占显存；审查是罕见事件，冷载几秒可接受）；
   * 决策全量落 logs/guardian.log（moray 根 logger 只放 ERROR 的教训：模块自挂 handler）；
   * 模型名/开关/超时/硬规则开关全部 env 可覆写（MORAY_GUARDIAN_*），不改 config.py。
@@ -22,11 +24,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -93,10 +97,12 @@ HIGH_RISK_NAME_RE = re.compile(
 
 # ---- Tier 1 硬规则（确定性拦截，不依赖小模型） ----
 
-#: 递归强删特征：rm -r/-rf/--recursive、del /q /s、rd /s、rmdir /s、
+#: 递归强删特征：rm -r/-rf/--recursive、rm -fr（f 在前变体，体检修复 2026-11-14：
+#: 旧式仅要求旗标 r 开头，`rm -fr` 漏拦掉进 Tier2 慢路径）、del /q /s、rd /s、rmdir /s、
 #: Remove-Item -Recurse
 _RECURSIVE_DELETE_RE = re.compile(
     r"(\brm\s+(?:-{1,2}[\w-]+\s+)*-{1,2}r[a-z]*f?[a-z]*\b"
+    r"|\brm\s+(?:-{1,2}[\w-]+\s+)*-{1,2}fr[a-z]*\b"
     r"|\bdel\s+/[a-z]\b|\b(?:rd|rmdir)\s+/s\b"
     r"|\bremove-item\b.*-\w*recurse)", re.I)
 
@@ -110,6 +116,8 @@ _CATASTROPHIC_RE = re.compile(
     r"\bdiskpart\b|\bcipher\s+/w\b|\bshutdown\s+(/[sr]|-[sf])?\s*($|-t\s*0))", re.I)
 
 #: Tier 2 软特征：中度危险（触发语义审查，不直接拦）
+#: [体检修复 2026-11-14] 新增通用"管道喂解释器"特征（此前只认 curl/wget 前缀，
+#: `echo <b64> | base64 -d | sh` 这类变形在低危工具名下整体穿透 Tier0 —— 体检 E2E 实锤）
 _SOFT_DANGER_RE = re.compile(
     r"(\brm\b|\bdel\s|\brd\s|\brmdir\b|\bremove-item\b|\bunlink\b"
     r"|\breg\s+(add|import)\b|\bregedit\b"
@@ -117,7 +125,8 @@ _SOFT_DANGER_RE = re.compile(
     r"|\btaskkill\b|\bstop-process\b"
     r"|\bsudo\b|\bchmod\b|\bchown\b"
     r"|\biex\b|\binvoke-expression\b|\bpowershell\s+-enc"
-    r"|curl[^\n]*\|\s*(ba)?sh|wget[^\n]*\|\s*(ba)?sh)", re.I)
+    r"|curl[^\n]*\|\s*(ba)?sh|wget[^\n]*\|\s*(ba)?sh"
+    r"|\|\s*(ba)?sh\b|\|\s*python3?\b|\|\s*pwsh\b|\|\s*powershell\b)", re.I)
 
 
 def _iter_strings(obj: Any):
@@ -146,6 +155,68 @@ def _root_target_present(blob: str) -> bool:
     seg = re.split(r"[&|;]", blob[m.end():])[0]
     toks = [t.strip("\"'") for t in seg.split()]
     return any(_ROOT_TARGET_RE.match(t) for t in toks)
+
+
+#: base64 特征 token（≥8 位合法 b64 字符集；误报由"解码成功 + 可打印"双重过滤兜底。
+#: 阈值不能高——"rm -rf C:/" 的 b64 只有 14 字符，{16,} 会漏掉短致命载荷）
+_B64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
+_B64_MAX_TOKENS = 8
+_B64_MAX_CHARS = 4096
+#: 零宽/软连字符（NFKC 不归一、命令里永远无意义，纯绕过垫字）
+_ZWSP_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u00ad]")
+
+
+def _decoded_base64_payloads(text: str) -> str:
+    """[体检修复 2026-11-14] 就地解码扫描文本里的 base64 载荷（体检 E2E 实锤：
+    `echo <b64> | base64 -d | sh` 在低危工具名下 Tier0 0ms 直通——守卫看不懂变形）。
+    utf-8 优先；utf-16-le 走 ASCII 位模式启发（powershell -enc 惯例）。
+    解码失败/不可打印一律静默跳过，解码面任何异常不反噬判定。"""
+    out = []
+    try:
+        for tok in _B64_TOKEN_RE.findall(text)[:_B64_MAX_TOKENS]:
+            padded = tok + "=" * (-len(tok) % 4)
+            try:
+                raw = base64.b64decode(padded, validate=True)
+            except Exception:  # noqa: BLE001 - 非 b64 token 静默跳过
+                continue
+            dec = None
+            try:
+                d8 = raw.decode("utf-8")
+                if d8.isprintable():
+                    dec = d8
+            except Exception:  # noqa: BLE001 - 非 utf-8 文本
+                dec = None
+            if dec is None:
+                try:
+                    if len(raw) >= 4 and raw[1::2].count(0) >= len(raw) // 4:
+                        d16 = raw.decode("utf-16-le")
+                        if d16.isprintable():
+                            dec = d16
+                except Exception:  # noqa: BLE001 - 非 utf-16 文本
+                    dec = None
+            if dec:
+                out.append(dec.strip()[:_B64_MAX_CHARS])
+    except Exception:  # noqa: BLE001 - 解码面任何异常不反噬判定
+        pass
+    return "\n".join(out)
+
+
+def _augment_scan_text(blob: str) -> str:
+    """[体检修复 2026-11-14] 三级共享扫描面增强：
+      1. Unicode NFKC 规范化（全角 ｒｍ/-ｒｆ 等同形字符归一，体检单元矩阵实证
+         全角载荷此前只能靠不可靠的 Tier2 兜底）；
+      2. 零宽字符剥离（U+200B/200C/200D/BOM/软连字符——NFKC 不归一的绕过垫字）；
+      3. base64 就地解码追加（解码产物一并进 Tier0/Tier1 匹配面）。
+    任何异常回退原始 blob（守卫自身故障绝不反噬主链路）。"""
+    try:
+        text = unicodedata.normalize("NFKC", str(blob or ""))
+        text = _ZWSP_RE.sub("", text)
+        extra = _decoded_base64_payloads(text)
+        if extra:
+            text = text + "\n" + extra
+        return text
+    except Exception:  # noqa: BLE001
+        return str(blob or "")
 
 
 def _parse_verdict(raw: str) -> Tuple[Optional[bool], str]:
@@ -208,8 +279,11 @@ async def _llm_verdict(tool_name: str, args_blob: str) -> Tuple[bool, str]:
 async def check_tool_safety(tool_name: str, args: dict) -> Tuple[bool, str]:
     """守门员主入口：工具执行前调用。返回 (放行?, 理由)。
 
-    低危直通零模型开销；硬规则确定性拦截；语义审查 fail-open；顶层任何异常
-    也 fail-open（守卫故障绝不能反噬 MCP 主链路）。"""
+    低危直通零模型开销；硬规则确定性拦截。
+    [体检修复 2026-11-14] 语义审查判定不可得（超时/异常/不可解析）时按工具风险分级：
+    高危工具 fail-close（拦截，绝不给 execute/refactor 系留"守卫失明窗口"）；
+    非高危软特征保持 fail-open（模型故障不反噬正常业务）。顶层异常仍 fail-open
+    （守卫自身代码故障绝不 brick MCP 主链路——Tier2 的模型失败不会走到顶层）。"""
     t0 = time.time()
     try:
         if not GUARDIAN_ENABLED:
@@ -217,24 +291,26 @@ async def check_tool_safety(tool_name: str, args: dict) -> Tuple[bool, str]:
         if not isinstance(args, dict):
             args = {"_raw": str(args)[:500]}
         blob = " | ".join(_iter_strings(args))[:1500]
+        # [体检修复 2026-11-14] 三级共享扫描面：NFKC 规范化 + 零宽剥离 + b64 解码追加
+        scan = _augment_scan_text(blob)
         high_risk = bool(tool_name in HIGH_RISK_TOOLS) \
             or bool(HIGH_RISK_NAME_RE.search(tool_name))
         # ---- Tier 0：低危直通（零模型开销） ----
-        if not high_risk and not _SOFT_DANGER_RE.search(blob):
+        if not high_risk and not _SOFT_DANGER_RE.search(scan):
             return True, "low-risk passthrough"
         # ---- Tier 1：硬规则确定性拦截（不依赖小模型） ----
         if GUARDIAN_HARD_BLOCK and (
-                _CATASTROPHIC_RE.search(blob)
-                or (_RECURSIVE_DELETE_RE.search(blob) and _root_target_present(blob))):
-            frag = _matched_fragment(_CATASTROPHIC_RE, blob) \
+                _CATASTROPHIC_RE.search(scan)
+                or (_RECURSIVE_DELETE_RE.search(scan) and _root_target_present(scan))):
+            frag = _matched_fragment(_CATASTROPHIC_RE, scan) \
                 or "recursive delete on root/wildcard"
             logger.info("HARD-BLOCK %s %.0fms frag=%s",
                         tool_name, (time.time() - t0) * 1000, frag[:80])
             return False, "guardian hard-block: %s" % frag
-        # ---- Tier 2：1.5B 语义审查（fail-open） ----
+        # ---- Tier 2：1.5B 语义审查（判定不可得时按风险分级） ----
         try:
             safe, reason = await asyncio.wait_for(
-                _llm_verdict(tool_name, blob[:600]),
+                _llm_verdict(tool_name, scan[:600]),
                 timeout=GUARDIAN_TIMEOUT + 5.0)
             logger.info("SEMANTIC %s safe=%s %.0fms reason=%s",
                         tool_name, safe, (time.time() - t0) * 1000, reason[:80])
@@ -242,8 +318,19 @@ async def check_tool_safety(tool_name: str, args: dict) -> Tuple[bool, str]:
                 return False, "guardian semantic block: %s" % (reason[:200] or "unsafe")
             return True, "guardian semantic pass: %s" % (reason[:120] or "ok")
         except asyncio.TimeoutError:
+            if high_risk:
+                logger.warning("FAIL-CLOSE %s %.0fms reason=model timeout",
+                               tool_name, (time.time() - t0) * 1000)
+                return False, ("guardian fail-close: semantic review unavailable "
+                               "(model timeout >%.0fs)" % GUARDIAN_TIMEOUT)
             return True, "guardian fail-open: model timeout (>%.0fs)" % GUARDIAN_TIMEOUT
-        except Exception as e:  # noqa: BLE001 - Tier-2 任何失败 fail-open
+        except Exception as e:  # noqa: BLE001 - Tier-2 失败按工具风险分级
+            if high_risk:
+                logger.warning("FAIL-CLOSE %s %.0fms reason=%s: %s",
+                               tool_name, (time.time() - t0) * 1000,
+                               type(e).__name__, str(e)[:120])
+                return False, ("guardian fail-close: semantic review unavailable "
+                               "(%s: %s)" % (type(e).__name__, str(e)[:120]))
             return True, "guardian fail-open: %s: %s" % (type(e).__name__, str(e)[:160])
     except Exception as top:  # noqa: BLE001 - 顶层 fail-open
         try:
