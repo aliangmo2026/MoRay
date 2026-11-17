@@ -96,12 +96,16 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
 -- [真实数据链路 2026-10-26] 对话级真实用量账本：llm_proxy 流式/非流式收尾各写一行。
 -- tokens 为上游真值（Ollama eval_count / OpenAI 兼容 usage 块）；cost_cny 后端无价目表
 -- 暂记 0.0（金额由前端 CostEngine 按其人民币价目表换算，后端只记事实）。
+-- [P2-1 2026-11-17] 新增 cached_tokens：OpenAI 兼容 usage.prompt_tokens_details.
+-- cached_tokens（提示词缓存命中部分，计费折扣幅度通常一档以上）。本地 Ollama
+-- 无此块恒 0；账本从此能看见"缓存命中了多少、省了多少钱"。
 CREATE TABLE IF NOT EXISTS usage_log (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   date              TEXT NOT NULL,              -- 本地日期 YYYY-MM-DD（按日聚合键）
   model             TEXT NOT NULL DEFAULT '',   -- 实际应答模型（非请求模型）
   prompt_tokens     INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens     INTEGER NOT NULL DEFAULT 0, -- 提示词缓存命中 tokens（上游无此块恒 0）
   cost_cny          REAL NOT NULL DEFAULT 0.0,  -- 预留：后端价目表接入前恒 0.0
   ms                INTEGER NOT NULL DEFAULT 0, -- 端到端耗时（首字到收尾按实现口径）
   ts                INTEGER NOT NULL DEFAULT 0  -- epoch 毫秒
@@ -120,6 +124,9 @@ _MIGRATION_COLUMNS = [
     ("event_snapshots", "error_msg", "TEXT NOT NULL DEFAULT ''"),
     ("event_snapshots", "input_json", "TEXT NOT NULL DEFAULT ''"),
     ("event_snapshots", "output_json", "TEXT NOT NULL DEFAULT ''"),
+    # [P2-1 2026-11-17] 既有 usage_log 老库补缓存命中列（幂等：PRAGMA 查列后
+    # 缺哪列补哪列，不动既有行）。
+    ("usage_log", "cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

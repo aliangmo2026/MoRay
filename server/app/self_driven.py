@@ -53,6 +53,7 @@ json_repair 容错解析（self_narrative._parse_narrative_json 同款），targ
 """
 import asyncio
 import datetime
+import io
 import json
 import logging
 import os
@@ -2033,6 +2034,10 @@ def generate_self_fix_goal() -> dict:
             logger.warning("[self_driven] 拒发自愈卡：路径硬闸 %s（verify=%s）",
                            problem, card["verify_cmd"][:100])
             return {"ran": False, "reason": "verify_%s" % problem, "card": None}
+        # [P2-2 2026-11-17] 幻影目录根治：目录没建出来就不发卡（fail-close）——
+        # 否则新卡又指向不存在的路径，14 张历史卡的老病复发。
+        if not _ensure_self_fix_sandbox():
+            return {"ran": False, "reason": "fix_dir_failed", "card": None}
         if not _record_goal(card, quota_free=True):
             return {"ran": False, "reason": "record_failed", "card": None}
         # 留痕（approve 删卡不影响）：self_fix_log 追加 + 原子落盘
@@ -2072,6 +2077,83 @@ def maybe_generate_self_fix() -> dict:
         return {"ran": False,
                 "reason": "unhandled: %s: %s" % (type(e).__name__, str(e)[:120]),
                 "card": None}
+
+
+# ---- [P2-2 2026-11-17] 幻影自愈沙箱根治：目录必须真实存在 ----
+# [体检 2026-11-16 实锤] state.self_fix_log 14 张 pending 卡全部指向
+# workspace/self_fix/ 下不存在的文件——卡片生成只写 state JSON，目标目录
+# 从未有任何代码创建（原本指望审批后引擎去写），全卡 pending → 目录从未
+# 问世 = 幻影目录，审查/晨报/验收都在引用一个不存在的路径。
+
+def _ensure_self_fix_sandbox() -> bool:
+    """自愈沙箱目录 + 占位 README 落盘（幂等，绝不抛）。成功 True。
+
+    刻意只写 _README.md 占位、不碰任何卡片目标文件：verify_cmd 校验的是
+    目标文件内容里的 organ/修复草案标记，占位文件若含标记 = 判据被空卡
+    白嫖通过（自愈练习变假通过）。README 同样规避该标记字面量。"""
+    try:
+        os.makedirs(_SELF_FIX_DIR, exist_ok=True)
+        readme = os.path.join(_SELF_FIX_DIR, "_README.md")
+        if not os.path.isfile(readme):
+            with io.open(readme, "w", encoding="utf-8") as f:
+                f.write("# 自愈产物沙箱（workspace/self_fix）\n\n"
+                        "自驱系统的自愈练习沙箱：连败器官触发自愈卡后，诊断报告与"
+                        "修复草案落在这里（每卡一个 self_fix_<日期>_<器官>.md）。\n"
+                        "修复永远是草案：动核心代码必须人工审批；本目录是留痕区，"
+                        "不在任何清理清单里。\n")
+        return True
+    except OSError as e:
+        logger.warning("[self_driven] 自愈沙箱目录创建失败（fail-close，不发自愈卡）：%s: %s",
+                       type(e).__name__, str(e)[:120])
+        return False
+
+
+def _backfill_self_fix_targets() -> int:
+    """历史 pending 自愈卡的目标文件补盘（幂等）。返回本次新写的存根数。
+
+    [体检 2026-11-16] state.self_fix_log 14 条 pending 留痕指向不存在的目标
+    文件：卡片生成时代码只落 state JSON，目标文件从未问世。存根刻意不含
+    organ/修复草案标记——verify_cmd 依旧失败，直到引擎真正执行该卡并覆盖
+    写入真报告（占位 ≠ 假通过）。"""
+    n = 0
+    try:
+        root = os.path.abspath(_SELF_FIX_DIR)
+        prefix = root.lower() + os.sep
+        for e in (_load_state().get("self_fix_log") or []):
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("card_status") or "pending_approval") != "pending_approval":
+                continue  # 只补 pending 卡：非 pending 的目标文件由执行流负责
+            target = str(e.get("fix_target") or "")
+            if not target or os.path.isfile(target):
+                continue  # 空目标跳过；已有真文件/已补过的不碰（幂等）
+            if not os.path.abspath(target).lower().startswith(prefix):
+                continue  # 越界目标（脏数据）绝不落盘——存根只许写进自愈沙箱
+            try:
+                os.makedirs(_SELF_FIX_DIR, exist_ok=True)
+                with io.open(target, "w", encoding="utf-8") as f:
+                    f.write("自愈占位存根：对应自愈卡尚未执行（等待人工审批）。\n"
+                            "引擎执行该卡时会覆盖本文件，写入真正的诊断报告与修复草案；\n"
+                            "执行前本文件仅为占位，判据（文件存在 + 内容标记段）不会通过。\n"
+                            "task_id: %s\ncreated_at: %s\n"
+                            % (e.get("task_id") or "", e.get("created_at") or ""))
+                n += 1
+            except OSError:
+                continue
+    except Exception as e:  # noqa: BLE001 - 补盘旁路绝不反噬启动
+        logger.warning("[self_driven] 历史 pending 自愈卡补盘异常：%s: %s",
+                       type(e).__name__, str(e)[:120])
+    return n
+
+
+# [P2-2 2026-11-17] 进程拉起即补历史幻影（幂等）：目录 + README + 历史 pending
+# 卡的存根，一次进程重启全部落地。失败只落日志，绝不反噬 import。
+try:
+    _ensure_self_fix_sandbox()
+    _backfill_self_fix_targets()
+except Exception as _e:  # noqa: BLE001
+    logger.warning("[self_driven] 自愈沙箱启动补盘旁路异常（忽略）：%s: %s",
+                   type(_e).__name__, str(_e)[:120])
 
 
 # ---- API（generate/approve/reject 三 POST + GET queue） ----

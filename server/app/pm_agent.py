@@ -80,15 +80,24 @@ class _PmFileHandler(logging.Handler):
 
 
 def _ensure_pm_logger() -> None:
-    if any(isinstance(h, _PmFileHandler) for h in logger.handlers):
+    # [体检修复 2026-11-17] 防双写判定改标记位：原 isinstance(h, _PmFileHandler)
+    # 在模块被两个名字 import（app.pm_agent / pm_agent 两个 sys.modules 键）时
+    # 类身份失配——第二份模块的 _PmFileHandler 是不同的类，判不出第一份已挂的
+    # handler → 再挂一个文件 handler，同一 record 两条 pm_agent.log（2026-11-14/
+    # 11-16 实证同毫秒成对双写）。getattr 标记位跨类身份稳定，根治。
+    if any(getattr(h, "_moray_pm_file", False) for h in logger.handlers):
         return
     logger.setLevel(logging.INFO)
-    logger.addHandler(_PmFileHandler())
+    _fh = _PmFileHandler()
+    _fh._moray_pm_file = True
+    logger.addHandler(_fh)
     # 控制台只放 WARNING+（moray 根 logger 对 INFO 静默，重复挂会双写）
-    _console = logging.StreamHandler()
-    _console.setLevel(logging.WARNING)
-    _console.setFormatter(logging.Formatter("[pm_agent] %(levelname)s %(message)s"))
-    logger.addHandler(_console)
+    if not any(getattr(h, "_moray_pm_console", False) for h in logger.handlers):
+        _console = logging.StreamHandler()
+        _console.setLevel(logging.WARNING)
+        _console.setFormatter(logging.Formatter("[pm_agent] %(levelname)s %(message)s"))
+        _console._moray_pm_console = True
+        logger.addHandler(_console)
     logger.propagate = False
 
 

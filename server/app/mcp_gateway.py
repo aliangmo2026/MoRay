@@ -579,11 +579,16 @@ async def run_server_tool_rounds(payload: Dict[str, Any], upstream_url: str,
             _u = data.get("usage") or {}
             _pt = int(_u.get("prompt_tokens") or 0)
             _ct = int(_u.get("completion_tokens") or 0)
+            # [P2-1 2026-11-17] 工具轮 usage 同样带缓存命中（OpenAI 兼容
+            # prompt_tokens_details.cached_tokens；本地 Ollama 无此块恒 0）。
+            # 经关键字传参：llm_proxy 注入的回调已接受 cached=，外部注入的旧
+            # 回调不支持时 TypeError 被下方 except 吞掉（与既有旁路纪律一致）。
+            _cached = int((_u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
             # 工具轮也是真实消耗：usage 照记 usage_log（旁路，同 _record_usage_log 惯例）
             if record_usage is not None:
                 try:
                     # [体检修复2 2026-11-14] usage 落库离环（同步 sqlite 不再阻塞事件循环）
-                    await asyncio.to_thread(record_usage, model, _pt, _ct, 0)
+                    await asyncio.to_thread(record_usage, model, _pt, _ct, 0, cached=_cached)
                 except Exception:  # noqa: BLE001
                     pass
             ours, others = [], []
@@ -633,6 +638,7 @@ async def run_server_tool_rounds(payload: Dict[str, Any], upstream_url: str,
                         args = None
                     # [P0 总时限] 工具执行包进剩余预算：到点取消在飞器官调用，回灌
                     # 超时信封（协议面完整——tool_call 有对应 tool 结果），随后熔断
+                    _t_tool = time.monotonic()
                     try:
                         env = await asyncio.wait_for(
                             execute_chat_tool(server, raw, args if isinstance(args, dict) else {}),
@@ -641,6 +647,22 @@ async def run_server_tool_rounds(payload: Dict[str, Any], upstream_url: str,
                         env = {"code": "MCP_TOTAL_TIMEOUT",
                                "data": {"message": "工具执行超出工具环总时限（%.0fs），已中止" % total_budget}}
                         timed_out = True
+                        # [P3 2026-11-17] 被熔断掐死的在飞工具补审计：execute_chat_tool
+                        # 的审计在 call_tool 返回后才写，总时限 wait_for 一取消它就永远
+                        # 走不到——能力雷达对"被熔断杀死的慢器官"是盲的（scribe_scan
+                        # 120s 熔断形态，11-16 体检实锤缺口）。status='timeout' 让雷达
+                        # 正确计入失败。审计旁路绝不反噬熔断收尾。
+                        try:
+                            from . import crud as _crud
+                            await asyncio.to_thread(
+                                _crud.append_agent_log,
+                                "mcp__%s__%s" % (str(server)[:20], str(raw)[:36]),
+                                "", True, "timeout",
+                                int((time.monotonic() - _t_tool) * 1000),
+                                "source=mcp | code=MCP_TOTAL_TIMEOUT | "
+                                "工具执行超出工具环总时限，被熔断中止（未返回信封）")
+                        except Exception:  # noqa: BLE001
+                            pass
                 if str(env.get("code")) != "OK":
                     _round_failures += 1
                 call_id = str((tc or {}).get("id") or ("call_mcp_%d_%d" % (rounds, i)))

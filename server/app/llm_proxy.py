@@ -65,13 +65,18 @@ _warmup_hint_logged: bool = False
 
 # ---------------- [真实数据链路 2026-10-26] 对话级用量落库（旁路） ----------------
 def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms: int,
-                      cloud: bool = False) -> None:
+                      cloud: bool = False, cached_tokens: int = 0) -> None:
     """把一次对话的真实用量写入 usage_log（db.py SCHEMA 尾部建表）。
 
     tokens 取上游真值（Ollama eval_count / OpenAI 兼容 usage 块）；cost_cny 后端无
     价目表恒 0.0（金额由前端 CostEngine 按人民币价目表换算，后端只记事实）。
     旁路原则：任何异常只落 DEBUG，绝不影响已成功的对话响应（同 settle/refund 惯例）。
     SQL 为字面量 + ? 绑定（外部值绝不拼接）。
+
+    [P2-1 2026-11-17] cached_tokens：OpenAI 兼容 usage.prompt_tokens_details.
+    cached_tokens（提示词缓存命中部分）。只进账本做可见性（直观看到缓存省了
+    多少），不动 cloud_budget_guard.record_tokens 的原始口径——预算闸继续按
+    全量 prompt_tokens 计，方向偏保守，缓存折扣不放大预算余量。
 
     [账单修复 2026-11-14] cloud=True 时把真实 token 同步累计进云端预算账本
     （cloud_budget_guard.record_tokens）——本函数是**唯一上游调用记账汇聚点**
@@ -82,10 +87,11 @@ def _record_usage_log(model: str, prompt_tokens: int, completion_tokens: int, ms
         conn = _db.connect()
         try:
             conn.execute(
-                "INSERT INTO usage_log (date, model, prompt_tokens, completion_tokens, cost_cny, ms, ts) "
-                "VALUES (?, ?, ?, ?, 0.0, ?, ?)",
+                "INSERT INTO usage_log (date, model, prompt_tokens, completion_tokens, cached_tokens, cost_cny, ms, ts) "
+                "VALUES (?, ?, ?, ?, ?, 0.0, ?, ?)",
                 (time.strftime("%Y-%m-%d"), str(model or "")[:120],
                  max(0, int(prompt_tokens or 0)), max(0, int(completion_tokens or 0)),
+                 max(0, int(cached_tokens or 0)),
                  max(0, int(ms or 0)), int(time.time() * 1000)))
             conn.commit()
         finally:
@@ -151,8 +157,10 @@ def _scan_stream_usage(raw: bytes, capt: dict) -> None:
 
     行缓冲处理 TCP 分包：先按 \\n 切行，行内子串快筛（eval_count / "usage"）命中才
     json.loads——无 usage 的普通 token 行零解析成本。capt 契约：
-    {buf:bytes, pt:int, ct:int, model:str}；Ollama 收尾行取 eval_count/prompt_eval_count，
-    OpenAI 兼容流收尾 chunk 取 usage 块；多行取 max 防乱序/重复。"""
+    {buf:bytes, pt:int, ct:int, cached:int, model:str}；Ollama 收尾行取
+    eval_count/prompt_eval_count，OpenAI 兼容流收尾 chunk 取 usage 块（含
+    prompt_tokens_details.cached_tokens 缓存命中，P2-1 2026-11-17）；多行取 max
+    防乱序/重复。"""
     capt["buf"] += raw
     while b"\n" in capt["buf"]:
         line, _, capt["buf"] = capt["buf"].partition(b"\n")
@@ -173,6 +181,9 @@ def _scan_stream_usage(raw: bytes, capt: dict) -> None:
         if isinstance(u, dict):  # OpenAI 兼容 chunk 收尾 usage 块
             capt["pt"] = max(capt["pt"], int(u.get("prompt_tokens") or 0))
             capt["ct"] = max(capt["ct"], int(u.get("completion_tokens") or 0))
+            # [P2-1 2026-11-17] 缓存命中（prompt_tokens_details.cached_tokens）
+            capt["cached"] = max(capt.get("cached", 0),
+                                 int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0))
             capt["model"] = capt["model"] or str(j.get("model") or "")
 
 
@@ -1591,6 +1602,9 @@ async def llm_chat(request: Request):
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
+        # [P2-1 2026-11-17] 缓存命中捕获：OpenAI 兼容 usage.prompt_tokens_details.
+        # cached_tokens（上游无此块/本地 Ollama 恒 0）。
+        _cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         out = {
             "ok": True,
             "content": message.get("content") or "",
@@ -1600,6 +1614,7 @@ async def llm_chat(request: Request):
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "cached_tokens": _cached,
             },
         }
         # [阶段0 本机 Agent] 工具轮：上游返回 tool_calls 时原样透传（无 tools 的旧请求不含此键，行为不变）
@@ -1620,7 +1635,8 @@ async def llm_chat(request: Request):
         await asyncio.to_thread(
             _record_usage_log, out["model"], out["usage"]["prompt_tokens"] + _extra_pt,
             out["usage"]["completion_tokens"] + _extra_ct,
-            int((time.time() - _t0) * 1000), cloud=not use_local)
+            int((time.time() - _t0) * 1000), cloud=not use_local,
+            cached_tokens=out["usage"]["cached_tokens"])
         return out
 
     async def _stream():
@@ -1760,7 +1776,7 @@ async def llm_chat(request: Request):
                 # OpenAI 兼容 usage 块，收尾写 usage_log（旁路，失败绝不中断透传）。
                 # 替换原裸 aiter_bytes 透传：多一次子串快筛，无 usage 的 token 行零 json 成本。
                 _t0 = time.time()
-                capt = {"buf": b"", "pt": 0, "ct": 0, "model": ""}
+                capt = {"buf": b"", "pt": 0, "ct": 0, "cached": 0, "model": ""}
                 # [2026-10-29 修正] 旧版按“原始 SSE 分块数 >64”硬放行——推理模型（r1:7b）
                 # 的 reasoning 分块会把额度烧光，正文还没开始就放行了，身份泄漏因此漏网。
                 # 现在只缓冲**正文帧**：reasoning/role/finish 帧立即透传，不参与扣流；
@@ -1837,7 +1853,8 @@ async def llm_chat(request: Request):
                         # 被丢弃的那次调用照样入账（钱花了就得记）
                         await asyncio.to_thread(
                             _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
-                            int((time.time() - _t0) * 1000), cloud=not use_local)
+                            int((time.time() - _t0) * 1000), cloud=not use_local,
+                            cached_tokens=capt.get("cached", 0))
                     await upstream.aclose()
                     if _substitute:
                         # [2026-10-29 身份叛变] 身份追问 + 沾厂商名 → 固定 MoRay 口径，
@@ -1856,7 +1873,8 @@ async def llm_chat(request: Request):
                 if capt["pt"] or capt["ct"]:
                     await asyncio.to_thread(
                         _record_usage_log, capt["model"] or model, capt["pt"], capt["ct"],
-                        int((time.time() - _t0) * 1000), cloud=not use_local)
+                        int((time.time() - _t0) * 1000), cloud=not use_local,
+                        cached_tokens=capt.get("cached", 0))
                 return
         except asyncio.CancelledError:
             raise
@@ -1886,8 +1904,8 @@ async def llm_chat(request: Request):
         # [体检修复2 2026-11-14] 工具环最长 120s：断连竞速，客户端走了就取消整个环
         # [账单修复 2026-11-14] 环内每轮上游调用经 _record_usage_cloud 按路由记 token：
         #   工具环是"一轮 permit 多次上游调用"的记账盲区主源（11-14：实发 550 / 记账 310）
-        def _record_usage_for_ring(m, p, c, ms):
-            _record_usage_log(m, p, c, ms, cloud=not use_local)
+        def _record_usage_for_ring(m, p, c, ms, cached=0):
+            _record_usage_log(m, p, c, ms, cloud=not use_local, cached_tokens=cached)
 
         _ok_loop, _loop_rounds = await _cancel_on_disconnect(
             request,
